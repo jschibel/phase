@@ -2257,20 +2257,21 @@ fn try_parse_return_to_hand_cost(rest_lower: &str) -> Option<AbilityCost> {
         filter
     };
     let filter = match filter {
-        TargetFilter::Any => {
-            // CR 201.5: A cost using the source card's own name, such as
-            // "Return Recurring Nightmare to its owner's hand", refers to that
-            // source object.
-            TargetFilter::SelfRef
-        }
+        // CR 201.5: A cost using the source card's own name, such as
+        // "Return Recurring Nightmare to its owner's hand", refers to that
+        // source object. Only one object is the source, so an unreadable
+        // object phrase with a count above one is declined rather than
+        // lowered as an unpayable self-reference.
+        TargetFilter::Any if count == 1 => TargetFilter::SelfRef,
+        TargetFilter::Any => return None,
         TargetFilter::Typed(TypedFilter {
             type_filters,
             controller: None,
             properties,
         }) if type_filters.is_empty() && properties.is_empty() => {
-            // CR 201.5: A cost using the source card's own name, such as
-            // "Return Recurring Nightmare to its owner's hand", refers to that
-            // source object.
+            if count != 1 {
+                return None;
+            }
             TargetFilter::SelfRef
         }
         filter => filter,
@@ -4700,6 +4701,49 @@ mod tests {
                 "{text:?} must not lower to ReturnToHand, got {cost:?}"
             );
         }
+    }
+
+    /// "your hand" is number-neutral: a non-count quantity must not be lowered
+    /// as a count-1 return there either.
+    #[test]
+    fn cost_return_x_cards_to_your_hand_declines() {
+        // Reach guard: the same object phrase and destination with an article.
+        assert!(matches!(
+            parse_oracle_cost("Return a creature card from your graveyard to your hand"),
+            AbilityCost::ReturnToHand { count: 1, .. }
+        ));
+        for text in [
+            "Return X creature cards from your graveyard to your hand",
+            "Return any number of creature cards from your graveyard to your hand",
+        ] {
+            let cost = parse_oracle_cost(text);
+            assert!(
+                !matches!(cost, AbilityCost::ReturnToHand { .. }),
+                "{text:?} must not lower to ReturnToHand, got {cost:?}"
+            );
+        }
+    }
+
+    /// The source-name self-reference fallback names ONE object; a counted
+    /// return of an unreadable object phrase must not lower to an unpayable
+    /// `ReturnToHand { count: 2, filter: SelfRef }`.
+    #[test]
+    fn cost_counted_return_of_unreadable_phrase_is_not_self_ref() {
+        // Reach guard: the same object phrase with an article reaches the
+        // fallback and becomes the self-reference.
+        assert_eq!(
+            parse_oracle_cost("Return a Recurring Nightmare to its owner's hand"),
+            AbilityCost::ReturnToHand {
+                count: 1,
+                filter: Some(TargetFilter::SelfRef),
+                from_zone: None,
+            }
+        );
+        let cost = parse_oracle_cost("Return two Recurring Nightmares to their owner's hand");
+        assert!(
+            !matches!(cost, AbilityCost::ReturnToHand { .. }),
+            "counted unreadable phrase must not lower to ReturnToHand, got {cost:?}"
+        );
     }
 
     #[test]

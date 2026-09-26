@@ -462,9 +462,10 @@ pub struct CountedReturnObject<'a> {
 }
 
 /// CR 601.2h: splits "[count] <object> to <hand destination>…" (the count is
-/// part of the total cost). A plural destination with no count token
-/// ("X lands …", "any number of …") is declined rather than read as one, so
-/// no unsupported count is ever lowered as 1. Lowercase input.
+/// part of the total cost). A plural destination with no count token, or an
+/// object phrase led by a non-count quantity ("X lands …", "any number of …")
+/// on any destination, is declined rather than read as one, so no unsupported
+/// count is ever lowered as 1. Lowercase input.
 pub fn split_counted_return_to_hand_object(input: &str) -> Option<CountedReturnObject<'_>> {
     let (before, number, trailing) = scan_preceded(input, parse_return_to_hand_destination)?;
     let object = before.trim_end();
@@ -474,6 +475,11 @@ pub fn split_counted_return_to_hand_object(input: &str) -> Option<CountedReturnO
     ))
     .parse(object)
     .ok()?;
+    // "x …" and "any number of …" are quantities, not a count token; on the
+    // number-neutral "your hand" destination they would otherwise read as one.
+    if count.is_none() && parse_non_count_quantity(object).is_ok() {
+        return None;
+    }
     let count = match (count, number) {
         (None, ReturnedObjectNumber::Plural) => return None,
         (None, ReturnedObjectNumber::Singular | ReturnedObjectNumber::Unmarked) => 1,
@@ -487,6 +493,11 @@ pub fn split_counted_return_to_hand_object(input: &str) -> Option<CountedReturnO
         object,
         trailing,
     })
+}
+
+/// A leading quantity that is not a fixed count ("x ", "any number of ").
+fn parse_non_count_quantity(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("x "), tag("any number of "))).parse(input)
 }
 
 /// Parse "it" as a self-reference, requiring a word boundary after "it"
@@ -1158,6 +1169,28 @@ mod tests {
         assert_eq!(
             split_counted_return_to_hand_object(
                 "any number of lands you control to their owners' hands"
+            ),
+            None
+        );
+        // "your hand" is number-neutral: a non-count quantity declines there
+        // too (reach guard: the same destination with an article parses).
+        assert_eq!(
+            split_counted_return_to_hand_object("a creature card from your graveyard to your hand"),
+            Some(CountedReturnObject {
+                count: 1,
+                object: "creature card from your graveyard",
+                trailing: "",
+            })
+        );
+        assert_eq!(
+            split_counted_return_to_hand_object(
+                "x creature cards from your graveyard to your hand"
+            ),
+            None
+        );
+        assert_eq!(
+            split_counted_return_to_hand_object(
+                "any number of creature cards from your graveyard to your hand"
             ),
             None
         );
