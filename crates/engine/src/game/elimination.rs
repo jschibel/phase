@@ -734,7 +734,10 @@ fn prune_pending_trigger_order(state: &mut GameState) {
 /// CR 800.4a: Remove deferred triggers controlled by eliminated players.
 fn prune_deferred_triggers_for_eliminated_players(state: &mut GameState) {
     let deferred = std::mem::take(&mut state.deferred_triggers);
-    let mut terminal_firings = Vec::new();
+    // CR 800.4a + CR 601.2c: abilities held for a spell still being cast leave
+    // with their controller too.
+    let mut terminal_firings =
+        crate::game::triggers::prune_announced_spell_triggers_for_eliminated_players(state);
     for context in deferred {
         if state
             .players

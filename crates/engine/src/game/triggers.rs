@@ -832,7 +832,6 @@ impl TriggerCollectionSession {
 /// current live state and replays the operations before collecting its next
 /// event slice. Dropping it is cancellation: neither operations nor contexts
 /// escape to the live game.
-#[cfg_attr(not(test), allow(dead_code))] // Casting owns this session in the next activation step.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PendingActivationTriggerCollection {
     overlay: TriggerCollectionOverlay,
@@ -840,9 +839,8 @@ pub(crate) struct PendingActivationTriggerCollection {
     pending_contexts: Vec<PendingTriggerContext>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Exercised by unit tests until casting adopts it.
 impl PendingActivationTriggerCollection {
-    #[cfg_attr(not(test), allow(dead_code))] // Construction moves into the activation announcement path next.
+    #[cfg(test)]
     pub(crate) fn for_activated_ability(source_id: ObjectId, controller: PlayerId) -> Self {
         Self {
             overlay: TriggerCollectionOverlay::for_activated_ability(source_id, controller),
@@ -890,7 +888,6 @@ impl PendingActivationTriggerCollection {
     /// Later slices replay the earlier collector operations into a fresh staged
     /// clone, so per-turn trigger constraints and event-observation ledgers
     /// behave as one uninterrupted transaction without touching live state.
-    #[cfg_attr(not(test), allow(dead_code))] // Called by target/cost continuation roots next.
     pub(crate) fn collect(&mut self, state: &GameState, events: &[GameEvent]) {
         let mut staged_state = self.rebuild_staged_state(state);
         self.overlay
@@ -910,7 +907,6 @@ impl PendingActivationTriggerCollection {
 
     /// Commit collector consequences exactly once and append the retained
     /// contexts to the caller's deferred delivery list.
-    #[cfg_attr(not(test), allow(dead_code))] // Called by the activated stack-push boundary next.
     pub(crate) fn commit_into(
         self,
         state: &mut GameState,
@@ -946,16 +942,30 @@ impl PendingActivationTriggerCollection {
 /// the targets ends without a priority window, so no ordinary collector ever
 /// sees its target events. This carrier holds them transactionally, exactly as
 /// an announced activation's collection does: committed once when the spell
-/// becomes cast (CR 601.2i), dropped if the cast is reversed (CR 733.1).
+/// becomes cast (CR 601.2i), together with the triggers of that action, as one
+/// CR 603.3b batch; dropped if the cast ends any other way (CR 733.1).
 ///
 /// It is keyed by the spell's object rather than carried on `PendingCast`
-/// because the casting continuation rebuilds its `PendingCast` across payment
-/// steps, while the spell's announced stack object persists from CR 601.2a
-/// until it becomes cast or is removed.
+/// because a spell's `PendingCast` does not survive its own payment seam:
+/// `finish_pending_cast_cost_or_pay` explodes it into fields for
+/// `pay_and_push_with_lock` / `pay_and_push_adventure`, which build a fresh
+/// `PendingCast::new` at every pause they return (cost-reduction order,
+/// harmonize, `{X}`, convoke/delve, manual or assisted mana payment), carrying
+/// only `CostLockInput` across; an answered additional-cost, distribution or
+/// cost-reduction prompt re-enters that seam and rebuilds it again. The
+/// spell's announced stack entry is the one carrier that persists from
+/// CR 601.2a until the spell becomes cast or the cast ends.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AnnouncedSpellTriggerCollection {
     spell: ObjectId,
     collection: PendingActivationTriggerCollection,
+}
+
+impl AnnouncedSpellTriggerCollection {
+    /// The trigger contexts held for the spell, for load-time validation.
+    pub(crate) fn pending_contexts(&self) -> &[PendingTriggerContext] {
+        &self.collection.pending_contexts
+    }
 }
 
 /// CR 601.2a + CR 601.2i: A spell is being cast while its announcement holds a
@@ -980,8 +990,14 @@ fn spell_is_being_cast(state: &GameState, object_id: ObjectId) -> bool {
 /// later action can change the game, against a staged clone so nothing becomes
 /// public before the spell is cast. An action that finishes the cast itself
 /// leaves no spell being cast, so its events stay with the ordinary priority
-/// collector. Collections whose spell is no longer being cast without having
-/// been committed are discarded here (CR 733.1).
+/// collector.
+///
+/// CR 733.1: this is also the one place a collection is dropped. A collection
+/// whose spell is no longer being cast and was not committed belongs to a cast
+/// that ended some other way — cancelled (`CancelCast`), or removed with a
+/// caster who left the game — and it is discarded at the end of the action
+/// that ended it. A cast reversed inside an action (`handle_cancel_cast`
+/// followed by an error) restores the pre-action snapshot, collection included.
 pub(crate) fn stage_announced_spell_target_events(state: &mut GameState, events: &[GameEvent]) {
     if !state.announced_spell_trigger_collections.is_empty() {
         let live: Vec<bool> = state
@@ -1046,9 +1062,26 @@ pub(crate) fn stage_announced_spell_target_events(state: &mut GameState, events:
 }
 
 /// CR 601.2c + CR 601.2i: Once the spell becomes cast, the abilities that
-/// triggered on its target announcement join the triggers waiting to be put on
-/// the stack the next time a player would receive priority (CR 603.3).
-pub(crate) fn commit_announced_spell_trigger_collection(state: &mut GameState, spell: ObjectId) {
+/// triggered on its target announcement wait with the abilities that trigger
+/// as it becomes cast, to be put on the stack the next time a player would
+/// receive priority (CR 603.3).
+///
+/// CR 603.3b: they are one batch — "every ability that has triggered since the
+/// last time a player received priority" — so its controllers order them
+/// together, in APNAP order, against the spell-cast triggers ("whenever you
+/// cast", prowess, magecraft). The commit therefore collects the finalizing
+/// action's own unclaimed events (its `SpellCast` among them) into the same
+/// transaction, commits the whole of it as one deferred batch, and claims those
+/// event occurrences so the reducer's priority pipeline does not collect them
+/// a second time — the commit an announced activation makes at its stack push
+/// (`casting_costs::push_ability_entry`). A spell whose casting never paused
+/// has no collection, and its triggers stay with the ordinary priority
+/// collector.
+pub(crate) fn commit_announced_spell_trigger_collection(
+    state: &mut GameState,
+    spell: ObjectId,
+    events: &[GameEvent],
+) {
     let Some(index) = state
         .announced_spell_trigger_collections
         .iter()
@@ -1056,18 +1089,59 @@ pub(crate) fn commit_announced_spell_trigger_collection(state: &mut GameState, s
     else {
         return;
     };
-    let entry = state.announced_spell_trigger_collections.remove(index);
+    let mut entry = state.announced_spell_trigger_collections.remove(index);
+    let unclaimed_events = filter_already_collected_trigger_events_from(
+        state,
+        events,
+        0,
+        &state.consumed_before_priority_trigger_events,
+    );
+    entry.collection.collect(state, &unclaimed_events);
     let mut deferred_contexts = std::mem::take(&mut state.deferred_triggers);
     entry.collection.commit_into(state, &mut deferred_contexts);
     state.deferred_triggers = deferred_contexts;
+    // CR 603.7 + CR 603.3b: the claim below hides these events from the
+    // priority pipeline's delayed-trigger scan as well, so delayed triggered
+    // abilities they trigger join the same batch here.
+    collect_delayed_triggers_into_deferred(state, &unclaimed_events);
+    state
+        .consumed_before_priority_trigger_events
+        .extend(
+            events
+                .iter()
+                .enumerate()
+                .map(|(index, event)| ConsumedTriggerEventOccurrence {
+                    event: event.clone(),
+                    occurrence: trigger_event_occurrence(events, index),
+                    scope: ConsumedTriggerEventScope::AllCollectors,
+                }),
+        );
 }
 
-/// CR 733.1: A reversed cast triggers nothing; drop whatever its target
-/// announcement collected.
-pub(crate) fn discard_announced_spell_trigger_collection(state: &mut GameState, spell: ObjectId) {
-    state
-        .announced_spell_trigger_collections
-        .retain(|entry| entry.spell != spell);
+/// CR 800.4a: A player who leaves the game while a spell is being cast takes
+/// the abilities they control with them, including any that triggered on the
+/// spell's target announcement and are still held for it. Returns the firings
+/// of the dropped contexts so the caller can record their terminal disposition.
+pub(crate) fn prune_announced_spell_triggers_for_eliminated_players(
+    state: &mut GameState,
+) -> Vec<TriggerFiring> {
+    let in_game: Vec<PlayerId> = state
+        .players
+        .iter()
+        .filter(|player| !player.is_eliminated)
+        .map(|player| player.id)
+        .collect();
+    let mut dropped = Vec::new();
+    for entry in &mut state.announced_spell_trigger_collections {
+        entry.collection.pending_contexts.retain(|context| {
+            let keep = in_game.contains(&context.pending.controller);
+            if !keep {
+                dropped.push(context.firing());
+            }
+            keep
+        });
+    }
+    dropped
 }
 
 /// Installs one CR 603.7 delayed triggered ability and journals it.

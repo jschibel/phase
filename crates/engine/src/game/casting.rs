@@ -27679,9 +27679,6 @@ pub fn handle_cancel_cast(
     _events: &mut Vec<GameEvent>,
 ) {
     state.cancelled_casts.push(pending.object_id);
-    // CR 733.1: no abilities trigger as a result of an undone action, so the
-    // reversed spell's target announcement leaves no trigger behind.
-    super::triggers::discard_announced_spell_trigger_collection(state, pending.object_id);
 
     // CR 601.2 + CR 733.1: Backing out of a cast reverses every choice and
     // payment made during it ("the entire action is reversed"). A pre-cost

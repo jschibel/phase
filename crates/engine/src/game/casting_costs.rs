@@ -12436,11 +12436,6 @@ fn finalize_cast_with_phyrexian_choices_inner(
                 .spell_mana_value(),
         ),
     });
-    // CR 601.2c + CR 601.2i: the spell has become cast, so abilities that
-    // triggered on its target announcement during a paused cast now wait with
-    // this action's triggers to be put on the stack.
-    super::triggers::commit_announced_spell_trigger_collection(state, object_id);
-
     // CR 608.2c + CR 608.2g + CR 601.2i: A paid during-resolution cast is the
     // "performed optional" the moment its spell is on the stack and its mana is
     // paid — this line is reached only on full payment completion (a pause
@@ -12665,6 +12660,13 @@ fn finalize_cast_with_phyrexian_choices_inner(
             new_cumulative,
         });
     }
+
+    // CR 601.2c + CR 601.2i + CR 603.3b: the spell has become cast, so abilities
+    // that triggered on its target announcement during a paused cast now wait,
+    // in one batch with the abilities that trigger as it becomes cast, to be put
+    // on the stack. This runs after the cast is recorded in the turn's cast
+    // ledger, which "first spell each turn" cast triggers read.
+    super::triggers::commit_announced_spell_trigger_collection(state, object_id, events);
 
     Ok(resolution_success_waiting_for.unwrap_or(WaitingFor::Priority { player }))
 }

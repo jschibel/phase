@@ -11705,6 +11705,22 @@ pub(crate) fn validate_trigger_firing_coherence(state: &GameState) -> Result<(),
             "deferred trigger",
         )?;
     }
+    for context in state
+        .announced_spell_trigger_collections
+        .iter()
+        .flat_map(|entry| entry.pending_contexts())
+    {
+        validate_trigger_dispatch_origin(
+            context.dispatch_origin,
+            context.firing(),
+            "held spell-target trigger",
+        )?;
+        validate_firing(
+            context.firing(),
+            context.pending.source_id,
+            "held spell-target trigger",
+        )?;
+    }
     if let Some(order) = &state.pending_trigger_order {
         for group in &order.groups {
             for context in &group.triggers {
@@ -20355,9 +20371,12 @@ declare_game_state! {
 
     /// CR 601.2c + CR 601.2i: Becomes-target triggers of spells whose casting
     /// paused after their targets were announced, held until the spell becomes
-    /// cast (`triggers::commit_announced_spell_trigger_collection`) or dropped
-    /// with a reversed cast (CR 733.1). Engine-private: redacted from every
-    /// viewer projection, like an activation's trigger collection.
+    /// cast (`triggers::commit_announced_spell_trigger_collection`, one CR 603.3b
+    /// batch with its cast triggers) or dropped when the cast ends otherwise
+    /// (CR 733.1) or their controller leaves the game (CR 800.4a).
+    /// Engine-private: redacted from every viewer projection, like an
+    /// activation's trigger collection. Keyed by the spell rather than carried
+    /// on `PendingCast`; see `triggers::AnnouncedSpellTriggerCollection`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) announced_spell_trigger_collections:
         Vec<crate::game::triggers::AnnouncedSpellTriggerCollection>,
