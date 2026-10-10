@@ -7473,6 +7473,13 @@ pub enum CastPaymentMode {
     Manual,
 }
 
+impl CastPaymentMode {
+    /// Whether this is the default mode, which wire formats omit.
+    pub fn is_auto(&self) -> bool {
+        matches!(self, CastPaymentMode::Auto)
+    }
+}
+
 /// CR 601.2g + CR 601.2h + CR 602.2b: POSITIVE signal of which "mana first,
 /// non-mana cost last" detour a pending activation took, so
 /// `push_activated_ability_to_stack` knows whether `activation_cost` is the
@@ -8376,17 +8383,21 @@ impl PendingCast {
     /// CR 602.2b: the root of an in-flight ACTIVATED ability. Every activation
     /// root is built here, so each one must name its cost-modifier carrier
     /// (`None` only for the mana-free loyalty fast path and legacy callers) —
-    /// the carrier cannot be silently dropped by a fresh root.
+    /// the carrier cannot be silently dropped by a fresh root. Likewise each
+    /// root names the activation's payment mode (CR 602.2b + CR 601.2g-h), so a
+    /// root rebuilt mid-activation cannot fall back to automatic payment.
     pub fn for_activation(
         source_id: ObjectId,
         ability: ResolvedAbility,
         cost: ManaCost,
         ability_index: usize,
         activation_cost_snapshot: Option<Box<crate::types::casting_costs::ActivationCostSnapshot>>,
+        payment_mode: CastPaymentMode,
     ) -> Self {
         let mut pending = Self::new(source_id, CardId(0), ability, cost);
         pending.activation_ability_index = Some(ability_index);
         pending.activation_cost_snapshot = activation_cost_snapshot;
+        pending.payment_mode = payment_mode;
         pending
     }
 
@@ -16094,6 +16105,11 @@ pub enum WaitingFor {
         /// selection builds one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         activation_cost_snapshot: Option<Box<crate::types::casting_costs::ActivationCostSnapshot>>,
+        /// CR 602.2b + CR 601.2g-h: for activated abilities, the activation's
+        /// payment mode, carried like the cost-modifier carrier until mode
+        /// selection builds the `PendingCast`.
+        #[serde(default, skip_serializing_if = "CastPaymentMode::is_auto")]
+        activation_payment_mode: CastPaymentMode,
         /// Mode indices unavailable due to NoRepeatThisTurn/NoRepeatThisGame constraints.
         /// CR 700.2: Engine computes which modes have been previously chosen; frontend uses this to disable them.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -43932,6 +43948,7 @@ mod tests {
             ability_cost: None,
             activation_cost_snapshot: None,
             unavailable_modes: vec![],
+            activation_payment_mode: CastPaymentMode::Auto,
         }));
         variants.push(Box::new(WaitingFor::PayCost {
             player: PlayerId(0),
@@ -44308,6 +44325,7 @@ mod tests {
             ability_cost: None,
             activation_cost_snapshot: None,
             unavailable_modes: Vec::new(),
+            activation_payment_mode: CastPaymentMode::Auto,
         };
         let members = [
             WaitingFor::ModalFaceChoice {
@@ -44478,6 +44496,7 @@ mod tests {
             ability_cost: None,
             activation_cost_snapshot: None,
             unavailable_modes: Vec::new(),
+            activation_payment_mode: CastPaymentMode::Auto,
         };
         assert!(!ability_modes.allows_cancel_cast());
 

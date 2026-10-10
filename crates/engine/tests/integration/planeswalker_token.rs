@@ -71,6 +71,7 @@ fn enumerated_ability_indices(runner: &GameRunner, source: ObjectId) -> Vec<usiz
             GameAction::ActivateAbility {
                 source_id,
                 ability_index,
+                ..
             } if *source_id == source => Some(*ability_index),
             _ => None,
         })
@@ -281,6 +282,7 @@ fn jace_token_loyalty_abilities_respect_once_per_turn() {
         .act(GameAction::ActivateAbility {
             source_id: jace,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activating [−1] must succeed");
     runner.advance_until_stack_empty();

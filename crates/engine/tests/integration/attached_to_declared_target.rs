@@ -3357,6 +3357,7 @@ fn spellskite_on_fiery(with_equipment: bool) -> (GameRunner, ObjectId, ObjectId,
         .act(GameAction::ActivateAbility {
             source_id: spellskite,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate Spellskite");
     if matches!(

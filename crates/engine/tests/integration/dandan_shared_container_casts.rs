@@ -1147,6 +1147,7 @@ fn graveyard_activation_stays_owner() {
         let activation = runner.act(GameAction::ActivateAbility {
             source_id: zombie,
             ability_index,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         });
         assert_eq!(activation.is_ok(), actor == P0, "{actor:?}");
     }

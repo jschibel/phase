@@ -1152,6 +1152,7 @@ fn v8_crown_of_convergence_offers_the_pile_to_bottom() {
             .act(GameAction::ActivateAbility {
                 source_id: crown,
                 ability_index: 0,
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             })
             .expect("activation accepted");
         runner.resolve_top();
@@ -1206,6 +1207,7 @@ fn v9_manakin_and_millikin_mills_the_pile_to_pay() {
             let result = runner.act(GameAction::ActivateAbility {
                 source_id: manakin,
                 ability_index: 0,
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             });
 
             assert_eq!(
@@ -1527,6 +1529,7 @@ fn v6_kylox_voltstrider_collects_evidence_from_the_pile_graveyard() {
             .act(GameAction::ActivateAbility {
                 source_id: vehicle,
                 ability_index: index,
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             })
             .expect("collect evidence 6 is payable from the pile graveyard");
 
@@ -1581,6 +1584,7 @@ fn v6_altar_of_the_wretched_crafts_from_the_pile_graveyard() {
             let result = runner.act(GameAction::ActivateAbility {
                 source_id: altar,
                 ability_index: index,
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             });
 
             assert_eq!(
@@ -1631,6 +1635,7 @@ fn v6_baron_helmut_zemo_boasts_by_exiling_black_cards_from_the_pile_graveyard() 
             let result = runner.act(GameAction::ActivateAbility {
                 source_id: baron,
                 ability_index: index,
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             });
 
             assert_eq!(

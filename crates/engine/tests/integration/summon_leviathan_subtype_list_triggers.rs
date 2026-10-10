@@ -1493,6 +1493,7 @@ fn pyromancer_decree_board(theft: bool, bounce: bool, pending: bool) -> (i32, i3
             .act(GameAction::ActivateAbility {
                 source_id: pyromancer,
                 ability_index: 0,
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             })
             .expect("P1 activates Prodigal Pyromancer");
         runner
@@ -1632,6 +1633,7 @@ fn chandras_outrage_hits_the_live_controller_of_a_source_with_a_pending_ability(
         .act(GameAction::ActivateAbility {
             source_id: pyromancer,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("P1 activates Prodigal Pyromancer");
     runner

@@ -216,6 +216,7 @@ fn activate_to_priority(
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("the activation must be accepted");
     for _ in 0..16 {

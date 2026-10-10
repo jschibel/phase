@@ -557,6 +557,7 @@ fn royal_decree_damages_the_tapper_of_a_departed_borrowed_mountain() {
             .act(GameAction::ActivateAbility {
                 source_id: mountain,
                 ability_index: 0,
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             })
             .expect("tap the Mountain for mana");
         drain_ordering(&mut runner);
@@ -688,6 +689,7 @@ fn pyromancer_runner_board(theft: Theft, fate: SourceFate) -> (usize, usize) {
         .act(GameAction::ActivateAbility {
             source_id: pyromancer,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate");
     if let WaitingFor::TargetSelection { .. } = runner.state().waiting_for {
@@ -1038,6 +1040,7 @@ fn lava_runner_after_a_copied_chimera_exchange_punishes_the_trigger_controller()
         .act(GameAction::ActivateAbility {
             source_id: resonator,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate Strionic Resonator");
     for _ in 0..6 {
@@ -1142,6 +1145,7 @@ fn fractured_loyalty_gives_the_creature_to_the_ability_controller() {
             .act(GameAction::ActivateAbility {
                 source_id: pyromancer,
                 ability_index: 0,
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             })
             .expect("activate");
         if let WaitingFor::TargetSelection { .. } = runner.state().waiting_for {
@@ -1196,6 +1200,7 @@ fn a_fresh_target_choice_names_its_own_controller_not_the_targeter() {
         .act(GameAction::ActivateAbility {
             source_id: pyromancer,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate");
     if let WaitingFor::TargetSelection { .. } = runner.state().waiting_for {
@@ -1275,6 +1280,7 @@ fn royal_decree_damages_the_tapped_incarnations_controller_after_a_blink() {
             .act(GameAction::ActivateAbility {
                 source_id: pyromancer,
                 ability_index: 0,
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             })
             .expect("tap the Pyromancer");
         if let WaitingFor::TargetSelection { .. } = runner.state().waiting_for {
@@ -1423,6 +1429,7 @@ fn an_unattached_equipment_does_not_pump_its_former_host() {
             .act(GameAction::ActivateAbility {
                 source_id: blade,
                 ability_index: 0,
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             })
             .expect("activate the Equipment's ability");
         while !runner.state().stack.is_empty() {
@@ -1517,6 +1524,7 @@ fn a_blinked_equipment_does_not_pump_its_former_host() {
             .act(GameAction::ActivateAbility {
                 source_id: blade,
                 ability_index: 0,
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             })
             .expect("activate the Equipment's ability");
         while !runner.state().stack.is_empty() {

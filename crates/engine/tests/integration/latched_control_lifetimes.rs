@@ -451,6 +451,7 @@ fn rootwater_source_can_depart_before_the_activation_resolves() {
         .act(GameAction::ActivateAbility {
             source_id: sources[0],
             ability_index: index,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .unwrap();
     assert!(matches!(
@@ -689,6 +690,7 @@ fn never_started_control_duration_cannot_sustain_itself() {
             .act(GameAction::ActivateAbility {
                 source_id: champion,
                 ability_index: index,
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             })
             .unwrap();
         runner

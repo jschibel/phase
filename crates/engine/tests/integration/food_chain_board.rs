@@ -133,6 +133,7 @@ pub(super) fn exile_with_food_chain(
         .act(GameAction::ActivateAbility {
             source_id: food_chain,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("Food Chain activates");
     runner

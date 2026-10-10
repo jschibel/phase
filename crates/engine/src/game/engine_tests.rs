@@ -679,6 +679,7 @@ fn shigeki_channel_x_zero_resolves_from_stack_without_zone_choice() {
         GameAction::ActivateAbility {
             source_id: shigeki,
             ability_index: 1,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -796,6 +797,7 @@ fn eldrazi_temple_restricted_mana_casts_kindred_eldrazi_spell_only() {
         GameAction::ActivateAbility {
             source_id: temple,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -879,6 +881,7 @@ fn eldrazi_temple_restricted_mana_casts_kindred_eldrazi_spell_only() {
         GameAction::ActivateAbility {
             source_id: temple,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -1749,6 +1752,7 @@ fn broadside_bombardiers_boast_activates_after_attacking_and_requires_sacrifice(
         GameAction::ActivateAbility {
             source_id: bombardiers,
             ability_index,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -5042,6 +5046,7 @@ fn black_dragon_gate_tap_offers_fixed_black_or_chosen_color() {
         GameAction::ActivateAbility {
             source_id: gate,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -7194,6 +7199,7 @@ fn multi_mana_land_activates_via_ability_index() {
         GameAction::ActivateAbility {
             source_id: dual_id,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -7259,6 +7265,7 @@ fn multi_mana_land_undoable_after_activate_ability() {
         GameAction::ActivateAbility {
             source_id: dual_id,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -7308,6 +7315,7 @@ fn controller_harming_mana_land_is_not_undoable_after_manual_activation() {
         GameAction::ActivateAbility {
             source_id: brushland,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -7436,6 +7444,7 @@ fn utopia_sprawl_on_forest_taps_for_both_base_and_additional_mana_inline() {
         GameAction::ActivateAbility {
             source_id: forest,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .expect("Forest mana ability should activate");
@@ -9243,6 +9252,7 @@ fn test_mana_ability_during_priority_does_not_push_stack() {
         GameAction::ActivateAbility {
             source_id: obj_id,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -9404,6 +9414,7 @@ fn test_mana_ability_during_mana_payment_stays_in_mana_payment() {
         GameAction::ActivateAbility {
             source_id: obj_id,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -9499,6 +9510,7 @@ fn springleaf_drum_prompts_for_creature_then_adds_mana() {
         GameAction::ActivateAbility {
             source_id: drum,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -9653,6 +9665,7 @@ fn taps_for_mana_multiplier_fires_once_on_color_choice_priority_resume() {
         GameAction::ActivateAbility {
             source_id: any_color,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -9850,6 +9863,7 @@ fn taps_for_mana_multiplier_fires_once_on_color_choice_mana_payment_resume() {
         GameAction::ActivateAbility {
             source_id: any_color,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -10113,6 +10127,7 @@ fn non_mana_activation_tap_creatures_cost_prompts_then_pays() {
         GameAction::ActivateAbility {
             source_id: lathril,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -10204,6 +10219,7 @@ fn non_mana_activation_tap_creatures_cost_rejects_tapped_source_before_prompt() 
         GameAction::ActivateAbility {
             source_id: source,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap_err();
@@ -12958,6 +12974,7 @@ fn a_reversed_activation_discards_its_lifecycle_frame() {
             GameAction::ActivateAbility {
                 source_id: source,
                 ability_index: 0,
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .expect("the activation reaches its election");
