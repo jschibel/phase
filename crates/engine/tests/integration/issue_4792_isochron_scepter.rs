@@ -102,6 +102,7 @@ fn isochron_scepter_copies_and_casts_imprinted_instant() {
         .act(GameAction::ActivateAbility {
             source_id: scepter,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("Isochron activation must be legal with imprint and mana");
 
@@ -149,6 +150,7 @@ fn isochron_cast_copy_snapshots_thrumming_stone_ripple() {
         .act(GameAction::ActivateAbility {
             source_id: scepter,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate Isochron Scepter");
     let copy_id = (0..20)
@@ -283,6 +285,7 @@ fn isochron_scepter_copies_correct_card_across_unrelated_tracked_set_activity() 
         .act(GameAction::ActivateAbility {
             source_id: scepter,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("Isochron activation must be legal with the real imprint and mana");
 
@@ -371,6 +374,7 @@ fn isochron_copy_cast_fires_bonus_round_once() {
         .act(GameAction::ActivateAbility {
             source_id: scepter,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate Isochron Scepter");
     for step in 0..120 {

@@ -327,6 +327,7 @@ fn sacrifice_run(
         .act(GameAction::ActivateAbility {
             source_id: seer,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("Viscera Seer activates");
     for _ in 0..12 {

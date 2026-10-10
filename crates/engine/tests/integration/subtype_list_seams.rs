@@ -59,6 +59,7 @@ fn mary_discards(subtypes: Vec<&'static str>, land: bool) -> (GameRunner, Vec<Ob
         .act(GameAction::ActivateAbility {
             source_id: mary,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate");
     for _ in 0..16 {

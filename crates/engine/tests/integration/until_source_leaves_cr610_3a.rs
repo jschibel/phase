@@ -166,6 +166,7 @@ fn activate_exert_exile_under(
         .act(GameAction::ActivateAbility {
             source_id: angel,
             ability_index,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("Angel's exert ability can be activated");
     drive(runner, priority_with_stack(stack_len), VecDeque::from([c1]));

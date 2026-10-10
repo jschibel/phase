@@ -424,6 +424,7 @@ mod top_plot {
                 .act(GameAction::ActivateAbility {
                     source_id: top,
                     ability_index: index,
+                    payment_mode: engine::types::game_state::CastPaymentMode::Auto,
                 })
                 .expect("the holder plots the pile top");
             let plotted = &runner.state().objects[&top];
@@ -460,6 +461,7 @@ mod top_plot {
                 .act(GameAction::ActivateAbility {
                     source_id: top,
                     ability_index: index,
+                    payment_mode: engine::types::game_state::CastPaymentMode::Auto,
                 })
                 .is_err(),
             "the owner of the pile top cannot plot it without the permission"
@@ -479,6 +481,7 @@ mod top_plot {
             .act(GameAction::ActivateAbility {
                 source_id: own_top,
                 ability_index: index,
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             })
             .expect("the holder plots its own top");
         assert_eq!(runner.state().objects[&own_top].zone, Zone::Exile);
