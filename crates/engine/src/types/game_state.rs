@@ -20353,6 +20353,15 @@ declare_game_state! {
     pub consumed_before_priority_trigger_events:
         Vec<crate::game::triggers::ConsumedTriggerEventOccurrence>,
 
+    /// CR 601.2c + CR 601.2i: Becomes-target triggers of spells whose casting
+    /// paused after their targets were announced, held until the spell becomes
+    /// cast (`triggers::commit_announced_spell_trigger_collection`) or dropped
+    /// with a reversed cast (CR 733.1). Engine-private: redacted from every
+    /// viewer projection, like an activation's trigger collection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) announced_spell_trigger_collections:
+        Vec<crate::game::triggers::AnnouncedSpellTriggerCollection>,
+
     // CR 607.2a + CR 406.5: Exile tracking for "until leaves" linked abilities.
     #[serde(default)]
     pub exile_links: Vec<ExileLink>,
@@ -27523,6 +27532,7 @@ impl GameState {
             deferred_triggers: Vec::new(),
             pending_trigger_order: None,
             consumed_before_priority_trigger_events: Vec::new(),
+            announced_spell_trigger_collections: Vec::new(),
             exile_links: Vec::new(),
             paradigm_primed: Vec::new(),
             delayed_triggers: Vec::new(),
@@ -29912,6 +29922,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         deferred_triggers: _,
         pending_trigger_order: _,
         consumed_before_priority_trigger_events: _,
+        announced_spell_trigger_collections: _,
         exile_links: _,
         paradigm_primed: _,
         delayed_triggers: _,
@@ -30278,6 +30289,8 @@ impl PartialEq for GameState {
             && self.pending_trigger_firing == other.pending_trigger_firing
             && self.pending_trigger_entry == other.pending_trigger_entry
             && self.deferred_triggers == other.deferred_triggers
+            && self.announced_spell_trigger_collections
+                == other.announced_spell_trigger_collections
             && self.pending_trigger_order == other.pending_trigger_order
             && self.exile_links == other.exile_links
             && self.paradigm_primed == other.paradigm_primed

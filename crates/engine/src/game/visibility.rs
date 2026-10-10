@@ -1351,6 +1351,8 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
         pending.activation_trigger_collection = None;
         redact_parent_target_iteration_members(&mut pending.ability);
     }
+    // The same holds for a paused spell cast's becomes-target collection.
+    filtered.announced_spell_trigger_collections.clear();
     redact_activation_records(&mut filtered);
     redact_waiting_for_iteration_members(&mut filtered.waiting_for);
     filtered = project_paid_cast_cleanup_authority(&filtered);

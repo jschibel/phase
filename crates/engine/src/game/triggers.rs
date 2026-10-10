@@ -871,6 +871,20 @@ impl PendingActivationTriggerCollection {
         }
     }
 
+    /// Creates the collector for a spell whose casting has paused after its
+    /// targets were announced.
+    ///
+    /// CR 601.2a + CR 601.2c: a spell is put on the stack when its casting
+    /// begins, so its stack entry already answers every source question a
+    /// becomes-target trigger asks; no virtual source projection is needed.
+    pub(crate) fn for_announced_spell() -> Self {
+        Self {
+            overlay: TriggerCollectionOverlay::default(),
+            operation_journal: Vec::new(),
+            pending_contexts: Vec::new(),
+        }
+    }
+
     /// Collect one event slice emitted while the activation is still pending.
     ///
     /// Later slices replay the earlier collector operations into a fresh staged
@@ -920,6 +934,140 @@ impl PendingActivationTriggerCollection {
     fn staged_state_for_test(&self, state: &GameState) -> GameState {
         self.rebuild_staged_state(state)
     }
+}
+
+/// Becomes-target trigger collection held for a spell whose casting paused
+/// after its targets were announced.
+///
+/// CR 601.2c: abilities that trigger when an object or player becomes the
+/// target of a spell trigger as the target is announced, but wait to be put on
+/// the stack until the spell has finished being cast. When the cast pauses
+/// (for mana payment or any later casting choice), the action that announced
+/// the targets ends without a priority window, so no ordinary collector ever
+/// sees its target events. This carrier holds them transactionally, exactly as
+/// an announced activation's collection does: committed once when the spell
+/// becomes cast (CR 601.2i), dropped if the cast is reversed (CR 733.1).
+///
+/// It is keyed by the spell's object rather than carried on `PendingCast`
+/// because the casting continuation rebuilds its `PendingCast` across payment
+/// steps, while the spell's announced stack object persists from CR 601.2a
+/// until it becomes cast or is removed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AnnouncedSpellTriggerCollection {
+    spell: ObjectId,
+    collection: PendingActivationTriggerCollection,
+}
+
+/// CR 601.2a + CR 601.2i: A spell is being cast while its announcement holds a
+/// spell entry on the stack but the card has not yet moved there and become
+/// cast. Finalization moves the card to the stack and stamps its cast
+/// occurrence; a reversed cast removes the announcement entry.
+fn spell_is_being_cast(state: &GameState, object_id: ObjectId) -> bool {
+    state
+        .objects
+        .get(&object_id)
+        .is_some_and(|object| object.zone != Zone::Stack && object.cast_occurrence.is_none())
+        && state.stack.iter().any(|entry| {
+            entry.id == object_id && matches!(entry.kind, StackEntryKind::Spell { .. })
+        })
+}
+
+/// Stage the target events of every spell still being cast when an action
+/// ends, so that they trigger when the spell becomes cast.
+///
+/// CR 601.2c + CR 603.2: the target events triggered when they occurred; the
+/// collection runs at the boundary of the action that emitted them, before any
+/// later action can change the game, against a staged clone so nothing becomes
+/// public before the spell is cast. An action that finishes the cast itself
+/// leaves no spell being cast, so its events stay with the ordinary priority
+/// collector. Collections whose spell is no longer being cast without having
+/// been committed are discarded here (CR 733.1).
+pub(crate) fn stage_announced_spell_target_events(state: &mut GameState, events: &[GameEvent]) {
+    if !state.announced_spell_trigger_collections.is_empty() {
+        let live: Vec<bool> = state
+            .announced_spell_trigger_collections
+            .iter()
+            .map(|entry| spell_is_being_cast(state, entry.spell))
+            .collect();
+        let mut live = live.into_iter();
+        state
+            .announced_spell_trigger_collections
+            .retain(|_| live.next().unwrap_or(false));
+    }
+
+    let announcing_spell_targets = |event: &GameEvent| match event {
+        GameEvent::BecomesTarget { source_id, .. } => {
+            spell_is_being_cast(state, *source_id).then_some(*source_id)
+        }
+        _ => None,
+    };
+    if !events
+        .iter()
+        .any(|event| announcing_spell_targets(event).is_some())
+    {
+        return;
+    }
+    let spell_target_events: Vec<(ObjectId, GameEvent)> =
+        filter_already_collected_trigger_events_from(
+            state,
+            events,
+            0,
+            &state.consumed_before_priority_trigger_events,
+        )
+        .into_iter()
+        .filter_map(|event| announcing_spell_targets(&event).map(|spell| (spell, event)))
+        .collect();
+    let mut spells: Vec<ObjectId> = Vec::new();
+    for (spell, _) in &spell_target_events {
+        if !spells.contains(spell) {
+            spells.push(*spell);
+        }
+    }
+    for spell in spells {
+        let target_events: Vec<GameEvent> = spell_target_events
+            .iter()
+            .filter(|(event_spell, _)| *event_spell == spell)
+            .map(|(_, event)| event.clone())
+            .collect();
+        let mut entry = match state
+            .announced_spell_trigger_collections
+            .iter()
+            .position(|entry| entry.spell == spell)
+        {
+            Some(index) => state.announced_spell_trigger_collections.remove(index),
+            None => AnnouncedSpellTriggerCollection {
+                spell,
+                collection: PendingActivationTriggerCollection::for_announced_spell(),
+            },
+        };
+        entry.collection.collect(state, &target_events);
+        state.announced_spell_trigger_collections.push(entry);
+    }
+}
+
+/// CR 601.2c + CR 601.2i: Once the spell becomes cast, the abilities that
+/// triggered on its target announcement join the triggers waiting to be put on
+/// the stack the next time a player would receive priority (CR 603.3).
+pub(crate) fn commit_announced_spell_trigger_collection(state: &mut GameState, spell: ObjectId) {
+    let Some(index) = state
+        .announced_spell_trigger_collections
+        .iter()
+        .position(|entry| entry.spell == spell)
+    else {
+        return;
+    };
+    let entry = state.announced_spell_trigger_collections.remove(index);
+    let mut deferred_contexts = std::mem::take(&mut state.deferred_triggers);
+    entry.collection.commit_into(state, &mut deferred_contexts);
+    state.deferred_triggers = deferred_contexts;
+}
+
+/// CR 733.1: A reversed cast triggers nothing; drop whatever its target
+/// announcement collected.
+pub(crate) fn discard_announced_spell_trigger_collection(state: &mut GameState, spell: ObjectId) {
+    state
+        .announced_spell_trigger_collections
+        .retain(|entry| entry.spell != spell);
 }
 
 /// Installs one CR 603.7 delayed triggered ability and journals it.

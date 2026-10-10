@@ -10518,6 +10518,23 @@ fn apply_action(
     action: GameAction,
     stack_resolution_limit: Option<u32>,
 ) -> Result<ActionResult, EngineError> {
+    let result = apply_action_reducer(state, actor, action, stack_resolution_limit)?;
+    // CR 601.2c + CR 603.2: an action that announced a spell's targets and then
+    // paused its casting ends without a priority window, so its target events
+    // are held for the spell here, at the action boundary, until it becomes
+    // cast. A reversed action restores its snapshot, so it stages nothing.
+    if result.disposition.is_applied() {
+        triggers::stage_announced_spell_target_events(state, &result.events);
+    }
+    Ok(result)
+}
+
+fn apply_action_reducer(
+    state: &mut GameState,
+    actor: PlayerId,
+    action: GameAction,
+    stack_resolution_limit: Option<u32>,
+) -> Result<ActionResult, EngineError> {
     // Clear stale revealed_cards from the previous action.
     // RevealTop reveals (e.g. Goblin Guide) are momentary — shown for one state update.
     // RevealHand reveals (e.g. Thoughtseize) persist through the RevealChoice interaction.
