@@ -1185,6 +1185,7 @@ fn drillworks_mole_declared_commander_gets_its_counter() {
         .act(GameAction::ActivateAbility {
             source_id: mole,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activating the Mole must be legal");
     // CR 601.2c + CR 115.6: the conjunct's own announced set makes the slot a

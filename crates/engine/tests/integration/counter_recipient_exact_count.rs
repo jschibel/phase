@@ -643,6 +643,7 @@ fn rot_curse_rakshasa_first_declared_target_illegal_still_decays_the_other() {
         .act(GameAction::ActivateAbility {
             source_id: rakshasa,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("renew must be activatable from the graveyard at sorcery speed");
     choose_x_then_offered(&mut runner, 2);
@@ -694,6 +695,7 @@ fn rot_curse_rakshasa_renew_offers_creatures_only() {
         .act(GameAction::ActivateAbility {
             source_id: rakshasa,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("renew must be activatable from the graveyard at sorcery speed");
     let offered = choose_x_then_offered(&mut runner, 1);

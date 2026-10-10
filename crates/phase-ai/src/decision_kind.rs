@@ -363,7 +363,8 @@ mod tests {
                 &priority,
                 &GameAction::ActivateAbility {
                     source_id: ObjectId(0),
-                    ability_index: 0
+                    ability_index: 0,
+                    payment_mode: CastPaymentMode::Auto
                 }
             ),
             DecisionKind::ActivateAbility

@@ -689,6 +689,7 @@ pub(crate) fn begin_variable_speed_payment(
     ability_index: usize,
     target_selection: ActivationTargetSelection,
     activation_cost_snapshot: Option<Box<ActivationCostSnapshot>>,
+    payment_mode: CastPaymentMode,
 ) -> WaitingFor {
     let max_speed = effective_speed(state, player);
     let (min, max) = variable_speed_payment_range(&cost, max_speed).unwrap_or((0, max_speed));
@@ -698,6 +699,7 @@ pub(crate) fn begin_variable_speed_payment(
         ManaCost::NoCost,
         ability_index,
         activation_cost_snapshot,
+        payment_mode,
     );
     pending.activation_cost = Some(cost);
     pending.activation_target_selection = target_selection;
@@ -23320,6 +23322,7 @@ fn pending_activation_after_cost_pause(
     ability_index: usize,
     remaining_cost: Option<AbilityCost>,
     activation_cost_snapshot: Option<Box<ActivationCostSnapshot>>,
+    payment_mode: CastPaymentMode,
 ) -> PendingCast {
     let mut pending = PendingCast::for_activation(
         source_id,
@@ -23327,6 +23330,7 @@ fn pending_activation_after_cost_pause(
         ManaCost::NoCost,
         ability_index,
         activation_cost_snapshot,
+        payment_mode,
     );
     pending.activation_cost = remaining_cost;
     pending
@@ -25712,6 +25716,7 @@ pub(super) fn try_finalize_activation_mana_payment(
     cost: &AbilityCost,
     target_selection: ActivationTargetSelection,
     activation_cost_snapshot: Option<Box<ActivationCostSnapshot>>,
+    payment_mode: CastPaymentMode,
     events: &mut Vec<GameEvent>,
 ) -> Result<Option<WaitingFor>, EngineError> {
     let mut pending = PendingCast::for_activation(
@@ -25720,6 +25725,7 @@ pub(super) fn try_finalize_activation_mana_payment(
         ManaCost::NoCost,
         ability_index,
         activation_cost_snapshot,
+        payment_mode,
     );
     pending.activation_target_selection = target_selection;
     try_finalize_activation_mana_payment_from_root(
@@ -25767,10 +25773,7 @@ pub(super) fn try_finalize_pending_activation_mana_leg(
     pending.activation_cost = remaining;
     pending.activation_ability_index = Some(ability_index);
     pending.activation_residual = ActivationResidual::ManaLeg;
-    let target_first_interactive_suffix = matches!(
-        pending.activation_target_selection,
-        ActivationTargetSelection::Settled
-    ) && pending.activation_cost.is_some();
+    let waits_for_player = activation_mana_leg_waits_for_player(&pending);
     let pending_source_id = pending.object_id;
     state.pending_cast = Some(Box::new(pending));
     let waiting = casting_costs::maybe_pause_for_phyrexian_choice(
@@ -25786,14 +25789,38 @@ pub(super) fn try_finalize_pending_activation_mana_leg(
     if let Some(waiting) = waiting {
         return Ok(Some(waiting));
     }
-    if target_first_interactive_suffix {
-        // CR 601.2g-h + CR 602.2b: A target-first activation has already
-        // declared its targets but still has an unpaid interactive suffix. Its
-        // mana leg therefore exposes ManaPayment rather than invalidating that
-        // target declaration before the suffix can be paid.
+    if waits_for_player {
         casting_costs::enter_payment_step(state, player, None, events).map(Some)
     } else {
         casting_costs::finalize_automatic_mana_payment(state, player, events).map(Some)
+    }
+}
+
+/// CR 602.2b + CR 601.2g-h: whether an activation's unpaid mana leg opens the
+/// `ManaPayment` window rather than being paid automatically. Two roots wait:
+///
+/// * a manual-payment activation — the player activates the mana abilities
+///   they choose while paying (CR 601.2g), exactly as a manual cast does;
+/// * a target-first activation with an unpaid interactive suffix, which has
+///   already declared its targets, so its mana leg must not invalidate that
+///   declaration before the suffix can be paid. Otherwise an unaffordable
+///   activation is illegal immediately.
+///
+/// `enter_payment_step` still pays a choice-free Auto obligation itself.
+fn activation_mana_leg_waits_for_player(pending: &PendingCast) -> bool {
+    let target_first_interactive_suffix = matches!(
+        pending.activation_target_selection,
+        ActivationTargetSelection::Settled
+    ) && pending.activation_cost.is_some();
+    activation_pays_mana_manually(pending) || target_first_interactive_suffix
+}
+
+/// CR 602.2b + CR 601.2g: whether the player chose to activate the mana
+/// abilities that pay this activation themself.
+fn activation_pays_mana_manually(pending: &PendingCast) -> bool {
+    match pending.payment_mode {
+        CastPaymentMode::Manual => true,
+        CastPaymentMode::Auto | CastPaymentMode::AutoExceptSacrificialMana => false,
     }
 }
 
@@ -25822,10 +25849,7 @@ pub(super) fn finalize_pending_activation_mana_payment(
         activation_payment_context(state, pending.object_id, Some(ability_index));
     let activation_ctx = activation_context.as_payment_context();
     let source_id = pending.object_id;
-    let target_first_interactive_suffix = matches!(
-        pending.activation_target_selection,
-        ActivationTargetSelection::Settled
-    ) && pending.activation_cost.is_some();
+    let waits_for_player = activation_mana_leg_waits_for_player(&pending);
     state.pending_cast = Some(Box::new(pending));
     if let Some(waiting) = casting_costs::maybe_pause_for_phyrexian_choice(
         state,
@@ -25839,10 +25863,7 @@ pub(super) fn finalize_pending_activation_mana_payment(
     ) {
         return Ok(waiting);
     }
-    if target_first_interactive_suffix {
-        // CR 601.2g-h + CR 602.2b: Preserve the manual-payment boundary only
-        // while target declaration still precedes an unpaid interactive suffix;
-        // otherwise an unaffordable activation is illegal immediately.
+    if waits_for_player {
         casting_costs::enter_payment_step(state, player, None, events)
     } else {
         casting_costs::finalize_automatic_mana_payment(state, player, events)
@@ -25861,8 +25882,13 @@ fn try_finalize_activation_mana_payment_from_root(
 ) -> Result<Option<WaitingFor>, EngineError> {
     // Preserve the established left-to-right self-discard path: the source-card
     // discard can pause before the later mana leg, whose continuation then
-    // establishes this same serialized root.
-    if find_non_self_battlefield_removal_cost(cost).is_some() || has_self_ref_discard_cost(cost) {
+    // establishes this same serialized root. That path pays its mana leg
+    // automatically, so a manual-payment activation (a cycling card's {2}) takes
+    // this root instead: CR 601.2g-h lets the mana be paid in its window first
+    // and the discard after it, with the rest of the cost.
+    if find_non_self_battlefield_removal_cost(cost).is_some()
+        || (has_self_ref_discard_cost(cost) && !activation_pays_mana_manually(&pending))
+    {
         return Ok(None);
     }
     pending.ability = Box::new(resolved.clone());
@@ -25879,7 +25905,37 @@ pub fn handle_activate_ability(
     ability_index: usize,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
-    activate_with_cost_carrier(state, player, source_id, ability_index, None, events)
+    handle_activate_ability_with_payment_mode(
+        state,
+        player,
+        source_id,
+        ability_index,
+        CastPaymentMode::Auto,
+        events,
+    )
+}
+
+/// CR 602.2b + CR 601.2g-h: activate with an explicit mana-payment mode.
+/// `Manual` keeps every mana leg of the activation in `ManaPayment`, after
+/// modes, X and targets are announced, so the player activates the mana
+/// abilities they choose instead of the engine auto-tapping.
+pub fn handle_activate_ability_with_payment_mode(
+    state: &mut GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    ability_index: usize,
+    payment_mode: CastPaymentMode,
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    activate_with_cost_carrier(
+        state,
+        player,
+        source_id,
+        ability_index,
+        None,
+        payment_mode,
+        events,
+    )
 }
 
 /// The resolution of a `WaitingFor::OrderCostReductions` answer for an
@@ -25946,6 +26002,7 @@ pub(crate) fn resume_activation_after_cost_election(
                 pending.object_id,
                 ability_index,
                 Some(snapshot),
+                pending.payment_mode,
                 events,
             )
         }
@@ -26174,6 +26231,7 @@ fn activate_with_cost_carrier(
     source_id: ObjectId,
     ability_index: usize,
     carrier: Option<Box<ActivationCostSnapshot>>,
+    payment_mode: CastPaymentMode,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     if !state.objects.contains_key(&source_id) {
@@ -26423,6 +26481,9 @@ fn activate_with_cost_carrier(
             source_id,
             ability_index,
             Some(Box::new(dry_run)),
+            // The dry run proves the default order payable; automatic
+            // payment is that proof, whatever mode the player chose.
+            CastPaymentMode::Auto,
             &mut Vec::new(),
         )?;
         let reductions = snapshot.reductions.clone();
@@ -26432,6 +26493,7 @@ fn activate_with_cost_carrier(
             ManaCost::NoCost,
             ability_index,
             Some(snapshot),
+            payment_mode,
         );
         return Ok(WaitingFor::OrderCostReductions {
             player,
@@ -26564,6 +26626,7 @@ fn activate_with_cost_carrier(
             ability_index: Some(ability_index),
             ability_cost: ability_def.cost.clone(),
             activation_cost_snapshot: carrier.clone(),
+            activation_payment_mode: payment_mode,
             unavailable_modes,
         });
     }
@@ -26644,6 +26707,7 @@ fn activate_with_cost_carrier(
                 mana_cost.unwrap_or(ManaCost::NoCost),
                 ability_index,
                 carrier.clone(),
+                payment_mode,
             );
             pending_x.activation_cost = remaining;
             pending_x.deferred_target_selection = has_effect_targets;
@@ -26686,6 +26750,7 @@ fn activate_with_cost_carrier(
                 mana_cost,
                 ability_index,
                 carrier.clone(),
+                payment_mode,
             );
             pending_x.activation_cost = remaining;
             pending_x.deferred_target_selection = has_effect_targets;
@@ -26752,6 +26817,7 @@ fn activate_with_cost_carrier(
                     mana_cost,
                     ability_index,
                     carrier.clone(),
+                    payment_mode,
                 );
                 pending_leg.activation_cost = remaining;
                 pending_leg.activation_residual = ActivationResidual::ManaLeg;
@@ -26772,6 +26838,7 @@ fn activate_with_cost_carrier(
                 ManaCost::NoCost,
                 ability_index,
                 carrier.clone(),
+                payment_mode,
             );
             pending_interactive.activation_cost = Some(cost.clone());
             let initial_activation_cost = pending_interactive.activation_cost.clone();
@@ -26811,6 +26878,7 @@ fn activate_with_cost_carrier(
                     ManaCost::NoCost,
                     ability_index,
                     carrier.clone(),
+                    payment_mode,
                 );
                 pending_discard.activation_cost = Some(cost.clone());
                 return Ok(WaitingFor::PayCost {
@@ -26847,6 +26915,7 @@ fn activate_with_cost_carrier(
                     ManaCost::NoCost,
                     ability_index,
                     carrier.clone(),
+                    payment_mode,
                 );
                 pending.activation_cost = Some(cost.clone());
                 return super::effects::collect_evidence::begin_cost_payment(
@@ -26888,6 +26957,7 @@ fn activate_with_cost_carrier(
                     ManaCost::NoCost,
                     ability_index,
                     carrier.clone(),
+                    payment_mode,
                 );
                 pending_agg.activation_cost = Some(cost.clone());
                 let max_count = eligible.len();
@@ -26940,6 +27010,7 @@ fn activate_with_cost_carrier(
                     ManaCost::NoCost,
                     ability_index,
                     carrier.clone(),
+                    payment_mode,
                 );
                 pending_exile.activation_cost = Some(cost.clone());
                 return Ok(WaitingFor::PayCost {
@@ -26979,6 +27050,7 @@ fn activate_with_cost_carrier(
                     ManaCost::NoCost,
                     ability_index,
                     carrier.clone(),
+                    payment_mode,
                 );
                 pending_craft.activation_cost = Some(cost.clone());
                 return Ok(WaitingFor::PayCost {
@@ -27018,6 +27090,7 @@ fn activate_with_cost_carrier(
                     ManaCost::NoCost,
                     ability_index,
                     carrier.clone(),
+                    payment_mode,
                 );
                 pending_one_of.activation_cost = Some(cost.clone());
                 return Ok(WaitingFor::ActivationCostOneOfChoice {
@@ -27044,6 +27117,7 @@ fn activate_with_cost_carrier(
                     ManaCost::NoCost,
                     ability_index,
                     carrier.clone(),
+                    payment_mode,
                 );
                 pending_return.activation_cost = Some(cost.clone());
                 return Ok(WaitingFor::PayCost {
@@ -27102,6 +27176,7 @@ fn activate_with_cost_carrier(
                     ManaCost::NoCost,
                     ability_index,
                     carrier.clone(),
+                    payment_mode,
                 );
                 pending_counter.activation_cost = Some(cost.clone());
                 let max_count = match selection {
@@ -27166,6 +27241,7 @@ fn activate_with_cost_carrier(
                     ManaCost::NoCost,
                     ability_index,
                     carrier.clone(),
+                    payment_mode,
                 );
                 pending_tap.activation_cost = Some(cost.clone());
                 return Ok(WaitingFor::PayCost {
@@ -27192,6 +27268,7 @@ fn activate_with_cost_carrier(
                     ManaCost::NoCost,
                     ability_index,
                     carrier.clone(),
+                    payment_mode,
                 );
                 pending_interactive.activation_cost = Some(cost.clone());
                 if let Some(waiting_for) =
@@ -27222,6 +27299,7 @@ fn activate_with_cost_carrier(
                     wb_cost.clone(),
                     ability_index,
                     carrier.clone(),
+                    payment_mode,
                 );
                 pending_wb.activation_cost = Some(cost.clone());
                 state.pending_cast = Some(Box::new(pending_wb));
@@ -27258,6 +27336,7 @@ fn activate_with_cost_carrier(
                 ManaCost::NoCost,
                 ability_index,
                 carrier.clone(),
+                payment_mode,
             );
             pending.activation_cost = ability_def.cost.clone();
             pending.target_constraints = target_constraints;
@@ -27274,6 +27353,7 @@ fn activate_with_cost_carrier(
             crate::types::mana::ManaCost::NoCost,
             ability_index,
             carrier.clone(),
+            payment_mode,
         );
         pending_target.activation_cost = ability_def.cost.clone();
         pending_target.target_constraints = target_constraints;
@@ -27303,6 +27383,7 @@ fn activate_with_cost_carrier(
                 ability_index,
                 ActivationTargetSelection::Pending,
                 carrier.clone(),
+                payment_mode,
             ));
         }
         stamp_self_ref_discard_cost_paid_object(state, source_id, &mut resolved, cost);
@@ -27315,6 +27396,7 @@ fn activate_with_cost_carrier(
             cost,
             ActivationTargetSelection::Pending,
             carrier.clone(),
+            payment_mode,
             events,
         )? {
             return Ok(waiting);
@@ -27333,6 +27415,7 @@ fn activate_with_cost_carrier(
                 ability_index,
                 remaining_cost,
                 carrier.clone(),
+                payment_mode,
             );
             if let Some(pending) =
                 casting_costs::attach_pending_cast_to_cost_move(state, Box::new(pending))
@@ -32643,6 +32726,7 @@ mod sacrifice_cost_context_identity_tests {
                 None,
                 false,
                 None,
+                crate::types::game_state::CastPaymentMode::Auto,
                 &mut vec![],
             )
             .unwrap();

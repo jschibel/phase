@@ -1218,6 +1218,7 @@ fn grouped_mana_requires_priority(state: &GameState, player: PlayerId) -> bool {
             GameAction::ActivateAbility {
                 source_id,
                 ability_index,
+                ..
             } => activate_mana_action_would_queue_non_mana_trigger(
                 state,
                 player,
@@ -1285,6 +1286,7 @@ fn classify_flat_priority_action(action: &GameAction) -> FlatPriorityActionClass
         GameAction::ActivateAbility {
             source_id,
             ability_index,
+            ..
         } => FlatPriorityActionClass::ActivateAbility {
             source_id: *source_id,
             ability_index: *ability_index,
@@ -1490,7 +1492,7 @@ fn meaningful_sacrifice_mana_actions<'a>(
             action,
             GameAction::ActivateAbility {
                 source_id,
-                ability_index,
+                ability_index, ..
             } if activate_ability_is_meaningful_priority(state, *source_id, *ability_index)
         )
     })
@@ -1863,6 +1865,7 @@ fn beneficial_mana_tap_trigger_hold(
             GameAction::ActivateAbility {
                 source_id,
                 ability_index,
+                ..
             } => {
                 let has_tap = state
                     .objects
@@ -3706,6 +3709,7 @@ mod tests {
                 &GameAction::ActivateAbility {
                     source_id: card,
                     ability_index: 0,
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto
                 },
             ),
             "cycling ActivateAbility must be offered"
@@ -3745,6 +3749,7 @@ mod tests {
                 &GameAction::ActivateAbility {
                     source_id: card,
                     ability_index: 0,
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto
                 },
             ),
             "cycling ActivateAbility must still be offered"
@@ -3826,6 +3831,7 @@ mod tests {
                 &GameAction::ActivateAbility {
                     source_id: hand_sliver,
                     ability_index: transient_index,
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto
                 },
             ),
             "legal actions must expose the runtime-granted Slivercycling activation"
@@ -3836,6 +3842,7 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: hand_sliver,
                 ability_index: transient_index,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("runtime-granted Typecycling activation should be accepted");
@@ -3953,6 +3960,7 @@ mod tests {
             &GameAction::ActivateAbility {
                 source_id: rock,
                 ability_index,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto
             },
         ));
         assert!(!flat.iter().any(
@@ -3996,6 +4004,7 @@ mod tests {
         let mana_action = GameAction::ActivateAbility {
             source_id: rock,
             ability_index,
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
         };
         let count = grouped
             .get(&rock)
@@ -4113,6 +4122,7 @@ mod tests {
             &GameAction::ActivateAbility {
                 source_id: altar,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto
             },
         ));
         assert!(!flat.iter().any(
@@ -4508,6 +4518,7 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: land,
                 ability_index: 1,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         ];
         assert!(
@@ -4525,6 +4536,7 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: land,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         ];
         assert!(
@@ -4625,6 +4637,7 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: kci,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         ];
         // Classifier reach-guard: the sac-for-mana is still a meaningful
@@ -4654,6 +4667,7 @@ mod tests {
                 &GameAction::ActivateAbility {
                     source_id: kci,
                     ability_index: 0,
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto
                 },
             ),
             "KCI activation must appear in legal_actions_by_object"
@@ -4801,6 +4815,7 @@ mod tests {
         let action = GameAction::ActivateAbility {
             source_id: source,
             ability_index,
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
         };
         let flat = super::flat_priority_actions(runner.state());
         assert!(
@@ -4999,6 +5014,7 @@ mod tests {
                 &GameAction::ActivateAbility {
                     source_id: kci,
                     ability_index: 0,
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto
                 },
             ),
             "KCI activation must appear in legal_actions_by_object"
@@ -6639,7 +6655,7 @@ mod tests {
                 action,
                 GameAction::ActivateAbility {
                     source_id,
-                    ability_index: 1,
+                    ability_index: 1, ..
                 } if *source_id == land_id
             )),
             "flash sacrifice ability must be activatable when {{1}} is payable"
@@ -7851,6 +7867,7 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: src,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         ];
 
@@ -7888,6 +7905,7 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: src,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         ];
 
@@ -7938,6 +7956,7 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: src,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         ];
         let cast_actions = vec![
@@ -8023,6 +8042,7 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: src,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         ];
 

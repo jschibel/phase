@@ -1995,6 +1995,7 @@ fn tibalt_destroyed_in_response_plus_two_still_feeds_emblem() {
         .act(GameAction::ActivateAbility {
             source_id: tibalt,
             ability_index: TIBALT_PLUS_TWO,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("+2 activation");
     assert_eq!(runner.state().stack.len(), 1, "+2 on the stack");
@@ -2354,6 +2355,7 @@ fn announced_provenance(
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activation is accepted");
     for _ in 0..8 {

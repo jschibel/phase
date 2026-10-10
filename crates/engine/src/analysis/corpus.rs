@@ -1184,6 +1184,7 @@ pub(crate) fn activate_and_resolve(
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index: index,
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
         })
         .is_err()
     {
@@ -1544,6 +1545,7 @@ fn drive_ballista_ping(probe: &mut LoopProbe, ballista: ObjectId, ability_index:
         .act(GameAction::ActivateAbility {
             source_id: ballista,
             ability_index,
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate Ballista remove-counter ability");
     // The ability targets "any target"; choose the opponent.

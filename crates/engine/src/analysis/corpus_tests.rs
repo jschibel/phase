@@ -783,6 +783,7 @@ fn drive_one_ping(probe: &mut LoopProbe, pinger: ObjectId) {
         .act(GameAction::ActivateAbility {
             source_id: pinger,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("activate pinger");
     assert!(
@@ -1753,6 +1754,7 @@ fn drive_finite_stack_keeps_ring_empty() {
             .act(GameAction::ActivateAbility {
                 source_id: artifact,
                 ability_index: gain_idx,
+                payment_mode: CastPaymentMode::Auto,
             })
             .expect("activate costless gain-life");
     }

@@ -3429,6 +3429,7 @@ impl<'a> AbilityActivation<'a> {
             GameAction::ActivateAbility {
                 source_id: source,
                 ability_index,
+                payment_mode: CastPaymentMode::Auto,
             },
             &mut events,
         )

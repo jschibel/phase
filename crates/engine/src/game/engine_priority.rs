@@ -676,6 +676,47 @@ fn stage_pending_activation_trigger_events(
         }));
 }
 
+/// Route the events of an action that leaves an activation open in its
+/// `ManaPayment` window into that activation's private trigger transaction.
+///
+/// CR 602.2b + CR 603.2 + CR 603.3: targets declared on the way to the
+/// payment window can trigger abilities,
+/// which wait until the activation is complete. The post-action pipeline runs
+/// only at a priority boundary, and the stack push that completes the
+/// activation collects only its own action's events, so without this an
+/// activation paid through the window would lose them. Occurrences another
+/// collector already claimed this action (a mana ability activated in the
+/// window collects its own) are skipped.
+pub(super) fn stage_activation_trigger_events_at_mana_payment(
+    state: &mut GameState,
+    events: &[GameEvent],
+    waiting_for: &WaitingFor,
+) {
+    if !matches!(waiting_for, WaitingFor::ManaPayment { .. }) || events.is_empty() {
+        return;
+    }
+    let Some(mut collection) = state.take_pending_activation_trigger_collection() else {
+        return;
+    };
+    let unclaimed = triggers::filter_already_collected_trigger_events_from(
+        state,
+        events,
+        0,
+        &state.consumed_before_priority_trigger_events,
+    );
+    collection.collect(state, &unclaimed);
+    state.restore_pending_activation_trigger_collection(collection);
+    state
+        .consumed_before_priority_trigger_events
+        .extend(events.iter().enumerate().map(|(index, event)| {
+            triggers::ConsumedTriggerEventOccurrence {
+                event: event.clone(),
+                occurrence: triggers::trigger_event_occurrence(events, index),
+                scope: triggers::ConsumedTriggerEventScope::AllCollectors,
+            }
+        }));
+}
+
 /// CR 603.3b + CR 608.2g: settles a terminal resolution marker only after its
 /// final free cast has actually been announced. The drain uses the
 /// stack-announcement boundary so B/C's triggers may be ordered above their

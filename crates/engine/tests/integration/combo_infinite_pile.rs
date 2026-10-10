@@ -3431,6 +3431,7 @@ fn low3_activate_and_settle(runner: &mut GameRunner, source: ObjectId, ability_i
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activation is legal");
     for _ in 0..60 {

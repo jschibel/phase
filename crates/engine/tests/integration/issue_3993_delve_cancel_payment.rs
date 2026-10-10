@@ -366,6 +366,7 @@ fn cancel_after_signet_activation_leaves_selected_fuel_in_graveyard() {
         .act(GameAction::ActivateAbility {
             source_id: signet,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("activate Dimir Signet");
 

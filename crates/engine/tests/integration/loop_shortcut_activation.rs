@@ -115,6 +115,7 @@ fn activate_and_drive(runner: &mut GameRunner, host: ObjectId, ability_index: us
         .act(GameAction::ActivateAbility {
             source_id: host,
             ability_index,
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("the granted {T} activation is legal");
     for _ in 0..60 {
@@ -455,6 +456,7 @@ fn activation_interruptibility_defused_opponent_responds_no_grant() {
         .act(GameAction::ActivateAbility {
             source_id: c.host,
             ability_index: idx,
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("the granted {T} activation is legal");
     // P0 passes ⇒ P1 gets priority with the {T} on the stack (the real response window).
