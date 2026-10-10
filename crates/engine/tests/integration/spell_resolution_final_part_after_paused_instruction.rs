@@ -25,7 +25,13 @@
 //!   it with them — its owner leaving exiles it (and its controller still
 //!   finishes it, CR 608.2m), its controller leaving exiles it when that player
 //!   still controls it — rather than the final part putting it into a
-//!   graveyard.
+//!   graveyard. CR 608.2m: such a spell is reported resolved exactly once when
+//!   a surviving player still had one of its instructions to answer; one whose
+//!   departed player's question was its last live work is retired with that
+//!   player and not reported resolved.
+//! * The owed final part is state of the resolution carrier
+//!   (`GameState::owed_spell_final_part`), never of the spell's ability, so a
+//!   copy of a paused spell (CR 707.10) inherits none of it.
 //! * A paused spell that its own instruction moves off the stack ("Exile
 //!   Invoke Calamity", after its CR 608.2g free-cast window) is left where it
 //!   was put, and is still reported resolved once.
@@ -36,7 +42,8 @@ use engine::types::ability::CastingPermission;
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::game_state::{
-    CastOfferKind, CastPaymentMode, CastingVariant, GameState, StackEntryKind, WaitingFor,
+    CastOfferKind, CastPaymentMode, CastingVariant, GameState, OwedSpellFinalPart, StackEntryKind,
+    WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaColor, ManaCost, ManaType, ManaUnit};
@@ -363,6 +370,10 @@ fn assert_settled(state: &GameState) {
         state.resolving_stack_entry.is_none(),
         "the resolution carrier was retired"
     );
+    assert!(
+        state.owed_spell_final_part().is_none(),
+        "the owed final part ends with its carrier"
+    );
     let stranded: Vec<&str> = state
         .objects
         .values()
@@ -549,6 +560,17 @@ fn a_replacement_ordering_choice_on_the_deferred_move_is_asked_and_completed() {
                     .all(|card| state.objects[card].zone == Zone::Exile)
             {
                 ordered_the_spells_own_move = true;
+                // The final part has run and parked its own CR 616.1 question:
+                // it is no longer owed, but its carrier stays until answered.
+                assert!(
+                    state.owed_spell_final_part().is_none(),
+                    "a final part that parked its own question is no longer owed"
+                );
+                assert_eq!(
+                    state.resolving_stack_entry.as_ref().map(|entry| entry.id),
+                    Some(looting),
+                    "the carrier stays installed until the parked question is answered"
+                );
             }
             GameAction::ChooseReplacement { index: 0 }
         })
@@ -592,17 +614,9 @@ fn an_end_the_combat_phase_spell_paused_after_combat_ended_is_still_exiled() {
     run_until_settled(&mut runner, |state| {
         if matches!(state.waiting_for, WaitingFor::DiscardChoice { .. }) {
             paused_after_combat = !state.phase.is_combat();
-            let latched = match state
-                .resolving_stack_entry
-                .as_ref()
-                .map(|entry| &entry.kind)
-            {
-                Some(StackEntryKind::Spell {
-                    ability: Some(ability),
-                    ..
-                }) => ability.context.resolution_start_phase,
-                _ => None,
-            };
+            let latched = state
+                .owed_spell_final_part()
+                .map(|owed| owed.resolution_start_phase);
             assert_eq!(
                 latched,
                 Some(Phase::DeclareAttackers),
@@ -697,7 +711,8 @@ fn a_paused_spell_leaves_the_game_with_its_departing_owner() {
     assert_eq!(
         stack_resolved_count(&events, looting),
         0,
-        "a spell that left the game is not reported resolved"
+        "a spell whose departing player's question was its last live work is retired with that \
+         player and not reported resolved"
     );
     assert_settled(state);
 }
@@ -947,5 +962,256 @@ fn a_paused_spell_that_exiles_itself_is_left_in_exile_and_reported_resolved() {
     );
     assert!(!graveyard(state, P0).contains(&invoke));
     assert_eq!(stack_resolved_count(&events, invoke), 1);
+    assert_settled(state);
+}
+
+/// CR 707.10: a copy copies the spell and the choices made casting it; the
+/// state of the original's resolution is not one of those. Chain of Smog's
+/// resolution pauses on its target's discard and its copy offer, so its final
+/// part is owed by its carrier — and the copy it makes while paused must carry
+/// none of that. The copy's own resolution later owes its own final part.
+#[test]
+fn a_copy_of_a_paused_spell_inherits_no_owed_final_part() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let smog = scenario.add_real_card(P0, "Chain of Smog", Zone::Hand, db());
+    for name in ["P1 A", "P1 B", "P1 C"] {
+        scenario.add_card_to_hand(P1, name);
+    }
+    scenario.add_card_to_hand(P0, "P0 A");
+    scenario.add_card_to_hand(P0, "P0 B");
+    scenario.with_mana_pool(P0, mana(ManaType::Black, 2));
+    let mut runner = scenario.build();
+
+    runner.cast(smog).target_player(P1).commit();
+    let announced = runner
+        .state()
+        .stack
+        .iter()
+        .find(|entry| entry.id == smog)
+        .and_then(|entry| match &entry.kind {
+            StackEntryKind::Spell {
+                ability: Some(ability),
+                ..
+            } => Some(ability.context.clone()),
+            _ => None,
+        })
+        .expect("Chain of Smog is on the stack with its announced ability");
+    // CR 707.10: `copy_spell` clears exactly these cast-only fields on a copy;
+    // everything else of the announced context is copied as it was.
+    let mut expected_copy_context = announced;
+    expected_copy_context.cast_from_zone = None;
+    expected_copy_context.alt_cost_grant_source = None;
+    expected_copy_context.graveyard_permission_authority = None;
+    expected_copy_context.graveyard_permission_latch = None;
+
+    let mut events = Vec::new();
+    let mut copy: Option<ObjectId> = None;
+    let mut smog_owed_at_its_discard = false;
+    let mut copy_context_checked = false;
+    let mut copy_owed_at_its_offer = false;
+    for _ in 0..40 {
+        let state = runner.state();
+        let action = match &state.waiting_for {
+            WaitingFor::Priority { .. } if state.stack.is_empty() => break,
+            WaitingFor::Priority { .. } => GameAction::PassPriority,
+            WaitingFor::DiscardChoice {
+                player,
+                cards,
+                count,
+                ..
+            } => {
+                if copy.is_none() {
+                    assert_eq!(*player, P1, "Chain of Smog's target discards");
+                    assert_eq!(
+                        state.owed_spell_final_part(),
+                        Some(&OwedSpellFinalPart {
+                            spell: smog,
+                            resolution_start_phase: Phase::PreCombatMain,
+                        }),
+                        "the paused Chain of Smog's carrier owes its final part"
+                    );
+                    smog_owed_at_its_discard = true;
+                }
+                GameAction::SelectCards {
+                    cards: cards.iter().copied().take(*count).collect(),
+                }
+            }
+            WaitingFor::OptionalEffectChoice { player, .. } => {
+                assert_eq!(*player, P1, "\"that player may copy this spell\"");
+                match copy {
+                    // Chain of Smog's own offer: P1 copies it.
+                    None => GameAction::DecideOptionalEffect { accept: true },
+                    // The copy's offer, from inside the copy's own paused
+                    // resolution: the copy's carrier owes the copy's final
+                    // part, and Chain of Smog has already finished.
+                    Some(copy) => {
+                        assert_eq!(
+                            state.owed_spell_final_part().map(|owed| owed.spell),
+                            Some(copy),
+                            "the copy's own paused resolution owes the copy's final part"
+                        );
+                        assert_eq!(
+                            state.objects[&smog].zone,
+                            Zone::Graveyard,
+                            "reach guard: Chain of Smog has finished into its owner's graveyard"
+                        );
+                        copy_owed_at_its_offer = true;
+                        GameAction::DecideOptionalEffect { accept: false }
+                    }
+                }
+            }
+            WaitingFor::CopyRetarget { copy_id, .. } => {
+                let entry = state
+                    .stack
+                    .iter()
+                    .find(|entry| entry.id == *copy_id)
+                    .expect("the copy is on the stack");
+                assert_ne!(entry.id, smog);
+                assert_eq!(entry.controller, P1, "CR 707.10: P1 controls the copy");
+                let StackEntryKind::Spell {
+                    ability: Some(ability),
+                    ..
+                } = &entry.kind
+                else {
+                    panic!("the copy is a spell with an ability: {:?}", entry.kind);
+                };
+                assert_eq!(
+                    ability.context, expected_copy_context,
+                    "CR 707.10: the copy carries the announced context, and nothing of the \
+                     original's paused resolution"
+                );
+                copy_context_checked = true;
+                copy = Some(*copy_id);
+                GameAction::ChooseTarget { target: None }
+            }
+            other => panic!("unexpected prompt while resolving: {other:?}"),
+        };
+        events.extend(
+            runner
+                .act(action)
+                .expect("the engine accepts the answer")
+                .events,
+        );
+    }
+
+    assert!(
+        smog_owed_at_its_discard,
+        "reach guard: Chain of Smog paused"
+    );
+    assert!(copy_context_checked, "reach guard: P1 copied Chain of Smog");
+    assert!(
+        copy_owed_at_its_offer,
+        "reach guard: the copy's own resolution paused on its offer"
+    );
+    let copy = copy.expect("the copy was made");
+    let state = runner.state();
+    assert!(
+        state.players[P1.0 as usize].hand.is_empty(),
+        "reach guard: the original made P1 discard two cards and the copy the last one"
+    );
+    assert_eq!(state.objects[&smog].zone, Zone::Graveyard);
+    assert_eq!(stack_resolved_count(&events, smog), 1);
+    assert_eq!(stack_resolved_count(&events, copy), 1);
+    assert_settled(state);
+}
+
+/// CR 608.2m + CR 800.4a: Diabolic Edict ("Target player sacrifices a creature
+/// of their choice.") pauses on its target's sacrifice. Its controller leaves
+/// the game while that player is still answering: the spell is exiled with its
+/// departing controller, but the resolution goes on for the player answering
+/// its instruction, and the spell is reported resolved exactly once, when that
+/// answer finishes it.
+#[test]
+fn a_spell_whose_controller_leaves_while_another_player_answers_is_reported_resolved_once() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let edict = scenario.add_real_card(P0, "Diabolic Edict", Zone::Hand, db());
+    let first = scenario.add_vanilla(P1, 2, 2);
+    let second = scenario.add_vanilla(P1, 2, 2);
+    scenario.with_mana_pool(P0, mana(ManaType::Black, 2));
+    let mut runner = scenario.build();
+
+    runner.cast(edict).target_player(P1).commit();
+    pass_until_a_prompt(&mut runner);
+    assert!(
+        matches!(
+            &runner.state().waiting_for,
+            WaitingFor::EffectZoneChoice { player, cards, .. }
+                if *player == P1 && cards.contains(&first) && cards.contains(&second)
+        ),
+        "reach guard: the Edict paused on P1's sacrifice, got {:?}",
+        runner.state().waiting_for
+    );
+
+    let conceded = concede(&mut runner, P0);
+    assert_eq!(stack_resolved_count(&conceded, edict), 0);
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::EffectZoneChoice { player, .. } if player == P1
+        ),
+        "reach guard: CR 608.2m: P1 still answers the Edict, got {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(
+        runner.state().objects[&edict].zone,
+        Zone::Exile,
+        "reach guard: CR 800.4a: the Edict left the game with its departing controller"
+    );
+
+    let answered = runner
+        .act(GameAction::SelectCards { cards: vec![first] })
+        .expect("P1 sacrifices a creature")
+        .events;
+    assert_eq!(
+        stack_resolved_count(&answered, edict),
+        1,
+        "CR 608.2m: the resolution finished by P1 is reported exactly once"
+    );
+    let mut events = answered;
+    events.extend(run_until_settled(&mut runner, |_| None));
+    let state = runner.state();
+    assert_eq!(state.objects[&first].zone, Zone::Graveyard);
+    assert_eq!(state.objects[&edict].zone, Zone::Exile);
+    assert_eq!(stack_resolved_count(&events, edict), 1);
+    assert_settled(state);
+}
+
+/// CR 608.2n + CR 702.82a: Zombify ("Return target creature card from your
+/// graveyard to the battlefield.") returning Mycoloth (Devour 2) pauses on the
+/// devour choice inside Zombify's own resolution. The recovery guards that
+/// refuse an owing carrier as terminal residue must not stall this live
+/// resolution: once the devour choice is answered, Zombify's final part runs.
+#[test]
+fn zombify_returning_a_devourer_still_finishes_its_final_part() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let zombify = scenario.add_real_card(P0, "Zombify", Zone::Hand, db());
+    let mycoloth = scenario.add_real_card(P0, "Mycoloth", Zone::Graveyard, db());
+    scenario.add_vanilla(P0, 1, 1);
+    scenario.add_vanilla(P0, 1, 1);
+    scenario.with_mana_pool(P0, mana(ManaType::Black, 4));
+    let mut runner = scenario.build();
+
+    runner.cast(zombify).target_object(mycoloth).commit();
+    let mut asked_to_devour = false;
+    let events = run_until_settled(&mut runner, |state| {
+        matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }).then(|| {
+            asked_to_devour = true;
+            assert_eq!(
+                state.objects[&zombify].zone,
+                Zone::Stack,
+                "Zombify is still resolving while the devour choice is asked"
+            );
+            GameAction::SelectCards { cards: vec![] }
+        })
+    });
+
+    assert!(asked_to_devour, "reach guard: Mycoloth's devour was asked");
+    let state = runner.state();
+    assert_eq!(state.objects[&mycoloth].zone, Zone::Battlefield);
+    assert_eq!(state.objects[&zombify].zone, Zone::Graveyard);
+    assert_eq!(stack_resolved_count(&events, zombify), 1);
     assert_settled(state);
 }

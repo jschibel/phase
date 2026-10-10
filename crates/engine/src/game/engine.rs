@@ -1859,10 +1859,9 @@ fn sweep_and_recover_priority_boundary_rest(state: &mut GameState) -> bool {
 }
 
 /// The event sink for settling a recovered terminal rest on a clone. Each
-/// recovery above guards that the carrier it retires is a permanent spell's or
-/// one whose spell has already left the stack, so the CR 608.2n final part
-/// (`stack::finish_deferred_spell_resolution`) is not owed and emits nothing
-/// into it; the debug assertion pins that nothing is discarded.
+/// recovery above refuses a carrier that owes a spell's CR 608.2n final part
+/// (its guard reads `stack::resolving_spell_owes_final_part`), so nothing is
+/// discarded into this sink; the assertion pins that.
 fn recovered_rest_scratch_events(state: &GameState) -> Vec<GameEvent> {
     debug_assert!(
         !super::stack::resolving_spell_owes_final_part(state),
@@ -1920,6 +1919,9 @@ fn is_orphaned_devour_completion_at_priority_boundary(state: &GameState) -> bool
         && state
             .active_post_replacement_drains()
             .is_some_and(crate::types::game_state::PostReplacementDrainStack::is_empty)
+        // CR 608.2n: a carrier still owing its spell's final part is live work
+        // for the final part's authority, not a terminal rest.
+        && !super::stack::resolving_spell_owes_final_part(state)
 }
 
 fn is_orphaned_spell_resolution_at_priority_boundary(state: &GameState) -> bool {
@@ -1940,6 +1942,9 @@ fn is_orphaned_spell_resolution_at_priority_boundary(state: &GameState) -> bool 
                 ..
             }) if *id == pending.object_id
         )
+        // CR 608.2n: a carrier still owing its spell's final part is live work
+        // for the final part's authority, not a terminal rest.
+        && !super::stack::resolving_spell_owes_final_part(state)
 }
 
 /// Finalize a checked persisted restore after its runtime-only data is present.

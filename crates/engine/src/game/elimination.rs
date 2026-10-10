@@ -570,16 +570,15 @@ pub fn eliminate_players_simultaneously(
             }
         }
 
-        // CR 800.4a + CR 608.2n: a paused spell that the departure sweeps took
-        // off the stack while its controller left will never have its
-        // instructions finished — its resolution leaves with that player — and
-        // it has no final part left to run. Once the departed player's
-        // question is gone and nothing of the resolution is still live, retire
-        // its carrier as eliminated. (A spell whose controller stays keeps
-        // resolving for that player, CR 608.2m; one that reverted to a
-        // surviving owner stays on the stack, and its final part puts it into
-        // that owner's graveyard once the resolution completes — at once when
-        // the departed player's question was its last instruction.)
+        // CR 800.4a + CR 608.2m + CR 608.2n: a paused spell the departure
+        // sweeps took off the stack while its controller left. When nothing of
+        // its resolution is still live — the departed player's question was its
+        // last instruction — its carrier is retired here as `Eliminated`, and
+        // the spell is never reported resolved. When a surviving player still
+        // has one of its instructions to answer, the carrier stays; once those
+        // instructions are done, the departed-spell path reports it resolved
+        // exactly once. (A spell that reverted to a surviving owner stays on the
+        // stack, and its final part puts it into that owner's graveyard.)
         if let Some((spell, controller)) = paused_spell {
             if leaving_set.contains(&controller)
                 && state
