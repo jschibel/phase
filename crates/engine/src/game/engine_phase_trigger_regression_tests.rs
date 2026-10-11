@@ -864,7 +864,7 @@ fn issue_1243_end_step_may_pay_trigger_accept_pays_and_resolves_reflexive() {
         "paying {{1}} must place one +1/+1 counter on the lone Shrine"
     );
     assert_eq!(
-        state.players[0].mana_pool.mana.len(),
+        state.players[0].mana_pool.total(),
         0,
         "the {{1}} must actually be paid on accept"
     );
@@ -3186,7 +3186,7 @@ fn choose_one_of_branch_resolves_selected_branch_with_original_controller() {
         source_id,
         branches: vec![branch_gain, branch_lose],
         branch_descriptions: vec!["Gain 3 life.".to_string(), "Lose 3 life.".to_string()],
-        parent_targets: vec![],
+        parent_occurrences: Default::default(),
         context: Default::default(),
         continuation: None,
         replacement_applied: Default::default(),

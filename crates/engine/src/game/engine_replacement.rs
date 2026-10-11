@@ -3063,7 +3063,7 @@ pub(super) fn apply_post_replacement_effect(
     if ability_definition_uses_post_replacement_event_target(effect_def) {
         if let Some(target) = state.post_replacement_event_target() {
             if !resolved.targets.contains(target) {
-                resolved.targets.push(target.clone());
+                resolved.push_target(target.clone());
             }
         }
     }
@@ -8428,7 +8428,7 @@ mod tests {
             source_id: source,
             branches,
             branch_descriptions: Vec::new(),
-            parent_targets: Vec::new(),
+            parent_occurrences: Default::default(),
             context: Default::default(),
             continuation: None,
             replacement_applied: Default::default(),
@@ -9015,17 +9015,7 @@ mod tests {
         );
     }
 
-    /// The post-replacement dispatch binds the REPLACEMENT SOURCE'S player, not the active player
-    /// — the other half of the universe argument the block-(3) `execute` firewall relief
-    /// (`analysis::resource::reveal_from_hand_execute_provably_excludes_class`) rests on. That arm
-    /// censuses `players[replacement_source_player(source)].hand`, which is the right pool only if
-    /// THIS dispatch binds the same authority: bound to `state.active_player` instead, the arm
-    /// would census one player's hand while the effect read another's, and the relief would be
-    /// unsound wherever the reveal land's controller is not the active player. A
-    /// `-> source.controller` divergence is deliberately not registered as a mutation, because
-    /// `controller_or_owner()` returns `controller` for every `Zone::Battlefield` source and the
-    /// firewall walk yields only `[Battlefield, Command]` sources with non-emblem Command dropped
-    /// upstream — no input it can produce distinguishes the two.
+    /// The post-replacement dispatch binds the REPLACEMENT SOURCE'S player, not the active player.
     ///
     /// REVERT / MUTATION PROBE: bind `apply_post_replacement_effect`'s `controller` to
     /// `state.active_player` ⇒ **this row FAILS** (the prompt goes to `PlayerId(0)`).

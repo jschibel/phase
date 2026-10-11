@@ -3346,6 +3346,32 @@ mod tests {
         }
     }
 
+    /// The bump this number is at: `GameState::linked_exile_lki` holds one
+    /// incarnation-bounded `LinkedExileLki` per departure (CR 400.7); a v129 peer
+    /// cannot decode a non-empty map, so it must be refused before it receives
+    /// v130 state.
+    ///
+    /// v129: `WaitingFor::LoopShortcut` and
+    /// `ShortcutProposal` gained a required `road: OfferRoad`. A v128 peer drops
+    /// the key from every frame it re-encodes, so the handshake refuses the
+    /// pairing rather than leave the road to the legacy-offer migration's
+    /// inference.
+    ///
+    /// The resolved-rules journal admits a land-play `rebound_from` on a
+    /// `ResolvedZoneChangeCommand` (Library/Graveyard/Exile -> Battlefield); a v123
+    /// peer rejects that `GameState.resolved_rules_journal`, so it must be refused
+    /// before it receives v124 state.
+    /// `MulliganDecisionEntry` and `MulliganDeclaration` gain `free_reveals_taken`; a
+    /// v124 peer drops the count, so it must be refused before it receives v125 state.
+    /// `ZoneChangeRecord` gains `arrival`; a v125 peer rejects the journal when the
+    /// departure owner differs from the command owner, so it must be refused before it
+    /// receives v126 state.
+    /// `TargetFilter::DeclaredPlayer` is new in serialized full-game state
+    /// (CR 608.2c + CR 115.1a); a v127 peer cannot deserialize it, so it must be
+    /// refused before it receives v128 state. `SpellContext` also gains
+    /// `outer_declared_players` (CR 603.7a), the players a delayed ability's
+    /// creating chain named by group, omitted when empty; amended in place, not
+    /// bumped.
     /// `FilterProp::PrepareSpell` (CR 722.3d), the `scope` field on
     /// `Effect::BecomePrepared` / `BecomeUnprepared` (CR 722.3a + CR 115.10a),
     /// `SpellCastRecord::prepared_copy_source`, `CopiableValues::prepare_face`
@@ -3360,6 +3386,14 @@ mod tests {
     /// The successful-mana-history ledger now stores the actual receiving
     /// player with each trigger definition. A v120 peer cannot decode a
     /// nonempty pair ledger, so it must be refused before v121 state.
+    /// `FilterProp`'s attachment-referent siblings are one parameterized
+    /// `FilterProp::AttachedTo { to: AttachmentReferent }` (CR 701.3a + CR
+    /// 303.4b); a v126 peer cannot parse the `"AttachedTo"` tag carried in
+    /// `GameState` ability definitions, so it must be refused before it
+    /// receives v127 state. v127 also carries the positional retarget wire
+    /// (`RetargetSpell` `null` keeps, engine-derived copy-walk keep
+    /// permissions), which a v126 peer cannot parse or render.
+    /// (Reserved as 119 and then 121 while under review; it landed after 126, so 119 stays unused.)
     /// The CR 601.2a spell announcement adds `GameObject::spell_announcement`,
     /// `GameState::next_spell_announcement` and `GameEvent::BecomesTarget.targeter`;
     /// a v119 peer cannot decode v120 state, so it must be refused before state
@@ -3479,8 +3513,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_123_for_prepared_spell_and_mass_prepare() {
-        assert_eq!(PROTOCOL_VERSION, 123);
+    fn protocol_version_is_130_for_linked_exile_lki_bounds() {
+        assert_eq!(PROTOCOL_VERSION, 130);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3491,7 +3525,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_123_for_prepared_spell_and_mass_prepare` stays
+    /// `protocol_version_is_130_for_linked_exile_lki_bounds` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

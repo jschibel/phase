@@ -5,7 +5,7 @@
   "icon": "G",
   "format": "standard",
   "version": 1,
-  "updated": "2026-10-09T00:00:00Z",
+  "updated": "2026-10-11T00:00:00Z",
   "source": "https://www.mtggoldfish.com/metagame/standard",
   "decks": [
     {
@@ -147,19 +147,31 @@
       "main": [
         {
           "count": 4,
-          "name": "Esper Origins"
+          "name": "Fabled Passage"
         },
         {
           "count": 2,
-          "name": "Keen-Eyed Curator"
+          "name": "Elven Passage"
         },
         {
-          "count": 1,
-          "name": "Surrak, Elusive Hunter"
+          "count": 2,
+          "name": "Escape Tunnel"
         },
         {
           "count": 3,
-          "name": "Mightform Harmonizer"
+          "name": "Ba Sing Se"
+        },
+        {
+          "count": 14,
+          "name": "Forest"
+        },
+        {
+          "count": 1,
+          "name": "Bushwhack"
+        },
+        {
+          "count": 4,
+          "name": "Llanowar Elves"
         },
         {
           "count": 4,
@@ -167,7 +179,7 @@
         },
         {
           "count": 4,
-          "name": "Llanowar Elves"
+          "name": "Esper Origins"
         },
         {
           "count": 4,
@@ -178,12 +190,8 @@
           "name": "Lumbering Worldwagon"
         },
         {
-          "count": 2,
-          "name": "Shared Roots"
-        },
-        {
-          "count": 4,
-          "name": "Earthbender Ascension"
+          "count": 1,
+          "name": "Surrak, Elusive Hunter"
         },
         {
           "count": 1,
@@ -191,33 +199,45 @@
         },
         {
           "count": 4,
-          "name": "Sapling Nursery"
+          "name": "Earthbender Ascension"
         },
         {
-          "count": 3,
-          "name": "Ba Sing Se"
-        },
-        {
-          "count": 4,
-          "name": "Escape Tunnel"
-        },
-        {
-          "count": 4,
-          "name": "Fabled Passage"
+          "count": 2,
+          "name": "Glimpse the Core"
         },
         {
           "count": 1,
-          "name": "Demolition Field"
+          "name": "Keen-Eyed Curator"
         },
         {
-          "count": 14,
-          "name": "Forest"
+          "count": 4,
+          "name": "Mightform Harmonizer"
+        },
+        {
+          "count": 3,
+          "name": "Sapling Nursery"
+        },
+        {
+          "count": 1,
+          "name": "Promising Vein"
         }
       ],
       "sideboard": [
         {
+          "count": 3,
+          "name": "Meltstrider's Gear"
+        },
+        {
           "count": 1,
-          "name": "Gigantic Big Bear"
+          "name": "Keen-Eyed Curator"
+        },
+        {
+          "count": 2,
+          "name": "Torpor Orb"
+        },
+        {
+          "count": 1,
+          "name": "Sandman, Shifting Scoundrel"
         },
         {
           "count": 2,
@@ -228,20 +248,12 @@
           "name": "Mossborn Hydra"
         },
         {
-          "count": 3,
-          "name": "Torpor Orb"
-        },
-        {
-          "count": 2,
-          "name": "Meltstrider's Resolve"
+          "count": 1,
+          "name": "Leatherhead, Swamp Stalker"
         },
         {
           "count": 1,
-          "name": "Keen-Eyed Curator"
-        },
-        {
-          "count": 2,
-          "name": "Warg Tactics"
+          "name": "Sapling Nursery"
         }
       ]
     },
@@ -668,6 +680,165 @@
       ]
     },
     {
+      "name": "Azorius Control",
+      "author": "MTGGoldfish",
+      "colors": [
+        "W",
+        "U"
+      ],
+      "tags": [
+        "metagame"
+      ],
+      "main": [
+        {
+          "count": 4,
+          "name": "Deserted Beach"
+        },
+        {
+          "count": 4,
+          "name": "Countersculpt"
+        },
+        {
+          "count": 3,
+          "name": "Plains"
+        },
+        {
+          "count": 4,
+          "name": "Get Lost"
+        },
+        {
+          "count": 2,
+          "name": "Erode"
+        },
+        {
+          "count": 2,
+          "name": "Pinnacle Starcage"
+        },
+        {
+          "count": 1,
+          "name": "Island"
+        },
+        {
+          "count": 1,
+          "name": "Island"
+        },
+        {
+          "count": 3,
+          "name": "No More Lies"
+        },
+        {
+          "count": 1,
+          "name": "Island"
+        },
+        {
+          "count": 4,
+          "name": "Hallowed Fountain"
+        },
+        {
+          "count": 3,
+          "name": "Jace's Machinations"
+        },
+        {
+          "count": 2,
+          "name": "Restless Anchorage"
+        },
+        {
+          "count": 2,
+          "name": "Petrified Hamlet"
+        },
+        {
+          "count": 1,
+          "name": "Fountainport"
+        },
+        {
+          "count": 4,
+          "name": "Floodfarm Verge"
+        },
+        {
+          "count": 1,
+          "name": "Fatehold Charm"
+        },
+        {
+          "count": 1,
+          "name": "Spell Snare"
+        },
+        {
+          "count": 2,
+          "name": "Theorist's Sanctum"
+        },
+        {
+          "count": 2,
+          "name": "Day of Judgment"
+        },
+        {
+          "count": 3,
+          "name": "Seam Rip"
+        },
+        {
+          "count": 1,
+          "name": "Three Steps Ahead"
+        },
+        {
+          "count": 4,
+          "name": "Consult the Star Charts"
+        },
+        {
+          "count": 1,
+          "name": "Petrified Hamlet"
+        },
+        {
+          "count": 4,
+          "name": "The Theorist, Jace Beleren"
+        }
+      ],
+      "sideboard": [
+        {
+          "count": 2,
+          "name": "Beza, the Bounding Spring"
+        },
+        {
+          "count": 1,
+          "name": "Captain Marvel, Earth's Protector"
+        },
+        {
+          "count": 1,
+          "name": "Disdainful Stroke"
+        },
+        {
+          "count": 1,
+          "name": "Emeritus of Ideation"
+        },
+        {
+          "count": 1,
+          "name": "Erode"
+        },
+        {
+          "count": 1,
+          "name": "Flashfreeze"
+        },
+        {
+          "count": 2,
+          "name": "Pinnacle Starcage"
+        },
+        {
+          "count": 2,
+          "name": "Sphinx of False Conclusions"
+        },
+        {
+          "count": 1,
+          "name": "Disdainful Stroke"
+        },
+        {
+          "count": 1,
+          "name": "Flashfreeze"
+        },
+        {
+          "count": 2,
+          "name": "Ultima"
+        }
+      ]
+    },
+    {
       "name": "4c Control",
       "author": "MTGGoldfish",
       "colors": [
@@ -845,39 +1016,63 @@
       ]
     },
     {
-      "name": "Azorius Control",
+      "name": "Lifegain",
       "author": "MTGGoldfish",
       "colors": [
         "W",
-        "U"
+        "B"
       ],
       "tags": [
         "metagame"
       ],
       "main": [
         {
-          "count": 4,
-          "name": "Countersculpt"
-        },
-        {
-          "count": 4,
-          "name": "Jace's Machinations"
+          "count": 1,
+          "name": "Bleachbone Verge"
         },
         {
           "count": 2,
-          "name": "Fatehold Charm"
-        },
-        {
-          "count": 2,
-          "name": "Theorist's Sanctum"
+          "name": "Deep-Cavern Bat"
         },
         {
           "count": 1,
-          "name": "Day of Judgment"
+          "name": "Emptiness"
+        },
+        {
+          "count": 3,
+          "name": "Enlightened Confidant"
+        },
+        {
+          "count": 3,
+          "name": "Haliya, Guided by Light"
+        },
+        {
+          "count": 4,
+          "name": "Hinterland Sanctifier"
+        },
+        {
+          "count": 3,
+          "name": "Liliana the Faultless"
+        },
+        {
+          "count": 3,
+          "name": "Moseo, Vein's New Dean"
         },
         {
           "count": 2,
-          "name": "Petrified Hamlet"
+          "name": "Starscape Cleric"
+        },
+        {
+          "count": 1,
+          "name": "Zoraline, Cosmos Caller"
+        },
+        {
+          "count": 4,
+          "name": "Case of the Uneaten Feast"
+        },
+        {
+          "count": 3,
+          "name": "Lunar Convocation"
         },
         {
           "count": 2,
@@ -885,240 +1080,97 @@
         },
         {
           "count": 4,
-          "name": "Consult the Star Charts"
+          "name": "Amalia Benavides Aguirre"
         },
         {
           "count": 3,
-          "name": "Seam Rip"
-        },
-        {
-          "count": 2,
-          "name": "Pinnacle Starcage"
+          "name": "Concealed Courtyard"
         },
         {
           "count": 1,
-          "name": "Three Steps Ahead"
-        },
-        {
-          "count": 3,
-          "name": "No More Lies"
+          "name": "Dalkovan Encampment"
         },
         {
           "count": 2,
-          "name": "Restless Anchorage"
+          "name": "Godless Shrine"
+        },
+        {
+          "count": 1,
+          "name": "Plains"
         },
         {
           "count": 4,
-          "name": "Hallowed Fountain"
+          "name": "Shattered Sanctum"
         },
         {
           "count": 4,
-          "name": "Deserted Beach"
+          "name": "Starting Town"
+        },
+        {
+          "count": 1,
+          "name": "Swamp"
         },
         {
           "count": 3,
-          "name": "Demolition Field"
+          "name": "Ajani Resolute"
         },
         {
-          "count": 4,
-          "name": "Get Lost"
+          "count": 1,
+          "name": "Godless Shrine"
         },
         {
-          "count": 4,
-          "name": "The Theorist, Jace Beleren"
+          "count": 1,
+          "name": "Godless Shrine"
         },
         {
           "count": 2,
           "name": "Plains"
         },
         {
-          "count": 4,
-          "name": "Floodfarm Verge"
-        },
-        {
-          "count": 3,
-          "name": "Island"
+          "count": 1,
+          "name": "Swamp"
         }
       ],
       "sideboard": [
         {
           "count": 2,
-          "name": "Captain Marvel, Earth's Protector"
-        },
-        {
-          "count": 1,
-          "name": "Emeritus of Ideation"
-        },
-        {
-          "count": 1,
-          "name": "Erode"
-        },
-        {
-          "count": 1,
-          "name": "Seam Rip"
-        },
-        {
-          "count": 2,
-          "name": "Pinnacle Starcage"
-        },
-        {
-          "count": 1,
-          "name": "Elspeth, Storm Slayer"
-        },
-        {
-          "count": 2,
-          "name": "Beza, the Bounding Spring"
-        },
-        {
-          "count": 1,
-          "name": "Day of Judgment"
-        },
-        {
-          "count": 1,
-          "name": "Disdainful Stroke"
-        },
-        {
-          "count": 1,
-          "name": "Disdainful Stroke"
-        },
-        {
-          "count": 2,
-          "name": "Flashfreeze"
-        }
-      ]
-    },
-    {
-      "name": "Boros Dwarves",
-      "author": "MTGGoldfish",
-      "colors": [
-        "R",
-        "W"
-      ],
-      "tags": [
-        "metagame"
-      ],
-      "main": [
-        {
-          "count": 2,
-          "name": "Thorin Oakenshield"
-        },
-        {
-          "count": 2,
-          "name": "Zack Fair"
-        },
-        {
-          "count": 1,
-          "name": "Erode"
-        },
-        {
-          "count": 4,
-          "name": "Inspiring Vantage"
+          "name": "Curious Farm Animals"
         },
         {
           "count": 3,
-          "name": "Buster Sword"
-        },
-        {
-          "count": 2,
-          "name": "Bofur, Reliable Guardian"
-        },
-        {
-          "count": 2,
-          "name": "The Lonely Mountain"
-        },
-        {
-          "count": 4,
-          "name": "Dwarven Mauler"
-        },
-        {
-          "count": 3,
-          "name": "Thorin, Mountain-king"
-        },
-        {
-          "count": 3,
-          "name": "Mountain"
+          "name": "Duress"
         },
         {
           "count": 1,
-          "name": "Skateboard"
-        },
-        {
-          "count": 3,
-          "name": "Cavern of Souls"
-        },
-        {
-          "count": 4,
-          "name": "Dain's Company"
-        },
-        {
-          "count": 4,
-          "name": "Sacred Foundry"
+          "name": "Decorum Dissertation"
         },
         {
           "count": 1,
-          "name": "Mjolnir, Hammer of Thor"
-        },
-        {
-          "count": 4,
-          "name": "Kili the Resourceful"
-        },
-        {
-          "count": 4,
-          "name": "Leyline Axe"
-        },
-        {
-          "count": 2,
-          "name": "Plains"
-        },
-        {
-          "count": 3,
-          "name": "Chainsaw"
-        },
-        {
-          "count": 3,
-          "name": "Cloud, Midgar Mercenary"
+          "name": "Lunar Convocation"
         },
         {
           "count": 1,
-          "name": "Dragonfire Blade"
-        },
-        {
-          "count": 4,
-          "name": "Sunbillow Verge"
-        }
-      ],
-      "sideboard": [
-        {
-          "count": 2,
           "name": "Requisition Raid"
         },
         {
-          "count": 3,
-          "name": "Sheltered by Ghosts"
-        },
-        {
           "count": 1,
-          "name": "Swiftfoot Boots"
-        },
-        {
-          "count": 1,
-          "name": "Ghost Vacuum"
+          "name": "Seam Rip"
         },
         {
           "count": 2,
-          "name": "Chandra, Spark Hunter"
-        },
-        {
-          "count": 3,
-          "name": "Rest in Peace"
-        },
-        {
-          "count": 2,
-          "name": "Bilbo's Gambit"
+          "name": "Shoot the Sheriff"
         },
         {
           "count": 1,
-          "name": "Erode"
+          "name": "Starscape Cleric"
+        },
+        {
+          "count": 2,
+          "name": "Strategic Betrayal"
+        },
+        {
+          "count": 1,
+          "name": "Strategic Betrayal"
         }
       ]
     },
@@ -1246,157 +1298,137 @@
       ]
     },
     {
-      "name": "Lifegain",
+      "name": "Dimir Excruciator",
       "author": "MTGGoldfish",
       "colors": [
-        "W",
-        "B"
+        "B",
+        "U"
       ],
       "tags": [
         "metagame"
       ],
       "main": [
         {
-          "count": 1,
-          "name": "Dalkovan Encampment"
-        },
-        {
-          "count": 1,
-          "name": "Bleachbone Verge"
-        },
-        {
-          "count": 4,
-          "name": "Shattered Sanctum"
+          "count": 2,
+          "name": "Archenemy's Charm"
         },
         {
           "count": 3,
-          "name": "Concealed Courtyard"
+          "name": "Bitter Triumph"
         },
         {
           "count": 2,
-          "name": "Deep-Cavern Bat"
-        },
-        {
-          "count": 4,
-          "name": "Godless Shrine"
-        },
-        {
-          "count": 4,
-          "name": "Case of the Uneaten Feast"
+          "name": "Cavern of Souls"
         },
         {
           "count": 2,
-          "name": "Starscape Cleric"
-        },
-        {
-          "count": 3,
-          "name": "Liliana the Faultless"
+          "name": "Day of Black Sun"
         },
         {
           "count": 1,
-          "name": "Zoraline, Cosmos Caller"
+          "name": "Deadly Cover-Up"
         },
         {
           "count": 4,
-          "name": "Hinterland Sanctifier"
+          "name": "Deceit"
         },
         {
           "count": 3,
-          "name": "Haliya, Guided by Light"
+          "name": "Doomsday Excruciator"
+        },
+        {
+          "count": 3,
+          "name": "Duress"
+        },
+        {
+          "count": 2,
+          "name": "Emeritus of Ideation"
+        },
+        {
+          "count": 4,
+          "name": "Gloomlake Verge"
         },
         {
           "count": 1,
+          "name": "Harvester of Misery"
+        },
+        {
+          "count": 4,
+          "name": "Requiting Hex"
+        },
+        {
+          "count": 4,
+          "name": "Restless Reef"
+        },
+        {
+          "count": 3,
+          "name": "Stock Up"
+        },
+        {
+          "count": 4,
+          "name": "Superior Spider-Man"
+        },
+        {
+          "count": 10,
           "name": "Swamp"
         },
         {
-          "count": 4,
-          "name": "Starting Town"
-        },
-        {
-          "count": 1,
-          "name": "Swamp"
-        },
-        {
           "count": 2,
-          "name": "Erode"
-        },
-        {
-          "count": 3,
-          "name": "Moseo, Vein's New Dean"
-        },
-        {
-          "count": 1,
-          "name": "Plains"
-        },
-        {
-          "count": 2,
-          "name": "Plains"
-        },
-        {
-          "count": 3,
-          "name": "Ajani Resolute"
-        },
-        {
-          "count": 2,
-          "name": "Enlightened Confidant"
-        },
-        {
-          "count": 1,
-          "name": "Emptiness"
+          "name": "Undercity Sewers"
         },
         {
           "count": 4,
-          "name": "Amalia Benavides Aguirre"
+          "name": "Watery Grave"
         },
         {
-          "count": 3,
-          "name": "Lunar Convocation"
-        },
-        {
-          "count": 1,
-          "name": "Enlightened Confidant"
+          "count": 2,
+          "name": "Winternight Stories"
         }
       ],
       "sideboard": [
         {
-          "count": 2,
-          "name": "Duress"
-        },
-        {
-          "count": 1,
-          "name": "Requisition Raid"
-        },
-        {
-          "count": 2,
-          "name": "Shoot the Sheriff"
-        },
-        {
-          "count": 1,
-          "name": "Starscape Cleric"
-        },
-        {
-          "count": 1,
-          "name": "Lunar Convocation"
-        },
-        {
           "count": 1,
           "name": "Duress"
         },
         {
-          "count": 3,
+          "count": 2,
+          "name": "Flashfreeze"
+        },
+        {
+          "count": 1,
+          "name": "Ghost Vacuum"
+        },
+        {
+          "count": 1,
+          "name": "Harvester of Misery"
+        },
+        {
+          "count": 1,
+          "name": "Negate"
+        },
+        {
+          "count": 2,
+          "name": "Oildeep Gearhulk"
+        },
+        {
+          "count": 2,
+          "name": "Qarsi Revenant"
+        },
+        {
+          "count": 2,
+          "name": "Quantum Riddler"
+        },
+        {
+          "count": 1,
           "name": "Strategic Betrayal"
         },
         {
           "count": 1,
-          "name": "Seam Rip"
-        },
-        {
-          "count": 2,
-          "name": "Curious Farm Animals"
+          "name": "Wan Shi Tong, Librarian"
         },
         {
           "count": 1,
-          "name": "Decorum Dissertation"
+          "name": "Preacher of the Schism"
         }
       ]
     }

@@ -106,6 +106,45 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  112 — GameState.linked_exile_lki holds one incarnation-bounded LinkedExileLki per
+ *       departure in game_setup and state_update; a v111 peer cannot decode a non-empty
+ *       map. Bumped with full-game protocol 130.
+ *  111 — game_setup and state_update carry GameState, whose loop-shortcut
+ *       offer and period confirmation change shape: WaitingFor::LoopShortcut's
+ *       schema replaced max_iterations with the pair measured_repetition_bound
+ *       and deliverable_capacity (serde defaults on both sides, so that skew is
+ *       silent rather than a parse error); DecisionSlot gained a required
+ *       `point` and PinnedDecision::Order replaced its bare `source` with a
+ *       full slot (no serde default, a parse break in both directions);
+ *       WaitingFor::LoopShortcut and ShortcutProposal gained a required road
+ *       naming the producer that minted the offer; WaitingFor gained
+ *       ManaAbilityManaPayment, a variant a v110 peer cannot parse; GameState
+ *       drops the recorded loop-action sequence; ConfirmedPeriod gains its
+ *       reach and PeriodicDelta its cleanup pair. First contact rejects the
+ *       skew. Bumped in lockstep with full-game protocol 129.
+ *  109 — game_setup and state_update carry GameState, whose attachment filters
+ *       are now one AttachedTo prop with a tagged `to` referent in place of the
+ *       AttachedToSource / AttachedToRecipient / AttachedToPlayer tags. Both
+ *       peers are browsers and neither validates the shape, so a v108 peer
+ *       would take the new shape with no decode error; first contact rejects
+ *       the skew instead. The same state carries positional retarget picks
+ *       (null keeps) and the engine-derived copy-walk keep and decline
+ *       permissions.
+ *       Bumped in lockstep with full-game protocol 127. (Reserved as 101 and then 103 while under review; it landed after 108, so 101 stays unused.)
+ *  110 — game_setup and state_update carry GameState, whose abilities may now
+ *       serialize TargetFilter::DeclaredPlayer. A v109 peer cannot deserialize
+ *       it, so first contact rejects the skew. SpellContext also gains
+ *       outer_declared_players (CR 603.7a), the players a delayed ability's
+ *       creating chain named by group, omitted when empty; amended in place, not
+ *       bumped. Bumped in lockstep with full-game protocol 128.
+ *  108 — ZoneChangeRecord carries arrival (the owner and controller the destination
+ *       object holds) in game_setup and state_update. Bumped with full-game protocol 126.
+ *  107 — MulliganDecisionEntry and MulliganDeclaration carry free_reveals_taken in
+ *       game_setup and state_update. Bumped with full-game protocol 125.
+ *  106 — game_setup and state_update carry GameState, whose resolved-rules journal
+ *       now admits a land-play rebound_from (Library/Graveyard/Exile -> Battlefield).
+ *       A v105 peer rejects the journal, so first contact rejects the skew. Bumped
+ *       with full-game protocol 124.
  *  105 — game_setup and state_update carry GameState, whose ability
  *       definitions now carry the "prepared spell" filter tag, a scope on
  *       the become-prepared / become-unprepared effects, the prepared-copy
@@ -611,7 +650,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 105 as const;
+export const WIRE_PROTOCOL_VERSION = 112 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

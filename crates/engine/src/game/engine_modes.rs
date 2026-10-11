@@ -50,6 +50,16 @@ pub(super) fn handle_ability_mode_choice(
         (false, _) => None,
     };
 
+    // CR 603.3c + CR 700.2b: a modal triggered ability answered with zero modes
+    // ("choose up to one" / "choose any number") is removed from the stack. It
+    // is never finalized as a no-op entry, and no mode usage is recorded.
+    if activated_ability_index.is_none() && indices.is_empty() {
+        let produced = remove_modal_trigger_with_no_mode(state, player, events);
+        return Ok(triggers::finish_trigger_construction_action(
+            state, events, produced,
+        ));
+    }
+
     record_modal_mode_choices(state, source_id, &modal, &indices);
 
     let mut resolved =
@@ -96,6 +106,20 @@ pub(super) fn handle_ability_mode_choice(
     }?;
 
     Ok(waiting_for)
+}
+
+/// CR 603.3c + CR 700.2b: "If no mode is chosen, the ability is removed from
+/// the stack." Drops the push-first in-construction entry through the single
+/// mid-construction removal authority, then announces any sibling triggers
+/// deferred behind it (CR 603.3b), exactly as a completed construction does.
+fn remove_modal_trigger_with_no_mode(
+    state: &mut GameState,
+    player: crate::types::player::PlayerId,
+    events: &mut Vec<GameEvent>,
+) -> WaitingFor {
+    super::engine::drop_mid_construction_pending_trigger(state);
+    triggers::drain_deferred_triggers_after_trigger_construction(state, events)
+        .unwrap_or(WaitingFor::Priority { player })
 }
 
 struct ActivatedModeChoice {
@@ -338,8 +362,9 @@ struct TriggeredModeChoice {
 /// `dispatch_pending_trigger_context`): `state.pending_trigger` is set and its
 /// stack entry is already pushed and tracked by `state.pending_trigger_entry`.
 ///
-/// Returns `Ok(None)` when no mode can be chosen (CR 603.3c); the caller drops
-/// the pushed entry through `drop_mid_construction_pending_trigger`.
+/// Returns `Ok(None)` when no mode is chosen, whether none can be or an "up to"
+/// draw chose zero (CR 603.3c); the caller drops the pushed entry through
+/// `drop_mid_construction_pending_trigger`.
 pub(super) fn resolve_random_modal_trigger(
     state: &mut GameState,
     player: crate::types::player::PlayerId,
@@ -349,11 +374,13 @@ pub(super) fn resolve_random_modal_trigger(
     unavailable_modes: &[usize],
     events: &mut Vec<GameEvent>,
 ) -> Result<Option<WaitingFor>, EngineError> {
+    // CR 603.3c + CR 700.2b: no mode can be chosen, or an "up to" draw chose
+    // none. Either way the ability is removed from the stack; the caller drops
+    // the pushed entry through `drop_mid_construction_pending_trigger`.
     let Some(indices) =
         super::ability_utils::random_select_modal_indices(state, &modal, unavailable_modes)
+            .filter(|indices| !indices.is_empty())
     else {
-        // CR 603.3c: No mode can be chosen. The caller drops the pushed entry
-        // through `drop_mid_construction_pending_trigger`.
         return Ok(None);
     };
 
@@ -379,6 +406,77 @@ pub(super) fn resolve_random_modal_trigger(
     Ok(Some(waiting_for))
 }
 
+/// CR 603.3c: choosing a modal trigger's modes is part of putting that one
+/// ability on the stack, so the chosen modes keep every stamp the trigger
+/// received when it triggered and was pushed.
+fn carry_trigger_provenance(
+    pending: &crate::types::ability::ResolvedAbility,
+    chosen: &mut crate::types::ability::ResolvedAbility,
+) {
+    if let Some(source) = &pending.trigger_source {
+        chosen.set_trigger_source_recursive(source.clone());
+    }
+    if pending.source_incarnation.is_some() {
+        chosen.set_source_incarnation_recursive(pending.source_incarnation);
+    }
+    if let Some(player) = pending.original_controller {
+        chosen.set_original_controller_recursive(player);
+    }
+    if let Some(definition_ref) = &pending.trigger_definition_ref {
+        chosen.set_trigger_definition_ref_recursive(definition_ref.clone());
+    }
+    if let Some(origin) = &pending.may_trigger_origin {
+        chosen.set_may_trigger_origin_recursive(origin.clone());
+    }
+    if let Some(player) = pending.scoped_player {
+        chosen.set_scoped_player_recursive(player);
+    }
+    if let Some(x) = pending.chosen_x {
+        chosen.set_chosen_x_recursive(x);
+    }
+    if let Some(snapshot) = &pending.cost_paid_object {
+        chosen.set_cost_paid_object_recursive(snapshot.clone());
+    }
+    if chosen.unless_pay.is_none() {
+        chosen.unless_pay.clone_from(&pending.unless_pay);
+    }
+    let context = &pending.context;
+    if context.source_transformation_count.is_some() {
+        chosen.set_source_transformation_count_recursive(context.source_transformation_count);
+    }
+    if context.source_ability_provenance.is_some() {
+        chosen.set_source_ability_provenance_recursive(context.source_ability_provenance);
+    }
+    if let Some(event) = &context.creation_lookback_event {
+        chosen.set_creation_lookback_event_recursive(event);
+    }
+    for &event in &context.duration_events {
+        chosen.record_duration_event_recursive(event);
+    }
+    // The trigger build stamps the source's cast facts on the root only.
+    chosen.context.cast_from_zone = chosen.context.cast_from_zone.or(context.cast_from_zone);
+    if !context.kickers_paid.is_empty() {
+        chosen
+            .context
+            .kickers_paid
+            .clone_from(&context.kickers_paid);
+    }
+    if !context.additional_cost_payments.is_empty() {
+        chosen
+            .context
+            .additional_cost_payments
+            .clone_from(&context.additional_cost_payments);
+    }
+    chosen.context.additional_cost_payment_count = context.additional_cost_payment_count;
+    chosen.context.additional_cost_paid |= context.additional_cost_paid;
+    chosen.bind_force_block_source_recursive(pending.source_incarnation.map(|incarnation| {
+        crate::types::identifiers::ObjectIncarnationRef {
+            object_id: pending.source_id,
+            incarnation,
+        }
+    }));
+}
+
 fn handle_triggered_mode_choice(
     state: &mut GameState,
     choice: TriggeredModeChoice,
@@ -387,7 +485,7 @@ fn handle_triggered_mode_choice(
     let TriggeredModeChoice {
         player,
         source_id,
-        resolved,
+        mut resolved,
         modal,
         mode_abilities,
         indices,
@@ -397,6 +495,13 @@ fn handle_triggered_mode_choice(
         .pending_trigger
         .take()
         .ok_or_else(|| EngineError::InvalidAction("No pending trigger".to_string()))?;
+    // The stack entry holds the push-time stamps the pending carrier lacks.
+    let pending = state
+        .pending_trigger_entry
+        .and_then(|id| state.stack.iter().rev().find(|entry| entry.id == id))
+        .and_then(|entry| entry.ability())
+        .unwrap_or(trigger.ability.as_ref());
+    carry_trigger_provenance(pending, &mut resolved);
     // CR 603.2 + CR 109.4: Re-establish the trigger event context for
     // the duration of mode-target computation. The modal was paused for mode
     // choice (`trigger_dispatch`) AFTER restoring the context to its pre-dispatch
