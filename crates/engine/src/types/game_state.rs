@@ -6849,23 +6849,25 @@ pub enum BatchCompletion {
     },
 }
 
+/// CR 608.2c + CR 608.2n: an instant or sorcery whose instructions paused for a
+/// choice (CR 608.2d / CR 608.2g) still owes the final part of its resolution —
+/// leaving the stack — once those instructions are done. Owned by the resolution
+/// carrier it names (`resolving_stack_entry`), never by the spell's ability or
+/// stack entry, so a copy of the spell (CR 707.10) cannot inherit it.
+/// CR 724.1b / CR 724.2b: `resolution_start_phase` is the phase the resolution
+/// began in — "end the combat phase" exiles the resolving object only when it
+/// began resolving during combat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwedSpellFinalPart {
+    pub spell: ObjectId,
+    pub resolution_start_phase: crate::types::phase::Phase,
+}
+
 /// CR 603.3b + CR 608.2g: terminal settlement that must wait until the
 /// resolution-cast spell has completed its announcement. `source_id` proves
 /// the terminal batch belongs to the still-stashed resolving Ripple ability;
 /// the post-announcement boundary then combines this cast's triggers with the
 /// earlier accepted casts' parked observers before ordering the one batch.
-/// CR 608.2n + CR 608.2g: the move of a resolving instant or sorcery to the
-/// zone it goes to "as the final part" of its resolution, held back while the
-/// spell is paused on its own during-resolution free-cast window (Finale of
-/// Promise, Collected Conjuring). The spell stays on the stack until the window
-/// and the rest of its instructions are done; the destination is the one
-/// `resolve_top` selected.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeferredSpellDelivery {
-    pub object_id: ObjectId,
-    pub destination: crate::types::zones::Zone,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingResolutionCompletion {
     pub player: PlayerId,
@@ -12597,6 +12599,31 @@ pub(crate) fn validate_trigger_firing_coherence(state: &GameState) -> Result<(),
         );
     }
     Ok(())
+}
+
+/// CR 608.2n: an owed final part belongs to the instant or sorcery whose
+/// resolution carrier is installed. A restored marker that names no carrier, a
+/// non-spell carrier, or a different spell is rejected rather than published.
+pub(crate) fn validate_owed_spell_final_part_coherence(state: &GameState) -> Result<(), String> {
+    let Some(owed) = state.resolving_spell_final_part else {
+        return Ok(());
+    };
+    let names_installed_spell =
+        state
+            .resolving_stack_entry
+            .as_ref()
+            .is_some_and(|entry| match &entry.kind {
+                StackEntryKind::Spell { .. } => entry.id == owed.spell,
+                StackEntryKind::ActivatedAbility { .. }
+                | StackEntryKind::TriggeredAbility { .. }
+                | StackEntryKind::KeywordAction { .. }
+                | StackEntryKind::CombatDamage { .. } => false,
+            });
+    if names_installed_spell {
+        Ok(())
+    } else {
+        Err("an owed spell final part must name the installed spell carrier".to_string())
+    }
 }
 
 /// The public scheduling classifier and private firing identity are redundant
@@ -23220,15 +23247,16 @@ declare_game_state! {
     /// stack into its active resolution context. `None` is normal or legacy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resolving_trigger_firing: Option<TriggerFiring>,
+    /// CR 608.2n: see [`OwedSpellFinalPart`]. Paired with
+    /// `resolving_stack_entry` like `resolving_trigger_firing`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resolving_spell_final_part: Option<OwedSpellFinalPart>,
     /// CR 603.3b + CR 608.2g: a terminal resolution batch (currently Ripple)
     /// has settled, but its final spell is still completing announcement. Keep
     /// the provenance until the post-announcement priority pipeline can collect
     /// that spell's cast triggers into the same deferred ordering batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_resolution_completion: Option<PendingResolutionCompletion>,
-    /// CR 608.2n + CR 608.2g: see [`DeferredSpellDelivery`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deferred_spell_delivery: Option<DeferredSpellDelivery>,
     /// CR 107.3i: the X announced for an in-flight COST, keyed by the object whose cost
     /// it is. CR 107.3i: "Normally, all instances of X on an object have the same value
     /// at any given time" — so a triggered ability of that SAME object which fires
@@ -23984,6 +24012,7 @@ impl GameStateDecode {
         // See the pairing comment there for why one site is not enough.
         reject_viewer_projection_as_authority(&state)?;
         validate_trigger_firing_coherence(&state)?;
+        validate_owed_spell_final_part_coherence(&state)?;
         validate_return_result_occurrence_coherence(&state)?;
         reject_zero_bound_shortcut_offer(&state)?;
         #[cfg(debug_assertions)]
@@ -24024,6 +24053,7 @@ impl GameStateDecode {
         // (`decode_persisted_resolution_state`), which is what a saved game restores
         // through and where installing a projection as authority is the actual defect.
         validate_trigger_firing_coherence(&state)?;
+        validate_owed_spell_final_part_coherence(&state)?;
         if state.viewer_projection.is_none() {
             validate_return_result_occurrence_coherence(&state)?;
         }
@@ -25765,6 +25795,11 @@ fn annotate_paused_exile_event(
 }
 
 impl GameState {
+    /// CR 608.2n: the final part the resolving instant or sorcery still owes, if any.
+    pub fn owed_spell_final_part(&self) -> Option<&OwedSpellFinalPart> {
+        self.resolving_spell_final_part.as_ref()
+    }
+
     /// CR 704.3: Whether the game is inside a process that no player receives
     /// priority during, so the state-based action check must wait until it
     /// completes. There are four owners:
@@ -29278,8 +29313,8 @@ impl GameState {
             current_trigger_match_count: None,
             resolving_stack_entry: None,
             resolving_trigger_firing: None,
+            resolving_spell_final_part: None,
             pending_resolution_completion: None,
-            deferred_spell_delivery: None,
             resolution_source_relatch: None,
             current_trigger_events: Vec::new(),
             last_discover_value: None,
@@ -32297,8 +32332,8 @@ fn _gamestate_partition_is_total(s: &GameState) {
         turn_up_paid_cost_source: _,
         resolving_stack_entry: _,
         resolving_trigger_firing: _,
+        resolving_spell_final_part: _,
         pending_resolution_completion: _,
-        deferred_spell_delivery: _,
         current_trigger_events: _,
         stack_trigger_event_batches: _,
         stack_trigger_firings: _,
@@ -32595,7 +32630,7 @@ impl PartialEq for GameState {
             && self.resolution_stack.game_state_eq(&other.resolution_stack)
             && self.payment_transaction == other.payment_transaction
             && self.pending_resolution_completion == other.pending_resolution_completion
-            && self.deferred_spell_delivery == other.deferred_spell_delivery
+            && self.resolving_spell_final_part == other.resolving_spell_final_part
             // CR 104.4b: volatile resolution-scoped flip result. A flip already
             // advances `state.rng`, so iterations differ regardless; comparing
             // this field never masks a real repeat (safe to include).
@@ -38189,6 +38224,159 @@ mod tests {
                 .trigger_firing,
             Some(TriggerFiring::LegacyDelayed)
         );
+    }
+
+    fn owed_final_part_spell_carrier(id: ObjectId) -> StackEntry {
+        StackEntry {
+            id,
+            source_id: id,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(id.0),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        }
+    }
+
+    fn owed_final_part_state(carrier: Option<StackEntry>, spell: ObjectId) -> GameState {
+        let mut state = GameState::new_two_player(42);
+        state.resolving_stack_entry = carrier;
+        state.resolving_spell_final_part = Some(OwedSpellFinalPart {
+            spell,
+            resolution_start_phase: state.phase,
+        });
+        state
+    }
+
+    /// The engine's own raw persistence writer, which declares the current
+    /// resolution-wire version (so decode takes the typed-frame arm, not v1).
+    fn current_version_persisted_payload(state: &GameState) -> serde_json::Value {
+        let payload = serde_json::to_value(PersistedGameState::Raw(Box::new(state.clone())))
+            .expect("the raw snapshot serializes");
+        assert!(
+            payload
+                .get("resolution_state_version")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|version| version > 1),
+            "reach guard: the payload declares a current resolution-wire version"
+        );
+        payload
+    }
+
+    /// CR 608.2n: a restored owed final part must name the installed instant
+    /// or sorcery carrier. A marker with no carrier, a non-spell carrier, or a
+    /// different spell is rejected on the transport decode and on the persisted
+    /// decode of a current-version payload alike; a coherent one decodes and
+    /// round-trips. (An unversioned payload with no frames is a v1 one, whose
+    /// completed-carrier normalization clears the marker with its carrier.)
+    #[test]
+    fn an_owed_final_part_that_names_no_installed_spell_carrier_is_rejected_on_decode() {
+        let spell = ObjectId(4_201);
+        let activated = StackEntry {
+            id: spell,
+            source_id: spell,
+            controller: PlayerId(0),
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: spell,
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::NoOp,
+                    Vec::new(),
+                    spell,
+                    PlayerId(0),
+                )),
+            },
+        };
+        let incoherent = [
+            ("no carrier", owed_final_part_state(None, spell)),
+            (
+                "a non-spell carrier",
+                owed_final_part_state(Some(activated), spell),
+            ),
+            (
+                "another spell's carrier",
+                owed_final_part_state(Some(owed_final_part_spell_carrier(ObjectId(4_202))), spell),
+            ),
+        ];
+        for (shape, state) in incoherent {
+            let raw = serde_json::to_value(&state).expect("the fixture serializes");
+            let transport = serde_json::from_value::<GameState>(raw.clone())
+                .expect_err("the transport decode rejects an incoherent marker");
+            assert!(
+                transport
+                    .to_string()
+                    .contains("an owed spell final part must name the installed spell carrier"),
+                "{shape}: rejected for the marker, got {transport}"
+            );
+            let versioned = current_version_persisted_payload(&state);
+            let persisted = serde_json::from_value::<PersistedGameState>(versioned)
+                .expect_err("the persisted decode rejects an incoherent marker");
+            assert!(
+                persisted
+                    .to_string()
+                    .contains("an owed spell final part must name the installed spell carrier"),
+                "{shape}: rejected for the marker, got {persisted}"
+            );
+        }
+
+        let coherent = owed_final_part_state(Some(owed_final_part_spell_carrier(spell)), spell);
+        let raw = serde_json::to_value(&coherent).expect("the fixture serializes");
+        let decoded = serde_json::from_value::<GameState>(raw.clone())
+            .expect("a marker naming its installed spell carrier decodes");
+        assert_eq!(decoded, coherent, "and round-trips");
+        assert_eq!(
+            decoded.owed_spell_final_part(),
+            coherent.resolving_spell_final_part.as_ref()
+        );
+        let PersistedGameState::Raw(persisted) = serde_json::from_value::<PersistedGameState>(
+            current_version_persisted_payload(&coherent),
+        )
+        .expect("the persisted decode accepts the coherent marker") else {
+            panic!("an unenveloped payload decodes as a raw snapshot");
+        };
+        assert_eq!(
+            persisted.resolving_spell_final_part,
+            coherent.resolving_spell_final_part
+        );
+    }
+
+    /// CR 608.2n: the v1 normalization of a completed resolution clears the
+    /// owed final part together with the carrier it belongs to; without the
+    /// paired clear, the marker would be left naming no carrier and rejected.
+    #[test]
+    fn v1_completed_carrier_normalization_clears_its_owed_final_part() {
+        let spell = ObjectId(4_203);
+        let mut state = owed_final_part_state(Some(owed_final_part_spell_carrier(spell)), spell);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        let mut v1 = serde_json::to_value(state).expect("v1 fixture serializes");
+        v1["resolution_state_version"] = serde_json::Value::from(1);
+        assert!(
+            v1.get("resolving_spell_final_part").is_some(),
+            "reach guard: the v1 payload carries the marker"
+        );
+
+        let PersistedGameState::Raw(restored) = serde_json::from_value::<PersistedGameState>(v1)
+            .expect("the v1 completed carrier normalizes")
+        else {
+            panic!("an unenveloped payload decodes as a raw snapshot");
+        };
+        assert!(restored.resolving_stack_entry.is_none());
+        assert!(restored.resolving_spell_final_part.is_none());
+    }
+
+    /// CR 104.4b: the owed final part is resolution state, so two states that
+    /// differ only in it are different states.
+    #[test]
+    fn game_state_equality_compares_the_owed_final_part() {
+        let spell = ObjectId(4_204);
+        let owing = owed_final_part_state(Some(owed_final_part_spell_carrier(spell)), spell);
+        let mut settled = owing.clone();
+        assert_eq!(owing, settled);
+        settled.resolving_spell_final_part = None;
+        assert_ne!(owing, settled);
     }
 
     #[test]
