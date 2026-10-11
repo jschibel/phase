@@ -176,6 +176,9 @@ fn run_post_action_pipeline_core(
     // is over, so the batch it completes goes on the stack above any spell still
     // below it (that spell has not begun to resolve, CR 405.5). The #1793 guard
     // is for a resolution still under way, which never reaches this point.
+    // The seam's own policy, before a final part settles it: whether this pass
+    // owns the batch of casts announced during the finished resolution.
+    let seam_drain_policy = drain_policy;
     let drain_policy = if final_part_ran {
         drain_policy.after_spell_final_part()
     } else {
@@ -213,7 +216,10 @@ fn run_post_action_pipeline_core(
     // resolution are put on the stack with this action's fresh observers as
     // ONE batch, above the cast spells; the fresh observers join the queue
     // instead of being dispatched ahead of it.
-    let announced_cast_batch = drain_policy == DeferredTriggerDrainPolicy::ResolutionSafe
+    // A resolution whose CR 608.2n final part ran in this pass is finished too:
+    // its announced casts' observers batch with the final part's and the
+    // state-based actions' observers exactly as for any finished resolution.
+    let announced_cast_batch = seam_drain_policy == DeferredTriggerDrainPolicy::ResolutionSafe
         && matches!(state.waiting_for, WaitingFor::Priority { .. })
         && triggers::deferred_triggers_hold_announced_casts(state);
 

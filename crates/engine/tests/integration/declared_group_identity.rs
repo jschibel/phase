@@ -867,7 +867,21 @@ fn run_on(
             .collect(),
         fingerprint: format!(
             "{}|{:?}|{:?}",
-            serde_json::to_string(&state.players).unwrap(),
+            // CR 608.2n: a same-chain clause that pauses for a choice leaves the probe spell on
+            // the stack until its final part, while a delayed payload's spell resolved long
+            // before; where the probe itself is is not what these rows compare.
+            serde_json::to_string(
+                &state
+                    .players
+                    .iter()
+                    .cloned()
+                    .map(|mut p| {
+                        p.graveyard.retain(|id| *id != spell);
+                        p
+                    })
+                    .collect::<Vec<_>>()
+            )
+            .unwrap(),
             {
                 let mut revealed: Vec<_> = state.revealed_cards.iter().copied().collect();
                 revealed.sort();
