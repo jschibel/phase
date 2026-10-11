@@ -1136,6 +1136,79 @@ pub fn spell_modal_unavailable_modes(
     unavailable_modes
 }
 
+/// CR 700.2a + CR 601.2b-c: Whether a mode selection the rules accept exists
+/// once `unavailable_modes` (repeat constraints and modes with no legal target
+/// assignment) are excluded. A mode that requires a target with no legal
+/// choice can't be chosen; when the spell's minimum number of modes can't be
+/// met from the modes that can, the spell can't be cast at all.
+///
+/// - CR 700.2d: Without repeats, at least `min_choices` distinct choosable
+///   modes are needed ("choose two" with one choosable mode has no legal
+///   selection); with repeats, one choosable mode can fill every pick.
+/// - CR 700.2i: For a pawprint points-budget modal, the cheapest
+///   `min_choices` choosable modes must fit within the point budget.
+/// - CR 700.2a + CR 115.1: Modal target constraints (each mode targets a
+///   different player) must admit a legal assignment for some selection of
+///   the required size (`modal_choice_with_target_assignment_limit`, the cap
+///   the activated and triggered mode prompts apply).
+///
+/// `modal` is the effective choice the prompt would present (conditional and
+/// dynamic maxima already resolved).
+pub fn modal_has_legal_mode_selection(
+    state: &GameState,
+    source_id: ObjectId,
+    controller: PlayerId,
+    modal: &ModalChoice,
+    mode_abilities: &[AbilityDefinition],
+    unavailable_modes: &[usize],
+) -> bool {
+    // CR 700.2: the instruction sets how many modes are chosen; "choose up to
+    // N" admits choosing none.
+    if modal.min_choices == 0 {
+        return true;
+    }
+    let available: Vec<usize> = (0..modal.mode_count)
+        .filter(|idx| !unavailable_modes.contains(idx))
+        .collect();
+    let enough_modes = if modal.mode_pawprints.is_empty() {
+        if modal.allow_repeat_modes {
+            !available.is_empty()
+        } else {
+            available.len() >= modal.min_choices
+        }
+    } else {
+        let mut weights: Vec<u32> = available
+            .iter()
+            .filter_map(|&idx| modal.mode_pawprints.get(idx).copied().map(u32::from))
+            .collect();
+        weights.sort_unstable();
+        let cheapest = if modal.allow_repeat_modes {
+            weights
+                .first()
+                .map(|&weight| weight.saturating_mul(modal.min_choices as u32))
+        } else {
+            weights
+                .get(..modal.min_choices)
+                .map(|cheapest| cheapest.iter().sum::<u32>())
+        };
+        cheapest.is_some_and(|spent| spent <= modal.max_choices as u32)
+    };
+    // CR 700.2a + CR 700.2d: `modal_choice_with_target_assignment_limit` only
+    // weighs selections of `min_choices..=max_choices` modes, so `Some` means a
+    // selection of at least the minimum has a legal target assignment, and
+    // `None` that none does.
+    enough_modes
+        && modal_choice_with_target_assignment_limit(
+            state,
+            source_id,
+            controller,
+            modal,
+            mode_abilities,
+            unavailable_modes,
+        )
+        .is_some()
+}
+
 /// Spell-kind abilities on a modal spell object — one entry per printed mode.
 pub fn modal_spell_mode_abilities(
     obj: &crate::game::game_object::GameObject,
@@ -17966,6 +18039,166 @@ mod tests {
 
         // Mode 0 is available — should succeed.
         assert!(validate_modal_indices(&modal, &[0], &[1]).is_ok());
+    }
+
+    /// Two "target opponent" modes under "each mode must target a different
+    /// player", in a two-player game: either mode alone has a legal target,
+    /// but no two modes can be chosen together.
+    fn different_opponents_modal(min_choices: usize) -> (ModalChoice, Vec<AbilityDefinition>) {
+        let modal = ModalChoice {
+            min_choices,
+            max_choices: 2,
+            mode_count: 2,
+            constraints: vec![ModalSelectionConstraint::DifferentTargetPlayers],
+            ..Default::default()
+        };
+        let target_opponent_mode = |value| {
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::LoseLife {
+                    amount: QuantityExpr::Fixed { value },
+                    target: Some(TargetFilter::Typed(
+                        TypedFilter::default().controller(ControllerRef::Opponent),
+                    )),
+                },
+            )
+        };
+        (
+            modal,
+            vec![target_opponent_mode(2), target_opponent_mode(3)],
+        )
+    }
+
+    #[test]
+    fn modal_selection_needs_its_minimum_under_target_constraints() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Modal Spell".to_string(),
+            Zone::Hand,
+        );
+
+        // Reach guard: each mode alone has a legal target assignment, so
+        // "choose one or both" is satisfiable and its cap drops to one mode.
+        let (one_or_both, modes) = different_opponents_modal(1);
+        let capped = modal_choice_with_target_assignment_limit(
+            &state,
+            source,
+            PlayerId(0),
+            &one_or_both,
+            &modes,
+            &[],
+        )
+        .expect("a one-mode selection has a legal target assignment");
+        assert_eq!(capped.max_choices, 1);
+        assert!(modal_has_legal_mode_selection(
+            &state,
+            source,
+            PlayerId(0),
+            &one_or_both,
+            &modes,
+            &[],
+        ));
+
+        // CR 700.2a + CR 700.2d: "choose two" needs both modes, which would
+        // have to target two different opponents — there is only one.
+        let (choose_two, modes) = different_opponents_modal(2);
+        assert!(!modal_has_legal_mode_selection(
+            &state,
+            source,
+            PlayerId(0),
+            &choose_two,
+            &modes,
+            &[],
+        ));
+    }
+
+    /// Untargeted spell modes, so `modal_choice_with_target_assignment_limit`
+    /// returns `Some` and the verdict isolates the count and budget arithmetic.
+    fn untargeted_spell_modes(count: usize) -> Vec<AbilityDefinition> {
+        (0..count)
+            .map(|_| {
+                AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn modal_selection_minimum_zero_and_pawprint_budget() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Modal Spell".to_string(),
+            Zone::Hand,
+        );
+        let verdict = |modal: &ModalChoice, unavailable: &[usize]| {
+            modal_has_legal_mode_selection(
+                &state,
+                source,
+                PlayerId(0),
+                modal,
+                &untargeted_spell_modes(modal.mode_count),
+                unavailable,
+            )
+        };
+
+        // (i-a) CR 700.2 + CR 700.2d: "choose up to two" with repeats allowed
+        // (the Moment of Reckoning shape) admits choosing no modes, so it has
+        // a legal selection even when every mode is unavailable.
+        let up_to_two_repeatable = ModalChoice {
+            min_choices: 0,
+            max_choices: 2,
+            mode_count: 2,
+            allow_repeat_modes: true,
+            ..Default::default()
+        };
+        assert!(verdict(&up_to_two_repeatable, &[0, 1]));
+
+        // (i-b) CR 700.2: the same without repeats (the Call Damage Control
+        // shape) — zero modes still meets "choose up to two".
+        let up_to_two = ModalChoice {
+            allow_repeat_modes: false,
+            ..up_to_two_repeatable
+        };
+        assert!(verdict(&up_to_two, &[0, 1]));
+
+        // (ii) CR 700.2i: a pawprint modal's `max_choices` is its point
+        // budget. With a budget of 1 and the 1-point mode unavailable, no
+        // choosable mode fits, though two modes remain choosable by count.
+        let one_point_budget = ModalChoice {
+            min_choices: 1,
+            max_choices: 1,
+            mode_count: 3,
+            mode_pawprints: vec![1, 2, 3],
+            ..Default::default()
+        };
+        assert!(!verdict(&one_point_budget, &[0]));
+
+        // (iii) CR 700.2i: reach guard for (ii) — with the 1-point mode
+        // choosable, it fits the budget.
+        assert!(verdict(&one_point_budget, &[]));
+
+        // (iv) CR 700.2d + CR 700.2i: with repeats, the one choosable 1-point
+        // mode fills both required picks within the 2-point budget (1+1 <= 2).
+        let two_point_budget_repeatable = ModalChoice {
+            min_choices: 2,
+            max_choices: 2,
+            mode_count: 3,
+            allow_repeat_modes: true,
+            mode_pawprints: vec![1, 2, 3],
+            ..Default::default()
+        };
+        assert!(verdict(&two_point_budget_repeatable, &[1, 2]));
     }
 
     #[test]
