@@ -264,10 +264,11 @@ pub fn eliminate_players_simultaneously(
             events,
         );
 
-    // CR 800.4a + CR 608.2n: the instant or sorcery paused mid-resolution, and
-    // who controls it as the departures begin — captured before the sweeps
-    // below move it off the stack.
-    let paused_spell = super::stack::spell_awaiting_final_part(state).map(|entry| {
+    // CR 800.4a + CR 608.2n: the instant or sorcery whose resolution is under
+    // way — its final part still owed, or run and parked on a question of its
+    // own — and who controls it as the departures begin, captured before the
+    // sweeps below move it off the stack.
+    let paused_spell = super::stack::resolving_instant_or_sorcery_on_stack(state).map(|entry| {
         (
             entry.id,
             super::stack::stack_object_controller(state, entry),
@@ -578,7 +579,9 @@ pub fn eliminate_players_simultaneously(
         // has one of its instructions to answer, the carrier stays; once those
         // instructions are done, the departed-spell path reports it resolved
         // exactly once. (A spell that reverted to a surviving owner stays on the
-        // stack, and its final part puts it into that owner's graveyard.)
+        // stack, and its final part puts it into that owner's graveyard.) A
+        // spell whose final part already ran and parked was reported resolved
+        // at that moment; its carrier is retired with its departed controller.
         if let Some((spell, controller)) = paused_spell {
             if leaving_set.contains(&controller)
                 && state
@@ -589,7 +592,7 @@ pub fn eliminate_players_simultaneously(
                     .objects
                     .get(&spell)
                     .is_none_or(|object| object.zone != Zone::Stack)
-                && super::engine::resolving_stack_entry_can_settle(state)
+                && super::engine::resolution_instructions_are_done(state)
             {
                 super::stack::finish_resolving_stack_entry(
                     state,
@@ -835,12 +838,15 @@ fn exile_owned_objects_on_player_left_game(
         Zone::Stack,
     ];
     // CR 608.2n: an instant or sorcery paused mid-resolution is still an
-    // object on the stack until its deferred final part runs, but the engine
-    // popped it from `state.stack` as it began resolving, so
-    // `zone_object_ids(Zone::Stack)` does not list it. Exiling it here leaves its
-    // controller's remaining instructions to finish (CR 608.2m) with nothing
-    // left to put into a graveyard.
-    let resolving_spell = super::stack::spell_awaiting_final_part(state).map(|entry| entry.id);
+    // object on the stack until its deferred final part moves it — and so is
+    // one whose final part already ran and parked a question of its own (a
+    // CR 616.1 ordering of its own move) — but the engine popped it from
+    // `state.stack` as it began resolving, so `zone_object_ids(Zone::Stack)`
+    // does not list it. Exiling it here leaves its controller's remaining
+    // instructions to finish (CR 608.2m) with nothing left to put into a
+    // graveyard.
+    let resolving_spell =
+        super::stack::resolving_instant_or_sorcery_on_stack(state).map(|entry| entry.id);
     let mut to_exile: Vec<_> = state
         .battlefield
         .iter()
@@ -1111,7 +1117,7 @@ fn remove_stack_objects_controlled_by_leaving_players(
         // mid-resolution is a card-represented object on the stack too (popped
         // from `state.stack`, so the sweep above cannot reach it). If the
         // leaver still controls it, it is exiled.
-        if let Some(resolving_spell) = super::stack::spell_awaiting_final_part(state)
+        if let Some(resolving_spell) = super::stack::resolving_instant_or_sorcery_on_stack(state)
             .filter(|entry| super::stack::stack_object_controller(state, entry) == player)
             .map(|entry| entry.id)
         {

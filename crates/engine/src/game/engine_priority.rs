@@ -98,6 +98,27 @@ pub(crate) fn run_post_action_pipeline_from_settled_priority(
     ))
 }
 
+/// CR 608.2n + CR 117.5: the pass pipeline after `stack::resolve_top`'s net
+/// ran a resolution's final part in this pass. Identical to
+/// `run_post_action_pipeline` except that the deferred batch drains with
+/// `DeferredTriggerDrainPolicy::after_spell_final_part`.
+pub(super) fn run_post_action_pipeline_after_spell_final_part(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+    default_wf: &WaitingFor,
+    skip_trigger_scan: bool,
+) -> Result<WaitingFor, EngineError> {
+    run_post_action_pipeline_from_with_policy(
+        state,
+        events,
+        0,
+        default_wf,
+        skip_trigger_scan,
+        DeferredTriggerDrainPolicy::ResolutionSafe.after_spell_final_part(),
+        None,
+    )
+}
+
 /// The shared post-action settlement core. Every ordinary wrapper reaches it
 /// through the boolean form above, with `carried_priority_recipient == None`,
 /// which preserves their current stack-growth fallback and every current
@@ -124,14 +145,18 @@ fn run_post_action_pipeline_from_with_policy(
 
     // CR 608.2c + CR 608.2n: an instant or sorcery whose instructions paused
     // is put into its owner's graveyard as the final part of its resolution,
-    // once those instructions are done. Whatever answer completed them, this
-    // priority boundary proves it (the settle predicate refuses while any of
-    // the resolution's work is still live), so run that final part here, before
-    // the trigger scan below, so the spell's own move reaches its observers in
-    // this same pass.
-    if super::stack::resolving_spell_owes_final_part(state) {
-        super::engine::settle_resolving_stack_entry_after_continuation_resume(state, events);
-    }
+    // once those instructions are done. This boundary completes it, before the
+    // scan below; the final part's triggers wait for this pass's batch.
+    let final_part_ran = super::engine::run_spell_final_part_if_due(state, events);
+    // CR 608.2n + CR 117.5 + CR 603.3: once the final part has run the resolution
+    // is over, so the batch it completes goes on the stack above any spell still
+    // below it (that spell has not begun to resolve, CR 405.5). The #1793 guard
+    // is for a resolution still under way, which never reaches this point.
+    let drain_policy = if final_part_ran {
+        drain_policy.after_spell_final_part()
+    } else {
+        drain_policy
+    };
 
     // CR 117.3c + CR 117.5: the wait a completed no-choice pass hands back. With
     // no carried recipient this is exactly baseline's active-player wait.
@@ -302,6 +327,11 @@ fn run_post_action_pipeline_from_with_policy(
             || state.pending_replacement.is_some()
             || state.pending_resolution_completion.is_some()
             || deferred_trigger_batch_was_sba_choice_parked
+            // CR 603.3 + CR 603.3b: a pass that completed a paused resolution
+            // puts everything that triggered since a player last received
+            // priority — the parked triggers, its final part's and this
+            // answer's — on the stack as one batch, through the drain below.
+            || final_part_ran
         {
             triggers::collect_triggers_into_deferred(state, &filtered_events);
         } else if state.game_end.is_none() {
@@ -721,10 +751,21 @@ pub(super) fn settle_pending_resolution_completion(
     // resolution. Now its terminal instruction has completed, so clear the
     // resolution-only LKI before the explicit post-announcement drain.
     state.pending_resolution_completion = None;
-    // CR 608.2n: the rippled spell's own final part runs first; should it park
-    // a question of its own, the carrier stays and the parked triggers wait for
-    // the ordinary priority-boundary drain instead of the post-announcement one.
-    super::engine::retire_completed_resolution_carrier(state, events);
+    // CR 608.2n: the rippled spell's own final part runs first, through the
+    // single final-part authority; should it park a question of its own, the
+    // carrier stays and the parked triggers wait for the ordinary
+    // priority-boundary drain instead of the post-announcement one. A carrier
+    // that owes no final part is retired here as at any completed resolution.
+    if super::stack::resolving_spell_owes_final_part(state) {
+        super::engine::run_spell_final_part_if_due(state, events);
+    } else {
+        super::stack::finish_resolving_stack_entry(
+            state,
+            super::lifecycle::DelayedTerminalDisposition::Resolved,
+        );
+        // CR 400.7j: resolution-scoped self-move state ends with its carrier.
+        state.resolution_source_relatch = None;
+    }
     state.resolving_stack_entry.is_none()
 }
 

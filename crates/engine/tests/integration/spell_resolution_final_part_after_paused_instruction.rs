@@ -35,11 +35,20 @@
 //! * A paused spell that its own instruction moves off the stack ("Exile
 //!   Invoke Calamity", after its CR 608.2g free-cast window) is left where it
 //!   was put, and is still reported resolved once.
+//! * CR 603.3b: whatever triggered while the paused resolution was under way —
+//!   its own instructions, the answer that finished it, and its final part's
+//!   move off the stack — is put on the stack as one batch the next time a
+//!   player would receive priority, above any spell still below it, whatever
+//!   answer finished the resolution.
+//! * CR 800.4a: a spell whose final part already ran and parked a question of
+//!   its own (a CR 616.1 ordering of its own move) is still an object on the
+//!   stack, and leaves the game with its departing owner.
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::scenario_db::GameScenarioDbExt;
-use engine::types::ability::CastingPermission;
+use engine::types::ability::{CastingPermission, EffectKind, TargetRef};
 use engine::types::actions::GameAction;
+use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
 use engine::types::game_state::{
     CastOfferKind, CastPaymentMode, CastingVariant, GameState, OwedSpellFinalPart, StackEntryKind,
@@ -1213,5 +1222,825 @@ fn zombify_returning_a_devourer_still_finishes_its_final_part() {
     assert_eq!(state.objects[&mycoloth].zone, Zone::Battlefield);
     assert_eq!(state.objects[&zombify].zone, Zone::Graveyard);
     assert_eq!(stack_resolved_count(&events, zombify), 1);
+    assert_settled(state);
+}
+
+// ---------------------------------------------------------------------------
+// CR 603.3b: the paused resolution's triggers, its answer's and its final
+// part's go on the stack as one batch, at the next priority.
+// ---------------------------------------------------------------------------
+
+const GRAVEYARD_ARCHIVIST: &str =
+    "Whenever a card is put into your graveyard from anywhere, you gain 1 life.";
+const DEATH_OBSERVER: &str = "Whenever another creature dies, you gain 1 life.";
+const SECOND_THOUGHTS: &str = "Draw a card. You may draw a card.";
+
+/// Bloodchief Ascension with three quest counters: "Whenever a card is put
+/// into an opponent's graveyard from anywhere, if this enchantment has three
+/// or more quest counters on it, you may have that player lose 2 life. If you
+/// do, you gain 2 life."
+fn bloodchief_ascension(scenario: &mut GameScenario, player: PlayerId) -> ObjectId {
+    let id = scenario.add_real_card(player, "Bloodchief Ascension", Zone::Battlefield, db());
+    scenario.with_counter(id, CounterType::Generic("quest".to_string()), 3);
+    id
+}
+
+/// Triggered abilities from `source` on the stack.
+fn triggers_from(state: &GameState, source: ObjectId) -> usize {
+    state
+        .stack
+        .iter()
+        .filter(|entry| {
+            matches!(entry.kind, StackEntryKind::TriggeredAbility { .. })
+                && entry.source_id == source
+        })
+        .count()
+}
+
+/// Controllers of the triggered abilities on the stack, bottom to top.
+fn trigger_controllers(state: &GameState) -> Vec<PlayerId> {
+    state
+        .stack
+        .iter()
+        .filter(|entry| matches!(entry.kind, StackEntryKind::TriggeredAbility { .. }))
+        .map(|entry| entry.controller)
+        .collect()
+}
+
+/// Pass priority until `spell` has left the stack zone.
+fn pass_until_resolved(runner: &mut GameRunner, spell: ObjectId) -> Vec<GameEvent> {
+    let mut events = Vec::new();
+    for _ in 0..12 {
+        if runner.state().objects[&spell].zone != Zone::Stack {
+            return events;
+        }
+        events.extend(
+            runner
+                .act(GameAction::PassPriority)
+                .expect("passing priority is accepted")
+                .events,
+        );
+    }
+    panic!(
+        "the spell did not resolve; waiting for {:?}",
+        runner.state().waiting_for
+    );
+}
+
+/// Pass priority while it is held over a non-empty stack, returning every
+/// event, until something other than a priority window is asked.
+fn pass_to_a_prompt_collecting(runner: &mut GameRunner) -> Vec<GameEvent> {
+    let mut events = Vec::new();
+    for _ in 0..12 {
+        let state = runner.state();
+        if !matches!(state.waiting_for, WaitingFor::Priority { .. }) || state.stack.is_empty() {
+            return events;
+        }
+        events.extend(
+            runner
+                .act(GameAction::PassPriority)
+                .expect("passing priority is accepted")
+                .events,
+        );
+    }
+    events
+}
+
+/// Accept the "you may" of Bloodchief Ascension's trigger while settling.
+fn accept_optional_effects(state: &GameState) -> Option<GameAction> {
+    matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. })
+        .then_some(GameAction::DecideOptionalEffect { accept: true })
+}
+
+struct EdictBoard {
+    runner: GameRunner,
+    edict: ObjectId,
+    ascension: ObjectId,
+    sacrificed: ObjectId,
+}
+
+/// Diabolic Edict ("Target player sacrifices a creature of their choice.") cast
+/// by P0 at P1, who controls Bloodchief Ascension and two creatures, paused on
+/// P1's sacrifice choice.
+fn edict_paused_on_a_sacrifice_choice() -> EdictBoard {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let edict = scenario.add_real_card(P0, "Diabolic Edict", Zone::Hand, db());
+    scenario.with_mana_pool(P0, mana(ManaType::Black, 2));
+    let ascension = bloodchief_ascension(&mut scenario, P1);
+    let sacrificed = scenario.add_vanilla(P1, 2, 2);
+    scenario.add_vanilla(P1, 2, 2);
+    let mut runner = scenario.build();
+
+    runner.cast(edict).target_player(P1).commit();
+    pass_until_a_prompt(&mut runner);
+    assert!(
+        matches!(
+            &runner.state().waiting_for,
+            WaitingFor::EffectZoneChoice { player, effect_kind: EffectKind::Sacrifice, cards, .. }
+                if *player == P1 && cards.contains(&sacrificed)
+        ),
+        "reach guard: the Edict paused on P1's sacrifice, got {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(runner.state().objects[&edict].zone, Zone::Stack);
+    EdictBoard {
+        runner,
+        edict,
+        ascension,
+        sacrificed,
+    }
+}
+
+/// CR 608.2n + CR 603.2: a sacrifice answer that finishes a paused Edict still
+/// lets the Edict's own move to P0's graveyard trigger P1's Bloodchief
+/// Ascension. The sacrificed creature goes to P1's own graveyard, so exactly
+/// one trigger.
+#[test]
+fn a_sacrifice_answer_that_finishes_a_paused_edict_triggers_on_its_own_graveyard_move() {
+    let EdictBoard {
+        mut runner,
+        edict,
+        ascension,
+        sacrificed,
+    } = edict_paused_on_a_sacrifice_choice();
+
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![sacrificed],
+        })
+        .expect("P1 sacrifices a creature");
+
+    let state = runner.state();
+    assert_eq!(state.objects[&edict].zone, Zone::Graveyard);
+    assert_eq!(graveyard(state, P0), vec![edict]);
+    assert_eq!(state.objects[&sacrificed].zone, Zone::Graveyard);
+    assert_eq!(
+        triggers_from(state, ascension),
+        1,
+        "CR 603.2: the Edict's own move into P0's graveyard triggers Bloodchief Ascension"
+    );
+
+    run_until_settled(&mut runner, accept_optional_effects);
+    let state = runner.state();
+    assert_eq!(state.players[P0.0 as usize].life, 18);
+    assert_eq!(state.players[P1.0 as usize].life, 22);
+    assert_settled(state);
+}
+
+/// CR 117.3b: the active player receives priority after the answer that
+/// finished the resolution puts its batch on the stack.
+#[test]
+fn the_active_player_receives_priority_after_a_finishing_answers_batch() {
+    let EdictBoard {
+        mut runner,
+        ascension,
+        sacrificed,
+        ..
+    } = edict_paused_on_a_sacrifice_choice();
+
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![sacrificed],
+        })
+        .expect("P1 sacrifices a creature");
+
+    let state = runner.state();
+    assert_eq!(triggers_from(state, ascension), 1);
+    assert_eq!(state.waiting_for, WaitingFor::Priority { player: P0 });
+}
+
+/// CR 608.2n + CR 603.2: the same move trigger on the player-scope sacrifice
+/// route (Innocent Blood: "Each player sacrifices a creature of their
+/// choice."), where only P1 has creatures to choose from.
+#[test]
+fn a_player_scope_sacrifice_answer_triggers_on_the_spells_own_graveyard_move() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let blood = scenario.add_real_card(P0, "Innocent Blood", Zone::Hand, db());
+    scenario.with_mana_pool(P0, mana(ManaType::Black, 1));
+    let ascension = bloodchief_ascension(&mut scenario, P1);
+    let sacrificed = scenario.add_vanilla(P1, 2, 2);
+    scenario.add_vanilla(P1, 2, 2);
+    let mut runner = scenario.build();
+
+    runner.cast(blood).commit();
+    pass_until_a_prompt(&mut runner);
+    assert!(
+        runner
+            .state()
+            .pending_player_scope_sacrifice_choice
+            .is_some(),
+        "reach guard: the player-scope sacrifice route, got {:?}",
+        runner.state().waiting_for
+    );
+    assert!(matches!(
+        &runner.state().waiting_for,
+        WaitingFor::EffectZoneChoice { player, .. } if *player == P1
+    ));
+
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![sacrificed],
+        })
+        .expect("P1 sacrifices a creature");
+
+    let state = runner.state();
+    assert_eq!(state.objects[&blood].zone, Zone::Graveyard);
+    assert_eq!(graveyard(state, P0), vec![blood]);
+    assert_eq!(triggers_from(state, ascension), 1);
+}
+
+/// Positive control of the instrument: an Edict whose target has one creature
+/// resolves with no choice, and its own move triggers Bloodchief Ascension.
+#[test]
+fn an_edict_with_no_choice_triggers_on_its_own_graveyard_move() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let edict = scenario.add_real_card(P0, "Diabolic Edict", Zone::Hand, db());
+    scenario.with_mana_pool(P0, mana(ManaType::Black, 2));
+    let ascension = bloodchief_ascension(&mut scenario, P1);
+    let only = scenario.add_vanilla(P1, 2, 2);
+    let mut runner = scenario.build();
+
+    runner.cast(edict).target_player(P1).commit();
+    let events = pass_until_resolved(&mut runner, edict);
+
+    assert_eq!(
+        stack_resolved_count(&events, edict),
+        1,
+        "reach guard: the Edict resolved through priority passes"
+    );
+    let state = runner.state();
+    assert!(!matches!(
+        state.waiting_for,
+        WaitingFor::EffectZoneChoice { .. }
+    ));
+    assert_eq!(state.objects[&edict].zone, Zone::Graveyard);
+    assert_eq!(state.objects[&only].zone, Zone::Graveyard);
+    assert_eq!(triggers_from(state, ascension), 1);
+}
+
+/// CR 603.3b (preservation): Faithless Looting's two discards and its own move
+/// are three cards put into P0's graveyard, triggering P1's Bloodchief
+/// Ascension three times in one batch.
+#[test]
+fn a_discard_answer_puts_the_spells_own_move_trigger_in_its_batch() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let looting = scenario.add_real_card(P0, "Faithless Looting", Zone::Hand, db());
+    let discard_a = scenario.add_card_to_hand(P0, "Discard A");
+    let discard_b = scenario.add_card_to_hand(P0, "Discard B");
+    scenario.with_library_top(P0, &["Draw One", "Draw Two", "Pad"]);
+    scenario.with_mana_pool(P0, mana(ManaType::Red, 1));
+    let ascension = bloodchief_ascension(&mut scenario, P1);
+    let mut runner = scenario.build();
+
+    runner.cast(looting).commit();
+    pass_until_a_prompt(&mut runner);
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::DiscardChoice { .. }
+    ));
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![discard_a, discard_b],
+        })
+        .expect("P0 discards two cards");
+
+    let state = runner.state();
+    let WaitingFor::OrderTriggers { player, triggers } = &state.waiting_for else {
+        panic!("P1 orders the batch, got {:?}", state.waiting_for);
+    };
+    assert_eq!(*player, P1);
+    assert_eq!(triggers.len(), 3);
+    assert!(trigger_controllers(state).is_empty());
+    assert_eq!(graveyard(state, P0), vec![discard_a, discard_b, looting]);
+
+    runner
+        .act(GameAction::OrderTriggers {
+            order: vec![0, 1, 2],
+        })
+        .expect("P1 orders the triggers");
+    assert_eq!(triggers_from(runner.state(), ascension), 3);
+    assert_eq!(trigger_controllers(runner.state()), vec![P1, P1, P1]);
+}
+
+/// CR 608.2n + CR 603.2 (preservation): a search answer that finishes
+/// Doomsday still lets its own move into P0's graveyard trigger P1's
+/// Bloodchief Ascension.
+#[test]
+fn a_search_answer_triggers_on_the_spells_own_graveyard_move() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(
+        P0,
+        &[
+            "Library A",
+            "Library B",
+            "Library C",
+            "Library D",
+            "Library E",
+            "Library F",
+            "Library G",
+        ],
+    );
+    scenario.with_graveyard(P0, &["Graveyard A", "Graveyard B", "Graveyard C"]);
+    let doomsday = scenario.add_real_card(P0, "Doomsday", Zone::Hand, db());
+    scenario.with_mana_pool(P0, mana(ManaType::Black, 3));
+    let ascension = bloodchief_ascension(&mut scenario, P1);
+    let mut runner = scenario.build();
+    let life = runner.state().players[P0.0 as usize].life;
+
+    runner.cast(doomsday).commit();
+    let mut searched = false;
+    for _ in 0..40 {
+        let state = runner.state();
+        if triggers_from(state, ascension) > 0 {
+            break;
+        }
+        let action = match &state.waiting_for {
+            WaitingFor::Priority { .. } if !state.stack.is_empty() => GameAction::PassPriority,
+            WaitingFor::SearchChoice { cards, count, .. } => {
+                searched = true;
+                GameAction::SelectCards {
+                    cards: cards.iter().copied().take(*count).collect(),
+                }
+            }
+            other => panic!("unexpected prompt while resolving Doomsday: {other:?}"),
+        };
+        runner.act(action).expect("the engine accepts the answer");
+    }
+
+    assert!(searched, "reach guard: Doomsday's search was answered");
+    let state = runner.state();
+    assert_eq!(state.players[P0.0 as usize].life, life - 10);
+    assert_eq!(state.objects[&doomsday].zone, Zone::Graveyard);
+    assert_eq!(triggers_from(state, ascension), 1);
+}
+
+struct OptionalDrawBoard {
+    runner: GameRunner,
+    spell: ObjectId,
+    locust_god: ObjectId,
+    ascension: ObjectId,
+    below: Option<ObjectId>,
+}
+
+/// "Second Thoughts" ("Draw a card. You may draw a card."), paused on its
+/// optional draw. P0 controls The Locust God ("Whenever you draw a card,
+/// create a 1/1 blue and red Insect creature token with flying and haste.");
+/// P1 controls Bloodchief Ascension. With `below`, P0 first casts "Below Draw"
+/// ("Draw a card."), which stays on the stack beneath it.
+fn second_thoughts_paused_on_its_optional_draw(below: bool) -> OptionalDrawBoard {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let below = below.then(|| {
+        scenario
+            .add_spell_to_hand_from_oracle(P0, "Below Draw", false, "Draw a card.")
+            .id()
+    });
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Second Thoughts", true, SECOND_THOUGHTS)
+        .id();
+    let locust_god = scenario.add_real_card(P0, "The Locust God", Zone::Battlefield, db());
+    scenario.with_library_top(
+        P0,
+        &["Draw One", "Draw Two", "Draw Three", "Pad A", "Pad B"],
+    );
+    let ascension = bloodchief_ascension(&mut scenario, P1);
+    let mut runner = scenario.build();
+    if let Some(below) = below {
+        runner.cast(below).commit();
+    }
+    runner.cast(spell).commit();
+    pass_until_a_prompt(&mut runner);
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::OptionalEffectChoice { player, .. } if player == P0
+        ),
+        "reach guard: the instant paused on its optional draw, got {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(runner.state().objects[&spell].zone, Zone::Stack);
+    assert_eq!(
+        runner.state().deferred_triggers.len(),
+        1,
+        "reach guard: the first draw's Locust God trigger waits for the batch"
+    );
+    OptionalDrawBoard {
+        runner,
+        spell,
+        locust_god,
+        ascension,
+        below,
+    }
+}
+
+/// CR 603.3b: Eureka Moment ("Draw two cards. You may put a land card from
+/// your hand onto the battlefield.") pauses after its draws triggered The
+/// Locust God twice. The answer completes the resolution; the final part's
+/// move triggers P1's Bloodchief Ascension; all three go on the stack as one
+/// APNAP batch, P0 ordering theirs first.
+#[test]
+fn triggers_from_the_paused_resolution_and_its_final_part_go_on_the_stack_as_one_batch() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let eureka = scenario.add_real_card(P0, "Eureka Moment", Zone::Hand, db());
+    scenario.add_real_card(P0, "The Locust God", Zone::Battlefield, db());
+    scenario.with_library_top(P0, &["Draw One", "Draw Two", "Pad"]);
+    let mut pool = mana(ManaType::Green, 2);
+    pool.extend(mana(ManaType::Blue, 2));
+    scenario.with_mana_pool(P0, pool);
+    bloodchief_ascension(&mut scenario, P1);
+    let mut runner = scenario.build();
+    let library_before = runner.state().players[P0.0 as usize].library.len();
+
+    runner.cast(eureka).commit();
+    pass_until_a_prompt(&mut runner);
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::OptionalEffectChoice { player, .. } if player == P0
+    ));
+    assert_eq!(runner.state().deferred_triggers.len(), 2);
+    assert_eq!(runner.state().objects[&eureka].zone, Zone::Stack);
+    assert_eq!(
+        runner.state().players[P0.0 as usize].library.len(),
+        library_before - 2,
+        "reach guard: two cards drawn"
+    );
+
+    runner
+        .act(GameAction::DecideOptionalEffect { accept: false })
+        .expect("P0 declines");
+    let state = runner.state();
+    assert_eq!(state.objects[&eureka].zone, Zone::Graveyard);
+    assert!(
+        matches!(state.waiting_for, WaitingFor::OrderTriggers { player, .. } if player == P0),
+        "P0 orders their triggers of the batch, got {:?}",
+        state.waiting_for
+    );
+    assert!(
+        trigger_controllers(state).is_empty(),
+        "no trigger of the batch is on the stack before the batch is ordered"
+    );
+
+    runner
+        .act(GameAction::OrderTriggers { order: vec![0, 1] })
+        .expect("P0 orders their triggers");
+    assert_eq!(trigger_controllers(runner.state()), vec![P0, P0, P1]);
+}
+
+/// CR 608.2n + CR 603.3 + CR 614.12a: Zombify returns Clone, which enters as a
+/// copy of Flametongue Kavu. Its enters trigger waits for Zombify's final
+/// part, and its target is chosen only once Zombify is in the graveyard and
+/// its resolution is over.
+#[test]
+fn a_trigger_the_resolution_creates_waits_for_the_spells_final_part() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let zombify = scenario.add_real_card(P0, "Zombify", Zone::Hand, db());
+    let clone = scenario.add_real_card(P0, "Clone", Zone::Graveyard, db());
+    scenario.with_mana_pool(P0, mana(ManaType::Black, 4));
+    let ftk = scenario.add_real_card(P1, "Flametongue Kavu", Zone::Battlefield, db());
+    let bear = scenario.add_vanilla(P1, 2, 2);
+    let mut runner = scenario.build();
+
+    runner.cast(zombify).target_object(clone).commit();
+    let mut events = Vec::new();
+    let mut selected_target = false;
+    for _ in 0..20 {
+        let state = runner.state();
+        let action = match &state.waiting_for {
+            WaitingFor::ReplacementChoice { candidates, .. } => GameAction::ChooseReplacement {
+                index: candidates
+                    .iter()
+                    .position(|candidate| candidate.source_name == "Clone")
+                    .expect("Clone's enter-as-a-copy replacement is offered"),
+            },
+            WaitingFor::CopyTargetChoice { .. } => GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(ftk)),
+            },
+            WaitingFor::TriggerTargetSelection { .. } => {
+                assert_eq!(
+                    state.objects[&clone].name, "Flametongue Kavu",
+                    "reach guard: Clone entered as a copy of Flametongue Kavu"
+                );
+                assert_eq!(
+                    state.objects[&zombify].zone,
+                    Zone::Graveyard,
+                    "CR 608.2n: Zombify's final part ran before the trigger's target is chosen"
+                );
+                assert!(
+                    state.resolving_stack_entry.is_none(),
+                    "Zombify's resolution is over when the trigger's target is chosen"
+                );
+                selected_target = true;
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(bear)),
+                }
+            }
+            WaitingFor::Priority { .. } if selected_target => break,
+            WaitingFor::Priority { .. } => GameAction::PassPriority,
+            other => panic!("unexpected prompt: {other:?}"),
+        };
+        events.extend(runner.act(action).expect("the engine accepts").events);
+    }
+    assert!(
+        selected_target,
+        "reach guard: the enters trigger's target was chosen"
+    );
+
+    events.extend(run_until_settled(&mut runner, |_| None));
+    let state = runner.state();
+    assert_eq!(state.objects[&bear].zone, Zone::Graveyard);
+    assert_eq!(stack_resolved_count(&events, zombify), 1);
+    assert_settled(state);
+}
+
+/// CR 603.3b: the final part's trigger (P0's Graveyard Archivist, on the
+/// Edict's own move) and the answer's trigger (P1's Death Observer, on the
+/// sacrifice) are one batch, put on the stack in APNAP order.
+#[test]
+fn the_final_parts_trigger_and_the_answers_trigger_are_one_apnap_batch() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let edict = scenario.add_real_card(P0, "Diabolic Edict", Zone::Hand, db());
+    scenario.with_mana_pool(P0, mana(ManaType::Black, 2));
+    let archivist = scenario
+        .add_enchantment_from_oracle(P0, "Graveyard Archivist", GRAVEYARD_ARCHIVIST)
+        .id();
+    let observer = scenario
+        .add_creature_from_oracle(P1, "Death Observer", 1, 1, DEATH_OBSERVER)
+        .id();
+    let vanilla = scenario.add_vanilla(P1, 2, 2);
+    let mut runner = scenario.build();
+
+    runner.cast(edict).target_player(P1).commit();
+    pass_until_a_prompt(&mut runner);
+    assert!(matches!(
+        &runner.state().waiting_for,
+        WaitingFor::EffectZoneChoice { player, cards, .. }
+            if *player == P1 && cards.contains(&vanilla) && cards.contains(&observer)
+    ));
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![vanilla],
+        })
+        .expect("P1 sacrifices the vanilla");
+
+    let state = runner.state();
+    assert_eq!(state.objects[&edict].zone, Zone::Graveyard);
+    assert_eq!(triggers_from(state, archivist), 1);
+    assert_eq!(triggers_from(state, observer), 1);
+    assert_eq!(trigger_controllers(state), vec![P0, P1]);
+}
+
+/// CR 603.3b: an answer's own trigger (the optional draw's Locust God
+/// trigger) joins the batch of the resolution it finishes, so P0 orders both
+/// of their Locust God triggers together.
+#[test]
+fn an_answers_own_trigger_joins_the_resolutions_batch() {
+    let OptionalDrawBoard {
+        mut runner, spell, ..
+    } = second_thoughts_paused_on_its_optional_draw(false);
+
+    runner
+        .act(GameAction::DecideOptionalEffect { accept: true })
+        .expect("P0 draws");
+    let state = runner.state();
+    assert_eq!(state.objects[&spell].zone, Zone::Graveyard);
+    assert!(
+        matches!(
+            &state.waiting_for,
+            WaitingFor::OrderTriggers { player, triggers } if *player == P0 && triggers.len() == 2
+        ),
+        "P0 orders both Locust God triggers, got {:?}",
+        state.waiting_for
+    );
+    assert!(trigger_controllers(state).is_empty());
+
+    runner
+        .act(GameAction::OrderTriggers { order: vec![0, 1] })
+        .expect("P0 orders their triggers");
+    assert_eq!(trigger_controllers(runner.state()), vec![P0, P0, P1]);
+}
+
+/// CR 608.2n + CR 117.5 + CR 603.3 + CR 405.5: once the paused instant's
+/// final part has run its resolution is over, so its batch goes on the stack
+/// above the spell still below it, before that spell begins to resolve,
+/// whether the answer accepted the optional draw or declined it.
+#[test]
+fn a_finished_resolutions_batch_goes_on_the_stack_above_a_spell_still_below_it() {
+    for accept in [true, false] {
+        let OptionalDrawBoard {
+            mut runner,
+            spell,
+            locust_god,
+            ascension,
+            below,
+        } = second_thoughts_paused_on_its_optional_draw(true);
+        let below = below.expect("a spell below");
+        assert_eq!(
+            runner
+                .state()
+                .stack
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![below]
+        );
+
+        let mut events = runner
+            .act(GameAction::DecideOptionalEffect { accept })
+            .expect("P0 answers")
+            .events;
+        assert_eq!(runner.state().objects[&spell].zone, Zone::Graveyard);
+        if accept {
+            assert!(
+                matches!(
+                    &runner.state().waiting_for,
+                    WaitingFor::OrderTriggers { player, triggers }
+                        if *player == P0 && triggers.len() == 2
+                ),
+                "accept: P0 orders both Locust God triggers, got {:?}",
+                runner.state().waiting_for
+            );
+            events.extend(
+                runner
+                    .act(GameAction::OrderTriggers { order: vec![0, 1] })
+                    .expect("P0 orders their triggers")
+                    .events,
+            );
+        } else {
+            assert_eq!(
+                runner.state().waiting_for,
+                WaitingFor::Priority { player: P0 },
+                "decline: the batch is on the stack and P0 holds priority"
+            );
+            assert!(runner.state().deferred_triggers.is_empty());
+        }
+
+        let state = runner.state();
+        let sources: Vec<ObjectId> = state.stack.iter().map(|entry| entry.source_id).collect();
+        let (expected_sources, expected_controllers) = if accept {
+            (
+                vec![below, locust_god, locust_god, ascension],
+                vec![P0, P0, P1],
+            )
+        } else {
+            (vec![below, locust_god, ascension], vec![P0, P1])
+        };
+        assert_eq!(
+            sources, expected_sources,
+            "accept={accept}: the batch sits above the spell below"
+        );
+        assert_eq!(trigger_controllers(state), expected_controllers);
+        assert_eq!(state.objects[&below].zone, Zone::Stack);
+        assert_eq!(
+            stack_resolved_count(&events, below),
+            0,
+            "accept={accept}: the spell below has not begun to resolve"
+        );
+    }
+}
+
+/// CR 117.5 + CR 405.5: the Edict's own move trigger goes on the stack above
+/// the spell P0 cast before it, and P0 receives priority (CR 117.3b).
+#[test]
+fn an_edicts_graveyard_move_trigger_goes_above_the_spell_it_was_cast_over() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let below = scenario
+        .add_spell_to_hand_from_oracle(P0, "Below Draw", false, "Draw a card.")
+        .id();
+    scenario.with_library_top(P0, &["Draw One", "Pad"]);
+    let edict = scenario.add_real_card(P0, "Diabolic Edict", Zone::Hand, db());
+    scenario.with_mana_pool(P0, mana(ManaType::Black, 2));
+    let ascension = bloodchief_ascension(&mut scenario, P1);
+    let sacrificed = scenario.add_vanilla(P1, 2, 2);
+    scenario.add_vanilla(P1, 2, 2);
+    let mut runner = scenario.build();
+
+    runner.cast(below).commit();
+    runner.cast(edict).target_player(P1).commit();
+    pass_until_a_prompt(&mut runner);
+    assert!(matches!(
+        &runner.state().waiting_for,
+        WaitingFor::EffectZoneChoice { player, effect_kind: EffectKind::Sacrifice, .. }
+            if *player == P1
+    ));
+    assert_eq!(runner.state().objects[&edict].zone, Zone::Stack);
+
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![sacrificed],
+        })
+        .expect("P1 sacrifices a creature");
+
+    let state = runner.state();
+    assert_eq!(state.objects[&edict].zone, Zone::Graveyard);
+    assert_eq!(
+        state
+            .stack
+            .iter()
+            .map(|entry| entry.source_id)
+            .collect::<Vec<_>>(),
+        vec![below, ascension]
+    );
+    assert_eq!(state.objects[&below].zone, Zone::Stack);
+    assert!(state.deferred_triggers.is_empty());
+    assert_eq!(state.waiting_for, WaitingFor::Priority { player: P0 });
+}
+
+// ---------------------------------------------------------------------------
+// CR 800.4a: a spell whose final part ran and parked its own question.
+// ---------------------------------------------------------------------------
+
+/// "Plain Draw" ("Draw a card.") cast by P0 in a three-player game where P1
+/// controls Rest in Peace and Leyline of the Void: its move off the stack asks
+/// P0 to order the two replacements (CR 616.1). The final part has run (the
+/// spell is reported resolved), but the spell is still on the stack and its
+/// carrier installed.
+fn plain_draw_parked_on_its_own_moves_ordering() -> (GameRunner, ObjectId, Vec<GameEvent>) {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_real_card(P1, "Rest in Peace", Zone::Battlefield, db());
+    scenario.add_real_card(P1, "Leyline of the Void", Zone::Battlefield, db());
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Plain Draw", false, "Draw a card.")
+        .id();
+    scenario.with_library_top(P0, &["Draw One", "Pad"]);
+    let mut runner = scenario.build();
+
+    runner.cast(spell).commit();
+    let events = pass_to_a_prompt_collecting(&mut runner);
+    let state = runner.state();
+    assert!(
+        matches!(state.waiting_for, WaitingFor::ReplacementChoice { player, .. } if player == P0),
+        "reach guard: the spell's own move asks P0 to order the replacements, got {:?}",
+        state.waiting_for
+    );
+    assert_eq!(state.objects[&spell].zone, Zone::Stack);
+    assert!(state.stack.is_empty());
+    assert!(
+        state.owed_spell_final_part().is_none(),
+        "the final part ran and parked its own question"
+    );
+    assert_eq!(
+        state.resolving_stack_entry.as_ref().map(|entry| entry.id),
+        Some(spell)
+    );
+    (runner, spell, events)
+}
+
+/// CR 800.4a: the spell is still an object on the stack, owned by P0, so it
+/// leaves the game with P0 rather than being stranded in the stack zone. It
+/// was reported resolved once, when its final part ran.
+#[test]
+fn a_spell_whose_final_part_parked_its_own_question_leaves_the_game_with_its_owner() {
+    let (mut runner, spell, mut events) = plain_draw_parked_on_its_own_moves_ordering();
+
+    events.extend(concede(&mut runner, P0));
+    let state = runner.state();
+    assert_eq!(
+        state.objects[&spell].zone,
+        Zone::Exile,
+        "CR 800.4a: the departed owner's spell leaves the game"
+    );
+    assert!(state.resolving_stack_entry.is_none());
+
+    events.extend(run_until_settled(&mut runner, |_| None));
+    assert_settled(runner.state());
+    assert_eq!(stack_resolved_count(&events, spell), 1);
+}
+
+/// CR 800.4a affects only the departing player's objects: P0's question
+/// stands, and answering it exiles the spell through the ordered replacement.
+#[test]
+fn an_unrelated_departure_leaves_a_parked_final_part_to_its_question() {
+    let (mut runner, spell, mut events) = plain_draw_parked_on_its_own_moves_ordering();
+
+    events.extend(concede(&mut runner, PlayerId(2)));
+    let state = runner.state();
+    assert!(
+        matches!(state.waiting_for, WaitingFor::ReplacementChoice { player, .. } if player == P0),
+        "P0's question is still live, got {:?}",
+        state.waiting_for
+    );
+    assert_eq!(state.objects[&spell].zone, Zone::Stack);
+
+    events.extend(
+        runner
+            .act(GameAction::ChooseReplacement { index: 0 })
+            .expect("P0 orders the replacements")
+            .events,
+    );
+    events.extend(run_until_settled(&mut runner, |_| None));
+    let state = runner.state();
+    assert_eq!(state.objects[&spell].zone, Zone::Exile);
+    assert!(state.resolving_stack_entry.is_none());
+    assert_eq!(stack_resolved_count(&events, spell), 1);
     assert_settled(state);
 }

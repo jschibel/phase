@@ -1602,17 +1602,17 @@ pub(crate) fn bind_resolving_ability_referents(
 /// instruction of its own outstanding — a question it asked is open, or work
 /// it parked (a continuation, a typed resolution frame, a replacement choice,
 /// a spell it is casting) has not drained. Read right after its instructions
-/// ran. It is exactly the condition under which the carrier authority
-/// (`engine::resolving_stack_entry_can_settle`, at a priority boundary) refuses
-/// to retire the resolution, so a final part deferred on it is completed by
-/// that authority and by nothing else.
+/// ran. It is exactly the condition under which
+/// `engine::run_spell_final_part_if_due` (`engine::resolution_instructions_are_done`)
+/// refuses to retire the resolution, so a final part deferred on it is
+/// completed by that authority and by nothing else.
 ///
 /// A game that ended during the resolution (CR 104.1) is not paused on
 /// anything: no answer will ever resume it, so the final part is not deferred.
 fn resolution_is_paused(state: &GameState) -> bool {
     match state.waiting_for {
         WaitingFor::GameOver { .. } => false,
-        WaitingFor::Priority { .. } => !super::engine::resolving_stack_entry_can_settle(state),
+        WaitingFor::Priority { .. } => !super::engine::resolution_instructions_are_done(state),
         _ => true,
     }
 }
@@ -1910,7 +1910,7 @@ pub(super) fn resolving_spell_owes_final_part(state: &GameState) -> bool {
 /// still owed (see [`resolving_spell_owes_final_part`]) and that is still on
 /// the stack. It was popped from `state.stack` as it began resolving, but it is
 /// still an object on the stack — `targeting::zone_object_ids(Zone::Stack)`
-/// cannot see it, so the player-leaves-the-game procedure asks for it here.
+/// cannot see it, the final part's own subject (`finish_deferred_spell_resolution`).
 ///
 /// The marker decides whether the final part is owed. A card that is again a
 /// live stack entry is a new cast of it (buyback, a recursion loop), not the
@@ -1925,12 +1925,29 @@ pub(super) fn spell_awaiting_final_part(state: &GameState) -> Option<&StackEntry
         })
 }
 
+/// CR 800.4a + CR 608.2n: the instant or sorcery the resolution carrier names,
+/// while it is still an object on the stack — whether its final part is still
+/// owed or already ran and parked a question of its own (a CR 616.1 ordering of
+/// its own move). `resolve_top` popped it from `state.stack` as it began
+/// resolving, so `targeting::zone_object_ids(Zone::Stack)` cannot list it; the
+/// player-leaves-the-game procedure asks for it here. A card that is again a
+/// live stack entry is a new cast of it, not this resolution. Permanent spells
+/// (CR 608.3) keep their own paused-entry carrier and are not included.
+pub(super) fn resolving_instant_or_sorcery_on_stack(state: &GameState) -> Option<&StackEntry> {
+    state.resolving_stack_entry.as_ref().filter(|entry| {
+        matches!(entry.kind, StackEntryKind::Spell { .. })
+            && !is_permanent_spell(state, entry.id)
+            && spell_still_on_stack(state, entry.id)
+            && !state.stack.iter().any(|live| live.id == entry.id)
+    })
+}
+
 /// CR 608.2c + CR 608.2n: run the final part of a resolution `resolve_top`
 /// deferred because one of the spell's instructions paused for a choice — the
 /// on-resolution keyword hooks, the destination rule, and the move off the
 /// stack, exactly as the inline completion runs them — now that every
-/// instruction has been followed. Called by the carrier authority at the
-/// moment it would retire the carrier; the carrier is retired only on
+/// instruction has been followed. Called only by
+/// `engine::run_spell_final_part_if_due`, which retires the carrier on
 /// `Completed` or `NotOwed`.
 ///
 /// This is also where the resolution is reported (`GameEvent::StackResolved`):
@@ -2086,11 +2103,18 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
         }
     }
 
+    // CR 608.2n + CR 405.5: a resolution whose paused instructions completed has
+    // its final part run before another object begins resolving. When it runs
+    // here nothing is popped: the pass's pipeline puts its batch on the stack
+    // above this entry first (`engine::pass_priority_once_with_pipeline`).
+    if super::engine::run_spell_final_part_if_due(state, events) {
+        return;
+    }
     // CR 608.2c: A resolution that completed at the preceding Priority
     // boundary must settle its exact carrier before another stack object can
     // begin resolving. A parked continuation remains live and therefore still
     // fails the invariant below rather than being silently cleared.
-    super::engine::settle_resolving_stack_entry_after_continuation_resume(state, events);
+    super::engine::settle_resolving_stack_entry_after_continuation_resume(state);
     // CR 608.2c + CR 608.2m: A prior resolution must finish its instructions
     // before another stack object begins resolving. A parked continuation owns
     // its carrier until its own completion or abort path; silently clearing it here would
@@ -2569,8 +2593,8 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // not come: the spell stays on the stack, still resolving, and
     // `finish_deferred_spell_resolution` runs the final part — the
     // on-resolution keyword hooks, the destination, the move, and the
-    // `StackResolved` report — once the carrier's resolution has completed
-    // (`engine::settle_finished_resolving_stack_entry`). Moving the spell now
+    // `StackResolved` report — at the priority boundary that proves its
+    // instructions done (`engine::run_spell_final_part_if_due`). Moving the spell now
     // would put Faithless Looting into the graveyard BENEATH the cards it then
     // discards, and Doomsday into the graveyard its own search then exiles
     // "the rest" of.
@@ -3802,7 +3826,7 @@ fn resolve_keyword_action(
 
 /// CR 608.2: Resolve the next stack object, collapsing a batch-safe run when
 /// one begins at the top. Returns the number of stack entries consumed
-/// (≥ 1) so the caller can correct the auto-pass baseline (§7.2).
+/// (0 when the top was not popped) so the caller can correct the auto-pass baseline (§7.2).
 pub fn resolve_next(state: &mut GameState, events: &mut Vec<GameEvent>) -> u32 {
     resolve_next_with_limit(state, events, None)
 }
@@ -3887,8 +3911,13 @@ pub fn resolve_next_with_limit(
             }
         }
     }
+    let top = state.stack.back().map(|entry| entry.id);
     resolve_top(state, events);
-    1
+    // §7.2: callers shrink their auto-pass baselines and advance the session
+    // cursor by this count, so it counts only an entry this call took off the
+    // stack. `resolve_top` returns without popping on a mid-construction top, a
+    // still-installed carrier, and when it ran an owed final part instead.
+    u32::from(top.is_some_and(|id| !state.stack.iter().any(|entry| entry.id == id)))
 }
 
 fn created_token_ids(events: &[GameEvent]) -> Vec<ObjectId> {
@@ -6376,17 +6405,14 @@ mod tests {
             player: PlayerId(0),
         };
 
-        let mut events = Vec::new();
-        super::super::engine::settle_resolving_stack_entry_before_trigger_selection(
-            &mut state,
-            &mut events,
-        );
+        super::super::engine::settle_resolving_stack_entry_before_trigger_selection(&mut state);
         assert!(
             state.resolving_stack_entry.is_some(),
             "the carrier stays while its spell's final part is owed"
         );
         assert_eq!(state.objects[&spell].zone, Zone::Stack);
 
+        let mut events = Vec::new();
         resolve_top(&mut state, &mut events);
         assert_eq!(state.objects[&spell].zone, Zone::Graveyard);
         assert!(state.players[0].graveyard.contains(&spell));
@@ -6401,6 +6427,130 @@ mod tests {
             state.resolving_spell_final_part.is_none(),
             "and the owed final part ends with its carrier"
         );
+    }
+
+    /// CR 608.2c + CR 608.2n: "the instructions are done" and "the carrier may
+    /// settle" are different questions. A carrier whose instructions are done
+    /// but which still owes its spell's final part is not retired by the settle
+    /// wrappers; only `run_spell_final_part_if_due` runs that part, retires the
+    /// carrier, and claims the part's events for the ordinary collector.
+    #[test]
+    fn the_settle_wrappers_never_run_an_owed_final_part() {
+        let mut state = setup();
+        let spell = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Paused Sorcery".to_string(),
+            Zone::Stack,
+        );
+        state.resolving_stack_entry = Some(pending_spell_entry(spell));
+        state.resolving_spell_final_part = Some(OwedSpellFinalPart {
+            spell,
+            resolution_start_phase: state.phase,
+        });
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+
+        assert!(super::super::engine::resolution_instructions_are_done(
+            &state
+        ));
+        super::super::engine::settle_resolving_stack_entry_after_continuation_resume(&mut state);
+        assert_eq!(
+            state.resolving_stack_entry.as_ref().map(|entry| entry.id),
+            Some(spell),
+            "the wrapper does not retire a carrier that owes its final part"
+        );
+        assert_eq!(state.objects[&spell].zone, Zone::Stack);
+
+        let mut events = Vec::new();
+        assert!(super::super::engine::run_spell_final_part_if_due(
+            &mut state,
+            &mut events
+        ));
+        assert_eq!(state.objects[&spell].zone, Zone::Graveyard);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GameEvent::StackResolved { object_id } if *object_id == spell
+                ))
+                .count(),
+            1
+        );
+        assert!(state.resolving_stack_entry.is_none());
+        assert!(state.resolving_spell_final_part.is_none());
+        assert!(!state.consumed_before_priority_trigger_events.is_empty());
+        assert!(state
+            .consumed_before_priority_trigger_events
+            .iter()
+            .all(|claimed| claimed.scope
+                == crate::game::triggers::ConsumedTriggerEventScope::OrdinaryCollectorsOnly));
+
+        // Paired positive: with no owed final part the same carrier is done
+        // and may settle, and the wrapper retires it.
+        let mut state = setup();
+        let spell = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Finished Sorcery".to_string(),
+            Zone::Graveyard,
+        );
+        state.resolving_stack_entry = Some(pending_spell_entry(spell));
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        super::super::engine::settle_resolving_stack_entry_after_continuation_resume(&mut state);
+        assert!(state.resolving_stack_entry.is_none());
+    }
+
+    /// §7.2: the resolver's count is the number of entries it took off the
+    /// stack. A refusal that leaves the top entry in place consumes nothing.
+    #[test]
+    fn the_resolver_counts_only_an_entry_it_popped() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Pending spell".to_string(),
+            Zone::Stack,
+        );
+        state.stack.push_back(StackEntry {
+            id: source,
+            source_id: source,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(1),
+                ability: Some(Box::new(ResolvedAbility::new(
+                    Effect::NoOp,
+                    Vec::new(),
+                    source,
+                    PlayerId(0),
+                ))),
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+        // A residual firing makes `resolve_top` refuse without popping.
+        crate::game::effects::restore_continuation_trigger_firing(
+            &mut state,
+            Some(TriggerFiring::Ordinary),
+        );
+        let mut events = Vec::new();
+
+        assert_eq!(resolve_next(&mut state, &mut events), 0);
+        assert_eq!(state.stack.len(), 1);
+        assert_eq!(state.stack.back().unwrap().id, source);
+
+        // Paired positive: once the firing is cleared the entry pops and
+        // resolves, and the count is 1.
+        state.resolving_trigger_firing = None;
+        assert_eq!(resolve_next(&mut state, &mut events), 1);
+        assert!(state.stack.is_empty());
     }
 
     /// CR 608.2n: an owed final part belongs to the carrier that owes it. A

@@ -1509,7 +1509,14 @@ fn eliminated_resolution_sacrifice_payer_declines_real_stack_carrier_without_pay
         WaitingFor::PayCost { player: P1, .. }
     ));
 
-    eliminate_player(runner.state_mut(), P1, &mut Vec::new());
+    // CR 608.2n: the final part runs at the priority boundary the departure's
+    // action reaches; the direct internal elimination call has none.
+    apply(
+        runner.state_mut(),
+        P1,
+        GameAction::Concede { player_id: P1 },
+    )
+    .unwrap();
 
     assert!(runner.state().active_optional_effect_frame().is_none());
     assert!(runner.state().active_ability_continuation().is_none());
@@ -1757,7 +1764,14 @@ fn eliminated_resolution_sacrifice_payer_declines_real_stack_replacement_pause()
     assert!(runner.state().pending_replacement.is_some());
     assert!(runner.state().pending_cost_move_resume.is_some());
 
-    eliminate_player(runner.state_mut(), P1, &mut Vec::new());
+    // CR 608.2n: the final part runs at the priority boundary the departure's
+    // action reaches; the direct internal elimination call has none.
+    apply(
+        runner.state_mut(),
+        P1,
+        GameAction::Concede { player_id: P1 },
+    )
+    .unwrap();
 
     assert!(runner.state().active_optional_effect_frame().is_none());
     assert!(runner.state().active_ability_continuation().is_none());
@@ -1839,4 +1853,165 @@ fn unrelated_elimination_preserves_resolution_sacrifice_root() {
     )
     .unwrap();
     assert_eq!(runner.state().players[P0.0 as usize].life, 23);
+}
+
+/// Trigger-bearing stack entries, bottom to top, as (controller, source).
+fn triggered_stack_entries(runner: &GameRunner) -> Vec<(PlayerId, ObjectId)> {
+    runner
+        .state()
+        .stack
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.kind,
+                engine::types::game_state::StackEntryKind::TriggeredAbility { .. }
+            )
+        })
+        .map(|entry| (entry.controller, entry.source_id))
+        .collect()
+}
+
+const GRAVEYARD_ARCHIVIST: &str =
+    "Whenever a card is put into your graveyard from anywhere, you gain 1 life.";
+
+/// CR 704.5a + CR 800.4a + CR 608.2m + CR 608.2n: the payer the resolution
+/// waits on is at 0 life when they answer, so the action boundary's
+/// state-based net eliminates them; their pending choice is canonically
+/// declined and the instructions resume against the remaining opponent and
+/// finish. The spell's final part then runs inside that same action, and its
+/// own graveyard move triggers Graveyard Archivist before the action returns.
+#[test]
+fn a_payer_lost_to_the_state_based_net_finishes_the_spell_before_the_action_returns() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let spell = scenario
+        .add_spell_to_hand(P0, "Optional Sacrifice", false)
+        .with_mana_cost(ManaCost::generic(0))
+        .with_ability_definition(optional_sacrifice_spell(TargetFilter::Opponent, 1))
+        .id();
+    let archivist = scenario
+        .add_enchantment_from_oracle(P0, "Graveyard Archivist", GRAVEYARD_ARCHIVIST)
+        .id();
+    scenario.add_creature(P1, "Foreign Fodder", 1, 1);
+    let mut runner = scenario.build();
+    let p2 = PlayerId(2);
+    let p2_life = runner.state().players[p2.0 as usize].life;
+    start_optional_sacrifice_spell(&mut runner, spell);
+    runner.state_mut().players[P1.0 as usize].life = 0;
+
+    apply(
+        runner.state_mut(),
+        P1,
+        GameAction::ChooseResolutionOptionalPaymentBranch {
+            choice: ResolutionOptionalPaymentChoice::Pay { index: 0 },
+        },
+    )
+    .unwrap();
+
+    let state = runner.state();
+    // Reach: the net eliminated the payer and the decline resumed against
+    // the remaining opponent.
+    assert!(state.players[P1.0 as usize].is_eliminated);
+    assert_eq!(state.players[p2.0 as usize].life, p2_life - 1);
+    assert_eq!(state.waiting_for, WaitingFor::Priority { player: P0 });
+
+    assert_eq!(state.objects[&spell].zone, Zone::Graveyard);
+    assert!(state.resolving_stack_entry.is_none());
+    assert!(state.owed_spell_final_part().is_none());
+    assert_eq!(
+        triggered_stack_entries(&runner),
+        vec![(P0, archivist)],
+        "CR 603.3: the spell's own move triggers before the action returns"
+    );
+}
+
+/// CR 608.2n + CR 405.5 + CR 117.5 + CR 603.3: a resolution whose paused
+/// instructions completed with no boundary to run its final part (here the
+/// internal elimination call, the shape a persisted state carries) is found
+/// owed and done when priority is next passed. The final part runs before the
+/// spell below it begins to resolve, and its trigger goes on the stack above
+/// that spell in the same pass.
+#[test]
+fn the_resolution_net_finishes_an_owed_spell_above_the_spell_below_before_it_resolves() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let below = scenario
+        .add_spell_to_hand_from_oracle(P0, "Below Draw", false, "Draw a card.")
+        .id();
+    scenario.with_library_top(P0, &["Draw One", "Pad", "Pad Two"]);
+    let spell = scenario
+        .add_spell_to_hand(P0, "Optional Sacrifice", true)
+        .with_mana_cost(ManaCost::generic(0))
+        .with_ability_definition(optional_sacrifice_spell(TargetFilter::Opponent, 1))
+        .id();
+    let archivist = scenario
+        .add_enchantment_from_oracle(P0, "Graveyard Archivist", GRAVEYARD_ARCHIVIST)
+        .id();
+    scenario.add_creature(P1, "Foreign Fodder", 1, 1);
+    let mut runner = scenario.build();
+    runner.cast(below).commit();
+    start_optional_sacrifice_spell(&mut runner, spell);
+    apply(
+        runner.state_mut(),
+        P1,
+        GameAction::ChooseResolutionOptionalPaymentBranch {
+            choice: ResolutionOptionalPaymentChoice::Pay { index: 0 },
+        },
+    )
+    .unwrap();
+    eliminate_player(runner.state_mut(), P1, &mut Vec::new());
+
+    // Reach: the instructions are done but the final part is still owed, with
+    // the spell below still on the stack.
+    {
+        let state = runner.state();
+        assert_eq!(state.waiting_for, WaitingFor::Priority { player: P0 });
+        assert_eq!(state.objects[&spell].zone, Zone::Stack);
+        assert_eq!(
+            state.resolving_stack_entry.as_ref().map(|entry| entry.id),
+            Some(spell)
+        );
+        assert_eq!(
+            state.owed_spell_final_part().map(|owed| owed.spell),
+            Some(spell)
+        );
+        assert_eq!(
+            state.stack.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![below]
+        );
+    }
+
+    let others: Vec<PlayerId> = [P1, PlayerId(2)]
+        .into_iter()
+        .filter(|player| !runner.state().players[player.0 as usize].is_eliminated)
+        .collect();
+    runner.state_mut().priority_passes = others.iter().copied().collect();
+    runner.state_mut().priority_pass_count = others.len() as u8;
+    let passed = apply(runner.state_mut(), P0, GameAction::PassPriority).unwrap();
+
+    let state = runner.state();
+    assert_eq!(state.objects[&spell].zone, Zone::Graveyard);
+    assert!(state.resolving_stack_entry.is_none());
+    assert!(state.owed_spell_final_part().is_none());
+    assert_eq!(
+        state.stack.front().map(|entry| entry.id),
+        Some(below),
+        "the spell below is still on the stack, at the bottom"
+    );
+    assert_eq!(state.objects[&below].zone, Zone::Stack);
+    assert_eq!(
+        triggered_stack_entries(&runner),
+        vec![(P0, archivist)],
+        "the final part's trigger goes on the stack above the spell below"
+    );
+    assert_eq!(state.stack.len(), 2);
+    assert!(
+        !passed.events.iter().any(|event| matches!(
+            event,
+            engine::types::events::GameEvent::StackResolved { object_id } if *object_id == below
+        )),
+        "the spell below does not begin to resolve in this pass"
+    );
+    assert!(state.deferred_triggers.is_empty());
+    assert_eq!(state.waiting_for, WaitingFor::Priority { player: P0 });
 }
