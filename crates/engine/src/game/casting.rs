@@ -19752,7 +19752,7 @@ fn spell_has_legal_targets_in_flushed_state(
 /// The mode choice a modal spell's `ModeChoice` prompt presents, with what it
 /// is judged against. See [`spell_mode_choice`].
 pub(super) struct SpellModeChoice {
-    /// The effective choice: chooser-resolved maxima, count-capped.
+    /// The effective choice: chooser-resolved maxima, count-capped unless pawprint (CR 700.2i: there `max_choices` is the point budget).
     pub(super) modal: crate::types::ability::ModalChoice,
     /// The spell's modes, one ability per printed mode.
     pub(super) mode_abilities: Vec<crate::types::ability::AbilityDefinition>,
