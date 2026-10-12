@@ -389,6 +389,10 @@ pub(crate) enum ContinuationAst {
         source_static: Box<StaticDefinition>,
         source_filter: Option<Box<TargetFilter>>,
     },
+    /// CR 608.2c: the Tidebinder-shaped rider clause whose type list cannot be
+    /// read. Lowers the preceding `Effect::Counter` to a strict-failure marker
+    /// (never an unrestricted rider). `fragment` is the printed clause.
+    CounterSourceRiderUnreadable { fragment: String },
     /// CR 701.8: "If a permanent's ability is countered this way, destroy that
     /// permanent." — patches `source_rider = Some(CounterSourceRider::Destroy)`
     /// on the preceding `Effect::Counter` (Teferi's Response, Green Slime).

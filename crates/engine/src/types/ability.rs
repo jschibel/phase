@@ -3140,7 +3140,7 @@ fn duration_until_host_leaves_play() -> Box<Duration> {
 /// that acts on the *source permanent* of an ability countered by the effect.
 ///
 /// The rider only fires when the countered object was an activated or triggered
-/// ability — per CR 110.1 / CR 113.1c a spell is not a permanent, so when a
+/// ability — per CR 110.1 (a permanent is on the battlefield) + CR 113.1c (a stack ability is an object whose source can be a permanent) a spell is not a permanent, so when a
 /// spell is countered there is no permanent for the rider to act on and it is
 /// skipped (the conditional "if a permanent's ability is countered this way" is
 /// encoded structurally by this spell-vs-ability gate, not by a separate

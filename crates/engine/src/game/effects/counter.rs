@@ -26,8 +26,8 @@ use crate::types::zones::Zone;
 ///
 /// CR 701.6 + CR 608.2c: If the effect carries a `source_rider`, it runs as a
 /// follow-up instruction acting on the countered ability's source permanent —
-/// only when an *ability* (not a spell) was countered (CR 110.1 / CR 113.1c: a
-/// spell is not a permanent). `CounterSourceRider::LosesAbilities` registers a
+/// only when an *ability* (not a spell) was countered (CR 110.1 (a permanent is on the battlefield) + CR 113.1c (a stack ability is an object whose source can be a permanent): a
+/// spell is not a permanent, and neither is an ability on the stack). `CounterSourceRider::LosesAbilities` registers a
 /// continuous "loses all abilities for as long as ~" static (Tidebinder);
 /// `CounterSourceRider::Destroy` destroys the permanent (Teferi's Response,
 /// Green Slime).
@@ -69,8 +69,8 @@ pub fn resolve(
 
     // CR 701.6 + CR 608.2c: When an *ability* is countered (not a spell), carry
     // its source permanent and the rider out of the loop so the follow-up
-    // instruction runs after EffectResolved (see CR 110.1 / CR 113.1c: a
-    // countered spell is not a permanent, so no rider fires for spells).
+    // instruction runs after EffectResolved (see CR 110.1 (a permanent is on the battlefield) + CR 113.1c (a stack ability is an object whose source can be a permanent):
+    // a countered spell is not a permanent, so no rider fires for spells).
     let mut countered_ability_source: Option<ObjectId> = None;
 
     for target in targets {
@@ -242,8 +242,8 @@ pub fn resolve(
                         | ZoneMoveResult::NeedsAuraAttachmentChoice => return Ok(()),
                     }
                 } else {
-                    // CR 110.1 / CR 113.1c: An ability was countered, so its
-                    // source is a permanent the rider can act on. Defer the
+                    // CR 110.1 (a permanent is on the battlefield) + CR 113.1c (a stack ability is an object whose source can be a permanent): An ability was
+                    // countered, so its source is a permanent the rider can act on. Defer the
                     // rider to the post-loop block so EffectResolved precedes
                     // any WaitingFor a replacement choice may set.
                     countered_ability_source = Some(source_permanent_id);
