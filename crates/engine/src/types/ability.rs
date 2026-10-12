@@ -3124,20 +3124,6 @@ pub enum EventCounterReproductionCount {
     PerKind(u32),
 }
 
-/// CR 701.6 + CR 608.2c: A follow-up instruction carried by `Effect::Counter`
-/// that acts on the *source permanent* of an ability countered by the effect.
-///
-/// The rider only fires when the countered object was an activated or triggered
-/// ability — per CR 701.8a / CR 110.1 a spell is not a permanent, so when a
-/// spell is countered there is no permanent for the rider to act on and it is
-/// skipped (the conditional "if a permanent's ability is countered this way" is
-/// encoded structurally by this spell-vs-ability gate, not by a separate
-/// `AbilityCondition`).
-///
-/// Both variants share one categorical axis — "an effect applied to the
-/// countered ability's source permanent" — so they live on a single enum rather
-/// than as sibling `Option` fields on `Effect::Counter` (parameterize, don't
-/// proliferate).
 /// serde default for `CounterSourceRider::LosesAbilities::duration` — keeps
 /// card-data serialized before the field was added deserializing correctly.
 /// Deliberately the OLD reading: before the field existed the resolver
@@ -3150,6 +3136,22 @@ fn duration_until_host_leaves_play() -> Box<Duration> {
     Box::new(Duration::UntilHostLeavesPlay)
 }
 
+/// CR 701.6 + CR 608.2c: A follow-up instruction carried by `Effect::Counter`
+/// that acts on the *source permanent* of an ability countered by the effect.
+///
+/// The rider only fires when the countered object was an activated or triggered
+/// ability — per CR 110.1 / CR 113.1c a spell is not a permanent, so when a
+/// spell is countered there is no permanent for the rider to act on and it is
+/// skipped (the conditional "if a permanent's ability is countered this way" is
+/// encoded structurally by this spell-vs-ability gate, not by a separate
+/// `AbilityCondition`). A type-restricted conditional ("if an ability of an
+/// artifact, creature, or planeswalker is countered this way") adds a typed
+/// gate on the source permanent: `LosesAbilities::source_filter`.
+///
+/// Both variants share one categorical axis — "an effect applied to the
+/// countered ability's source permanent" — so they live on a single enum rather
+/// than as sibling `Option` fields on `Effect::Counter` (parameterize, don't
+/// proliferate).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum CounterSourceRider {
@@ -3166,8 +3168,18 @@ pub enum CounterSourceRider {
     /// an explicit field (rather than hard-coded in the resolver) so the
     /// "as long as" clause is visible in the serialized AST and threaded to
     /// the transient continuous effect.
+    ///
+    /// CR 608.2c + CR 109.2: `source_filter` is the printed type condition on
+    /// the countered ability's source ("an ability of an artifact, creature, or
+    /// planeswalker is countered this way" — a description with a card type and
+    /// no zone means a permanent of that type). `None` is the untyped "a
+    /// permanent's ability" reading (and pre-field card data). It is evaluated
+    /// live at resolution against the source's current characteristics
+    /// (CR 608.2h), so a land or enchantment source is left untouched.
     LosesAbilities {
         static_def: Box<StaticDefinition>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_filter: Option<Box<TargetFilter>>,
         // Boxed: `Duration` is a large enum, and this rider is embedded in the
         // frequently-constructed `ZoneCounterImperativeAst`/`Effect::Counter`
         // holders — boxing keeps `CounterSourceRider` small (clippy

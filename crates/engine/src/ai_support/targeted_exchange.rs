@@ -1843,6 +1843,7 @@ mod tests {
                     target: TargetFilter::Any,
                     source_rider: Some(CounterSourceRider::LosesAbilities {
                         static_def: Box::new(grant_fight_static()),
+                        source_filter: None,
                         duration: Box::new(Duration::UntilHostLeavesPlay),
                     }),
                     countered_spell_zone: None,
