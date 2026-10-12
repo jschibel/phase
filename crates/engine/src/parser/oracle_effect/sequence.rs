@@ -4673,24 +4673,35 @@ fn recognize_counter_destroy_rider(lower: &str) -> bool {
     .is_ok()
 }
 
+/// Outcome of recognizing the Tishana's Tidebinder-shaped loses-all-abilities
+/// rider clause (see [`recognize_counter_loses_abilities_rider`]).
+enum CounterLosesAbilitiesRider {
+    /// The clause was fully read: the source-permanent type gate is `Some(filter)`
+    /// for the printed type list, `None` for the untyped "a permanent's ability".
+    Gate(Option<Box<TargetFilter>>),
+    /// The clause has the rider's shape but its type list cannot be read. The
+    /// gate must not be dropped (that would widen the rider to every source), so
+    /// the clause is claimed and gapped honestly instead.
+    UnreadableTypeList,
+}
+
 /// CR 608.2c + CR 109.2: nom recognizer for the "if an ability of a <type list>
 /// is countered this way, that permanent loses all abilities for as long as ~
 /// remains on the battlefield" continuation clause (Tishana's Tidebinder).
 /// Operates on lowercased text; tolerates a trailing period/whitespace.
 ///
-/// Returns `None` when the clause is not this shape — including an unparseable
-/// type list or a duration other than the presence-bound one — so the clause is
-/// never silently treated as an unrestricted `source_rider` (it falls through to the
-/// generic sequence path).
-/// Otherwise returns the source-permanent type gate: `Some(filter)` for the
-/// printed type list, `None` for the untyped "a permanent's ability" subject.
+/// Returns `None` when the clause is not this shape (including a duration other
+/// than the presence-bound one). When the shape matches but the type list is not
+/// fully readable it returns [`CounterLosesAbilitiesRider::UnreadableTypeList`],
+/// so the clause is claimed and gapped rather than silently falling to the
+/// generic sequence path or becoming an unrestricted `source_rider`.
 ///
 /// Composed from independent axes rather than enumerated as full strings:
 ///   - condition subject ("an ability of <type list>" via
 ///     `parse_type_phrase_folding` / "a permanent's ability" / "an ability").
 ///   - the loses-abilities consequence on the countered ability's source.
 ///   - the CR 611.2b duration, read by `parse_duration`.
-fn recognize_counter_loses_abilities_rider(lower: &str) -> Option<Option<Box<TargetFilter>>> {
+fn recognize_counter_loses_abilities_rider(lower: &str) -> Option<CounterLosesAbilitiesRider> {
     let clause = lower.trim().trim_end_matches('.').trim_end();
     let (rest, _) = tag::<_, _, OracleError<'_>>("if ").parse(clause).ok()?;
     let (rest, subject) = alt((
@@ -4705,18 +4716,6 @@ fn recognize_counter_loses_abilities_rider(lower: &str) -> Option<Option<Box<Tar
     ))
     .parse(rest)
     .ok()?;
-    let source_filter = match subject {
-        Some(type_list) => {
-            // `parse_type_phrase_folding` is infallible: an unrecognized phrase
-            // comes back unconsumed, so require the whole list to be read.
-            let (filter, remainder) = parse_type_phrase_folding(type_list);
-            if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
-                return None;
-            }
-            Some(Box::new(filter))
-        }
-        None => None,
-    };
     let (rest, _) =
         tag::<_, _, OracleError<'_>>(" is countered this way, that permanent loses all abilities ")
             .parse(rest)
@@ -4728,7 +4727,16 @@ fn recognize_counter_loses_abilities_rider(lower: &str) -> Option<Option<Box<Tar
         return None;
     }
     eof::<_, OracleError<'_>>.parse(rest).ok()?;
-    Some(source_filter)
+    let Some(type_list) = subject else {
+        return Some(CounterLosesAbilitiesRider::Gate(None));
+    };
+    // `parse_type_phrase_folding` is infallible: an unrecognized phrase comes
+    // back unconsumed, so require the whole list to be read.
+    let (filter, remainder) = parse_type_phrase_folding(type_list);
+    if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
+        return Some(CounterLosesAbilitiesRider::UnreadableTypeList);
+    }
+    Some(CounterLosesAbilitiesRider::Gate(Some(Box::new(filter))))
 }
 
 /// CR 701.6a + CR 614.1a: nom recognizer for the "if that spell is countered
@@ -5186,6 +5194,20 @@ pub(super) fn apply_clause_continuation(
                     source_filter,
                     duration: Box::new(Duration::WhileHostOnBattlefield),
                 });
+            }
+        }
+        // CR 608.2c: the rider's source-type gate is unreadable. Dropping it would
+        // widen the rider to every source, so gap the whole counter honestly
+        // (strict-failure marker) rather than counter with a wrong rider.
+        ContinuationAst::CounterSourceRiderUnreadable { fragment } => {
+            let Some(previous) = defs.last_mut() else {
+                return;
+            };
+            if matches!(&*previous.effect, Effect::Counter { .. }) {
+                *previous.effect =
+                    Effect::unimplemented("counter_source_rider_type_list", fragment);
+                previous.sub_ability = None;
+                previous.else_ability = None;
             }
         }
         ContinuationAst::CounterSourceRiderDestroy => {
@@ -6778,6 +6800,7 @@ pub(super) fn continuation_absorbs_current(
         ContinuationAst::ManaRestriction { .. }
         | ContinuationAst::ManaGrant { .. }
         | ContinuationAst::CounterSourceStatic { .. }
+        | ContinuationAst::CounterSourceRiderUnreadable { .. }
         | ContinuationAst::CounterSourceRiderDestroy
         | ContinuationAst::CounterSpellZoneRedirect { .. } => true,
         // CR 707.10c: recognition was already gated on a preceding CopySpell in
@@ -8481,17 +8504,26 @@ pub(super) fn parse_followup_continuation_ast_with_search_destination(
         // CR 608.2c + CR 109.2: "If an ability of an artifact, creature, or
         // planeswalker is countered this way, that permanent loses all
         // abilities for as long as ~ remains on the battlefield." (Tishana's
-        // Tidebinder). The recognizer carries the printed type gate; a clause it
-        // cannot read falls through un-claimed (never an unrestricted rider).
+        // Tidebinder). The recognizer carries the printed type gate; a rider-shaped
+        // clause whose type list it cannot read is claimed and gapped.
         Effect::Counter { .. }
-            if let Some(source_filter) = recognize_counter_loses_abilities_rider(&lower) =>
+            if let Some(rider) = recognize_counter_loses_abilities_rider(&lower) =>
         {
-            Some(ContinuationAst::CounterSourceStatic {
-                source_static: Box::new(StaticDefinition::continuous().modifications(vec![
-                    crate::types::ability::ContinuousModification::RemoveAllAbilities,
-                ])),
-                source_filter,
-            })
+            match rider {
+                CounterLosesAbilitiesRider::Gate(source_filter) => {
+                    Some(ContinuationAst::CounterSourceStatic {
+                        source_static: Box::new(StaticDefinition::continuous().modifications(
+                            vec![crate::types::ability::ContinuousModification::RemoveAllAbilities],
+                        )),
+                        source_filter,
+                    })
+                }
+                CounterLosesAbilitiesRider::UnreadableTypeList => {
+                    Some(ContinuationAst::CounterSourceRiderUnreadable {
+                        fragment: lower.trim().to_string(),
+                    })
+                }
+            }
         }
         // CR 701.8 + CR 608.2c: "If a permanent's ability is countered this way,
         // destroy that permanent." (Teferi's Response, Green Slime). Claiming

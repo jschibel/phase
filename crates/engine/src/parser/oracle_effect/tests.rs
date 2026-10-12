@@ -7896,27 +7896,34 @@ fn effect_counter_ability_untyped_loses_abilities_rider_has_no_source_filter() {
 }
 
 /// CR 608.2c: a type list the type-phrase reader cannot read must NOT be
-/// silently treated as an unrestricted rider. The rider is not claimed, so the
-/// clause is left to the generic sequence path (it does NOT lower to a
-/// strict-failure marker: it becomes an ordinary sub-ability), so a typed gate
-/// is only ever emitted for a fully-read type list.
+/// silently treated as an unrestricted rider, nor fall to the generic path as a
+/// `RemoveAllAbilities` sub-ability on the parent target. The rider-shaped clause
+/// is claimed and the whole counter is gapped with a strict-failure marker.
 #[test]
 fn effect_counter_ability_unreadable_source_type_list_is_not_an_unrestricted_rider() {
     let ability = parse_effect_chain(
             "counter up to one target activated or triggered ability. If an ability of a zorgle is countered this way, that permanent loses all abilities for as long as ~ remains on the battlefield",
             AbilityKind::Spell,
         );
-    // Reach-guard: the counter itself parsed.
-    let Effect::Counter { source_rider, .. } = &*ability.effect else {
-        panic!("expected Counter effect, got {:?}", ability.effect);
+    // The clause is honestly gapped: a strict-failure marker, no executable counter.
+    let Effect::Unimplemented { name, description } = &*ability.effect else {
+        panic!("expected a strict-failure marker, got {:?}", ability.effect);
     };
+    assert_eq!(name, "counter_source_rider_type_list");
     assert!(
-        source_rider.is_none(),
-        "an unreadable type list must not yield a rider, got {source_rider:?}"
+        description.as_deref().is_some_and(|d| d.contains("zorgle")),
+        "the marker must carry the printed clause, got {description:?}"
     );
+    // No generic-path mis-parse: no RemoveAllAbilities anywhere in the chain.
     assert!(
-        ability.sub_ability.is_some(),
-        "the unclaimed clause must remain a sub-ability, not be absorbed"
+        ability.sub_ability.is_none(),
+        "the clause must not survive as a sub-ability, got {:?}",
+        ability.sub_ability
+    );
+    let rendered = format!("{ability:?}");
+    assert!(
+        !rendered.contains("RemoveAllAbilities"),
+        "no RemoveAllAbilities may be emitted for an unreadable gate: {rendered}"
     );
 }
 
