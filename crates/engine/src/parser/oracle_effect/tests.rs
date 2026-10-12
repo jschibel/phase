@@ -7821,7 +7821,11 @@ fn effect_counter_ability_with_source_static_absorption() {
         "sub_ability should be absorbed"
     );
     if let Effect::Counter { source_rider, .. } = &*ability.effect {
-        let CounterSourceRider::LosesAbilities { static_def, .. } = source_rider
+        let CounterSourceRider::LosesAbilities {
+            static_def,
+            source_filter,
+            duration,
+        } = source_rider
             .as_ref()
             .expect("should have a LosesAbilities source_rider")
         else {
@@ -7832,9 +7836,88 @@ fn effect_counter_ability_with_source_static_absorption() {
             static_def.modifications,
             vec![ContinuousModification::RemoveAllAbilities]
         );
+        assert_eq!(**duration, Duration::WhileHostOnBattlefield);
+        // CR 608.2c + CR 109.2: the printed type list is carried as the typed
+        // gate on the countered ability's source — exactly artifact, creature
+        // and planeswalker (no land, no enchantment).
+        let TargetFilter::Or { filters } = &**source_filter
+            .as_ref()
+            .expect("the printed type list must be carried as source_filter")
+        else {
+            panic!("expected an Or of three type filters, got {source_filter:?}");
+        };
+        let mut types: Vec<TypeFilter> = Vec::new();
+        for f in filters {
+            let TargetFilter::Typed(tf) = f else {
+                panic!("expected a Typed leg, got {f:?}");
+            };
+            assert_eq!(tf.type_filters.len(), 1, "each leg is a single card type");
+            types.extend(tf.type_filters.iter().cloned());
+        }
+        types.sort_by_key(|t| format!("{t:?}"));
+        assert_eq!(
+            types,
+            vec![
+                TypeFilter::Artifact,
+                TypeFilter::Creature,
+                TypeFilter::Planeswalker
+            ]
+        );
     } else {
         panic!("expected Counter effect");
     }
+}
+
+/// CR 608.2c: the untyped conditional "if a permanent's ability is countered
+/// this way, that permanent loses all abilities ..." carries NO type gate
+/// (`source_filter: None`) — the sibling-negative of the typed rider above.
+#[test]
+fn effect_counter_ability_untyped_loses_abilities_rider_has_no_source_filter() {
+    use crate::types::ability::CounterSourceRider;
+
+    let ability = parse_effect_chain(
+            "counter up to one target activated or triggered ability. If a permanent's ability is countered this way, that permanent loses all abilities for as long as ~ remains on the battlefield",
+            AbilityKind::Spell,
+        );
+    assert!(ability.sub_ability.is_none());
+    let Effect::Counter { source_rider, .. } = &*ability.effect else {
+        panic!("expected Counter effect, got {:?}", ability.effect);
+    };
+    assert!(
+        matches!(
+            source_rider,
+            Some(CounterSourceRider::LosesAbilities {
+                source_filter: None,
+                ..
+            })
+        ),
+        "expected an untyped LosesAbilities rider, got {source_rider:?}"
+    );
+}
+
+/// CR 608.2c: a type list the type-phrase reader cannot read must NOT be
+/// silently treated as an unrestricted rider. The rider is not claimed, so the
+/// clause is left to the generic sequence path (it does NOT lower to a
+/// strict-failure marker: it becomes an ordinary sub-ability), so a typed gate
+/// is only ever emitted for a fully-read type list.
+#[test]
+fn effect_counter_ability_unreadable_source_type_list_is_not_an_unrestricted_rider() {
+    let ability = parse_effect_chain(
+            "counter up to one target activated or triggered ability. If an ability of a zorgle is countered this way, that permanent loses all abilities for as long as ~ remains on the battlefield",
+            AbilityKind::Spell,
+        );
+    // Reach-guard: the counter itself parsed.
+    let Effect::Counter { source_rider, .. } = &*ability.effect else {
+        panic!("expected Counter effect, got {:?}", ability.effect);
+    };
+    assert!(
+        source_rider.is_none(),
+        "an unreadable type list must not yield a rider, got {source_rider:?}"
+    );
+    assert!(
+        ability.sub_ability.is_some(),
+        "the unclaimed clause must remain a sub-ability, not be absorbed"
+    );
 }
 
 /// CR 701.8 + CR 608.2c: "If a permanent's ability is countered this way,

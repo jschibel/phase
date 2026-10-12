@@ -8,6 +8,7 @@ use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
 use super::super::oracle_nom::bridge::nom_on_lower;
+use super::super::oracle_nom::duration::parse_duration;
 use super::super::oracle_nom::enters_under::{
     bind_control_clause, fold_control_clauses, name_entry_control_antecedent,
 };
@@ -4672,6 +4673,64 @@ fn recognize_counter_destroy_rider(lower: &str) -> bool {
     .is_ok()
 }
 
+/// CR 608.2c + CR 109.2: nom recognizer for the "if an ability of a <type list>
+/// is countered this way, that permanent loses all abilities for as long as ~
+/// remains on the battlefield" continuation clause (Tishana's Tidebinder).
+/// Operates on lowercased text; tolerates a trailing period/whitespace.
+///
+/// Returns `None` when the clause is not this shape — including an unparseable
+/// type list or a duration other than the presence-bound one — so the clause is
+/// never silently treated as an unrestricted `source_rider` (it falls through to the
+/// generic sequence path).
+/// Otherwise returns the source-permanent type gate: `Some(filter)` for the
+/// printed type list, `None` for the untyped "a permanent's ability" subject.
+///
+/// Composed from independent axes rather than enumerated as full strings:
+///   - condition subject ("an ability of <type list>" via
+///     `parse_type_phrase_folding` / "a permanent's ability" / "an ability").
+///   - the loses-abilities consequence on the countered ability's source.
+///   - the CR 611.2b duration, read by `parse_duration`.
+fn recognize_counter_loses_abilities_rider(lower: &str) -> Option<Option<Box<TargetFilter>>> {
+    let clause = lower.trim().trim_end_matches('.').trim_end();
+    let (rest, _) = tag::<_, _, OracleError<'_>>("if ").parse(clause).ok()?;
+    let (rest, subject) = alt((
+        map(
+            preceded(
+                tag::<_, _, OracleError<'_>>("an ability of "),
+                take_until(" is countered this way, "),
+            ),
+            Some,
+        ),
+        value(None, alt((tag("a permanent's ability"), tag("an ability")))),
+    ))
+    .parse(rest)
+    .ok()?;
+    let source_filter = match subject {
+        Some(type_list) => {
+            // `parse_type_phrase_folding` is infallible: an unrecognized phrase
+            // comes back unconsumed, so require the whole list to be read.
+            let (filter, remainder) = parse_type_phrase_folding(type_list);
+            if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
+                return None;
+            }
+            Some(Box::new(filter))
+        }
+        None => None,
+    };
+    let (rest, _) =
+        tag::<_, _, OracleError<'_>>(" is countered this way, that permanent loses all abilities ")
+            .parse(rest)
+            .ok()?;
+    let (rest, duration) = parse_duration(rest).ok()?;
+    // CR 611.2b + CR 702.26f: the only duration the rider resolver applies is the
+    // presence-bound one ("for as long as ~ remains on the battlefield").
+    if duration != Duration::WhileHostOnBattlefield {
+        return None;
+    }
+    eof::<_, OracleError<'_>>.parse(rest).ok()?;
+    Some(source_filter)
+}
+
 /// CR 701.6a + CR 614.1a: nom recognizer for the "if that spell is countered
 /// this way, put it <zone> instead of into that player's graveyard"
 /// continuation clause (Memory Lapse, Remand, Spell Crumple). Operates on
@@ -5105,7 +5164,10 @@ pub(super) fn apply_clause_continuation(
                 grants.extend(new_grants);
             }
         }
-        ContinuationAst::CounterSourceStatic { source_static } => {
+        ContinuationAst::CounterSourceStatic {
+            source_static,
+            source_filter,
+        } => {
             let Some(previous) = defs.last_mut() else {
                 return;
             };
@@ -5121,6 +5183,7 @@ pub(super) fn apply_clause_continuation(
                 // a phase-out of this creature, not only on its exit.
                 *existing = Some(CounterSourceRider::LosesAbilities {
                     static_def: source_static,
+                    source_filter,
                     duration: Box::new(Duration::WhileHostOnBattlefield),
                 });
             }
@@ -8415,14 +8478,19 @@ pub(super) fn parse_followup_continuation_ast_with_search_destination(
         {
             Some(ContinuationAst::SelfCostKeywordCostClarification)
         }
+        // CR 608.2c + CR 109.2: "If an ability of an artifact, creature, or
+        // planeswalker is countered this way, that permanent loses all
+        // abilities for as long as ~ remains on the battlefield." (Tishana's
+        // Tidebinder). The recognizer carries the printed type gate; a clause it
+        // cannot read falls through un-claimed (never an unrestricted rider).
         Effect::Counter { .. }
-            if nom_primitives::scan_contains(&lower, "countered this way")
-                && nom_primitives::scan_contains(&lower, "loses all abilities") =>
+            if let Some(source_filter) = recognize_counter_loses_abilities_rider(&lower) =>
         {
             Some(ContinuationAst::CounterSourceStatic {
                 source_static: Box::new(StaticDefinition::continuous().modifications(vec![
                     crate::types::ability::ContinuousModification::RemoveAllAbilities,
                 ])),
+                source_filter,
             })
         }
         // CR 701.8 + CR 608.2c: "If a permanent's ability is countered this way,
