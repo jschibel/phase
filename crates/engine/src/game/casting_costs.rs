@@ -2630,10 +2630,69 @@ fn park_cost_payment_triggers_if_paused(
     );
 }
 
+/// CR 603.10a: What an in-flight multi-object cost move carries across a
+/// replacement-choice pause, so the group that left together is stamped once at
+/// terminal completion. Mirrors the pair `PendingCostMoveResume::SacrificeForCost`
+/// carries. Both fields live in `PendingCostMoveResume::Cast` while paused.
+#[derive(Debug, Default)]
+struct CostMoveLedger {
+    /// Cost events emitted in earlier actions of this one logical payment,
+    /// withheld from trigger collection until the group is stamped.
+    deferred_cost_events: Vec<GameEvent>,
+    /// Per-turn LKI record identities of the battlefield departures so far.
+    departure_record_indices: Vec<usize>,
+}
+
+/// CR 603.10a: Whether the selected objects can still leave the battlefield
+/// together in this payment: at least two have left already or still stand on
+/// the battlefield. A single object, or a move from another zone, never forms a
+/// simultaneous-departure group, so its triggers need no withholding.
+fn cost_move_group_may_form(
+    state: &GameState,
+    chosen: &[ObjectId],
+    departure_record_indices: &[usize],
+) -> bool {
+    let on_battlefield = chosen
+        .iter()
+        .filter(|id| {
+            state
+                .objects
+                .get(id)
+                .is_some_and(|obj| obj.zone == Zone::Battlefield)
+        })
+        .count();
+    on_battlefield + departure_record_indices.len() >= 2
+}
+
+/// CR 603.10a: The selected objects that left the battlefield in `events`, each
+/// once, in departure order. Read from the departures themselves so a resumed
+/// call, which holds only the tail of the selection, recomputes the same group.
+fn selected_battlefield_departures<'a>(
+    chosen: &[ObjectId],
+    events: impl Iterator<Item = &'a GameEvent>,
+) -> Vec<ObjectId> {
+    let mut group = Vec::new();
+    for event in events {
+        if let GameEvent::ZoneChanged {
+            object_id,
+            from: Some(Zone::Battlefield),
+            ..
+        } = event
+        {
+            if chosen.contains(object_id) && !group.contains(object_id) {
+                group.push(*object_id);
+            }
+        }
+    }
+    group
+}
+
 /// CR 601.2h + CR 616.1: Move `chosen[start_at_index..]` through the zone pipeline as
 /// cost moves. A move that parks for a replacement choice leaves the typed `Cast` root
-/// holding `pending` and `completion`, parks the span's already-raised cost triggers,
-/// and returns the live prompt; `None` means every move settled.
+/// holding `pending`, `completion` and the departure `ledger`, parks the span's
+/// already-raised cost triggers (or withholds them in the ledger while a
+/// simultaneous-departure group can still form), and returns the live prompt; `None`
+/// means every move settled.
 #[allow(clippy::too_many_arguments)]
 fn move_cost_objects(
     state: &mut GameState,
@@ -2644,6 +2703,7 @@ fn move_cost_objects(
     destination: Zone,
     completion: &PendingCostMoveCompletion,
     cost_event_start: usize,
+    ledger: &mut CostMoveLedger,
     events: &mut Vec<GameEvent>,
 ) -> Option<WaitingFor> {
     for (index, &object_id) in chosen.iter().enumerate().skip(start_at_index) {
@@ -2659,6 +2719,21 @@ fn move_cost_objects(
         match zone_pipeline::move_object(state, request, events) {
             ZoneMoveResult::Done => {}
             ZoneMoveResult::NeedsChoice(choice_player) => {
+                // CR 603.10a: the departures so far, and (while a group can still
+                // form) their events, travel with the root so terminal completion
+                // stamps the whole group and collects its triggers once.
+                record_sacrifice_cost_departure_records(
+                    &mut ledger.departure_record_indices,
+                    &events[cost_event_start..],
+                    chosen,
+                );
+                let withhold =
+                    cost_move_group_may_form(state, chosen, &ledger.departure_record_indices);
+                if withhold {
+                    ledger
+                        .deferred_cost_events
+                        .extend_from_slice(&events[cost_event_start..]);
+                }
                 state.pending_cost_move_resume = Some(PendingCostMoveResume::Cast {
                     player,
                     pending: Some(Box::new(pending.clone())),
@@ -2666,6 +2741,8 @@ fn move_cost_objects(
                     paused_at_index: index,
                     destination,
                     completion: completion.clone(),
+                    deferred_cost_events: std::mem::take(&mut ledger.deferred_cost_events),
+                    departure_record_indices: std::mem::take(&mut ledger.departure_record_indices),
                 });
                 // A delivered move can surface its own post-effect prompt; only a live
                 // CR 616.1 ordering choice is synthesized here.
@@ -2673,13 +2750,15 @@ fn move_cost_objects(
                     super::casting::pause_cost_payment_for_replacement_choice(state, choice_player);
                 }
                 let waiting_for = state.waiting_for.clone();
-                park_cost_payment_triggers_if_paused(
-                    state,
-                    events,
-                    cost_event_start,
-                    events.len(),
-                    &waiting_for,
-                );
+                if !withhold {
+                    park_cost_payment_triggers_if_paused(
+                        state,
+                        events,
+                        cost_event_start,
+                        events.len(),
+                        &waiting_for,
+                    );
+                }
                 return Some(waiting_for);
             }
             ZoneMoveResult::NeedsAuraAttachmentChoice => {
@@ -2701,26 +2780,9 @@ fn finish_cost_object_moves(
     completion: PendingCostMoveCompletion,
     cost_event_start: usize,
     park_events_after_completion: bool,
+    mut ledger: CostMoveLedger,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
-    // CR 603.10a: `departed_subset` requires ids verified on the battlefield
-    // before the move; this seam also moves hand/graveyard cards (pitch,
-    // Collect Evidence, craft's graveyard materials), so the group is the
-    // chosen objects that are on the battlefield now. Only a call that moves
-    // the WHOLE selection (`start_at_index == 0`) can stamp: a resumed call
-    // holds only the tail, and a partial stamp would break the mutual relation.
-    let battlefield_group: Option<Vec<ObjectId>> = (start_at_index == 0).then(|| {
-        chosen
-            .iter()
-            .copied()
-            .filter(|id| {
-                state
-                    .objects
-                    .get(id)
-                    .is_some_and(|obj| obj.zone == Zone::Battlefield)
-            })
-            .collect()
-    });
     if let Some(waiting_for) = move_cost_objects(
         state,
         player,
@@ -2730,6 +2792,7 @@ fn finish_cost_object_moves(
         destination,
         &completion,
         cost_event_start,
+        &mut ledger,
         events,
     ) {
         return Ok(waiting_for);
@@ -2737,14 +2800,46 @@ fn finish_cost_object_moves(
 
     // CR 603.10a: permanents moved together to pay one cost component leave
     // the battlefield simultaneously; stamp them so a co-departing
-    // leaves-the-battlefield observer sees each (mirrors the synchronous stamp
-    // in `handle_sacrifice_for_cost`). The cross-action paused case needs the
-    // record-ledger carry that `PendingCostMoveResume::SacrificeForCost` has
-    // and `::Cast` lacks.
-    if let Some(group) = battlefield_group {
-        crate::game::zones::mark_simultaneous_departures(
-            &mut events[cost_event_start..],
-            &crate::game::zones::departed_subset(state, &group),
+    // leaves-the-battlefield observer sees each (mirrors the stamp in
+    // `finish_sacrifice_for_cost`). The group is read from the departures
+    // themselves: this seam also moves hand/graveyard cards (pitch, Collect
+    // Evidence, craft's graveyard materials), which are never part of it, and a
+    // call resumed after a replacement-choice pause recomputes the whole group
+    // from the ledger it carried.
+    let CostMoveLedger {
+        mut deferred_cost_events,
+        mut departure_record_indices,
+    } = ledger;
+    record_sacrifice_cost_departure_records(
+        &mut departure_record_indices,
+        &events[cost_event_start..],
+        &chosen,
+    );
+    let group = selected_battlefield_departures(
+        &chosen,
+        deferred_cost_events
+            .iter()
+            .chain(events[cost_event_start..].iter()),
+    );
+    crate::game::zones::mark_simultaneous_departures(&mut deferred_cost_events, &group);
+    crate::game::zones::mark_simultaneous_departures(&mut events[cost_event_start..], &group);
+    crate::game::zones::mark_simultaneous_departure_records(
+        state,
+        &departure_record_indices,
+        &group,
+    );
+    let mut pending = pending;
+    if !deferred_cost_events.is_empty() {
+        // CR 603.2 + CR 603.3b: earlier action fragments of this payment were
+        // withheld from trigger collection; collect the fully stamped group once,
+        // together with this action's fragment.
+        settle_sacrifice_for_cost_events(
+            state,
+            Some(&mut pending),
+            deferred_cost_events,
+            events,
+            cost_event_start,
+            events.len(),
         );
     }
 
@@ -2775,7 +2870,6 @@ fn finish_cost_object_moves(
     // Placed after the loop so it is correct regardless of how many zones the
     // move traversed or whether a replacement effect redirected it; the
     // `NeedsChoice` arm above returns early and re-enters here on resume.
-    let mut pending = pending;
     pending.ability.settle_cost_paid_provenance_recursive(
         state,
         &chosen,
@@ -2981,6 +3075,7 @@ fn finish_selected_return_to_hand_after_automatic(
         PendingCostMoveCompletion::FinishPending,
         cost_event_start,
         park_events_after_completion,
+        CostMoveLedger::default(),
         events,
     )
 }
@@ -3045,6 +3140,8 @@ pub(crate) fn resume_interrupted_cost_payment(
             paused_at_index,
             destination,
             completion,
+            deferred_cost_events,
+            departure_record_indices,
         }) = state.pending_cost_move_resume.take()
         else {
             unreachable!("matched a cast cost-move continuation")
@@ -3064,6 +3161,10 @@ pub(crate) fn resume_interrupted_cost_payment(
             completion,
             replacement_action_cost_event_start.unwrap_or(events.len()),
             true,
+            CostMoveLedger {
+                deferred_cost_events,
+                departure_record_indices,
+            },
             events,
         );
     }
@@ -3548,6 +3649,7 @@ fn pay_delve_at_commit(
         Zone::Exile,
         &completion,
         events.len(),
+        &mut CostMoveLedger::default(),
         events,
     ))
 }
@@ -4620,6 +4722,17 @@ pub(crate) fn handle_return_to_hand_for_cost(
             chosen.len()
         )));
     }
+    // CR 118.3 + CR 601.2h: a cost of N permanents is not paid by returning one
+    // permanent N times.
+    if chosen
+        .iter()
+        .enumerate()
+        .any(|(index, id)| chosen[index + 1..].contains(id))
+    {
+        return Err(EngineError::InvalidAction(
+            "Cannot return the same permanent more than once for a cost".to_string(),
+        ));
+    }
     for id in chosen {
         if !legal_permanents.contains(id) {
             return Err(EngineError::InvalidAction(
@@ -4680,12 +4793,9 @@ pub(crate) fn handle_return_to_hand_for_cost(
         }
     }
 
-    // CR 603.10a: permanents returned to hand as one cost leave the battlefield
-    // together. Counted return costs ship (Ensnare, Thwart, activated counted
-    // returns), so `finish_cost_object_moves` stamps the synchronous group —
-    // taken from the chosen objects on the battlefield before the move — the
-    // same way `handle_sacrifice_for_cost` does. A move paused by a replacement
-    // choice and resumed in a later action is not stamped (known limitation).
+    // CR 603.10a: permanents returned as one cost leave together;
+    // `finish_cost_object_moves` stamps the group across any replacement-choice
+    // pause via `CostMoveLedger`.
     // A self-return component is paid by `pay_ability_cost` above. Moving
     // that source a second time would emit a spurious Hand -> Hand event.
     let to_return: Vec<_> = chosen
@@ -4709,6 +4819,7 @@ pub(crate) fn handle_return_to_hand_for_cost(
         PendingCostMoveCompletion::FinishPending,
         cost_event_start,
         false,
+        CostMoveLedger::default(),
         events,
     )
 }
@@ -5345,6 +5456,7 @@ pub(crate) fn handle_behold_for_cost(
             PendingCostMoveCompletion::FinishPending,
             cost_event_start,
             false,
+            CostMoveLedger::default(),
             events,
         );
     } else if !revealed_ids.is_empty() {
@@ -5630,6 +5742,7 @@ fn finish_exile_selection_for_cost(
         PendingCostMoveCompletion::FinishPending,
         cost_event_start,
         false,
+        CostMoveLedger::default(),
         events,
     )
 }
@@ -5716,6 +5829,7 @@ pub(crate) fn handle_exile_aggregate_for_cost(
         PendingCostMoveCompletion::PublishExileTrackedSet,
         cost_event_start,
         false,
+        CostMoveLedger::default(),
         events,
     )
 }
@@ -12137,6 +12251,7 @@ fn finalize_cast_with_phyrexian_choices_inner(
             },
             cost_event_start,
             false,
+            CostMoveLedger::default(),
             events,
         );
     }

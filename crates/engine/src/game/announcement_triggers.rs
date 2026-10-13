@@ -101,16 +101,21 @@ pub(crate) fn claim_ordinary_collected_span(
 fn retained_by_cost_owners(state: &GameState) -> Vec<GameEvent> {
     let mut retained = super::engine_priority::retained_logical_zone_events(state);
     match state.pending_cost_move_resume.as_ref() {
-        Some(PendingCostMoveResume::SacrificeForCost {
-            deferred_cost_events,
-            ..
-        }) => retained.extend(deferred_cost_events.iter().cloned()),
+        Some(
+            PendingCostMoveResume::Cast {
+                deferred_cost_events,
+                ..
+            }
+            | PendingCostMoveResume::SacrificeForCost {
+                deferred_cost_events,
+                ..
+            },
+        ) => retained.extend(deferred_cost_events.iter().cloned()),
         Some(PendingCostMoveResume::ManaAbilityPayment { cursor, .. }) => {
             retained.extend(cursor.deferred_cost_events.iter().cloned());
         }
         Some(
-            PendingCostMoveResume::Cast { .. }
-            | PendingCostMoveResume::WardSacrificePayment { .. }
+            PendingCostMoveResume::WardSacrificePayment { .. }
             | PendingCostMoveResume::ReplacementMayCost { .. }
             | PendingCostMoveResume::Foretell { .. }
             | PendingCostMoveResume::CollectEvidencePayment { .. }

@@ -6,9 +6,8 @@
 //! `AbilityCost::EffectCost { Bounce }`, which the spell payer silently skipped:
 //! the spell was free and the Islands stayed on the battlefield.
 //!
-//! NOTE: the Oracle constants below come from the task author (and Bull
-//! Elephant's from an existing repository test); they could not be verified
-//! against Scryfall/MTGJSON in the authoring environment.
+//! NOTE: The Oracle constants below equal the `data/card-data.json` export
+//! (MTGJSON-derived) text for Ensnare, Thwart and Daze; Gush's equals Scryfall's.
 //!
 //! CR 118.9: alternative costs. CR 601.2h: the total cost is paid.
 //! CR 400.3: an object put into a hand goes to its owner's hand.
@@ -19,17 +18,19 @@ use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::parser::oracle_cost::parse_oracle_cost;
 use engine::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, CostObjectCount, Effect,
-    FilterProp, QuantityExpr, SpellCastingOption, TargetFilter, TriggerDefinition, TypeFilter,
-    TypedFilter,
+    FilterProp, QuantityExpr, ReplacementDefinition, SpellCastingOption, TargetFilter,
+    TriggerDefinition, TypeFilter, TypedFilter,
 };
 use engine::types::actions::GameAction;
+use engine::types::card_type::Supertype;
 use engine::types::events::GameEvent;
 use engine::types::game_state::{CastPaymentMode, PayCostKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
+use engine::types::replacements::ReplacementEvent;
 use engine::types::triggers::TriggerMode;
-use engine::types::zones::Zone;
+use engine::types::zones::{EtbTapState, Zone};
 use std::sync::Arc;
 
 const ENSNARE: &str = "You may return two Islands you control to their owner's hand rather than pay this spell's mana cost.\nTap all creatures.";
@@ -649,4 +650,291 @@ fn craft_mixed_zone_materials_do_not_cross_stamp_graveyard_card() {
         co_departed.is_empty(),
         "one battlefield permanent forms no co-departure group"
     );
+}
+
+// ---------------------------------------------------------------------------
+// C-A2: a count-3 cost refuses a repeated permanent (Thwart-sized).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn counted_return_cost_refuses_a_repeated_permanent() {
+    let (mut runner, spell, lands) = return_cost_departure_board(3, 3);
+    let (a, b, c) = (lands[0], lands[1], lands[2]);
+    let card_id = runner.state().objects[&spell].card_id;
+
+    // Explicit `act`: this row asserts a refusal at the payment boundary.
+    runner
+        .act(GameAction::CastSpell {
+            object_id: spell,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("cast the counted-return witness");
+    let result = runner
+        .act(GameAction::DecideOptionalCost { pay: true })
+        .expect("accept the alternative cost");
+    assert!(
+        matches!(
+            result.waiting_for,
+            WaitingFor::PayCost {
+                kind: PayCostKind::ReturnToHand,
+                count: 3,
+                ..
+            }
+        ),
+        "reach guard: the count-3 prompt, got {:?}",
+        result.waiting_for
+    );
+
+    assert!(
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![a, b, b]
+            })
+            .is_err(),
+        "[a, b, b] must not pay a count-3 cost"
+    );
+    for id in [a, b, c] {
+        assert_eq!(runner.state().objects[&id].zone, Zone::Battlefield);
+    }
+
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![a, b, c],
+        })
+        .expect("three distinct lands pay");
+    for id in [a, b, c] {
+        assert_eq!(runner.state().objects[&id].zone, Zone::Hand);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C-A1: the activation route keeps the group across a replacement pause.
+// ---------------------------------------------------------------------------
+
+/// "If a land would be put into a hand from anywhere, exile it instead",
+/// scoped to `id`.
+fn redirect_land_to_exile(id: ObjectId) -> ReplacementDefinition {
+    ReplacementDefinition::new(ReplacementEvent::Moved)
+        .destination_zone(Zone::Hand)
+        .valid_card(TargetFilter::SpecificObject { id })
+        .execute(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                origin: None,
+                target: TargetFilter::SelfRef,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
+            },
+        ))
+}
+
+/// The counted-return activation with each listed land carrying two competing
+/// replacements. Returns (life gained, persisted departure records of the
+/// lands, pauses taken).
+fn counted_return_activation_with_pauses(
+    redirect: &[usize],
+) -> (i32, Vec<(ObjectId, Vec<ObjectId>)>, usize) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario
+        .add_creature(P0, "Counted Return Activation Witness", 1, 1)
+        .with_ability_definition(
+            AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    player: TargetFilter::Controller,
+                },
+            )
+            .cost(parse_oracle_cost(
+                "Return two lands you control to their owner's hand",
+            )),
+        )
+        .id();
+    let lands: Vec<ObjectId> = (0..2)
+        .map(|_| scenario.add_basic_land(P0, ManaColor::Green))
+        .collect();
+    for &index in redirect {
+        for name in ["First Redirect", "Second Redirect"] {
+            scenario
+                .add_creature(P0, &format!("{name} {index}"), 0, 0)
+                .as_enchantment()
+                .with_replacement_definition(redirect_land_to_exile(lands[index]));
+        }
+    }
+    let mut runner = scenario.build();
+    attach_land_departure_observer(&mut runner, lands[0]);
+    let life0 = runner.life(P0);
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: source,
+            ability_index: 0,
+        })
+        .expect("activate the counted-return ability");
+    runner
+        .act(GameAction::SelectCards {
+            cards: lands.clone(),
+        })
+        .expect("select both lands");
+    let mut pauses = 0;
+    while matches!(
+        runner.state().waiting_for,
+        WaitingFor::ReplacementChoice { .. }
+    ) {
+        pauses += 1;
+        runner
+            .act(GameAction::ChooseReplacement { index: 0 })
+            .expect("choose the replacement");
+    }
+    runner.advance_until_stack_empty();
+
+    let mut records: Vec<(ObjectId, Vec<ObjectId>)> = runner
+        .state()
+        .zone_changes_this_turn
+        .iter()
+        .filter(|record| {
+            record.from_zone == Some(Zone::Battlefield) && lands.contains(&record.object_id)
+        })
+        .map(|record| (record.object_id, record.co_departed.clone()))
+        .collect();
+    records.sort();
+    let mut expected = lands.clone();
+    expected.sort();
+    assert_eq!(
+        records.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        expected,
+        "reach guard: both lands left the battlefield"
+    );
+    (runner.life(P0) - life0, records, pauses)
+}
+
+#[test]
+fn counted_return_activation_group_survives_a_replacement_pause() {
+    // Unpaused sibling: the ability's own life (1) plus the observer seeing
+    // both lands (2). The pause shapes must reach the same total.
+    let (life, records, pauses) = counted_return_activation_with_pauses(&[]);
+    assert_eq!(pauses, 0);
+    assert_eq!(life, 3);
+    let (a, b) = (records[0].0, records[1].0);
+    assert_eq!(records, vec![(a, vec![b]), (b, vec![a])]);
+
+    for (label, redirect, expected_pauses) in [("second", vec![1], 1), ("both", vec![0, 1], 2)] {
+        let (life, records, pauses) = counted_return_activation_with_pauses(&redirect);
+        assert_eq!(
+            pauses, expected_pauses,
+            "{label}: pause count (reach guard)"
+        );
+        let (a, b) = (records[0].0, records[1].0);
+        assert_eq!(
+            records,
+            vec![(a, vec![b]), (b, vec![a])],
+            "{label}: the persisted records stay mutual"
+        );
+        assert_eq!(life, 3, "{label}: CR 603.10a observer sees both lands");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P4: the printed activated counted-return costs (verbatim card-data text).
+// ---------------------------------------------------------------------------
+
+fn find_return_to_hand_cost(cost: &AbilityCost) -> Option<(u32, Option<TargetFilter>)> {
+    match cost {
+        AbilityCost::ReturnToHand { count, filter, .. } => Some((*count, filter.clone())),
+        AbilityCost::Composite { costs } => costs.iter().find_map(find_return_to_hand_cost),
+        _ => None,
+    }
+}
+
+#[test]
+fn printed_activated_counted_return_costs_carry_their_counts() {
+    let cards: [(&str, &str, u32); 7] = [
+        (
+            "Flooded Shoreline",
+            "{U}{U}, Return two Islands you control to their owner's hand: Return target creature to its owner's hand.",
+            2,
+        ),
+        (
+            "Multani, Yavimaya's Avatar",
+            "Reach, trample\nMultani gets +1/+1 for each land you control and each land card in your graveyard.\n{1}{G}, Return two lands you control to their owner's hand: Return this card from your graveyard to your hand.",
+            2,
+        ),
+        (
+            "Soratami Seer",
+            "Flying\n{4}, Return two lands you control to their owner's hand: Discard all the cards in your hand, then draw that many cards.",
+            2,
+        ),
+        (
+            "Uyo, Silent Prophet",
+            "Flying\n{2}, Return two lands you control to their owner's hand: Copy target instant or sorcery spell. You may choose new targets for the copy.",
+            2,
+        ),
+        (
+            "Soratami Mirror-Mage",
+            "Flying\n{3}, Return three lands you control to their owner's hand: Return target creature to its owner's hand.",
+            3,
+        ),
+        (
+            "Pearl Lake Ancient",
+            "Flash\nThis spell can't be countered.\nProwess (Whenever you cast a noncreature spell, this creature gets +1/+1 until end of turn.)\nReturn three lands you control to their owner's hand: Return this creature to its owner's hand.",
+            3,
+        ),
+        (
+            "Icebreaker Kraken",
+            "Affinity for snow lands (This spell costs {1} less to cast for each snow land you control.)\nWhen this creature enters, artifacts and creatures target opponent controls don't untap during that player's next untap step.\nReturn three snow lands you control to their owner's hand: Return this creature to its owner's hand.",
+            3,
+        ),
+    ];
+    let mut scenario = GameScenario::new();
+    let ids: Vec<(ObjectId, &str, u32)> = cards
+        .iter()
+        .map(|(name, text, count)| {
+            (
+                scenario.add_creature_from_oracle(P0, name, 1, 1, text).id(),
+                *name,
+                *count,
+            )
+        })
+        .collect();
+    let runner = scenario.build();
+    for (id, name, count) in ids {
+        let found = runner.state().objects[&id]
+            .abilities
+            .iter()
+            .filter_map(|ability| ability.cost.as_ref())
+            .find_map(find_return_to_hand_cost);
+        let (found_count, filter) =
+            found.unwrap_or_else(|| panic!("{name}: no counted ReturnToHand activation cost"));
+        assert_eq!(found_count, count, "{name}");
+        let Some(TargetFilter::Typed(tf)) = filter else {
+            panic!("{name}: expected a typed land filter, got {filter:?}");
+        };
+        if name == "Flooded Shoreline" {
+            assert_eq!(tf.get_subtype(), Some("Island"));
+        }
+        if name == "Icebreaker Kraken" {
+            assert!(
+                tf.properties.iter().any(|prop| matches!(
+                    prop,
+                    FilterProp::HasSupertype {
+                        value: Supertype::Snow
+                    }
+                )),
+                "{name}: snow lands, got {:?}",
+                tf.properties
+            );
+        }
+    }
 }

@@ -4724,6 +4724,32 @@ mod tests {
         }
     }
 
+    /// A count token followed by a range tail ("one or more", "two or fewer") is
+    /// a quantifier, not an exact count; it must not lower to a count-1 or
+    /// self-referential return.
+    #[test]
+    fn cost_return_range_quantifier_declines() {
+        // Reach guard: the exact count of the same destination parses.
+        assert!(matches!(
+            parse_oracle_cost("Return two lands you control to their owner's hand"),
+            AbilityCost::ReturnToHand { count: 2, .. }
+        ));
+        for text in [
+            "Return one or more lands you control to their owner's hand",
+            "Return two or more lands you control to their owner's hand",
+            "Return 2 or more lands you control to their owner's hand",
+            "Return one or fewer lands you control to their owner's hand",
+            "Return three or fewer lands you control to their owner's hand",
+            "Return one or more lands you control to your hand",
+        ] {
+            let cost = parse_oracle_cost(text);
+            assert!(
+                !matches!(cost, AbilityCost::ReturnToHand { .. }),
+                "{text:?} must not lower to ReturnToHand, got {cost:?}"
+            );
+        }
+    }
+
     /// The source-name self-reference fallback names ONE object; a counted
     /// return of an unreadable object phrase must not lower to an unpayable
     /// `ReturnToHand { count: 2, filter: SelfRef }`.

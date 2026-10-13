@@ -464,8 +464,8 @@ pub struct CountedReturnObject<'a> {
 /// CR 601.2h: splits "[count] <object> to <hand destination>…" (the count is
 /// part of the total cost). A plural destination with no count token, or an
 /// object phrase led by a non-count quantity ("X lands …", "any number of …")
-/// on any destination, is declined rather than read as one, so no unsupported
-/// count is ever lowered as 1. Lowercase input.
+/// on any destination, is declined rather than read as one (an 'up to N'
+/// phrase is not declined here; no printed cost carries one). Lowercase input.
 pub fn split_counted_return_to_hand_object(input: &str) -> Option<CountedReturnObject<'_>> {
     let (before, number, trailing) = scan_preceded(input, parse_return_to_hand_destination)?;
     let object = before.trim_end();
@@ -475,6 +475,11 @@ pub fn split_counted_return_to_hand_object(input: &str) -> Option<CountedReturnO
     ))
     .parse(object)
     .ok()?;
+    // "one or more …" / "two or fewer …": a count token followed by a range
+    // tail is a quantifier, not the exact count the token alone would read as.
+    if count.is_some() && parse_count_range_tail(object).is_ok() {
+        return None;
+    }
     // "x …" and "any number of …" are quantities, not a count token; on the
     // number-neutral "your hand" destination they would otherwise read as one.
     if count.is_none() && parse_non_count_quantity(object).is_ok() {
@@ -493,6 +498,11 @@ pub fn split_counted_return_to_hand_object(input: &str) -> Option<CountedReturnO
         object,
         trailing,
     })
+}
+
+/// A range tail that follows a count token ("or more ", "or fewer ").
+fn parse_count_range_tail(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("or more "), tag("or fewer "))).parse(input)
 }
 
 /// A leading quantity that is not a fixed count ("x ", "any number of ").
@@ -1232,6 +1242,42 @@ mod tests {
             split_counted_return_to_hand_object("two islands you control"),
             None
         );
+    }
+
+    #[test]
+    fn split_counted_return_to_hand_object_declines_range_quantifiers() {
+        // Reach guards: the exact counts of the same destinations split.
+        assert_eq!(
+            split_counted_return_to_hand_object("two lands you control to their owner's hand"),
+            Some(CountedReturnObject {
+                count: 2,
+                object: "lands you control",
+                trailing: "",
+            })
+        );
+        assert_eq!(
+            split_counted_return_to_hand_object("a land you control to its owner's hand"),
+            Some(CountedReturnObject {
+                count: 1,
+                object: "land you control",
+                trailing: "",
+            })
+        );
+        for input in [
+            "one or more lands you control to their owner's hand",
+            "two or more lands you control to their owner's hand",
+            "2 or more lands you control to their owner's hand",
+            "one or fewer lands you control to their owner's hand",
+            "three or fewer lands you control to their owner's hand",
+            "one or more lands you control to your hand",
+            "one or more creature cards from your graveyard to your hand",
+        ] {
+            assert_eq!(
+                split_counted_return_to_hand_object(input),
+                None,
+                "{input:?} must decline"
+            );
+        }
     }
 
     #[test]
