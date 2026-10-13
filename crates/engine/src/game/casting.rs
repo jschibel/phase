@@ -8427,6 +8427,104 @@ fn casting_variant_candidates(
         .collect()
 }
 
+/// Hand-card alternative-cost casting candidates whose cost is paid INSTEAD of the
+/// printed mana cost and that are announced one-per-keyword (Bestow, Mutate, Awaken,
+/// Cleave, Impending, More Than Meets the Eye, Prototype). Keyword presence plus each
+/// keyword's own legality gate (a bestow/mutate/awaken target, a parsed cleave set, a
+/// complete prototype face) -- affordability is judged later by
+/// `casting_variant_choice_set` / `can_cast_prepared_now`.
+///
+/// CR 118.9 + CR 601.2b: a player may announce an alternative cost whenever it is
+/// payable, so a hand card is a legal cast whenever any one of these routes is
+/// affordable, even if the printed cost is not (Impending 5 Overlords cost less than
+/// their printed cost, CR 702.176a). Called with no `Normal` entry for a card without a
+/// free-cast permission; `casting_candidates` adds `Normal` afterwards whenever these
+/// join another alternative (granted Blitz, printed Evoke, ...), so the N-way election
+/// keeps the printed-cost cast (CR 118.9b). A sole alternative stays the legacy
+/// Normal-vs-alternative prompt.
+fn hand_alternative_cost_keyword_candidates(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    obj: &GameObject,
+) -> Vec<CastingVariant> {
+    let mut out = Vec::new();
+    let effective_keywords = effective_spell_keywords(state, player, object_id);
+
+    // CR 702.103a + CR 303.4a: Bestow — offered only when the bestow keyword
+    // is present AND the bestowed Aura has a legal target, judged on the
+    // bestowed form by the bestow offer's own authority
+    // (`bestowed_aura_targets`, CR 702.103b).
+    if effective_keywords
+        .iter()
+        .any(|k| matches!(k, crate::types::keywords::Keyword::Bestow(_)))
+        && bestowed_form(state, object_id)
+            .is_some_and(|bestowed| !bestowed_aura_targets(&bestowed, player, object_id).is_empty())
+    {
+        out.push(CastingVariant::Bestow);
+    }
+    // CR 702.140a: Mutate — keyword present AND a legal "non-Human creature
+    // you own" merge target exists (parity with the Mutate offer block).
+    if obj
+        .keywords
+        .iter()
+        .any(|k| matches!(k, crate::types::keywords::Keyword::Mutate(_)))
+        && !targeting::find_legal_targets(state, &mutate_target_filter(), player, object_id)
+            .is_empty()
+    {
+        out.push(CastingVariant::Mutate);
+    }
+    // CR 702.113a + CR 702.113b: Awaken — keyword present AND a land you
+    // control exists for the awaken land target (parity with the Awaken
+    // offer block's `has_legal_land` gate).
+    if obj
+        .keywords
+        .iter()
+        .any(|k| matches!(k, crate::types::keywords::Keyword::Awaken { .. }))
+    {
+        let land_filter = TargetFilter::Typed(
+            crate::types::ability::TypedFilter::land()
+                .controller(crate::types::ability::ControllerRef::You),
+        );
+        if !targeting::find_legal_targets(state, &land_filter, player, object_id).is_empty() {
+            out.push(CastingVariant::Awaken);
+        }
+    }
+    // CR 702.148a: Cleave — keyword present AND the bracket-removed ability
+    // set was parsed (parity with the Cleave offer block's
+    // `obj.cleave_variant.is_some()` gate).
+    if obj.cleave_variant.is_some()
+        && obj
+            .keywords
+            .iter()
+            .any(|k| matches!(k, crate::types::keywords::Keyword::Cleave(_)))
+    {
+        out.push(CastingVariant::Cleave);
+    }
+    // CR 702.176a: Impending (keyword presence).
+    if obj
+        .keywords
+        .iter()
+        .any(|k| matches!(k, crate::types::keywords::Keyword::Impending { .. }))
+    {
+        out.push(CastingVariant::Impending);
+    }
+    // CR 702.162a: More Than Meets the Eye (keyword presence).
+    if obj
+        .keywords
+        .iter()
+        .any(|k| matches!(k, crate::types::keywords::Keyword::MoreThanMeetsTheEye(_)))
+    {
+        out.push(CastingVariant::MoreThanMeetsTheEye);
+    }
+    // CR 702.160a: Prototype — offered only when the secondary
+    // characteristics are complete (parity with `prototype_form_from_object`).
+    if prototype_form_from_object(obj).is_some() {
+        out.push(CastingVariant::Prototype);
+    }
+    out
+}
+
 fn casting_candidates(
     state: &GameState,
     player: PlayerId,
@@ -8774,8 +8872,6 @@ fn casting_candidates(
                 candidates.push(CastingVariant::Normal);
             }
 
-            let effective_keywords = effective_spell_keywords(state, player, object_id);
-
             // CR 702.185a: Warp (keyword presence — mirrors the Warp offer block).
             if obj
                 .keywords
@@ -8784,79 +8880,9 @@ fn casting_candidates(
             {
                 candidates.push(CastingVariant::Warp);
             }
-            // CR 702.103a + CR 303.4a: Bestow — offered only when the bestow keyword
-            // is present AND the bestowed Aura has a legal target, judged on the
-            // bestowed form by the bestow offer's own authority
-            // (`bestowed_aura_targets`, CR 702.103b).
-            if effective_keywords
-                .iter()
-                .any(|k| matches!(k, crate::types::keywords::Keyword::Bestow(_)))
-                && bestowed_form(state, object_id).is_some_and(|bestowed| {
-                    !bestowed_aura_targets(&bestowed, player, object_id).is_empty()
-                })
-            {
-                candidates.push(CastingVariant::Bestow);
-            }
-            // CR 702.140a: Mutate — keyword present AND a legal "non-Human creature
-            // you own" merge target exists (parity with the Mutate offer block).
-            if obj
-                .keywords
-                .iter()
-                .any(|k| matches!(k, crate::types::keywords::Keyword::Mutate(_)))
-                && !targeting::find_legal_targets(state, &mutate_target_filter(), player, object_id)
-                    .is_empty()
-            {
-                candidates.push(CastingVariant::Mutate);
-            }
-            // CR 702.113a + CR 702.113b: Awaken — keyword present AND a land you
-            // control exists for the awaken land target (parity with the Awaken
-            // offer block's `has_legal_land` gate).
-            if obj
-                .keywords
-                .iter()
-                .any(|k| matches!(k, crate::types::keywords::Keyword::Awaken { .. }))
-            {
-                let land_filter = TargetFilter::Typed(
-                    crate::types::ability::TypedFilter::land()
-                        .controller(crate::types::ability::ControllerRef::You),
-                );
-                if !targeting::find_legal_targets(state, &land_filter, player, object_id).is_empty()
-                {
-                    candidates.push(CastingVariant::Awaken);
-                }
-            }
-            // CR 702.148a: Cleave — keyword present AND the bracket-removed ability
-            // set was parsed (parity with the Cleave offer block's
-            // `obj.cleave_variant.is_some()` gate).
-            if obj.cleave_variant.is_some()
-                && obj
-                    .keywords
-                    .iter()
-                    .any(|k| matches!(k, crate::types::keywords::Keyword::Cleave(_)))
-            {
-                candidates.push(CastingVariant::Cleave);
-            }
-            // CR 702.176a: Impending (keyword presence).
-            if obj
-                .keywords
-                .iter()
-                .any(|k| matches!(k, crate::types::keywords::Keyword::Impending { .. }))
-            {
-                candidates.push(CastingVariant::Impending);
-            }
-            // CR 702.162a: More Than Meets the Eye (keyword presence).
-            if obj
-                .keywords
-                .iter()
-                .any(|k| matches!(k, crate::types::keywords::Keyword::MoreThanMeetsTheEye(_)))
-            {
-                candidates.push(CastingVariant::MoreThanMeetsTheEye);
-            }
-            // CR 702.160a: Prototype — offered only when the secondary
-            // characteristics are complete (parity with `prototype_form_from_object`).
-            if prototype_form_from_object(obj).is_some() {
-                candidates.push(CastingVariant::Prototype);
-            }
+            candidates.extend(hand_alternative_cost_keyword_candidates(
+                state, player, object_id, obj,
+            ));
             // CR 702.37c / CR 702.168b + CR 708.4: Morph / Megamorph / Disguise
             // face-down cast — offered when an effective face-down keyword is present
             // and the face-down cast is permitted (parity with the FaceDown offer
@@ -8865,6 +8891,25 @@ fn casting_candidates(
                 && face_down_cast_is_permitted(state, player, object_id)
             {
                 candidates.push(CastingVariant::FaceDown);
+            }
+        } else {
+            // CR 118.9 + CR 601.2b: without a free-cast permission the alternative-cost
+            // keywords are still announceable casts of a hand card (sole candidates, no
+            // `Normal` entry), so a card whose printed cost is unaffordable but whose
+            // alternative cost is affordable stays a legal action.
+            candidates.extend(hand_alternative_cost_keyword_candidates(
+                state, player, object_id, obj,
+            ));
+            // CR 118.9b: an alternative cost is optional, so once the hand cast has
+            // two or more alternative methods -- counting the granted/printed ones
+            // pushed above (Blitz, Evoke, Dash, ...) together with the keyword
+            // alternatives just added -- the N-way election must keep the printed-cost
+            // cast too. `casting_variant_choice_set` drops this `Normal` when its
+            // printed cost is unpreparable or unaffordable. A single alternative keeps
+            // its legacy Normal-vs-alternative prompt, and the Fuse block's `Normal`
+            // is not duplicated.
+            if candidates.len() >= 2 && !candidates.contains(&CastingVariant::Normal) {
+                candidates.insert(0, CastingVariant::Normal);
             }
         }
     }
@@ -18570,6 +18615,19 @@ fn continue_with_prepared(
     let mut resolved = if let Some(ref ability_def) = prepared.ability_def {
         // CR 601.2c: The player announcing a spell with modes chooses the mode(s).
         if let Some(ref modal_choice) = prepared.modal {
+            // CR 613.1: judge the mode selection on characteristics with every
+            // continuous effect applied — the state the castability verdict
+            // (`castable_spell_modes_in_flushed_state` via `with_flushed_cast_state`) read.
+            super::layers::flush_layers(state);
+            // CR 700.2a + CR 601.2e: a mode whose targets can't be chosen can't be
+            // chosen; a spell whose minimum number of modes can't be met can't be
+            // cast, and the proposed cast is reversed (CR 733.1). Mirrors the
+            // activated modal refusal in `handle_activate_ability`.
+            if castable_spell_modes_in_flushed_state(state, prepared.object_id, player).is_none() {
+                return Err(EngineError::ActionNotAllowed(
+                    "No legal mode selection for modal spell".to_string(),
+                ));
+            }
             let mut placeholder = ResolvedAbility::new(
                 *ability_def.effect.clone(),
                 Vec::new(),
@@ -18596,22 +18654,17 @@ fn continue_with_prepared(
                     events,
                 );
             }
-            // Cap max_choices to actual mode count for count-capped modals.
-            let mut capped = modal_choice_for_player(
+            let SpellModeChoice {
+                modal: capped,
+                unavailable_modes,
+                ..
+            } = spell_mode_choice(
                 state,
                 player,
                 prepared.object_id,
                 modal_choice,
                 &crate::types::ability::SpellContext::default(),
             );
-            // CR 700.2i: for a pawprint points-budget modal, `max_choices` is the
-            // POINT BUDGET (Σ of chosen weights), NOT a mode count — do NOT clamp
-            // it to `mode_count`. Mirrors the same discriminant branch in
-            // `build_modal_choice` (parser) so the runtime prompt carries the full
-            // budget (e.g. 5) rather than a count cap (3).
-            if capped.mode_pawprints.is_empty() {
-                capped.max_choices = capped.max_choices.min(capped.mode_count);
-            }
             let target_constraints = target_constraints_from_modal(&capped);
 
             // Build a placeholder resolved ability -- will be replaced after mode selection
@@ -18634,18 +18687,6 @@ fn continue_with_prepared(
             // "an opponent chooses —"). Target selection still belongs to the
             // controller (CR 115.1) — `pending_cast` keeps the caster.
             let mode_chooser = resolve_modal_chooser(state, &capped, player, prepared.object_id);
-            let mode_abilities = state
-                .objects
-                .get(&prepared.object_id)
-                .map(super::ability_utils::modal_spell_mode_abilities)
-                .unwrap_or_default();
-            let unavailable_modes = super::ability_utils::spell_modal_unavailable_modes(
-                state,
-                prepared.object_id,
-                player,
-                &capped,
-                &mode_abilities,
-            );
             return Ok(WaitingFor::ModeChoice {
                 player: mode_chooser,
                 modal: capped,
@@ -19427,9 +19468,24 @@ pub fn spell_has_legal_targets_with_probe(
     player: PlayerId,
     probe: Option<&PriorityCastProbe>,
 ) -> bool {
+    with_flushed_cast_state(state, player, probe, |flushed| {
+        spell_has_legal_targets_in_flushed_state(flushed, object_id, player)
+    })
+}
+
+/// CR 613.1: Target legality is judged on characteristics with
+/// every continuous effect applied. Reads `probe`'s already-flushed state when
+/// it was taken for `player` on this `state`; otherwise flushes layers on a
+/// clone.
+fn with_flushed_cast_state<T>(
+    state: &GameState,
+    player: PlayerId,
+    probe: Option<&PriorityCastProbe>,
+    read: impl FnOnce(&GameState) -> T,
+) -> T {
     if let Some(probe) = probe.filter(|probe| probe.player() == player && probe.is_for_state(state))
     {
-        return spell_has_legal_targets_in_flushed_state(probe.state(), object_id, player);
+        return read(probe.state());
     }
     #[cfg(test)]
     RESOLUTION_CAST_PROJECTION_TARGET_DEPTH.with(|depth| {
@@ -19441,7 +19497,7 @@ pub fn spell_has_legal_targets_with_probe(
     });
     let mut simulated = state.clone();
     super::layers::flush_layers(&mut simulated);
-    spell_has_legal_targets_in_flushed_state(&simulated, object_id, player)
+    read(&simulated)
 }
 
 /// CR 601.2c: Read-only preview of the target slots a currently castable spell
@@ -19703,25 +19759,11 @@ fn spell_has_legal_targets_in_flushed_state(
         });
     }
 
-    // CR 700.2a-b: Modal spells are castable only when at least one mode has a
-    // legal targeting assignment (or needs no targets).
-    if let Some(ref modal) = obj.modal {
-        let mode_abilities = super::ability_utils::modal_spell_mode_abilities(obj);
-        let capped = modal_choice_for_player(
-            state,
-            player,
-            obj.id,
-            modal,
-            &crate::types::ability::SpellContext::default(),
-        );
-        let unavailable = super::ability_utils::spell_modal_unavailable_modes(
-            state,
-            obj.id,
-            player,
-            &capped,
-            &mode_abilities,
-        );
-        return unavailable.len() < capped.mode_count;
+    // CR 700.2a + CR 601.2b-c: Modal spells are castable only when a legal
+    // mode selection exists — enough modes with a legal targeting assignment
+    // (or no targets) to meet the spell's minimum.
+    if obj.modal.is_some() {
+        return castable_spell_modes_in_flushed_state(state, obj.id, player).is_some();
     }
 
     // Only Spell-kind abilities contribute targets when casting.
@@ -19751,6 +19793,97 @@ fn spell_has_legal_targets_in_flushed_state(
     ability_target_legality_needs_chosen_x(&resolved, ability_def.distribute.as_ref())
         && (casting_costs::required_additional_cost_can_declare_x(state, player, obj.id).is_some()
             || casting_costs::cost_has_x(&obj.mana_cost))
+}
+
+/// The mode choice a modal spell's `ModeChoice` prompt presents, with what it
+/// is judged against. See [`spell_mode_choice`].
+pub(super) struct SpellModeChoice {
+    /// The effective choice: chooser-resolved maxima, count-capped unless pawprint (CR 700.2i: there `max_choices` is the point budget).
+    pub(super) modal: crate::types::ability::ModalChoice,
+    /// The spell's modes, one ability per printed mode.
+    pub(super) mode_abilities: Vec<crate::types::ability::AbilityDefinition>,
+    /// Modes that can't be chosen: repeat constraints and, CR 700.2a, modes
+    /// with no legal target assignment.
+    pub(super) unavailable_modes: Vec<usize>,
+}
+
+/// CR 700.2a + CR 601.2b: The mode choice a modal spell presents when cast,
+/// and the modes that can't be chosen. The single authority for the cast's
+/// `ModeChoice` prompt, the deferred mode prompt and the castability check,
+/// so whether a modal spell is castable is decided by the prompt it would
+/// present.
+///
+/// CR 700.2i: `max_choices` is capped to the mode count only for count-capped
+/// modals; for a pawprint points-budget modal it is the POINT BUDGET (Σ of
+/// chosen weights), not a mode count, and is left alone — mirroring the same
+/// discriminant branch in `build_modal_choice` (parser), so the prompt carries
+/// the full budget (e.g. 5) rather than a count cap (3).
+pub(super) fn spell_mode_choice(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    modal: &crate::types::ability::ModalChoice,
+    context: &crate::types::ability::SpellContext,
+) -> SpellModeChoice {
+    let mut capped = modal_choice_for_player(state, player, object_id, modal, context);
+    if capped.mode_pawprints.is_empty() {
+        capped.max_choices = capped.max_choices.min(capped.mode_count);
+    }
+    let mode_abilities = state
+        .objects
+        .get(&object_id)
+        .map(super::ability_utils::modal_spell_mode_abilities)
+        .unwrap_or_default();
+    let unavailable_modes = super::ability_utils::spell_modal_unavailable_modes(
+        state,
+        object_id,
+        player,
+        &capped,
+        &mode_abilities,
+    );
+    SpellModeChoice {
+        modal: capped,
+        mode_abilities,
+        unavailable_modes,
+    }
+}
+
+/// CR 700.2a + CR 601.2b-c: The modes a modal spell could choose if it were
+/// cast now, or `None` when the spell is not modal or no legal mode selection
+/// exists, so it can't be cast. Judged on the prompt's own
+/// [`spell_mode_choice`]. Also read by the cast's own mode announcement in
+/// `continue_with_prepared`, which flushes layers first, so the castability
+/// verdict and the cast judge the same state.
+fn castable_spell_modes_in_flushed_state(
+    state: &GameState,
+    object_id: ObjectId,
+    player: PlayerId,
+) -> Option<Vec<usize>> {
+    let modal = state.objects.get(&object_id)?.modal.as_ref()?;
+    let SpellModeChoice {
+        modal,
+        mode_abilities,
+        unavailable_modes,
+    } = spell_mode_choice(
+        state,
+        player,
+        object_id,
+        modal,
+        &crate::types::ability::SpellContext::default(),
+    );
+    super::ability_utils::modal_has_legal_mode_selection(
+        state,
+        object_id,
+        player,
+        &modal,
+        &mode_abilities,
+        &unavailable_modes,
+    )
+    .then(|| {
+        (0..modal.mode_count)
+            .filter(|idx| !unavailable_modes.contains(idx))
+            .collect()
+    })
 }
 
 /// CR 601.2b + CR 118.9a: Check whether `object_id` can legally be cast for
@@ -19790,8 +19923,9 @@ pub fn can_cast_for_free_now_with_probe(
     };
     // CR 118.9a: NoCost means mana affordability is automatic; the remaining
     // gate is legal-targets for targeted spells (permanent spells skip via
-    // `spell_has_legal_targets` semantics).
-    prepared.modal.is_some() || spell_has_legal_targets_with_probe(state, obj.id, player, probe)
+    // `spell_has_legal_targets` semantics), and, CR 700.2a, a legal mode
+    // selection for modal spells.
+    spell_has_legal_targets_with_probe(state, obj.id, player, probe)
 }
 
 /// CR 601.2b: Enumerate `(object_id, source_id, frequency)` candidates for
@@ -20232,6 +20366,11 @@ fn can_cast_prepared_now_with_probe(
     if matches!(obj.zone, Zone::Hand | Zone::Command)
         && matches!(obj.mana_cost, ManaCost::NoCost)
         && !unlimited_hand_cast_free_applies(state, player, obj, prepared.casting_variant)
+        // CR 702.162a + CR 118.6a + CR 712.8c: a More Than Meets the Eye cast pays its
+        // own cost rather than the mana cost, and `obj` here is the converted spell
+        // (back face, whose mana cost is `NoCost`), not the printed front face whose
+        // cost is what the alternative cost replaces.
+        && prepared.casting_variant != CastingVariant::MoreThanMeetsTheEye
         && !(object_has_effective_face_down_keyword(state, prepared.object_id)
             && can_afford_face_down_cast(
                 state,
@@ -20304,8 +20443,7 @@ fn can_cast_prepared_now_with_probe(
     // sacrificing a legal matching permanent, not the unreduced
     // `prepared.mana_cost`.
     if prepared.casting_variant == CastingVariant::Emerge {
-        return (prepared.modal.is_some()
-            || spell_has_legal_targets_with_probe(state, obj.id, player, probe))
+        return spell_has_legal_targets_with_probe(state, obj.id, player, probe)
             && effective_emerge_cost(state, player, prepared.object_id).is_some_and(
                 |emerge_cost| {
                     casting_costs::can_pay_emerge_cost(
@@ -20502,18 +20640,26 @@ fn can_cast_prepared_now_with_probe(
             .as_ref()
             .map(GraveyardAuthorityResolution::authority),
     ) {
-        return castable
-            && (prepared.modal.is_some()
-                || spell_has_legal_targets_with_probe(state, obj.id, player, probe));
+        return castable && spell_has_legal_targets_with_probe(state, obj.id, player, probe);
     }
 
-    // CR 702.172: Spree spells must afford at least one mode to be castable.
+    // CR 702.172a / CR 702.183a: Spree and Tiered spells must afford at least
+    // one mode to be castable — and, CR 700.2a, one that can be chosen: a mode
+    // whose targets have no legal choice can't be, however affordable its cost.
     // CR 117.1d + CR 601.2g: Use the feasibility predicate so non-tap mana
     // abilities (Sacrifice / Discard / PayLife) the controller could activate
     // manually during cost payment are counted as castable mana sources.
     if let Some(ref modal) = prepared.modal {
         if !modal.mode_costs.is_empty() {
-            return modal.mode_costs.iter().any(|mode_cost| {
+            let Some(choosable) = with_flushed_cast_state(state, player, probe, |flushed| {
+                castable_spell_modes_in_flushed_state(flushed, obj.id, player)
+            }) else {
+                return false;
+            };
+            return choosable.iter().any(|&mode| {
+                let Some(mode_cost) = modal.mode_costs.get(mode) else {
+                    return false;
+                };
                 let total = restrictions::add_mana_cost(&prepared.mana_cost, mode_cost);
                 can_feasibly_pay_mana_cost_with_probe(
                     state,
@@ -20529,8 +20675,10 @@ fn can_cast_prepared_now_with_probe(
     // CR 117.1d + CR 601.2g: Feasibility, not just auto-tap, gates castability —
     // a player may activate sacrifice-/discard-/life-cost mana abilities during
     // payment (issue #562: KCI must expose Ichor Wellspring as castable).
-    let targets_ok = prepared.modal.is_some()
-        || spell_has_legal_targets_with_probe(state, obj.id, player, probe);
+    // CR 601.2c + CR 700.2a: the spell needs a legal target for each target it
+    // requires — for a modal spell, a legal mode selection (see
+    // `spell_has_legal_targets_in_flushed_state`).
+    let targets_ok = spell_has_legal_targets_with_probe(state, obj.id, player, probe);
     let mana_payable = can_feasibly_pay_harmonize_mana_cost_with_probe(
         state,
         player,
@@ -20575,8 +20723,7 @@ fn can_cast_prepared_now_with_probe(
         return true;
     }
 
-    if (prepared.modal.is_some()
-        || spell_has_legal_targets_with_probe(state, obj.id, player, probe))
+    if targets_ok
         && super::casting_costs::payable_spell_alternative_cost(state, player, prepared.object_id)
             .is_some()
     {

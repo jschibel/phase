@@ -31058,6 +31058,7 @@ fn render_net_reaches_every_nested_description_carrier() {
         target: TargetFilter::Any,
         source_rider: Some(CounterSourceRider::LosesAbilities {
             static_def: Box::new(counter_static),
+            source_filter: None,
             duration: Box::new(Duration::UntilHostLeavesPlay),
         }),
         countered_spell_zone: None,
