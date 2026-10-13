@@ -8438,8 +8438,10 @@ fn casting_variant_candidates(
 /// payable, so a hand card is a legal cast whenever any one of these routes is
 /// affordable, even if the printed cost is not (Impending 5 Overlords cost less than
 /// their printed cost, CR 702.176a). Called with no `Normal` entry for a card without a
-/// free-cast permission (the Evoke/Dash/Blitz shape: a sole alternative candidate). No
-/// printed card carries two of these keywords.
+/// free-cast permission; `casting_candidates` adds `Normal` afterwards whenever these
+/// join another alternative (granted Blitz, printed Evoke, ...), so the N-way election
+/// keeps the printed-cost cast (CR 118.9b). A sole alternative stays the legacy
+/// Normal-vs-alternative prompt.
 fn hand_alternative_cost_keyword_candidates(
     state: &GameState,
     player: PlayerId,
@@ -8898,6 +8900,17 @@ fn casting_candidates(
             candidates.extend(hand_alternative_cost_keyword_candidates(
                 state, player, object_id, obj,
             ));
+            // CR 118.9b: an alternative cost is optional, so once the hand cast has
+            // two or more alternative methods -- counting the granted/printed ones
+            // pushed above (Blitz, Evoke, Dash, ...) together with the keyword
+            // alternatives just added -- the N-way election must keep the printed-cost
+            // cast too. `casting_variant_choice_set` drops this `Normal` when its
+            // printed cost is unpreparable or unaffordable. A single alternative keeps
+            // its legacy Normal-vs-alternative prompt, and the Fuse block's `Normal`
+            // is not duplicated.
+            if candidates.len() >= 2 && !candidates.contains(&CastingVariant::Normal) {
+                candidates.insert(0, CastingVariant::Normal);
+            }
         }
     }
 

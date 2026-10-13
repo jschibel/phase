@@ -397,6 +397,114 @@ fn omniscience_with_impending_keeps_its_election_menu() {
 }
 
 // ---------------------------------------------------------------------------
+// Granted alternative + printed alternative: the optional printed-cost cast stays
+// ---------------------------------------------------------------------------
+
+/// Henzie "Toolbox" Torre's static text (the part that grants blitz).
+const HENZIE_ORACLE: &str = "Each creature spell you cast with mana value 4 or greater has blitz. The blitz cost is equal to its mana cost.";
+
+/// P0 holds Overlord of the Balemurk ({3}{B}{B}, Impending 5-{1}{B}) while a
+/// Henzie-style static gives it blitz at its own mana cost.
+fn balemurk_under_henzie() -> (GameRunner, ObjectId) {
+    let db = load_db().expect("integration fixture");
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario
+        .add_creature(P0, "Henzie \"Toolbox\" Torre", 3, 3)
+        .from_oracle_text(HENZIE_ORACLE);
+    let balemurk = scenario.add_real_card(P0, "Overlord of the Balemurk", Zone::Hand, db);
+    (build(scenario), balemurk)
+}
+
+fn menu_variants(runner: &GameRunner) -> Vec<CastingVariant> {
+    match &runner.state().waiting_for {
+        WaitingFor::CastingVariantChoice { options, .. } => {
+            options.iter().map(|option| option.variant).collect()
+        }
+        other => panic!("expected CastingVariantChoice, got {other:?}"),
+    }
+}
+
+/// CR 118.9b + CR 601.2b: alternative costs are optional. With Blitz (granted) and
+/// Impending (printed) both available and the printed {3}{B}{B} payable, the
+/// N-way election must still contain the ordinary cast; electing it pays
+/// {3}{B}{B} and yields a plain creature (no time counters, not blitzed).
+#[test]
+fn granted_blitz_and_impending_menu_keeps_the_printed_cost_cast() {
+    let (mut runner, balemurk) = balemurk_under_henzie();
+    add_mana(&mut runner, ManaType::Black, 5);
+
+    let offered = offered_cast(&runner, balemurk).expect("the cast is offered");
+    runner.act(offered).expect("offered cast accepted");
+
+    let variants = menu_variants(&runner);
+    for expected in [
+        CastingVariant::Normal,
+        CastingVariant::Blitz,
+        CastingVariant::Impending,
+    ] {
+        assert!(variants.contains(&expected), "menu: {variants:?}");
+    }
+    assert_eq!(variants.len(), 3, "menu: {variants:?}");
+    let normal = variants
+        .iter()
+        .position(|variant| *variant == CastingVariant::Normal)
+        .unwrap();
+
+    runner
+        .act(GameAction::ChooseCastingVariant { index: normal })
+        .expect("electing the printed-cost cast");
+    // The printed cost is elected: no further Normal-vs-alternative question.
+    assert_eq!(
+        stacked_variant(&runner, balemurk),
+        Some(CastingVariant::Normal),
+        "waiting_for = {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(pool_total(&runner), 0, "{{3}}{{B}}{{B}} is spent");
+    runner.advance_until_stack_empty();
+
+    let object = &runner.state().objects[&balemurk];
+    assert_eq!(object.zone, Zone::Battlefield);
+    assert_eq!(object.counters.get(&CounterType::Time).copied(), None);
+    assert!(is_creature(&runner, balemurk));
+    assert!(
+        !object.keywords.iter().any(|k| matches!(k, Keyword::Haste)),
+        "a plain cast is not blitzed"
+    );
+}
+
+/// Sibling: with only {1}{B} the printed {3}{B}{B} and the blitz cost (equal to
+/// it) are both unaffordable, so `Normal` is filtered out of the election and the
+/// sole payable route (Impending) is cast directly.
+#[test]
+fn granted_blitz_and_impending_menu_drops_the_unaffordable_printed_cost() {
+    let (mut runner, balemurk) = balemurk_under_henzie();
+    add_mana(&mut runner, ManaType::Black, 2);
+
+    let options: Vec<CastingVariant> =
+        engine::game::casting::current_casting_variant_choice_options(runner.state(), P0, balemurk)
+            .into_iter()
+            .map(|option| option.variant)
+            .collect();
+    assert_eq!(
+        options,
+        vec![CastingVariant::Impending],
+        "options: {options:?}"
+    );
+
+    let variant = perform_offered_cast(&mut runner, balemurk);
+    assert_eq!(variant, CastingVariant::Impending);
+    assert_eq!(
+        runner.state().objects[&balemurk]
+            .counters
+            .get(&CounterType::Time)
+            .copied(),
+        Some(5)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // V5: Prototype
 // ---------------------------------------------------------------------------
 
