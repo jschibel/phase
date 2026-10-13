@@ -101,7 +101,7 @@ use super::oracle_ir::trace::{
     document_candidate, parsed_candidate, OuterRoute, ParseObserver, ParserTrace,
     PayloadVisibility, TraceStage,
 };
-use super::oracle_ir::trigger::{TriggerIr, TriggerNodeIr};
+use super::oracle_ir::trigger::{TriggerBody, TriggerIr, TriggerNodeIr};
 pub use super::oracle_keyword::keyword_display_name;
 use super::oracle_keyword::{
     is_keyword_cost_line, is_kicker_family_line, parse_kicker_additional_cost_line,
@@ -4122,10 +4122,36 @@ pub(crate) fn lower_oracle_ir(ir: &mut OracleDocIr) -> ParsedAbilities {
     // The match stays EXHAUSTIVE over `OracleNodeIr` (no `_` arm): it is now the
     // single place a new node variant must declare whether it consumes a printed
     // slot, an obligation `finish()` used to carry.
+    // CR 115.10a + CR 303.4b + CR 301.5f: candidates for a lone "enchanted/
+    // equipped X" instruction that names its host without targeting it. Only the
+    // card's own spell/activated items and parsed effect-chain triggers are
+    // candidates; each records its printed-clause evidence here, and the
+    // conversion itself runs after every document relation has composed the
+    // final abilities (`convert_terminal_attachment_host_references` below), so a
+    // candidate that composition gives a follower, or folds into another
+    // ability, keeps its target.
+    //
+    // CR 700.2: conservatively, a document that carries a modal choice
+    // contributes no spell candidates at all — its `Spell` items are that
+    // choice's modes (the item does not record its route), so none is treated as
+    // a whole ability.
+    let owns_modal_modes = ir
+        .items
+        .iter()
+        .any(|item| matches!(item.node, OracleNodeIr::Modal(_)));
+    let mut host_reference_candidates = HostReferenceCandidates::default();
     for item in &ir.items {
         match &item.node {
             OracleNodeIr::Spell(ability_ir) => {
                 let mut def = lower_ability_ir(ability_ir);
+                if !owns_modal_modes {
+                    host_reference_candidates.abilities.push((
+                        item.id,
+                        crate::parser::oracle_effect::PrintedTargetWord::from_clauses(
+                            &ability_ir.body.clauses,
+                        ),
+                    ));
+                }
                 stamp_printed_ability_slot(&mut def, printed_ability_slot);
                 result.abilities.push(def);
                 ability_ids.push(item.id);
@@ -4165,6 +4191,20 @@ pub(crate) fn lower_oracle_ir(ir: &mut OracleDocIr) -> ParsedAbilities {
             }
             OracleNodeIr::Trigger(trigger_node) => {
                 let mut def = lower_trigger_node_ir(trigger_node);
+                // The card's own parsed effect-chain trigger is a candidate.
+                // Recorded here, not in `lower_trigger_ir`, which also lowers
+                // triggers quoted inside a grant ("… has 'When …'"); those keep
+                // their targets.
+                if let TriggerNodeIr::Parsed(trigger_ir) = trigger_node {
+                    if let Some(TriggerBody::EffectChain(chain_ir)) = &trigger_ir.body {
+                        host_reference_candidates.triggers.push((
+                            item.id,
+                            crate::parser::oracle_effect::PrintedTargetWord::from_clauses(
+                                &chain_ir.clauses,
+                            ),
+                        ));
+                    }
+                }
                 stamp_printed_trigger_slot(&mut def, result.triggers.len());
                 result.triggers.push(def);
                 trigger_ids.push(item.id);
@@ -4321,6 +4361,18 @@ pub(crate) fn lower_oracle_ir(ir: &mut OracleDocIr) -> ParsedAbilities {
     // former `synthesize`/`bind` passes ran (the audit reads `result` first).
     apply_etb_exile_ltb_return(&mut result, &ir.relations, &trigger_ids);
     apply_active_player_punisher(&mut result, &ir.relations, &ability_ids);
+
+    // PLACEMENT PIN: after every document relation has composed the final
+    // abilities and triggers, so the converter judges the composed tree; and
+    // before `demote_refused_granter_names`, the first pass that moves
+    // definitions between categories without their id tracks (a demoted
+    // definition is a residual, so its timing is moot).
+    convert_terminal_attachment_host_references(
+        &mut result,
+        &host_reference_candidates,
+        &ability_ids,
+        &trigger_ids,
+    );
     demote_refused_granter_names(&mut result, ir, &tracks);
 
     // The doc IR's diagnostics channel is the single source of parse warnings.
@@ -4330,6 +4382,58 @@ pub(crate) fn lower_oracle_ir(ir: &mut OracleDocIr) -> ParsedAbilities {
     // equivalent to assigning before them.
     result.parse_warnings = ir.diagnostics.clone();
     result
+}
+
+// --- CR 115.10a + CR 303.4b: lone host instruction → resolution-bound host ---
+
+/// The card's own abilities and triggers that may be a lone host instruction,
+/// by document item, with each one's printed-clause evidence.
+#[derive(Default)]
+struct HostReferenceCandidates {
+    abilities: Vec<(
+        OracleItemId,
+        crate::parser::oracle_effect::PrintedTargetWord,
+    )>,
+    triggers: Vec<(
+        OracleItemId,
+        crate::parser::oracle_effect::PrintedTargetWord,
+    )>,
+}
+
+/// CR 115.10a + CR 303.4b + CR 301.5f: convert each candidate that is still a
+/// whole ability of the card after document composition. A candidate is
+/// resolved through its own category's id track only: one that a relation
+/// folded into another ability (a CR 614.15 self-replacement override) or moved
+/// elsewhere is no longer there and keeps its target, and one that composition
+/// gave a follower is refused by the converter.
+fn convert_terminal_attachment_host_references(
+    result: &mut ParsedAbilities,
+    candidates: &HostReferenceCandidates,
+    ability_ids: &[OracleItemId],
+    trigger_ids: &[OracleItemId],
+) {
+    use crate::parser::oracle_effect::convert_terminal_attachment_host_reference;
+    debug_assert_eq!(
+        ability_ids.len(),
+        result.abilities.len(),
+        "ability id track"
+    );
+    debug_assert_eq!(trigger_ids.len(), result.triggers.len(), "trigger id track");
+    for (id, printed) in &candidates.abilities {
+        if let Some(def) =
+            position_of(ability_ids, *id).and_then(|pos| result.abilities.get_mut(pos))
+        {
+            convert_terminal_attachment_host_reference(def, *printed);
+        }
+    }
+    for (id, printed) in &candidates.triggers {
+        if let Some(execute) = position_of(trigger_ids, *id)
+            .and_then(|pos| result.triggers.get_mut(pos))
+            .and_then(|trigger| trigger.execute.as_deref_mut())
+        {
+            convert_terminal_attachment_host_reference(execute, *printed);
+        }
+    }
 }
 
 // --- CR 102.1 + CR 608.2c: active-player coerce → delayed punisher --

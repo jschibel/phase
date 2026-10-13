@@ -6,7 +6,7 @@ use crate::types::events::GameEvent;
 use crate::types::game_state::{
     DepartedStackSpell, GameState, StackEntry, StackEntryKind, TriggerSourceContext,
 };
-use crate::types::identifiers::{ObjectId, TrackedSetId};
+use crate::types::identifiers::{ObjectId, ObjectIncarnationRef, TrackedSetId};
 use crate::types::keywords::{HexproofFilter, Keyword};
 use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
@@ -1735,25 +1735,170 @@ pub(crate) fn resolved_object_ids_for_filter(
     resolved_object_ids_for_filter_with_context(state, ability, filter, &ctx)
 }
 
+/// CR 400.7 + CR 113.7a: the exact incarnation of the ability's source it was
+/// created from — the trigger's observed source, else the incarnation an
+/// activated ability captured, else (a spell) the current object.
+fn captured_source_ref(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> Option<ObjectIncarnationRef> {
+    match &ability.trigger_source {
+        Some(source) => Some(source.identity.reference),
+        None => ability.source_ref(state),
+    }
+}
+
+/// CR 303.4b + CR 303.4m + CR 301.5a + CR 301.5f + CR 400.7: the single
+/// authority for which object the source's "enchanted/equipped X" names. The
+/// host is admitted only when it is provably the very object the source is, or
+/// was, attached to; anything else is `None` and the instruction does nothing
+/// (fail closed; exact departed-host provenance is follow-up work).
+///
+/// - The captured source incarnation is on the battlefield: the battlefield
+///   object its own live attachment edge points at. Either end leaving the
+///   battlefield severs that edge (`zones::sever_battlefield_attachment_graph_on_exit`),
+///   so an edge that still names a battlefield object was made to that object,
+///   never to an earlier incarnation under the same storage id; transforming
+///   or turning either object face up or down leaves it untouched.
+/// - The captured source incarnation has left the battlefield: CR 608.2h, the
+///   source's own information is its last known information, so its exact
+///   departure record says what it was attached to. An explicit "attached to
+///   nothing" there wins. The named host is admitted, as a live object, only
+///   while it has had no zone change since that departure — then its current
+///   incarnation is the one the source was attached to. No information about
+///   the host itself is ever read from last known information.
+pub(crate) fn source_attachment_host(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> Option<ObjectIncarnationRef> {
+    let source = captured_source_ref(state, ability)?;
+    let live_source = state.objects.get(&source.object_id).filter(|object| {
+        object.zone == Zone::Battlefield && ObjectIncarnationRef::from_object(object) == source
+    });
+    let host = match live_source {
+        Some(object) => object.attached_to?.as_object()?,
+        None => {
+            let records = &state.zone_changes_this_turn;
+            let departure = records.iter().rposition(|record| {
+                record.object_id == source.object_id
+                    && record.from_zone == Some(Zone::Battlefield)
+                    && record
+                        .trigger_source_context()
+                        .is_some_and(|context| context.identity.reference == source)
+            })?;
+            let host = records[departure].attached_to?.as_object()?;
+            if records
+                .iter()
+                .skip(departure + 1)
+                .any(|record| record.object_id == host)
+            {
+                return None;
+            }
+            host
+        }
+    };
+    state
+        .objects
+        .get(&host)
+        .filter(|object| object.zone == Zone::Battlefield)
+        .map(ObjectIncarnationRef::from_object)
+}
+
 /// CR 301.5a + CR 301.5f + CR 303.4b + CR 115.10a: an untargeted "equipped
 /// creature" / "enchanted creature" recipient of a resolution-timed instruction
 /// is whatever the source is attached to as that instruction resolves. No target
 /// slot was announced for it (`ability.targets` is empty), so the host is read
-/// from the attachment relationship. Single authority for both the instruction's
-/// recipient (`counters::resolve_defined_or_targets`) and a condition whose
-/// anaphor names that recipient (`evaluate_condition`'s `TargetMatchesFilter`),
-/// so the two can never disagree about which object "it" is.
-/// `None` when this node does not name such a recipient.
+/// from the attachment relationship ([`source_attachment_host`]). Used by
+/// [`bind_resolution_attachment_hosts`], by `counters::resolve_defined_or_targets`
+/// and by `evaluate_condition`'s `TargetMatchesFilter`, so they can never
+/// disagree about which object "it" is. `None` when this node does not name
+/// such a recipient.
+///
+/// The object an instruction can act on: the provably live host, phased in
+/// (CR 702.26b) and still meeting the recipient's other constraints
+/// ("enchanted *creature*"). No provable host yields no object.
 pub(crate) fn resolution_bound_attachment_hosts(
     state: &GameState,
     ability: &ResolvedAbility,
     recipient: &TargetFilter,
 ) -> Option<Vec<ObjectId>> {
-    let names_resolution_bound_host = ability.target_choice_timing
-        == TargetChoiceTiming::Resolution
+    names_resolution_bound_host(ability, recipient).then(|| {
+        source_attachment_host(state, ability)
+            .filter(|host| live_host_meets_recipient(state, ability, recipient, host.object_id))
+            .map(|host| vec![host.object_id])
+            .unwrap_or_default()
+    })
+}
+
+fn names_resolution_bound_host(ability: &ResolvedAbility, recipient: &TargetFilter) -> bool {
+    ability.target_choice_timing == TargetChoiceTiming::Resolution
         && ability.targets.is_empty()
-        && recipient.contains_source_attachment_host();
-    names_resolution_bound_host.then(|| resolved_object_ids_for_filter(state, ability, recipient))
+        && recipient.contains_source_attachment_host()
+}
+
+fn live_host_meets_recipient(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    recipient: &TargetFilter,
+    host: ObjectId,
+) -> bool {
+    let ctx = super::filter::FilterContext::from_ability(ability);
+    state
+        .objects
+        .get(&host)
+        .is_some_and(|object| object.is_phased_in())
+        && super::filter::matches_target_filter(
+            state,
+            host,
+            &recipient.without_source_attachment_host(),
+            &ctx,
+        )
+}
+
+/// What [`bind_resolution_attachment_hosts`] found for a node as it begins to
+/// resolve.
+pub(crate) enum ResolutionHostBinding {
+    /// The node names no resolution-bound "enchanted/equipped X" recipient.
+    NotApplicable,
+    /// The live host, bound (pinned to its incarnation) into the node's targets.
+    Bound(Box<ResolvedAbility>),
+    /// CR 115.10a + CR 303.4b + CR 301.5f + CR 400.7: the node names its
+    /// source's host, but there is no provable host — the host has left or
+    /// changed zones, the source is (or was, as it left) attached to nothing,
+    /// or the host no longer meets the description. The instruction does nothing; it must
+    /// never fall back to a filter scan ("any creature with an Aura attached")
+    /// or to an object reusing a departed host's storage id.
+    Absent,
+}
+
+/// CR 115.10a + CR 608.2c: binds the host of a resolution-timed "enchanted /
+/// equipped X" instruction ([`source_attachment_host`]) into the node's targets
+/// as it begins to resolve, pinned to its exact incarnation, so its effect
+/// handler, its conditions and the anaphors of the instructions after it ("It
+/// deals damage to you equal to its power") all read the same object. The host
+/// is affected, not targeted: it is bound after target legality was checked
+/// (CR 608.2b) and raises no targeting event.
+pub(crate) fn bind_resolution_attachment_hosts(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> ResolutionHostBinding {
+    let Some(recipient) = ability
+        .effect
+        .target_filter()
+        .filter(|recipient| names_resolution_bound_host(ability, recipient))
+    else {
+        return ResolutionHostBinding::NotApplicable;
+    };
+    match source_attachment_host(state, ability)
+        .filter(|host| live_host_meets_recipient(state, ability, recipient, host.object_id))
+    {
+        Some(host) => {
+            let mut bound = ability.clone();
+            bound.replace_target_occurrences(vec![(TargetRef::Object(host.object_id), Some(host))]);
+            ResolutionHostBinding::Bound(Box::new(bound))
+        }
+        None => ResolutionHostBinding::Absent,
+    }
 }
 
 /// Resolve a filter with a caller-supplied semantic context. This preserves the

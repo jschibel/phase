@@ -11751,8 +11751,8 @@ pub(super) fn pay_and_push_adventure(
     let auto_payment_needs_input = payment_mode == CastPaymentMode::Auto
         && cost.mana_value() > 0
         && !super::casting::can_pay_cost_after_auto_tap(state, player, object_id, cost)
-        && super::casting::can_feasibly_pay_mana_cost(state, player, Some(object_id), cost)
-        && super::casting::has_manual_mana_payment_path_for_spell(state, player, object_id, cost);
+        && super::casting::spell_payment_manual_route(state, player, object_id, cost)
+            == super::casting::ManualPaymentRoute::Feasible;
     if has_x || convoke_mode.is_some() || manual_payment || auto_payment_needs_input {
         let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
         pending.base_cost = base_cost.clone();
