@@ -14666,6 +14666,18 @@ impl ZoneOpponentChooserPurpose {
     }
 }
 
+// clippy::large_enum_variant: Intentional. `WaitingFor` is stored inline in
+// `GameState`; the stack budget that matters is the `GameState` ceiling in
+// `types/game_state_size.rs`, and this enum's inline size (1,632 B on
+// x86_64-pc-windows-msvc = its largest variant, `NamedChoice`) is already inside
+// that measurement. Boxing the cold `OpponentGuess.owner` brought the enum from
+// 1,760 B to 1,632 B and left `NamedChoice` (1,631 B, dominated by
+// `NamedChoiceSource`, 1,560 B) as the outlier against `ChooseOneOfBranch`
+// (1,258 B). Boxing the next-largest variant only moves the outlier down and puts
+// an allocation on every common prompt without reducing the inline size any
+// `GameState` pays for. Follows the documented allows on `StackEntryKind`,
+// `Effect` and `CastingPermission`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum WaitingFor {

@@ -69,7 +69,9 @@
 //! pending) is boxed. On x86_64-pc-windows-msvc `GameState` then measures
 //! 14,208 B, `WaitingFor` 1,632 B and `TriggerSourceContext` 1,496 B, with
 //! `WaitingFor::NamedChoice` (1,631 B) the largest `WaitingFor` variant. The
-//! ceiling is unchanged.
+//! ceiling is unchanged. Boxing OpponentGuess.owner leaves NamedChoice and
+//! ChooseOneOfBranch more than 200 B apart, so `WaitingFor` carries an intentional
+//! `#[allow(clippy::large_enum_variant)]`; the GameState ceiling above is the bound.
 //!
 //! When one of these fires, re-run the measurement above and change the number
 //! deliberately — do not widen a ceiling to make a build pass.
