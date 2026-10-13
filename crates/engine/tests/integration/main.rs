@@ -1953,6 +1953,7 @@ mod welcome_the_dead;
 mod owned_you_target_authority;
 
 mod attack_target_latch;
+mod attacked_player_referent;
 mod base_pt_designation_filter;
 mod declared_group_identity;
 mod declared_player_gate_arms;
