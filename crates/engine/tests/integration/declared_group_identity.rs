@@ -983,7 +983,7 @@ fn d1_delayed_payload_matches_same_chain_for_every_player_effect() {
             (&delayed.fingerprint, &delayed.last_wait),
             "{name}: delayed vs same-chain"
         );
-        // CR 608.2c + CR 608.2m + CR 608.2n: a clause that pauses for a choice
+        // CR 608.2c + CR 608.2n: a clause that pauses for a choice
         // (a chosen discard, scry, surveil or dig) leaves the probe on the stack
         // until that choice is answered; every other clause lets it finish into
         // the graveyard. The delayed run's probe finished long before.
