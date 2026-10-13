@@ -51,13 +51,15 @@ fn run_trigger(pick: usize, cost_x_paid: Option<u32>) -> Outcome {
         r.state_mut().objects.get_mut(&sphere).unwrap().cost_x_paid = cost_x_paid;
     }
 
-    // Row 0 (parse pin): the trigger's execute is the optional tap-X PayCost with the Pump and
-    // DealDamage riders, all reading the Variable "X" the payment must define.
+    // Parse pin: the trigger's execute is the optional tap-X PayCost with the Pump and
+    // DealDamage riders, all reading the Variable "X" the payment must define. The
+    // "any number" tap count of a VariableX payment serializes as `u32::MAX`.
+    let any_number = u32::MAX.to_string();
     let parsed = serde_json::to_string(&r.state().objects[&sphere].trigger_definitions).unwrap();
     for needle in [
         "PayCost",
         "TapCreatures",
-        "4294967295",
+        any_number.as_str(),
         "Myr",
         "Pump",
         "DealDamage",
@@ -148,7 +150,7 @@ fn run_trigger(pick: usize, cost_x_paid: Option<u32>) -> Outcome {
     }
 }
 
-// R1: tap 3 of 4, no cast-time X.
+// Tapping three of four Myr, with no cast-time X, defines X as 3.
 #[test]
 fn trigger_tap_three_defines_x_for_pump_and_damage() {
     let o = run_trigger(3, None);
@@ -157,7 +159,7 @@ fn trigger_tap_three_defines_x_for_pump_and_damage() {
     assert_eq!(o.life_delta, -3, "X damage to you");
 }
 
-// R2: hostile cast-time authority loses to the chosen count.
+// A hostile cast-time X on the source loses to the chosen count.
 #[test]
 fn trigger_chosen_count_beats_cast_time_x() {
     let o = run_trigger(2, Some(5));
@@ -166,7 +168,7 @@ fn trigger_chosen_count_beats_cast_time_x() {
     assert_eq!(o.life_delta, -2, "chosen count, not cost_x_paid");
 }
 
-// R2b: tap 0 at the shown prompt stamps X = 0, not the cast-time value.
+// Tapping zero at the shown prompt stamps X = 0, not the cast-time value.
 #[test]
 fn trigger_tap_zero_stamps_x_zero_over_cast_time_x() {
     let o = run_trigger(0, Some(5));
@@ -175,7 +177,7 @@ fn trigger_tap_zero_stamps_x_zero_over_cast_time_x() {
     assert_eq!(o.life_delta, 0);
 }
 
-// R2c (sibling, paired with R1/R2b): tap 0 with no cast-time X.
+// Sibling of the tap-three and tap-zero rows above: tapping zero with no cast-time X.
 #[test]
 fn trigger_tap_zero_without_cast_time_x() {
     let o = run_trigger(0, None);
@@ -284,7 +286,7 @@ fn run_chain(
     }
 }
 
-// R3: VariableX with no trigger event: the chosen count alone defines X.
+// A VariableX payment with no trigger event: the chosen count alone defines X.
 #[test]
 fn chain_variable_x_defines_x() {
     let o = run_chain(
@@ -302,7 +304,7 @@ fn chain_variable_x_defines_x() {
     assert_eq!(o.life_delta, -2);
 }
 
-// R3a (sibling, paired with R3): a Fixed tap count must not define X.
+// Sibling of the VariableX chain row: a Fixed tap count must not define X.
 #[test]
 fn chain_fixed_count_does_not_define_x() {
     let o = run_chain(&TapCreaturesRequirement::Count { count: 2 }, true, 2, 2);
@@ -312,7 +314,7 @@ fn chain_fixed_count_does_not_define_x() {
     assert_eq!(o.life_delta, 0, "unbound X reads 0");
 }
 
-// R3b (sibling, paired with R3): a power-threshold (Crew/Saddle shape) tap must not define X.
+// Sibling of the VariableX chain row: a power-threshold (Crew/Saddle shape) tap must not define X.
 #[test]
 fn chain_aggregate_does_not_define_x() {
     let requirement = TapCreaturesRequirement::total_power_at_least(4);
@@ -328,7 +330,7 @@ fn chain_aggregate_does_not_define_x() {
     }
 }
 
-// R4 (sibling): no rider, nothing parked: the stamp is a no-op.
+// Sibling: no rider and nothing parked, so the stamp is a no-op.
 #[test]
 fn chain_without_rider_binds_nothing_and_does_not_panic() {
     let o = run_chain(
