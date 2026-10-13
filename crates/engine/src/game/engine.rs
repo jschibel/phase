@@ -1756,15 +1756,20 @@ fn converge_owed_spell_final_part(
 }
 
 /// CR 704.5a + CR 800.4a: the player-loss net, then the convergence of a
-/// resolution the net's elimination completed.
+/// resolution the net's elimination completed. `reconcile` is the net each
+/// side of the convergence runs: the full [`reconcile_terminal_result`], or,
+/// after an auto-pass drive that did not advance, only its terminal half
+/// ([`reconcile_terminal_sba`]) so the loop shortcut is evaluated once per
+/// priority frame (CR 732.2a).
 fn reconcile_terminal_result_completing_resolution(
     state: &mut GameState,
     result: &mut ActionResult,
+    reconcile: fn(&mut GameState, &mut ActionResult),
 ) -> Result<(), EngineError> {
-    reconcile_terminal_result(state, result);
+    reconcile(state, result);
     let scan_from = result.events.len();
     if converge_owed_spell_final_part(state, result, scan_from)? {
-        reconcile_terminal_result(state, result);
+        reconcile(state, result);
     }
     Ok(())
 }
@@ -2018,6 +2023,10 @@ fn is_orphaned_spell_resolution_at_priority_boundary(state: &GameState) -> bool 
         // CR 608.2n: a carrier still owing its spell's final part is live work
         // for the final part's authority, not a terminal rest.
         && !super::stack::resolving_spell_owes_final_part(state)
+        // CR 608.2n: an instant or sorcery still on the stack has not made its
+        // move to the graveyard; settling its carrier would strand it in the
+        // stack zone, so the frame is not a terminal rest.
+        && super::stack::resolving_instant_or_sorcery_on_stack(state).is_none()
 }
 
 /// Finalize a checked persisted restore after its runtime-only data is present.
@@ -2158,7 +2167,11 @@ fn finish_action_boundary_with_lifecycle(
         preserve_interaction,
         lifecycle,
     } = raw;
-    if let Err(err) = reconcile_terminal_result_completing_resolution(state, &mut result) {
+    if let Err(err) = reconcile_terminal_result_completing_resolution(
+        state,
+        &mut result,
+        reconcile_terminal_result,
+    ) {
         lifecycle.discard();
         *state = boundary_snapshot;
         return Err(err);
@@ -2181,17 +2194,17 @@ fn finish_action_boundary_with_lifecycle(
     } else {
         run_auto_pass_loop(state, &mut result)
     };
-<<<<<<< 9e4e73da6
-    if auto_pass_advanced {
-        reconcile_terminal_result(state, &mut result);
+    // CR 732.2a: a drive that did not advance re-runs only the terminal half.
+    let reconcile: fn(&mut GameState, &mut ActionResult) = if auto_pass_advanced {
+        reconcile_terminal_result
     } else {
-        reconcile_terminal_sba(state, &mut result);
-=======
-    if let Err(err) = reconcile_terminal_result_completing_resolution(state, &mut result) {
+        reconcile_terminal_sba
+    };
+    if let Err(err) = reconcile_terminal_result_completing_resolution(state, &mut result, reconcile)
+    {
         lifecycle.discard();
         *state = boundary_snapshot;
         return Err(err);
->>>>>>> 48164726d
     }
     if matches!(result.waiting_for, WaitingFor::GameOver { .. }) {
         take_and_restore_stack_resolution_session(state);
@@ -9505,23 +9518,28 @@ pub(crate) fn resume_stack_resolution_session_runner(state: &mut GameState) -> A
     // This seam has no error channel: a failed convergence restores the
     // seam's entry state and reports it unchanged. The owed carrier is then
     // still found by `stack::resolve_top`'s net at the next pass.
-    if reconcile_terminal_result_completing_resolution(state, &mut result).is_err() {
+    if reconcile_terminal_result_completing_resolution(
+        state,
+        &mut result,
+        reconcile_terminal_result,
+    )
+    .is_err()
+    {
         *state = boundary_snapshot;
         return ActionResult::applied(Vec::new(), state.waiting_for.clone());
     }
     bump_state_revision(state);
     sync_waiting_for(state, &result.waiting_for);
-<<<<<<< 9e4e73da6
-    if run_auto_pass_loop(state, &mut result) {
-        reconcile_terminal_result(state, &mut result);
+    // CR 732.2a: a drive that did not advance re-runs only the terminal half.
+    let reconcile: fn(&mut GameState, &mut ActionResult) = if run_auto_pass_loop(state, &mut result)
+    {
+        reconcile_terminal_result
     } else {
-        reconcile_terminal_sba(state, &mut result);
-=======
-    run_auto_pass_loop(state, &mut result);
-    if reconcile_terminal_result_completing_resolution(state, &mut result).is_err() {
+        reconcile_terminal_sba
+    };
+    if reconcile_terminal_result_completing_resolution(state, &mut result, reconcile).is_err() {
         *state = boundary_snapshot;
         return ActionResult::applied(Vec::new(), state.waiting_for.clone());
->>>>>>> 48164726d
     }
     if matches!(result.waiting_for, WaitingFor::GameOver { .. }) {
         take_and_restore_stack_resolution_session(state);
@@ -10093,25 +10111,29 @@ pub(crate) fn resume_auto_pass_after_resolve_all(
     // sides of the internal auto-pass drive. The resume seam bypasses
     // `finish_action_boundary`, so without this a loss created by its final
     // resolution could remain at Priority instead of becoming GameOver.
-<<<<<<< 9e4e73da6
-    reconcile_terminal_result(state, &mut result);
-    if run_auto_pass_loop(state, &mut result) {
-        reconcile_terminal_result(state, &mut result);
-    } else {
-        reconcile_terminal_sba(state, &mut result);
-=======
     // This seam has no error channel: a failed convergence restores the
     // seam's entry state and leaves `batch` untouched. The owed carrier is then
     // still found by `stack::resolve_top`'s net at the next pass.
-    if reconcile_terminal_result_completing_resolution(state, &mut result).is_err() {
+    if reconcile_terminal_result_completing_resolution(
+        state,
+        &mut result,
+        reconcile_terminal_result,
+    )
+    .is_err()
+    {
         *state = before;
         return;
     }
-    run_auto_pass_loop(state, &mut result);
-    if reconcile_terminal_result_completing_resolution(state, &mut result).is_err() {
+    // CR 732.2a: a drive that did not advance re-runs only the terminal half.
+    let reconcile: fn(&mut GameState, &mut ActionResult) = if run_auto_pass_loop(state, &mut result)
+    {
+        reconcile_terminal_result
+    } else {
+        reconcile_terminal_sba
+    };
+    if reconcile_terminal_result_completing_resolution(state, &mut result, reconcile).is_err() {
         *state = before;
         return;
->>>>>>> 48164726d
     }
 
     let log_entries = super::log::resolve_log_entries(&result.events, &before, state);

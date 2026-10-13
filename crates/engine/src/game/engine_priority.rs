@@ -157,7 +157,6 @@ fn run_post_action_pipeline_from_with_policy(
     settled
 }
 
-<<<<<<< 9e4e73da6
 #[allow(clippy::too_many_arguments)]
 fn run_post_action_pipeline_core(
     state: &mut GameState,
@@ -168,7 +167,6 @@ fn run_post_action_pipeline_core(
     drain_policy: DeferredTriggerDrainPolicy,
     carried_priority_recipient: Option<PlayerId>,
 ) -> Result<WaitingFor, EngineError> {
-=======
     // CR 608.2c + CR 608.2n: an instant or sorcery whose instructions paused
     // is put into its owner's graveyard as the final part of its resolution,
     // once those instructions are done. This boundary completes it, before the
@@ -178,13 +176,18 @@ fn run_post_action_pipeline_core(
     // is over, so the batch it completes goes on the stack above any spell still
     // below it (that spell has not begun to resolve, CR 405.5). The #1793 guard
     // is for a resolution still under way, which never reaches this point.
+    //
+    // CR 603.3b: batch ownership is read from the policy the pass was entered
+    // with: `after_spell_final_part` shifts `ResolutionSafe` to `SettledPriority`
+    // for the drain, and a batch of announced casts latched by the resolution
+    // that just finished belongs to the same pass whose final part ran.
+    let seam_drain_policy = drain_policy;
     let drain_policy = if final_part_ran {
         drain_policy.after_spell_final_part()
     } else {
         drain_policy
     };
 
->>>>>>> 48164726d
     // CR 117.3c + CR 117.5: the wait a completed no-choice pass hands back. With
     // no carried recipient this is exactly baseline's active-player wait.
     let settled_priority_wait = WaitingFor::Priority {
@@ -216,7 +219,7 @@ fn run_post_action_pipeline_core(
     // resolution are put on the stack with this action's fresh observers as
     // ONE batch, above the cast spells; the fresh observers join the queue
     // instead of being dispatched ahead of it.
-    let announced_cast_batch = drain_policy == DeferredTriggerDrainPolicy::ResolutionSafe
+    let announced_cast_batch = seam_drain_policy == DeferredTriggerDrainPolicy::ResolutionSafe
         && matches!(state.waiting_for, WaitingFor::Priority { .. })
         && triggers::deferred_triggers_hold_announced_casts(state);
 
@@ -445,13 +448,12 @@ fn run_post_action_pipeline_core(
             );
             // CR 603.3b: SBA-generated triggers join the terminal batch rather
             // than being ordered before its final cast trigger is collected.
-<<<<<<< 9e4e73da6
-            if state.pending_resolution_completion.is_some() || announced_cast_batch {
-=======
             // CR 117.5 + CR 603.3b: in the pass that ran a spell's final part,
             // they join that resolution's batch the same way.
-            if state.pending_resolution_completion.is_some() || final_part_ran {
->>>>>>> 48164726d
+            if state.pending_resolution_completion.is_some()
+                || announced_cast_batch
+                || final_part_ran
+            {
                 triggers::collect_triggers_into_deferred(state, &sba_events);
             } else {
                 triggers::process_triggers(state, &sba_events);
@@ -510,11 +512,8 @@ fn run_post_action_pipeline_core(
         // join the batch of a resolution whose final part ran in this pass.
         if !matches!(state.waiting_for, WaitingFor::Priority { .. })
             || state.pending_resolution_completion.is_some()
-<<<<<<< 9e4e73da6
             || announced_cast_batch
-=======
             || final_part_ran
->>>>>>> 48164726d
         {
             triggers::collect_triggers_into_deferred(state, &unconsumed_exile_return_events);
         } else {

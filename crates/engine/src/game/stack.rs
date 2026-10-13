@@ -1815,6 +1815,23 @@ fn arm_on_resolution_hooks(
     })
 }
 
+/// Whether the spell's own root effect is the "end the turn" or "end the combat
+/// phase" procedure, which exiles the resolving object itself. "End the combat
+/// phase" does so only when the resolution began during combat.
+///
+/// CR 724.1b + CR 724.2b: the procedure exiles every object on the stack,
+/// including the resolving object.
+fn end_procedure_exiles_resolving_object(
+    ability: Option<&ResolvedAbility>,
+    resolution_start_phase: crate::types::phase::Phase,
+) -> bool {
+    ability.is_some_and(|ability| {
+        matches!(ability.effect, Effect::EndTheTurn)
+            || (matches!(ability.effect, Effect::EndCombatPhase)
+                && resolution_start_phase.is_combat())
+    })
+}
+
 /// The zone a resolving spell leaves the stack for once its instructions are
 /// done: the battlefield for a permanent spell (CR 608.3), its owner's
 /// graveyard for an instant or sorcery (CR 608.2n), or wherever a keyword,
@@ -1833,12 +1850,7 @@ fn resolved_spell_destination(
     arming: OnResolutionArming,
     resolution_start_phase: crate::types::phase::Phase,
 ) -> Zone {
-    let end_procedure_exiles_resolving_object = ability.is_some_and(|ability| {
-        matches!(ability.effect, Effect::EndTheTurn)
-            || (matches!(ability.effect, Effect::EndCombatPhase)
-                && resolution_start_phase.is_combat())
-    });
-    if end_procedure_exiles_resolving_object {
+    if end_procedure_exiles_resolving_object(ability, resolution_start_phase) {
         // CR 724.1b / CR 724.2b: The "end the turn" and "end the combat
         // phase" procedures exile every object on the stack, including the
         // resolving object that `resolve_top` already popped before
@@ -2656,7 +2668,21 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
     //
     // Permanent spells are CR 608.3, not CR 608.2n: their entry is its own
     // pipeline below, with its own paused-entry carrier (`PendingSpellResolution`).
-    if is_spell && !is_permanent_spell(state, entry.id) && resolution_is_paused(state) {
+    //
+    // CR 724.1b + CR 724.1d: a spell whose own end procedure is the whole of its
+    // instructions exiles the resolving object itself, before the phase ends;
+    // the cleanup prompt a turn transition raises belongs to that transition
+    // and is not a pending instruction of the spell, so it owes no final part.
+    let end_procedure_is_the_whole_spell =
+        end_procedure_exiles_resolving_object(ability.as_deref(), resolution_start_phase)
+            && ability
+                .as_deref()
+                .is_some_and(|ability| ability.sub_ability.is_none());
+    if is_spell
+        && !is_permanent_spell(state, entry.id)
+        && resolution_is_paused(state)
+        && !end_procedure_is_the_whole_spell
+    {
         let carrier_is_this_spell = state
             .resolving_stack_entry
             .as_ref()

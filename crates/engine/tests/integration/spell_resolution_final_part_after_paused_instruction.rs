@@ -44,17 +44,22 @@
 //!   its own (a CR 616.1 ordering of its own move) is still an object on the
 //!   stack, and leaves the game with its departing owner.
 
+use engine::game::engine::apply;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::scenario_db::GameScenarioDbExt;
+use engine::game::zones::create_object;
 use engine::types::ability::{CastingPermission, EffectKind, TargetRef};
 use engine::types::actions::GameAction;
+use engine::types::card_type::CoreType;
 use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
+use engine::types::format::FormatConfig;
 use engine::types::game_state::{
-    CastOfferKind, CastPaymentMode, CastingVariant, GameState, OwedSpellFinalPart, StackEntryKind,
-    WaitingFor,
+    CastOfferKind, CastPaymentMode, CastingVariant, GameState, OwedSpellFinalPart,
+    PendingSpellResolution, PersistedGameState, PersistedRestoreError,
+    PersistedRestoreFinalization, StackEntry, StackEntryKind, WaitingFor,
 };
-use engine::types::identifiers::ObjectId;
+use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::mana::{ManaColor, ManaCost, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
@@ -2261,4 +2266,538 @@ fn an_unrelated_departure_leaves_a_parked_final_part_to_its_question() {
     assert!(state.resolving_stack_entry.is_none());
     assert_eq!(stack_resolved_count(&events, spell), 1);
     assert_settled(state);
+}
+
+/// Quest for Ancient Secrets: "Whenever a card is put into your graveyard from
+/// anywhere, you may put a quest counter on this enchantment." (its sacrifice
+/// ability is not under test).
+///
+/// CR 608.2n + CR 603.2 + CR 603.2c: Diabolic Edict ("Target player sacrifices a
+/// creature of their choice.") cast by P0 at P1 pauses on P1's choice; the
+/// answer finishes the resolution, and the Edict's own move into P0's graveyard
+/// triggers P0's Quest exactly once. The sacrificed creature goes to P1's
+/// graveyard, which "your graveyard" does not see.
+#[test]
+fn quest_for_ancient_secrets_sees_a_paused_edicts_own_graveyard_move() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let edict = scenario.add_real_card(P0, "Diabolic Edict", Zone::Hand, db());
+    scenario.with_mana_pool(P0, mana(ManaType::Black, 2));
+    let quest = scenario.add_real_card(P0, "Quest for Ancient Secrets", Zone::Battlefield, db());
+    let sacrificed = scenario.add_vanilla(P1, 2, 2);
+    scenario.add_vanilla(P1, 2, 2);
+    let mut runner = scenario.build();
+
+    runner.cast(edict).target_player(P1).commit();
+    pass_until_a_prompt(&mut runner);
+    assert!(
+        matches!(
+            &runner.state().waiting_for,
+            WaitingFor::EffectZoneChoice { player, effect_kind: EffectKind::Sacrifice, cards, .. }
+                if *player == P1 && cards.contains(&sacrificed)
+        ),
+        "reach guard: the Edict paused on P1's sacrifice, got {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(runner.state().objects[&edict].zone, Zone::Stack);
+    assert_eq!(triggers_from(runner.state(), quest), 0);
+
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![sacrificed],
+        })
+        .expect("P1 sacrifices a creature");
+
+    let state = runner.state();
+    assert_eq!(state.objects[&edict].zone, Zone::Graveyard);
+    assert_eq!(graveyard(state, P0), vec![edict]);
+    assert_eq!(state.objects[&sacrificed].zone, Zone::Graveyard);
+    assert_eq!(
+        triggers_from(state, quest),
+        1,
+        "CR 603.2c: one card went into P0's graveyard, the Edict itself"
+    );
+}
+
+const PLANAR_VOID: &str =
+    "Whenever another card is put into a graveyard from anywhere, exile that card.";
+
+/// CR 608.2n + CR 603.3b: Innocent Blood ("Each player sacrifices a creature of
+/// their choice.") with a Planar Void on each side. Three cards go into
+/// graveyards (P0's creature, P1's creature, Innocent Blood itself), so each
+/// Void triggers three times. Both players' triggers are one batch: P0 orders
+/// theirs, then P1 orders theirs (APNAP), before either group resolves.
+#[test]
+fn innocent_blood_with_planar_voids_orders_the_sacrifices_and_its_own_move() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let blood = scenario.add_real_card(P0, "Innocent Blood", Zone::Hand, db());
+    scenario.with_mana_pool(P0, mana(ManaType::Black, 1));
+    let void_0 = scenario
+        .add_enchantment_from_oracle(P0, "Planar Void", PLANAR_VOID)
+        .id();
+    let void_1 = scenario
+        .add_enchantment_from_oracle(P1, "Planar Void", PLANAR_VOID)
+        .id();
+    let own_creature = scenario.add_vanilla(P0, 2, 2);
+    let chosen = scenario.add_vanilla(P1, 2, 2);
+    let other = scenario.add_vanilla(P1, 2, 2);
+    let mut runner = scenario.build();
+
+    runner.cast(blood).commit();
+    pass_until_a_prompt(&mut runner);
+    assert!(
+        runner
+            .state()
+            .pending_player_scope_sacrifice_choice
+            .is_some(),
+        "reach guard: the player-scope sacrifice route, got {:?}",
+        runner.state().waiting_for
+    );
+    let WaitingFor::EffectZoneChoice { player, cards, .. } = runner.state().waiting_for.clone()
+    else {
+        panic!(
+            "expected a sacrifice choice, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(player, P1, "only P1 has a creature to choose between");
+    assert!(cards.contains(&chosen) && cards.contains(&other));
+
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![chosen],
+        })
+        .expect("P1 sacrifices a creature");
+
+    let mut ordering_players = Vec::new();
+    for _ in 0..4 {
+        let WaitingFor::OrderTriggers { player, triggers } = runner.state().waiting_for.clone()
+        else {
+            break;
+        };
+        assert_eq!(
+            triggers.len(),
+            3,
+            "one Void trigger per card put into a graveyard, the Blood's own move included"
+        );
+        ordering_players.push(player);
+        runner
+            .act(GameAction::OrderTriggers {
+                order: (0..triggers.len()).collect(),
+            })
+            .expect("the player orders their triggers");
+    }
+    assert_eq!(
+        ordering_players,
+        vec![P0, P1],
+        "CR 603.3b: APNAP, before either group resolves"
+    );
+
+    let state = runner.state();
+    assert_eq!(state.objects[&blood].zone, Zone::Graveyard);
+    assert_eq!(triggers_from(state, void_0), 3);
+    assert_eq!(triggers_from(state, void_1), 3);
+
+    run_until_settled(&mut runner, |_| None);
+    let state = runner.state();
+    for card in [blood, own_creature, chosen] {
+        assert_eq!(
+            state.objects[&card].zone,
+            Zone::Exile,
+            "each card put into a graveyard was exiled by a Void"
+        );
+    }
+    assert_eq!(state.objects[&other].zone, Zone::Battlefield);
+    assert_settled(state);
+}
+
+/// What a Reanimate-on-Clone run leaves, for the W2 rows.
+struct ReanimatedClone {
+    runner: GameRunner,
+    reanimate: ObjectId,
+    clone: ObjectId,
+    bolt: Option<ObjectId>,
+    /// The legal targets of the copied trigger's prompt, empty when it chose
+    /// its only target without one.
+    trigger_choices: Vec<TargetRef>,
+}
+
+/// Reanimate ("Put target creature card from a graveyard onto the battlefield
+/// under your control. You lose life equal to that card's mana value.") on a
+/// Clone ("You may have this creature enter as a copy of any creature on the
+/// battlefield.") that copies Skullwinder ("When this creature enters, return
+/// target card from your graveyard to your hand, then choose an opponent. That
+/// player returns a card from their graveyard to their hand."). Drives the
+/// copy-entry replacement choice, the copy choice and the copied trigger's
+/// target choice.
+///
+/// Life is deliberately not read: Reanimate whose target enters through a
+/// copy-entry replacement pause loses no life, at the base too; that defect is
+/// tracked separately.
+fn reanimate_a_clone_as_skullwinder(other_graveyard_card: bool) -> ReanimatedClone {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let reanimate = scenario.add_real_card(P0, "Reanimate", Zone::Hand, db());
+    scenario.with_mana_pool(P0, mana(ManaType::Black, 1));
+    let clone = scenario.add_real_card(P0, "Clone", Zone::Graveyard, db());
+    let bolt = other_graveyard_card
+        .then(|| scenario.add_real_card(P0, "Lightning Bolt", Zone::Graveyard, db()));
+    let skullwinder = scenario.add_real_card(P1, "Skullwinder", Zone::Battlefield, db());
+    let mut runner = scenario.build();
+
+    runner.cast(reanimate).target_object(clone).commit();
+    let mut trigger_choices: Vec<TargetRef> = Vec::new();
+    let mut copied = false;
+    for _ in 0..30 {
+        let action = match runner.state().waiting_for.clone() {
+            WaitingFor::ReplacementChoice { .. } => GameAction::ChooseReplacement { index: 0 },
+            WaitingFor::CopyTargetChoice { valid_targets, .. } => {
+                assert!(valid_targets.contains(&skullwinder));
+                copied = true;
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(skullwinder)),
+                }
+            }
+            WaitingFor::TriggerTargetSelection {
+                target_slots,
+                selection,
+                ..
+            } => {
+                trigger_choices = target_slots[selection.current_slot].legal_targets.clone();
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(reanimate)),
+                }
+            }
+            WaitingFor::Priority { .. } if !runner.state().stack.is_empty() => {
+                GameAction::PassPriority
+            }
+            _ => break,
+        };
+        runner.act(action).expect("the engine accepts the answer");
+    }
+    assert!(copied, "reach guard: the Clone was asked what to copy");
+    ReanimatedClone {
+        runner,
+        reanimate,
+        clone,
+        bolt,
+        trigger_choices,
+    }
+}
+
+/// CR 608.2n + CR 603.3 + CR 603.3d: the copied "when this creature enters"
+/// trigger chooses its targets when it is put on the stack, after the spell
+/// finished, so Reanimate (the only card in P0's graveyard) is already there to
+/// be chosen: the trigger is not dropped for want of a target, and returns it.
+#[test]
+fn a_copy_entry_trigger_sees_the_parent_spell_in_the_graveyard_when_the_graveyard_was_empty() {
+    let ReanimatedClone {
+        runner,
+        reanimate,
+        clone,
+        trigger_choices,
+        ..
+    } = reanimate_a_clone_as_skullwinder(false);
+    let state = runner.state();
+
+    assert_eq!(state.objects[&clone].zone, Zone::Battlefield);
+    assert_eq!(
+        state.objects[&clone].name, "Skullwinder",
+        "the Clone entered as a copy of Skullwinder"
+    );
+    assert!(
+        trigger_choices.is_empty(),
+        "a single legal target is chosen without a prompt, got {trigger_choices:?}"
+    );
+    assert_eq!(
+        state.objects[&reanimate].zone,
+        Zone::Hand,
+        "the copied trigger was not dropped: it targeted Reanimate and returned it"
+    );
+}
+
+/// The same with another card in P0's graveyard: Reanimate is a legal target
+/// beside it, so the copied trigger prompts for the choice.
+#[test]
+fn a_copy_entry_trigger_sees_the_parent_spell_in_the_graveyard_among_other_graveyard_cards() {
+    let ReanimatedClone {
+        runner,
+        reanimate,
+        clone,
+        bolt,
+        trigger_choices,
+    } = reanimate_a_clone_as_skullwinder(true);
+    let state = runner.state();
+    let bolt = bolt.expect("the variant has a second graveyard card");
+
+    assert_eq!(state.objects[&clone].zone, Zone::Battlefield);
+    assert_eq!(state.objects[&clone].name, "Skullwinder");
+    let mut offered = trigger_choices;
+    offered.sort_by_key(|target| format!("{target:?}"));
+    let mut expected = vec![TargetRef::Object(bolt), TargetRef::Object(reanimate)];
+    expected.sort_by_key(|target| format!("{target:?}"));
+    assert_eq!(
+        offered, expected,
+        "reach guard: the trigger asked for a target, and Reanimate is selectable"
+    );
+    assert_eq!(state.objects[&reanimate].zone, Zone::Hand);
+    assert_eq!(state.objects[&bolt].zone, Zone::Graveyard);
+}
+
+/// Sibling: a Clone copying a creature with no enters trigger has nothing to
+/// target, and Reanimate still ends in the graveyard.
+#[test]
+fn a_clone_copying_a_vanilla_creature_leaves_reanimate_in_the_graveyard() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let reanimate = scenario.add_real_card(P0, "Reanimate", Zone::Hand, db());
+    scenario.with_mana_pool(P0, mana(ManaType::Black, 1));
+    let clone = scenario.add_real_card(P0, "Clone", Zone::Graveyard, db());
+    let bears = scenario.add_vanilla(P1, 2, 2);
+    let mut runner = scenario.build();
+
+    runner.cast(reanimate).target_object(clone).commit();
+    let mut copied = false;
+    for _ in 0..30 {
+        let action = match runner.state().waiting_for.clone() {
+            WaitingFor::ReplacementChoice { .. } => GameAction::ChooseReplacement { index: 0 },
+            WaitingFor::CopyTargetChoice { .. } => {
+                copied = true;
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(bears)),
+                }
+            }
+            WaitingFor::Priority { .. } if !runner.state().stack.is_empty() => {
+                GameAction::PassPriority
+            }
+            _ => break,
+        };
+        runner.act(action).expect("the engine accepts the answer");
+    }
+
+    assert!(copied, "reach guard: the Clone was asked what to copy");
+    let state = runner.state();
+    assert_eq!(state.objects[&clone].zone, Zone::Battlefield);
+    assert_eq!(state.objects[&reanimate].zone, Zone::Graveyard);
+    assert_settled(state);
+}
+
+/// Omnath, Locus of Mana ("You don't lose unspent green mana as steps and phases
+/// end.") and Horizon Stone ("If you would lose unspent mana, that mana becomes
+/// colorless instead.") both apply to the mana emptying of the cleanup step, so
+/// CR 616.1 has P0 order them.
+///
+/// CR 724.1b + CR 724.1d: Time Stop ("End the turn.") exiles every object on
+/// the stack, including the resolving Time Stop, before the turn skips to the
+/// cleanup step; the ordering prompt belongs to that transition, so Time Stop
+/// is already in exile when it is asked, not on the stack beside it.
+#[test]
+fn time_stop_is_exiled_before_the_cleanup_mana_order_prompt() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let stop = scenario
+        .add_spell_to_hand_from_oracle(P0, "Time Stop", true, "End the turn.")
+        .id();
+    let omnath = scenario.add_real_card(P0, "Omnath, Locus of Mana", Zone::Battlefield, db());
+    let stone = scenario
+        .add_artifact_from_oracle(
+            P0,
+            "Horizon Stone",
+            "If you would lose unspent mana, that mana becomes colorless instead.",
+        )
+        .id();
+    scenario.with_mana_pool(P0, mana(ManaType::Green, 2));
+    let mut runner = scenario.build();
+
+    runner.cast(stop).commit();
+    pass_until_a_prompt(&mut runner);
+
+    let state = runner.state();
+    let WaitingFor::ReplacementChoice { candidates, .. } = &state.waiting_for else {
+        panic!(
+            "reach guard: the cleanup mana emptying asks for an order, got {:?}",
+            state.waiting_for
+        );
+    };
+    let mut sources: Vec<ObjectId> = candidates.iter().map(|c| c.source_id).collect();
+    sources.sort();
+    let mut expected = vec![omnath, stone];
+    expected.sort();
+    assert_eq!(sources, expected, "reach guard: both replacements compete");
+    assert_eq!(state.phase, Phase::Cleanup);
+    assert_eq!(
+        state.objects[&stop].zone,
+        Zone::Exile,
+        "CR 724.1b: Time Stop was exiled by its own procedure before the prompt"
+    );
+
+    runner
+        .act(GameAction::ChooseReplacement { index: 0 })
+        .expect("P0 orders the replacements");
+    run_until_settled(&mut runner, |_| None);
+    let state = runner.state();
+    assert_eq!(state.objects[&stop].zone, Zone::Exile);
+    assert_settled(state);
+}
+
+/// A decoded game state at a priority window holding one bare spell-resolution
+/// frame: an empty stack, the resolving carrier naming a spell object of the
+/// given type in the given zone, and no other continuation. Returns the state
+/// and the object's id.
+fn bare_spell_resolution_frame(core_type: CoreType, zone: Zone) -> (GameState, ObjectId) {
+    let mut state = GameState::new(FormatConfig::free_for_all(), 2, 0x57AC);
+    state.phase = Phase::PreCombatMain;
+    state.active_player = P0;
+    state.priority_player = P0;
+    state.waiting_for = WaitingFor::Priority { player: P0 };
+    let spell = create_object(&mut state, CardId(77), P0, "Rested Spell".to_string(), zone);
+    {
+        let object = state.objects.get_mut(&spell).expect("the object exists");
+        object.card_types.core_types.push(core_type);
+        object.base_card_types = object.card_types.clone();
+    }
+    state.resolving_stack_entry = Some(StackEntry {
+        id: spell,
+        source_id: spell,
+        controller: P0,
+        kind: StackEntryKind::Spell {
+            card_id: CardId(77),
+            ability: None,
+            casting_variant: CastingVariant::Normal,
+            actual_mana_spent: 0,
+        },
+    });
+    state.push_spell_resolution(PendingSpellResolution {
+        object_id: spell,
+        controller: P0,
+        casting_variant: CastingVariant::Normal,
+        cast_from_zone: None,
+        cast_controller: Some(P0),
+        cast_timing_permission: None,
+        spell_targets: vec![],
+        actual_mana_spent: 0,
+        kickers_paid: vec![],
+        additional_cost_payment_count: 0,
+        additional_cost_payments: vec![],
+        convoked_creatures: vec![],
+    });
+    (state, spell)
+}
+
+/// What a stale pass over a decoded state leaves: it is accepted, and an
+/// instant or sorcery's carrier is not settled out from under it.
+fn assert_stale_pass_keeps_the_carrier_and_the_spell(mut state: GameState, spell: ObjectId) {
+    apply(&mut state, P0, GameAction::PassPriority)
+        .expect("the priority holder may submit a stale pass");
+    assert_eq!(
+        state.resolving_stack_entry.as_ref().map(|entry| entry.id),
+        Some(spell),
+        "the carrier is kept"
+    );
+    assert_eq!(
+        state.objects[&spell].zone,
+        Zone::Stack,
+        "the spell is not stranded by a settled carrier"
+    );
+}
+
+/// CR 608.2n: a bare spell-resolution frame beside an instant or sorcery that
+/// is still in the stack zone is live final-delivery debt, not a terminal rest:
+/// the spell has not made its move to the graveyard, and settling the carrier
+/// would strand it there. Restore fails closed with the existing error, with no
+/// owed marker needed to say so.
+#[test]
+fn a_persisted_bare_spell_rest_naming_a_stacked_instant_or_sorcery_fails_closed() {
+    for core_type in [CoreType::Sorcery, CoreType::Instant] {
+        let (state, spell) = bare_spell_resolution_frame(core_type, Zone::Stack);
+        assert!(
+            matches!(state.waiting_for, WaitingFor::Priority { .. })
+                && state.resolution_stack.len() == 1
+                && state.owed_spell_final_part().is_none()
+                && state.resolving_stack_entry.as_ref().map(|entry| entry.id) == Some(spell),
+            "reach guard: a bare markerless frame naming the carrier ({core_type:?})"
+        );
+
+        let restore = PersistedGameState::Raw(Box::new(state.clone()))
+            .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated);
+        assert_eq!(
+            restore.err(),
+            Some(PersistedRestoreError::UnsettledPriorityResolution),
+            "{core_type:?} in the stack zone"
+        );
+        assert_stale_pass_keeps_the_carrier_and_the_spell(state, spell);
+    }
+}
+
+/// Discriminating controls for the refusal above, each markerless and each
+/// restoring: a permanent spell (in the stack zone, or already on the
+/// battlefield, the shape the permanent-entry epilogue leaves) and an instant or
+/// sorcery already in the graveyard are genuine terminal rests the restore
+/// settles. A refusal of every typed carrier, or of every object in the stack
+/// zone, would fail one of these.
+#[test]
+fn a_persisted_bare_spell_rest_naming_a_spell_that_has_left_the_stack_still_settles() {
+    for (core_type, zone) in [
+        (CoreType::Creature, Zone::Battlefield),
+        (CoreType::Creature, Zone::Stack),
+        (CoreType::Sorcery, Zone::Graveyard),
+    ] {
+        let (state, _spell) = bare_spell_resolution_frame(core_type, zone);
+        let restored = PersistedGameState::Raw(Box::new(state))
+            .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+            .unwrap_or_else(|error| panic!("{core_type:?} in {zone:?} must restore: {error:?}"))
+            .finalize_after_rehydration(|_| Ok(()))
+            .expect("the settled state is publishable");
+
+        assert!(
+            restored.resolving_stack_entry.is_none() && restored.resolution_stack.is_empty(),
+            "{core_type:?} in {zone:?}: the carrier is settled"
+        );
+        assert_eq!(restored.waiting_for, WaitingFor::Priority { player: P0 });
+    }
+}
+
+/// CR 608.2n: the same refusal when the snapshot also carries the owed
+/// final-part marker (the shape the engine itself writes): restore fails closed
+/// and a stale pass leaves the carrier, the spell and the marker alone.
+#[test]
+fn a_persisted_bare_spell_rest_owing_a_final_part_fails_closed() {
+    let (state, spell) = bare_spell_resolution_frame(CoreType::Sorcery, Zone::Stack);
+    let mut raw = serde_json::to_value(&state).expect("the state serializes");
+    raw["resolving_spell_final_part"] = serde_json::to_value(OwedSpellFinalPart {
+        spell,
+        resolution_start_phase: Phase::PreCombatMain,
+    })
+    .expect("the marker serializes");
+    let persisted: PersistedGameState =
+        serde_json::from_value(raw.clone()).expect("the snapshot decodes");
+    assert!(
+        serde_json::to_value(&persisted)
+            .expect("the decoded snapshot reserializes")
+            .get("resolving_spell_final_part")
+            .is_some(),
+        "reach guard: the decoded snapshot carries the owed final part"
+    );
+
+    assert_eq!(
+        persisted
+            .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+            .err(),
+        Some(PersistedRestoreError::UnsettledPriorityResolution)
+    );
+
+    let mut decoded: GameState = serde_json::from_value(raw).expect("the state decodes");
+    assert!(decoded.owed_spell_final_part().is_some());
+    apply(&mut decoded, P0, GameAction::PassPriority)
+        .expect("the priority holder may submit a stale pass");
+    assert_eq!(
+        decoded.resolving_stack_entry.as_ref().map(|entry| entry.id),
+        Some(spell)
+    );
+    assert_eq!(decoded.objects[&spell].zone, Zone::Stack);
+    assert!(
+        decoded.owed_spell_final_part().is_some(),
+        "the marker is kept"
+    );
 }
