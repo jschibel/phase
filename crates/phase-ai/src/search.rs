@@ -6620,8 +6620,9 @@ mod tests {
         tally
     }
 
-    /// CR 118.5: a free {0} unless-payment is answered `pay: true` at every
-    /// difficulty and seed (the engine now asks for it instead of auto-paying).
+    /// CR 118.5: a free {0} unless-payment is answered `pay: true` at VeryEasy through
+    /// VeryHard and every seed (the engine now asks for it instead of auto-paying). The pre-emption precedes every difficulty-keyed
+    /// branch, so CEDH takes it too.
     #[test]
     fn free_unless_payment_is_paid_at_every_difficulty() {
         let payer = PlayerId(1);
