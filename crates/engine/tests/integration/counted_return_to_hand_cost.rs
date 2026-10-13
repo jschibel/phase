@@ -367,6 +367,7 @@ fn counted_return_activation_cost_returns_both_lands() {
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate the counted-return ability");
     match &result.waiting_for {
@@ -403,6 +404,7 @@ fn counted_return_activation_cost_returns_both_lands() {
     let refused = runner.act(GameAction::ActivateAbility {
         source_id: source,
         ability_index: 0,
+        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
     });
     assert!(
         matches!(
@@ -614,6 +616,7 @@ fn craft_mixed_zone_materials_do_not_cross_stamp_graveyard_card() {
         .act(GameAction::ActivateAbility {
             source_id: blade,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate the craft-shaped ability");
     match &result.waiting_for {
@@ -781,6 +784,7 @@ fn counted_return_activation_with_pauses(
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate the counted-return ability");
     runner

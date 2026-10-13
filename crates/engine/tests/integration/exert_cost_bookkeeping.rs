@@ -148,6 +148,7 @@ fn activate_ritualist(
         GameAction::ActivateAbility {
             source_id: ritualist,
             ability_index: index,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         },
         acc,
     );
