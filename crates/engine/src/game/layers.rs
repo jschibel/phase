@@ -30973,7 +30973,7 @@ mod declared_zone_self_static_tests {
         assert_grist_is_creature_card(&state, grist, Zone::Stack);
     }
 
-    /// L1 executor extra: the recipient set survives an incremental flush.
+    /// The remote-recipient set survives an incremental flush, so a later full pass still resets the object.
     #[test]
     fn declared_zone_recipient_set_survives_an_incremental_flush() {
         let mut state = GameState::new_two_player(7);
@@ -31392,8 +31392,10 @@ mod declared_zone_self_static_tests {
         assert_grist_is_only_a_planeswalker(&state, b);
     }
 
-    /// Executor extra (writer sweep, row r2-a): no live-only `color`/`power`/
-    /// `toughness` writer beyond the two the reset re-applies.
+    /// The layers the remote-recipient bookkeeping restores are exactly types,
+    /// colour and power/toughness (CR 613.1d, CR 613.1e, CR 613.4a-d); a layer
+    /// added to `Layer::all()` must be classified by `layer_restored_on_remote_objects`
+    /// and listed here.
     #[test]
     fn layer_predicate_matches_the_bookkeeping_layers() {
         let restored: Vec<Layer> = Layer::all()

@@ -1,5 +1,5 @@
-//! Grist, the Hunger Tide (phase 1 of the Grist run): a zone-declared self static
-//! functions in the zones it declares.
+//! Grist, the Hunger Tide: a zone-declared self static functions in the zones it
+//! declares.
 //!
 //! Oracle: "As long as Grist isn't on the battlefield, it's a 1/1 Insect creature
 //! in addition to its other types." CR 113.6c: an ability that states which zones
@@ -9,8 +9,8 @@
 //! graveyard is a creature card and counts for her own -5.
 //!
 //! Every row drives a production entry (`GameRunner::cast`, `activate`, `act`)
-//! with the verbatim Oracle text. The +1 repeat loop and a milled Grist inside the
-//! +1 are phase 3 (DEFERRED); the interim fact they rest on is row I9.
+//! with the verbatim Oracle text. A milled Grist is checked as a card that has just
+//! reached the graveyard (row I9), not through the +1.
 
 use engine::game::layers::flush_layers;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
@@ -414,7 +414,7 @@ fn command_zone_grist_is_a_creature_card() {
     assert_eq!(types_of(&runner, grist), vec![CoreType::Planeswalker]);
 }
 
-/// I9 (interim for the +1 loop, phase 3): a milled Grist is an Insect creature
+/// I9: a milled Grist is an Insect creature
 /// card in the graveyard at once.
 #[test]
 fn milled_grist_is_an_insect_creature_card_at_once() {
@@ -475,7 +475,7 @@ fn declared_zone_static_lapses_when_the_forest_leaves() {
 }
 
 /// I11: when Painter's Servant leaves, a hand card goes back to its own colour
-/// (CR 613.1e: the effect ends with its source).
+/// (CR 611.3b + CR 613.1e: the colour effect applies only while its source is on the battlefield).
 #[test]
 fn painters_servant_leaving_returns_a_hand_card_to_its_own_colour() {
     let mut scenario = main_phase();
