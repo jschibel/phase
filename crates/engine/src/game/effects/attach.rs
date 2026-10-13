@@ -944,10 +944,15 @@ pub(crate) fn attachment_candidates_from_zone_change(
     else {
         return Vec::new();
     };
+    // CR 603.12: a "When … this way" reflexive carries the zone change as its
+    // creation-gate event; it names the same event-scoped set as an "if" head.
     let Some(AbilityCondition::ZoneChangedThisWay {
         filter,
         destination: Some(Zone::Battlefield),
-    }) = ability.condition.as_ref()
+    }) = ability
+        .condition
+        .as_ref()
+        .and_then(AbilityCondition::zone_changed_this_way_head)
     else {
         return Vec::new();
     };

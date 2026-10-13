@@ -1716,7 +1716,7 @@ mod paused_search_audience_tests {
     use crate::game::zones::create_object;
     use crate::types::game_state::{
         HiddenSearchAudience, LibrarySearchDeliveryResume, PendingBatchDeliveries,
-        PendingZoneChangeDelivery,
+        PendingReplacement, PendingZoneChangeDelivery, ZoneMoveCompletion,
     };
     use crate::types::identifiers::CardId;
 
@@ -1803,6 +1803,113 @@ mod paused_search_audience_tests {
             "the paused member must not absorb the other search entry's audience"
         );
     }
+
+    /// CR 614.12a + CR 616.1f: a parked entry whose proposal an answer has
+    /// changed still settles its paused owner when the resume is Prevented.
+    /// The owner parked on the original event; the shared resume reads the key
+    /// through the record's pinned boundary, records the `Prevented` terminal
+    /// completion on that owner, and the owner retires on its drain. The changed
+    /// proposal itself is not the owner's key.
+    #[test]
+    fn prevented_resume_settles_the_owner_through_the_pinned_boundary() {
+        let mut state = GameState::new_two_player(9783);
+        let entrant = create_object(
+            &mut state,
+            CardId(9783),
+            PlayerId(0),
+            "Parked entrant".to_string(),
+            Zone::Graveyard,
+        );
+        let original =
+            ProposedEvent::zone_change(entrant, Zone::Graveyard, Zone::Battlefield, None);
+        state.pending_replacement = Some(PendingReplacement {
+            proposed: original.clone(),
+            sacrifice_provenance: None,
+            candidates: Vec::new(),
+            search_found_candidates: Vec::new(),
+            depth: 0,
+            is_optional: false,
+            choice_player: None,
+            library_placement: None,
+            exile_controller: None,
+            exile_duration: None,
+            exile_tracking: ZoneDeliveryExileTracking::None,
+            excess_recipient: None,
+            lifelink_bonus: 0,
+            may_cost_paid: false,
+            may_cost_remaining: None,
+            delivery_boundary: None,
+        });
+
+        // The owner parks on the unanswered event.
+        let paused_current = state
+            .pending_zone_change_delivery_from_replacement()
+            .expect("a parked zone change has a delivery key");
+        let logical_zone_change_group =
+            crate::game::triggers::allocate_logical_zone_change_group(&mut state, &[entrant]);
+        state.push_batch_delivery(PendingBatchDeliveries {
+            logical_zone_change_group,
+            paused_current: Some(paused_current),
+            remaining: Vec::new(),
+            destination: Zone::Battlefield,
+            source_id: None,
+            enter_tapped: EtbTapState::Unspecified,
+            exile_tracking: ZoneDeliveryExileTracking::None,
+            library_placement: None,
+            completion: None,
+            replacement_applied: HashSet::new(),
+            requests: Vec::new(),
+            attempted: Vec::new(),
+            zone_change_record_start: 0,
+            deferred_events: Vec::new(),
+        });
+
+        // An answer pins the boundary, then changes the proposal.
+        let pending = state.pending_replacement.as_mut().expect("parked entry");
+        pending.pin_delivery_boundary();
+        if let ProposedEvent::ZoneChange { enter_tapped, .. } = &mut pending.proposed {
+            *enter_tapped = EtbTapState::Tapped;
+        }
+        let changed = pending.proposed.clone();
+        assert_ne!(changed, original, "reach: the proposal changed");
+
+        // The shared resume reads the owner key before the record is consumed,
+        // and the replacement resolves as Prevented.
+        let key = state
+            .pending_zone_change_delivery_from_replacement()
+            .expect("the key survives the change");
+        assert_eq!(key.expected_event, original);
+        state.pending_replacement = None;
+        let member = key.member;
+        assert!(
+            !state.capture_paused_zone_change_delivery(
+                member,
+                &changed,
+                &[],
+                ZoneMoveCompletion::Prevented
+            ),
+            "the changed proposal is not the owner's key"
+        );
+        assert!(state.capture_paused_zone_change_delivery(
+            member,
+            &key.expected_event,
+            &[],
+            ZoneMoveCompletion::Prevented
+        ));
+        assert_eq!(
+            state
+                .active_batch_delivery()
+                .and_then(|owner| owner.paused_current.as_ref())
+                .and_then(|paused| paused.terminal_completion),
+            Some(ZoneMoveCompletion::Prevented)
+        );
+
+        drain_pending_batch_deliveries(&mut state, &mut Vec::new());
+        assert!(
+            state.active_batch_delivery().is_none(),
+            "the settled owner retires"
+        );
+    }
 }
 
 /// Deliver an event that already passed the replacement consult. Only callable
@@ -1874,7 +1981,17 @@ fn enters_with_additional_counters_for_entry(
         // CR 109.5: evaluate the "you control" + Other/Legendary/Nontoken filter
         // with the static's source as the context anchor.
         let ctx = crate::game::filter::FilterContext::from_source(state, source_obj.id);
-        if crate::game::filter::matches_target_filter(state, object_id, affected, &ctx) {
+        // CR 614.12: an entrant whose as-enters choices were made before it
+        // entered is matched as it exists with its own statics applied — the
+        // layer pass hasn't run on it yet — when that's proven for this filter.
+        let projected = crate::game::filter::EntryProjection::delivered(state, object_id, affected);
+        let matches = match projected.as_ref() {
+            Some(entrant) => {
+                crate::game::filter::matches_target_filter_on_object(state, entrant, affected, &ctx)
+            }
+            None => crate::game::filter::matches_target_filter(state, object_id, affected, &ctx),
+        };
+        if matches {
             additional.push((counter_type.clone(), *count));
         }
     }
@@ -3563,6 +3680,7 @@ pub(crate) fn deliver_replaced_zone_change(
         face_down_in_exile,
         chain_referent,
         enter_as_copy,
+        enter_with_choices,
         discard_frame,
         performed_by,
         applied,
@@ -3967,6 +4085,16 @@ pub(crate) fn deliver_replaced_zone_change(
             if chain_referent.publishes() {
                 crate::game::morph::publish_face_down_entry_referent(state, object_id);
             }
+        }
+        // CR 614.12a + CR 400.7: the entrant's as-enters choices were made
+        // before it entered and rode the event; install them on the new object
+        // (its `chosen_attributes` were reset as it entered) before ETB counters
+        // and triggers observe it. CR 613.1: they can gate layer effects.
+        if let (true, Some(choices)) = (entered_battlefield, enter_with_choices) {
+            if let Some(object) = state.objects.get_mut(&object_id) {
+                object.chosen_attributes.extend(choices.0);
+            }
+            crate::game::layers::mark_layers_full(state);
         }
         // CR 614.12a + CR 616.1c + CR 707.2: An enter-as-copy replacement
         // selected its copy source before this delivery and carried those

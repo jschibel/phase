@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::num::NonZeroU32;
@@ -851,6 +852,12 @@ impl PromptSourceBinding {
 pub enum NamedChoiceSourceBinding {
     ResolutionContext,
     ExactObjectAndResolution,
+    /// CR 614.12a: the answer belongs to the battlefield entry parked in
+    /// `GameState::pending_replacement` — an "As ~ enters, choose …"
+    /// replacement whose choice is made before the permanent enters. The answer
+    /// rides the entry event (`ProposedEvent::ZoneChange::enter_with_choices`)
+    /// and is never written onto a live object or resolution projection.
+    PendingEntry,
 }
 
 /// Exact source authority carried by a source-bound `NamedChoice` prompt.
@@ -9218,6 +9225,33 @@ fn visit_mana_ability_resume_events(
 }
 
 impl ManaAbilityResume {
+    /// CR 601.2g + CR 605.3b: Whether resuming this root continues an automatic
+    /// payment that suspended while auto-tap was paying it, rather than opening
+    /// a prompt or starting a fresh payment. Exhaustive so a new root has to be
+    /// classified. Auto-tap plans the remainder of such a payment with every
+    /// row (see `casting_costs::AutoTapRowPolicy`).
+    pub fn resumes_automatic_payment(&self) -> bool {
+        match self {
+            // The outer cost authority retries the same automatic payment after
+            // an auto-tapped source's paused cost move completed.
+            ManaAbilityResume::CompanionToHand { .. }
+            | ManaAbilityResume::TurnFaceUp { .. }
+            | ManaAbilityResume::EndContinuousEffect { .. }
+            | ManaAbilityResume::EffectPayCost { .. }
+            | ManaAbilityResume::PhyrexianCastPayment { .. }
+            | ManaAbilityResume::FinalizePendingManaPayment { .. } => true,
+            // CR 605.3a + CR 602.2b: a mana ability activated by hand retries
+            // its own activation; its automatic payment starts there, fresh.
+            ManaAbilityResume::ManaAbilityManaPayment { .. } => false,
+            // These return to a player's prompt or to priority; no automatic
+            // payment is in progress.
+            ManaAbilityResume::Priority
+            | ManaAbilityResume::ManaPayment { .. }
+            | ManaAbilityResume::ManaSourceSelection { .. }
+            | ManaAbilityResume::UnlessPayment { .. } => false,
+        }
+    }
+
     /// CR 601.2h + CR 602.2b + CR 116.2: Whether the outer payment root this
     /// resumes is a cast, activation or special action (no priority until it
     /// completes) rather than a resolution. Exhaustive so a new root has to be
@@ -20304,8 +20338,8 @@ pub struct StackPaidSnapshot {
 /// OR in `unclassified`. Over-approximation is correctness-preserving; under-
 /// approximation is a silent trigger drop.
 ///
-/// CR 603.6a + CR 611.2e: Granted triggers (sliver lords, Cairn Wanderer,
-/// Bramble Sovereign) are materialized by `evaluate_layers` into
+/// CR 613.1f: Granted triggers (sliver lords) are materialized by
+/// `evaluate_layers` into
 /// `obj.trigger_definitions`. The index's battlefield-scoped portion is
 /// rebuilt at the end of `evaluate_layers` so it always reflects post-layer
 /// trigger sets. That rebuild is the **authoritative correctness path**; the
@@ -20325,6 +20359,24 @@ pub struct TriggerIndex {
     /// Consulted on every event regardless of `keys_from_event` output.
     /// Empty for the common case where every trigger's mode is known.
     pub unclassified: smallvec::SmallVec<[ObjectId; 4]>,
+    /// `Built` once `TriggerIndex::rebuild_from_battlefield` has populated this
+    /// value; `Unbuilt` from `Default`, which is also what a deserialize produces
+    /// (the `GameState` field is `#[serde(skip)]`). `add` and `remove` (and
+    /// `reindex_object_triggers`, which composes them) leave it unchanged.
+    pub readiness: DerivedIndexReadiness,
+}
+
+/// Whether a derived index has been populated by a full scan of the state it
+/// indexes. Distinguishes "never built" from "built and legitimately empty",
+/// which bucket emptiness cannot. `Unbuilt` is the default, so a
+/// `#[serde(skip)]` index restores as `Unbuilt`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DerivedIndexReadiness {
+    /// Not populated by a full scan since this index value was created.
+    #[default]
+    Unbuilt,
+    /// Populated by a full scan since this index value was created.
+    Built,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21055,6 +21107,16 @@ declare_game_state! {
     /// inside that synchronous window; it is never serialized.
     #[serde(skip)]
     pub active_spend_only_on_x_count: Option<(ObjectId, u32)>,
+    /// CR 601.2g + CR 605.3b: the row policy of the automatic mana payment that
+    /// is executing (see `casting_costs::AutoTapRowPolicy`). Set while a
+    /// payment activates its selected sources, and to `AllRows` while a
+    /// suspended payment resumes, so every auto-tap inside that payment plans
+    /// under one policy.
+    /// `None` outside those synchronous windows; never serialized and never part
+    /// of state equality.
+    #[serde(skip)]
+    pub(crate) active_auto_tap_row_policy:
+        Option<crate::game::casting_costs::AutoTapRowPolicy>,
 
     // Shared zones
     pub battlefield: im::Vector<ObjectId>,
@@ -21296,9 +21358,8 @@ declare_game_state! {
     #[serde(skip)]
     pub static_gate_truth: im::HashMap<StaticGateKey, bool>,
     /// CR 603.2: Candidate pre-filter for `collect_pending_triggers`. Rebuilt
-    /// lazily after deserialize via a sentinel check at the top of the consult
-    /// site; rebuilt eagerly at the end of `evaluate_layers` (CR 611.2e) so the
-    /// post-layer trigger set is reflected. `#[serde(skip)]` because the index
+    /// eagerly at the end of `evaluate_layers` so the post-layer
+    /// trigger set is reflected. `#[serde(skip)]` because the index
     /// is derived state — reconstructed from `state.battlefield` + per-object
     /// `trigger_definitions` whenever needed.
     #[serde(skip)]
@@ -22190,6 +22251,17 @@ declare_game_state! {
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub crew_resolved_this_turn: HashSet<ObjectIncarnationRef>,
+    /// CR 702.122b + CR 702.122c: every (Vehicle, crewer) pair this turn — a
+    /// creature "crews" a Vehicle when it is tapped to pay that Vehicle's crew
+    /// cost, and the Vehicle is then "crewed by" it. Recorded at COST PAYMENT
+    /// (`crate::game::engine::record_crew_payment`), so a crew ability that is
+    /// later countered still counts. Both ends are pinned to their exact
+    /// incarnation (CR 400.7): a Vehicle or creature that left and returned is a
+    /// new object and matches none of its predecessor's records. Read by
+    /// `FilterProp::CrewedThisTurn`. Cleared at turn start.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+    pub crew_history_this_turn: HashSet<crate::game::crew_payment::CrewHistoryPair>,
     /// CR 606.1 + CR 606.3 + CR 603.4: Per-player count of loyalty-ability
     /// activations this turn. Incremented in
     /// `planeswalker::finalize_loyalty_activation` whenever any loyalty ability
@@ -25294,6 +25366,55 @@ pub struct PendingReplacement {
     /// before the replacement is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub may_cost_remaining: Option<AbilityCost>,
+    /// The event the logical zone-change owner parked on, when it differs from
+    /// `proposed`. An answered pre-entry choice (CR 614.12a) writes into
+    /// `proposed`, and a CR 616.1f re-park replaces it, but the owner's paused
+    /// delivery is keyed on the exact event it first parked on
+    /// (`PendingZoneChangeDelivery::captures`). `None` means `proposed` is that
+    /// boundary. Read and written only through the `PendingReplacement`
+    /// boundary methods below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_boundary: Option<Box<ProposedEvent>>,
+}
+
+impl PendingReplacement {
+    /// The event the logical owner of this paused zone-change delivery parked
+    /// on. The single authority every owner match reads — capture
+    /// (`GameState::pending_zone_change_delivery_from_replacement`),
+    /// settlement, and CR 800.4a abandonment — so none of them compares the
+    /// mutable `proposed` directly.
+    pub fn delivery_boundary_event(&self) -> &ProposedEvent {
+        self.delivery_boundary.as_deref().unwrap_or(&self.proposed)
+    }
+
+    /// Whether this record is the paused delivery its owner parked on as
+    /// `expected_event`.
+    pub fn parks_delivery(&self, expected_event: &ProposedEvent) -> bool {
+        self.delivery_boundary_event() == expected_event
+    }
+
+    /// Pin the current boundary before an answer changes `proposed` (CR
+    /// 614.12a pre-entry choice, CR 616.1b entry-controller choice).
+    pub fn pin_delivery_boundary(&mut self) {
+        if self.delivery_boundary.is_none() {
+            self.delivery_boundary = Some(Box::new(self.proposed.clone()));
+        }
+    }
+
+    /// CR 616.1f: a fresh record re-parked for the SAME zone change keeps the
+    /// boundary its predecessor answered to.
+    pub fn inherit_delivery_boundary(&mut self, predecessor: &ProposedEvent) {
+        let same_zone_change = matches!(
+            (&self.proposed, predecessor),
+            (
+                ProposedEvent::ZoneChange { object_id: now, .. },
+                ProposedEvent::ZoneChange { object_id: was, .. },
+            ) if now == was
+        );
+        if self.delivery_boundary.is_none() && same_zone_change && self.proposed != *predecessor {
+            self.delivery_boundary = Some(Box::new(predecessor.clone()));
+        }
+    }
 }
 
 /// CR 701.21a: The subject and controller of a sacrifice whose inner zone
@@ -27761,7 +27882,10 @@ impl GameState {
     pub fn pending_zone_change_delivery_from_replacement(
         &self,
     ) -> Option<PendingZoneChangeDelivery> {
-        let expected_event = self.pending_replacement.as_ref()?.proposed.clone();
+        let pending = self.pending_replacement.as_ref()?;
+        // The owner parked on the record's boundary, which an answered
+        // pre-entry choice or a CR 616.1f re-park may have left behind `proposed`.
+        let expected_event = pending.delivery_boundary_event().clone();
         let object_id = match &expected_event {
             ProposedEvent::ZoneChange { object_id, .. } => *object_id,
             _ => return None,
@@ -28902,7 +29026,26 @@ impl GameState {
             (AttackSubject::Source, CombatHistoryScope::ThisCombat) => {
                 self.creature_attacked_player_this_combat(source_id, target)
             }
+            // CR 508.6: one declaration is one combat, so the scope does not
+            // narrow the event's attacked players.
+            (AttackSubject::EventAttackers, _) => {
+                self.event_attacked_players().any(|player| player == target)
+            }
         }
+    }
+
+    /// CR 508.1b + CR 508.6: the players the current trigger event's attackers were
+    /// declared attacking. A planeswalker or battle attack attacks no player
+    /// (CR 506.3). Empty when no attack event is in scope.
+    fn event_attacked_players(&self) -> impl Iterator<Item = PlayerId> + '_ {
+        let attacks = match &self.current_trigger_event {
+            Some(GameEvent::AttackersDeclared { attacks, .. }) => attacks.as_slice(),
+            _ => &[],
+        };
+        attacks.iter().filter_map(|(_, target)| match target {
+            AttackTarget::Player(player) => Some(*player),
+            AttackTarget::Planeswalker(_) | AttackTarget::Battle(_) => None,
+        })
     }
 
     /// CR 509.1g + CR 400.7: Did exactly `blocker` block exactly `attacker` within `scope`?
@@ -28962,19 +29105,33 @@ impl GameState {
     }
 
     /// CR 508.6 + CR 702.121a: Defending players the subject attacked in the
-    /// current combat, read from declaration history for Melee-style counts.
+    /// current combat, read from declaration history for Melee-style counts. For
+    /// `EventAttackers`, the players the current trigger event's attackers were
+    /// declared attacking, read from the event rather than the combat ledger.
     pub fn attacked_defenders_this_combat_for(
         &self,
         subject: AttackSubject,
         controller: PlayerId,
         source_id: ObjectId,
-    ) -> Option<&HashSet<PlayerId>> {
-        let combat = self.combat.as_ref()?;
+    ) -> Option<Cow<'_, HashSet<PlayerId>>> {
         match subject {
-            AttackSubject::You => combat.attacked_defenders_this_combat.get(&controller),
-            AttackSubject::Source => combat
+            // CR 508.6: the event's attacked players; read from the trigger event,
+            // not from the combat ledger.
+            AttackSubject::EventAttackers => {
+                Some(Cow::Owned(self.event_attacked_players().collect()))
+            }
+            AttackSubject::You => self
+                .combat
+                .as_ref()?
+                .attacked_defenders_this_combat
+                .get(&controller)
+                .map(Cow::Borrowed),
+            AttackSubject::Source => self
+                .combat
+                .as_ref()?
                 .creature_attacked_defenders_this_combat
-                .get(&source_id),
+                .get(&source_id)
+                .map(Cow::Borrowed),
         }
     }
 
@@ -29018,6 +29175,7 @@ impl GameState {
             active_casting_permission_index: None,
             active_paid_resolution_offer_tail: None,
             active_spend_only_on_x_count: None,
+            active_auto_tap_row_policy: None,
             battlefield: im::Vector::new(),
             stack: im::Vector::new(),
             stack_paid_facts: HashMap::new(),
@@ -29143,6 +29301,7 @@ impl GameState {
             activated_abilities_this_game: HashMap::new(),
             crew_activated_this_turn: HashSet::new(),
             crew_resolved_this_turn: HashSet::new(),
+            crew_history_this_turn: HashSet::new(),
             loyalty_abilities_activated_this_turn: HashMap::new(),
             extra_loyalty_activations_this_turn: HashMap::new(),
             exerted_this_turn: std::collections::HashSet::new(),
@@ -30407,6 +30566,7 @@ impl GameState {
         // monotone source of fresh IDs is normalized for recurrence checks.
         clone.next_return_result_occurrence_id = 0;
         clone.active_paid_resolution_offer_tail = None;
+        clone.active_auto_tap_row_policy = None;
         // CR 104.4b: pip-id counter is a volatile monotonic field; zero it (like
         // next_object_id) so two otherwise-identical loop states compare equal.
         clone.next_pip_id = 0;
@@ -32011,6 +32171,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         active_casting_permission_index: _,
         active_paid_resolution_offer_tail: _,
         active_spend_only_on_x_count: _,
+        active_auto_tap_row_policy: _,
         battlefield: _,
         stack: _,
         stack_paid_facts: _,
@@ -32169,6 +32330,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         activated_abilities_this_game: _,
         crew_activated_this_turn: _,
         crew_resolved_this_turn: _,
+        crew_history_this_turn: _,
         loyalty_abilities_activated_this_turn: _,
         extra_loyalty_activations_this_turn: _,
         exerted_this_turn: _,
@@ -32525,6 +32687,7 @@ impl PartialEq for GameState {
             && self.activated_abilities_this_game == other.activated_abilities_this_game
             && self.crew_activated_this_turn == other.crew_activated_this_turn
             && self.crew_resolved_this_turn == other.crew_resolved_this_turn
+            && self.crew_history_this_turn == other.crew_history_this_turn
             && self.loyalty_abilities_activated_this_turn
                 == other.loyalty_abilities_activated_this_turn
             && self.extra_loyalty_activations_this_turn == other.extra_loyalty_activations_this_turn
@@ -47563,8 +47726,14 @@ mod tests {
         let mut state = GameState::new_two_player(7);
         state.active_casting_permission_index = Some(CastingPermissionIndex(42));
         state.active_spend_only_on_x_count = Some((ObjectId(123), 5));
+        state.active_auto_tap_row_policy =
+            Some(crate::game::casting_costs::AutoTapRowPolicy::AllRows);
 
         let serialized = serde_json::to_string(&state).expect("state must serialize");
+        assert!(
+            !serialized.contains("active_auto_tap_row_policy"),
+            "active_auto_tap_row_policy must be skipped by serde: {serialized}"
+        );
         assert!(
             !serialized.contains("active_casting_permission_index"),
             "active_casting_permission_index must be skipped by serde: {serialized}"
@@ -47583,6 +47752,10 @@ mod tests {
         assert_eq!(
             deserialized.active_spend_only_on_x_count, None,
             "deserialized active_spend_only_on_x_count must be None"
+        );
+        assert_eq!(
+            deserialized.active_auto_tap_row_policy, None,
+            "deserialized active_auto_tap_row_policy must be None"
         );
     }
 }

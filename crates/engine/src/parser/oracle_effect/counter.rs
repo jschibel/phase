@@ -796,7 +796,7 @@ fn parse_counter_for_each_suffix(remainder: &str) -> Option<(QuantityExpr, &str)
 /// event-context amounts ("that much", "that many", "the result"). The
 /// equivalent token-creation and life-gain paths already fall back to
 /// `parse_event_context_quantity` after their primary quantity parse
-/// (`token.rs` count-expression resolution, `imperative.rs::parse_life_equal_quantity`);
+/// (`oracle_util::parse_equal_to_count`, the token and life count positions' chain);
 /// the counter path is the remaining gap, so it gets the same fallback here
 /// rather than leaking "the result" into the shared `parse_quantity_ref` leaf
 /// (which would break the `parse_cda_quantity` "returns None for the bare
@@ -1698,6 +1698,10 @@ fn parse_pt_multiplier_word(input: &str) -> OracleResult<'_, u32> {
 /// 1. "{mult} <target>'s power [and toughness]" (possessive, Bulk Up / Tifa).
 /// 2. "{mult} its power [and toughness]" (anaphoric "it").
 /// 3. "{mult} the power/toughness of <target|each filter>".
+///
+/// Every arm hands its unconsumed remainder to `finish_multiply_pt`, so a
+/// same-sentence tail the arm doesn't parse fails the clause closed instead of
+/// being dropped.
 pub(super) fn try_parse_multiply_pt_effect(lower: &str, ctx: &mut ParseContext) -> Option<Effect> {
     let (factor, after_word) = nom_on_lower(lower, lower, parse_pt_multiplier_word)?;
 
@@ -1729,7 +1733,7 @@ pub(super) fn try_parse_multiply_pt_effect(lower: &str, ctx: &mut ParseContext) 
             let (target, rem) = parse_target(after_word);
             if !matches!(target, TargetFilter::Any) {
                 let rem_lower = rem.to_lowercase();
-                let mode: Option<DoublePTMode> = nom_on_lower(&rem_lower, &rem_lower, |i| {
+                let mode = nom_on_lower(&rem_lower, &rem_lower, |i| {
                     alt((
                         value(
                             DoublePTMode::PowerAndToughness,
@@ -1739,14 +1743,17 @@ pub(super) fn try_parse_multiply_pt_effect(lower: &str, ctx: &mut ParseContext) 
                         value(DoublePTMode::Toughness, tag("'s toughness")),
                     ))
                     .parse(i)
-                })
-                .map(|(m, _)| m);
-                if let Some(mode) = mode {
-                    return Some(Effect::DoublePT {
-                        mode,
-                        target,
-                        factor,
-                    });
+                });
+                if let Some((mode, tail)) = mode {
+                    return Some(finish_multiply_pt(
+                        Effect::DoublePT {
+                            mode,
+                            target,
+                            factor,
+                        },
+                        tail,
+                        lower,
+                    ));
                 }
             }
         }
@@ -1756,21 +1763,24 @@ pub(super) fn try_parse_multiply_pt_effect(lower: &str, ctx: &mut ParseContext) 
     if let Some(((), rest)) =
         nom_on_lower(after_word, after_word, |i| value((), tag("its ")).parse(i))
     {
-        let mode: Option<DoublePTMode> = nom_on_lower(rest, rest, |i| {
+        let mode = nom_on_lower(rest, rest, |i| {
             alt((
                 value(DoublePTMode::PowerAndToughness, tag("power and toughness")),
                 value(DoublePTMode::Power, tag("power")),
                 value(DoublePTMode::Toughness, tag("toughness")),
             ))
             .parse(i)
-        })
-        .map(|(m, _)| m);
-        if let Some(mode) = mode {
-            return Some(Effect::DoublePT {
-                mode,
-                target: resolve_it_pronoun(ctx),
-                factor,
-            });
+        });
+        if let Some((mode, tail)) = mode {
+            return Some(finish_multiply_pt(
+                Effect::DoublePT {
+                    mode,
+                    target: resolve_it_pronoun(ctx),
+                    factor,
+                },
+                tail,
+                lower,
+            ));
         }
         return None;
     }
@@ -1796,24 +1806,47 @@ pub(super) fn try_parse_multiply_pt_effect(lower: &str, ctx: &mut ParseContext) 
     })
     .is_some()
     {
-        let (target, _) = parse_target(after_mode);
-        return Some(Effect::DoublePT {
-            mode,
-            target,
-            factor,
-        });
+        let (target, tail) = parse_target(after_mode);
+        return Some(finish_multiply_pt(
+            Effect::DoublePT {
+                mode,
+                target,
+                factor,
+            },
+            tail,
+            lower,
+        ));
     }
 
     // "each creature you control" / "each other creature" / "each Dragon" → DoublePTAll
     let ((), filter_text) = nom_on_lower(after_mode, after_mode, |i| {
         value((), alt((tag("each "), tag("all ")))).parse(i)
     })?;
-    let (target, _) = parse_type_phrase_folding(filter_text);
-    Some(Effect::DoublePTAll {
-        mode,
-        target,
-        factor,
-    })
+    let (target, tail) = parse_type_phrase_folding(filter_text);
+    Some(finish_multiply_pt(
+        Effect::DoublePTAll {
+            mode,
+            target,
+            factor,
+        },
+        tail,
+        lower,
+    ))
+}
+
+/// CR 608.2c: the instructions of an ability are all followed in the order
+/// written, so a multiply-P/T arm may only claim its clause when it consumed all
+/// of it. Any unparsed same-sentence tail ("double its power and toughness and
+/// this Saga gains hexproof") fails the whole clause closed as an explicit gap,
+/// rather than reporting the leading doubling as fully supported. Callers strip
+/// the clause's duration and repeat count ("until end of turn", "X times")
+/// before dispatch, so those never reach this check.
+fn finish_multiply_pt(effect: Effect, tail: &str, clause: &str) -> Effect {
+    if super::imperative::terminal_punctuation_only(tail) {
+        effect
+    } else {
+        Effect::unimplemented("multiply_pt_trailing_clause", clause)
+    }
 }
 
 /// Parse a mana color name from text like "red mana in your mana pool".
@@ -2924,6 +2957,47 @@ mod tests {
         };
         assert_eq!(mode, DoublePTMode::Power);
         assert_eq!(factor, 3);
+    }
+
+    /// CR 608.2c: every multiply-P/T arm (possessive target, anaphoric "its",
+    /// "the … of target", "the … of each") fails the clause closed when an
+    /// unparsed same-sentence tail follows, for both multiplier words. The
+    /// complete clause, with or without terminal punctuation, still parses.
+    #[test]
+    fn multiply_pt_trailing_tail_fails_closed_on_every_arm() {
+        let heads = [
+            "double target creature's power and toughness",
+            "double ~'s power",
+            "double its power and toughness",
+            "double its toughness",
+            "double the power and toughness of target creature you control",
+            "double the power of each creature you control",
+            "triple target creature's power and toughness",
+        ];
+        for head in heads {
+            for complete in [head.to_string(), format!("{head}.")] {
+                let effect = try_parse_multiply_pt_effect(&complete, &mut default_ctx());
+                assert!(
+                    matches!(
+                        effect,
+                        Some(Effect::DoublePT { .. } | Effect::DoublePTAll { .. })
+                    ),
+                    "reach: {complete:?} parses as a P/T multiply, got {effect:?}"
+                );
+            }
+            for tail in [" and ~ gains hexproof", " and ~ gains \"{t}: add {c}.\""] {
+                let clause = format!("{head}{tail}");
+                let effect = try_parse_multiply_pt_effect(&clause, &mut default_ctx());
+                assert_eq!(
+                    effect,
+                    Some(Effect::unimplemented(
+                        "multiply_pt_trailing_clause",
+                        clause.clone()
+                    )),
+                    "{clause:?} must fail closed"
+                );
+            }
+        }
     }
 
     #[test]

@@ -1615,8 +1615,8 @@ pub(crate) fn move_to_zone_with_entry_flags(
     // leaves-battlefield last-known-information scan in
     // `collect_pending_triggers` reads `state.objects` directly (the object's
     // zone is no longer Battlefield), unaffected by this removal. The
-    // authoritative correctness path is the `evaluate_layers` rebuild
-    // (CR 611.2e); this hook is incremental optimization between layer flushes.
+    // authoritative correctness path is the `evaluate_layers` rebuild; this
+    // hook is incremental optimization between layer flushes.
     if from == Zone::Battlefield {
         state.trigger_index.remove(object_id);
     }
@@ -1776,7 +1776,7 @@ pub(crate) fn move_to_zone_with_entry_flags(
     // CR 603.6a: Register the post-reset trigger definitions in the index so
     // `state.clone()` consumers see a coherent battlefield → trigger candidate
     // map. AUTHORITATIVE PATH: the end-of-`evaluate_layers` rebuild
-    // (CR 611.2e, `layers.rs`) is the safety net; this hook is incremental
+    // (`layers.rs`) is the safety net; this hook is incremental
     // optimization between layer flushes. `state.layers_dirty = true` was set
     // above, guaranteeing a post-layer rebuild on the next
     // `collect_pending_triggers` consult.
