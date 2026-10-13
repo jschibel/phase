@@ -33,7 +33,7 @@ use engine::types::game_state::{
     ActionResult, CastPaymentMode, GameState, PayCostKind, PendingCostMoveResume, WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
-use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType};
+use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::replacements::ReplacementEvent;
 use engine::types::triggers::TriggerMode;
@@ -770,4 +770,217 @@ fn gush_group_survives_a_serialized_second_pause() {
 fn gush_group_without_a_pause_reaches_the_same_totals() {
     let run = run_gush_pause(Redirected::None, false);
     assert_group_survived_pause(run, 0, Redirected::None);
+}
+
+// ---------------------------------------------------------------------------
+// U-B: preservation of the unless-side "sacrifice it unless you return N lands".
+// Bull Elephant and Ovinomancer keep their prior behavior: paying returns the
+// lands one prompt at a time (CR 118.12), declining or being unable to pay
+// sacrifices the creature. A preservation row (green at BASE and here).
+// CR 118.12: "unless" a player pays a cost. CR 701.21a: sacrifice.
+// ---------------------------------------------------------------------------
+
+const BULL_ELEPHANT: &str = "When this creature enters, sacrifice it unless you return two Forests you control to their owner's hand.";
+const OVINOMANCER: &str = "When this creature enters, sacrifice it unless you return three basic lands you control to their owner's hand.\n{T}, Return this creature to its owner's hand: Destroy target creature. It can't be regenerated. That creature's controller creates a 0/1 green Sheep creature token.";
+
+struct UnlessReturnBoard {
+    runner: GameRunner,
+    creature: ObjectId,
+    lands: Vec<ObjectId>,
+}
+
+/// Cast `name` from P0's hand with its cost pooled (so the lands stay on the
+/// battlefield, untouched) and `lands` basic lands of `land_color`, then pass
+/// priority until the enters trigger parks the `UnlessPayment` prompt.
+fn unless_return_board(
+    name: &str,
+    oracle: &str,
+    (power, toughness): (i32, i32),
+    (shard, generic): (ManaCostShard, u32),
+    lands: usize,
+    land_color: ManaColor,
+) -> UnlessReturnBoard {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let creature = scenario
+        .add_creature_to_hand_from_oracle(P0, name, power, toughness, oracle)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![shard],
+            generic,
+        })
+        .id();
+    let lands: Vec<ObjectId> = (0..lands)
+        .map(|_| scenario.add_basic_land(P0, land_color))
+        .collect();
+    let mut runner = scenario.build();
+    let pooled = if shard == ManaCostShard::Green {
+        ManaType::Green
+    } else {
+        ManaType::Blue
+    };
+    for _ in 0..=generic {
+        let _ = runner
+            .state_mut()
+            .add_mana_to_pool(P0, ManaUnit::new(pooled, ObjectId(0), false, vec![]));
+    }
+    cast(&mut runner, creature).expect("cast the creature");
+    for _ in 0..6 {
+        if matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { .. }) {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("pass priority toward the enters trigger");
+    }
+    // Reach guard: the prompt is parked, the creature is on the battlefield and
+    // every land is still there.
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { .. }),
+        "the enters trigger must park the unless-payment prompt, got {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(zone(&runner, creature), Zone::Battlefield);
+    for land in &lands {
+        assert_eq!(zone(&runner, *land), Zone::Battlefield);
+    }
+    UnlessReturnBoard {
+        runner,
+        creature,
+        lands,
+    }
+}
+
+fn bull_elephant_board(forests: usize) -> UnlessReturnBoard {
+    unless_return_board(
+        "Bull Elephant",
+        BULL_ELEPHANT,
+        (4, 4),
+        (ManaCostShard::Green, 3),
+        forests,
+        ManaColor::Green,
+    )
+}
+
+/// Answer one `UnlessBounceChoice` prompt with `pick`; returns the `remaining`
+/// count the prompt carried and the choices it offered.
+fn answer_unless_bounce(runner: &mut GameRunner, pick: ObjectId) -> (u32, Vec<ObjectId>) {
+    let (remaining, permanents) = match &runner.state().waiting_for {
+        WaitingFor::UnlessBounceChoice {
+            remaining,
+            permanents,
+            ..
+        } => (*remaining, permanents.clone()),
+        other => panic!("expected UnlessBounceChoice, got {other:?}"),
+    };
+    runner
+        .act(GameAction::SelectCards { cards: vec![pick] })
+        .expect("return one land");
+    (remaining, permanents)
+}
+
+#[test]
+fn bull_elephant_pays_by_returning_two_forests_one_prompt_at_a_time() {
+    let mut board = bull_elephant_board(2);
+    let (a, b) = (board.lands[0], board.lands[1]);
+    board
+        .runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("choose to pay");
+    // First prompt: both Forests offered, two still owed.
+    let (remaining, offered) = answer_unless_bounce(&mut board.runner, a);
+    assert_eq!(remaining, 2);
+    assert!(offered.contains(&a) && offered.contains(&b));
+    assert_eq!(zone(&board.runner, a), Zone::Hand);
+    assert_eq!(zone(&board.runner, b), Zone::Battlefield);
+    // Second, sequential prompt: the returned Forest is gone from the choices.
+    match &board.runner.state().waiting_for {
+        WaitingFor::UnlessBounceChoice {
+            remaining,
+            permanents,
+            ..
+        } => {
+            assert_eq!(*remaining, 1);
+            assert_eq!(permanents, &vec![b]);
+        }
+        other => panic!("expected a second UnlessBounceChoice, got {other:?}"),
+    }
+    answer_unless_bounce(&mut board.runner, b);
+    board.runner.advance_until_stack_empty();
+    assert_eq!(zone(&board.runner, a), Zone::Hand);
+    assert_eq!(zone(&board.runner, b), Zone::Hand);
+    assert_eq!(zone(&board.runner, board.creature), Zone::Battlefield);
+}
+
+#[test]
+fn bull_elephant_declined_is_sacrificed_and_keeps_the_forests() {
+    let mut board = bull_elephant_board(2);
+    board
+        .runner
+        .act(GameAction::PayUnlessCost { pay: false })
+        .expect("decline to pay");
+    board.runner.advance_until_stack_empty();
+    assert_eq!(zone(&board.runner, board.creature), Zone::Graveyard);
+    for forest in &board.lands {
+        assert_eq!(zone(&board.runner, *forest), Zone::Battlefield);
+    }
+}
+
+#[test]
+fn bull_elephant_with_one_forest_cannot_pay_and_is_sacrificed() {
+    let mut board = bull_elephant_board(1);
+    let forest = board.lands[0];
+    board
+        .runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("attempt to pay");
+    assert!(
+        !matches!(
+            board.runner.state().waiting_for,
+            WaitingFor::UnlessBounceChoice { .. }
+        ),
+        "one Forest cannot pay a two-land cost: no return prompt"
+    );
+    board.runner.advance_until_stack_empty();
+    assert_eq!(zone(&board.runner, board.creature), Zone::Graveyard);
+    assert_eq!(zone(&board.runner, forest), Zone::Battlefield);
+}
+
+#[test]
+fn ovinomancer_pay_is_optional_and_returns_three_basic_lands() {
+    let ovinomancer = || {
+        unless_return_board(
+            "Ovinomancer",
+            OVINOMANCER,
+            (0, 1),
+            (ManaCostShard::Blue, 2),
+            3,
+            ManaColor::Green,
+        )
+    };
+    // Decline: sacrificed, lands stay.
+    let mut declined = ovinomancer();
+    declined
+        .runner
+        .act(GameAction::PayUnlessCost { pay: false })
+        .expect("decline to pay");
+    declined.runner.advance_until_stack_empty();
+    assert_eq!(zone(&declined.runner, declined.creature), Zone::Graveyard);
+    for land in &declined.lands {
+        assert_eq!(zone(&declined.runner, *land), Zone::Battlefield);
+    }
+    // Pay: three sequential prompts (remaining 3, 2, 1), all three to hand.
+    let mut paid = ovinomancer();
+    paid.runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("choose to pay");
+    let mut remainings = Vec::new();
+    for land in paid.lands.clone() {
+        remainings.push(answer_unless_bounce(&mut paid.runner, land).0);
+    }
+    assert_eq!(remainings, vec![3, 2, 1]);
+    paid.runner.advance_until_stack_empty();
+    for land in &paid.lands {
+        assert_eq!(zone(&paid.runner, *land), Zone::Hand);
+    }
+    assert_eq!(zone(&paid.runner, paid.creature), Zone::Battlefield);
 }
