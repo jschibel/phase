@@ -7092,10 +7092,11 @@ pub(super) fn exile_land_play_authorization(
     // purpose — a milled land carries its `PlayFromExile` grant into the
     // graveyard. A static `ExileCastPermission` source is different: its printed
     // scope is cards EXILED with it. Its this-turn pool
-    // (`cards_exiled_with_source_this_turn`) is keyed by `ObjectId`, which is
-    // stable across zone changes and is cleared only at turn end, never on zone
-    // exit — so a land exiled with such a source and then moved to a graveyard in
-    // the same turn is STILL in that pool. When the play-land capture was widened
+    // (`cards_exiled_with_source_this_turn`) lists exiled cards by `ObjectId`,
+    // which is stable across zone changes; an entry ends at the turn's start or
+    // when the source itself leaves the battlefield, never when a listed card
+    // leaves exile — so a land exiled with such a source and then moved to a
+    // graveyard in the same turn is STILL in that pool. When the play-land capture was widened
     // to graveyards, that land became playable from the graveyard through a
     // permission that only covers exile, and CR 116.2a would then put it onto the
     // battlefield "from the zone it was in" under an `Exile` origin it no longer
@@ -27690,7 +27691,8 @@ pub(crate) fn require_activation_record(
 /// `placed_entry` is the id of the `StackEntry` the caller just pushed. The
 /// placed ability is read from THAT entry by id — never from the top of the
 /// stack, which cannot tell two activations of one permanent's same ability
-/// apart.
+/// apart. It is also the identity the `AbilityActivated` event carries, so an
+/// activation trigger's "that ability" names this entry (CR 602.2a).
 ///
 /// `record` is the activation's facts, captured before any of its cost was
 /// paid (CR 601.2c precedes CR 601.2h). It is a required input: a placement
@@ -27738,6 +27740,7 @@ pub(crate) fn record_activated_ability_placed(
         player,
         source_id,
         kind,
+        Some(placed_entry),
         announced_zone,
         events,
     );
@@ -29056,6 +29059,7 @@ fn filter_prop_reads_chosen_target(prop: &FilterProp, read: TargetRead) -> bool 
         | FilterProp::Untapped
         | FilterProp::IsSaddled
         | FilterProp::SaddledSource
+        | FilterProp::CrewedThisTurn { .. }
         | FilterProp::ConvokedSource
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }

@@ -3346,7 +3346,34 @@ mod tests {
         }
     }
 
-    /// The bump this number is at: `PlayerFilter` gains `AnyOf { filters }` and
+    /// v140: `AttackSubject` gains `EventAttackers` (the players a trigger's
+    /// attack event's attackers attacked), carried in a resolving or pending
+    /// ability's `player_scope` inside `GameState`; a v139 peer cannot parse the
+    /// tag, so it must be refused before it receives v140 state.
+    ///
+    /// v139: CR 702.122c per-turn crew relation —
+    /// `GameState::crew_history_this_turn` and `FilterProp::CrewedThisTurn`, both
+    /// inside `GameState`; a v138 peer cannot parse the new filter tag, so it
+    /// must be refused before it receives v139 state.
+    ///
+    /// v134: `GameEvent::AbilityActivated` gains
+    /// `stack_entry`, the stack object a stack-using activation created, carried
+    /// in `GameState`'s trigger events; an older peer drops it silently and
+    /// resolves an activation trigger's "copy that ability" differently, so it
+    /// must be refused before it receives v134 state.
+    ///
+    /// v133: CR 614.12a pre-entry as-enters choices —
+    /// `NamedChoiceSourceBinding::PendingEntry`, `ProposedEvent::ZoneChange`'s
+    /// `enter_with_choices` and `PendingReplacement::delivery_boundary`, all
+    /// inside `GameState`; a v132 peer cannot parse the new binding tag, so it
+    /// must be refused before it receives v133 state.
+    ///
+    /// v132: `GameObject::exile_from_stack_linked_source`
+    /// carries the stamping incarnation (`ObjectIncarnationRef`, CR 400.7); a
+    /// v131 peer cannot decode a set rider, so it must be refused before it
+    /// receives v132 state.
+    ///
+    /// v131: `PlayerFilter` gains `AnyOf { filters }` and
     /// `TargetPlayer`, carried in a resolving or pending ability's `player_scope`
     /// inside `GameState`; a v130 peer cannot parse either tag, so it must be
     /// refused before it receives v131 state.
@@ -3517,8 +3544,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_131_for_coordinated_player_set() {
-        assert_eq!(PROTOCOL_VERSION, 131);
+    fn protocol_version_is_140_for_event_attackers() {
+        assert_eq!(PROTOCOL_VERSION, 140);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3529,7 +3556,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_131_for_coordinated_player_set` stays
+    /// `protocol_version_is_140_for_event_attackers` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

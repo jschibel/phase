@@ -6545,6 +6545,18 @@ pub enum CombatRelation {
     BlockedBySubject { scope: CombatHistoryScope },
 }
 
+/// CR 702.122b + CR 702.122c: which side of a crew payment the candidate of a
+/// [`FilterProp::CrewedThisTurn`] stands on, relative to the filter source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CrewRelation {
+    /// The candidate crewed the source Vehicle this turn (was tapped to pay its
+    /// crew cost) — "creature that crewed it this turn".
+    CrewedSource,
+    /// The candidate is a Vehicle the source crewed this turn — "Vehicle crewed
+    /// by ~ this turn".
+    CrewedBySource,
+}
+
 /// Context object for a combat relationship filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CombatRelationSubject {
@@ -6679,6 +6691,16 @@ pub enum FilterProp {
     /// of `BlockingSource`; used by "choose a creature that saddled it this turn"
     /// (Calamity, Galloping Inferno).
     SaddledSource,
+    /// CR 702.122b + CR 702.122c: crew-payment relation between the candidate
+    /// and the filter source this turn, read from
+    /// `GameState::crew_history_this_turn` by both objects' exact incarnations
+    /// (CR 400.7). `CrewedSource` — "creature that crewed it this turn"
+    /// (Getaway Car, Golden Argosy); `CrewedBySource` — "Vehicle crewed by ~
+    /// this turn" (Balthier and Fran). Recorded at crew cost payment, so a crew
+    /// ability countered after payment still counts (CR 702.122c).
+    CrewedThisTurn {
+        relation: CrewRelation,
+    },
     /// CR 702.51c: Matches a creature that convoked the filter source — i.e. was
     /// tapped to pay the source spell's convoke cost, recorded in the source
     /// object's `convoked_creatures`. Source-relative, mirroring `SaddledSource`
@@ -11113,6 +11135,13 @@ pub enum AttackSubject {
     You,
     /// The ability's source creature — "opponents this creature attacked".
     Source,
+    /// CR 508.1b + CR 508.6: the attacking creatures of the attack event the
+    /// resolving trigger answers to ("those players" of "one or more Devils you
+    /// control attack one or more players"). Read from `state.current_trigger_event`'s
+    /// `AttackersDeclared.attacks`, which a batched trigger narrows to its matching
+    /// attackers. One declaration is one combat, so `CombatHistoryScope` is inert
+    /// for this subject; the parser emits `ThisCombat`.
+    EventAttackers,
 }
 
 /// CR 500.8 + CR 511.3: The time window a combat-history predicate is measured over.
@@ -22382,6 +22411,262 @@ impl Effect {
         )
     }
 
+    /// CR 707.10 + CR 608.2k + CR 113.7a: True when this effect's anaphoric
+    /// `ParentTarget` names the spell or ability it copies ("copy that ability",
+    /// "copy that spell") — a stack object that exists independently of its
+    /// source, which `copy_spell::copy_source_entry` resolves from the parent
+    /// chain or the trigger event. Event-context binding yields the event's
+    /// object or the source's attached host, never the copied stack object, so
+    /// neither the trigger-push seeder's attached-host
+    /// fallback nor resolution-time hydration may bind it. Single authority for
+    /// both binders so they cannot disagree.
+    pub(crate) fn parent_target_is_copy_referent(&self) -> bool {
+        match self {
+            Effect::CopySpell {
+                target: TargetFilter::ParentTarget,
+                ..
+            } => true,
+            // Wildcard-free on purpose: a new variant whose `ParentTarget` names a
+            // copied stack object must answer here, or the binders would pin its
+            // referent to the event's object or the attached host. Do not add an
+            // `_ =>` arm.
+            Effect::StartYourEngines { .. }
+            | Effect::ChangeSpeed { .. }
+            | Effect::DealDamage { .. }
+            | Effect::ApplyPostReplacementDamage { .. }
+            | Effect::EachDealsDamageEqualToPower { .. }
+            | Effect::EachSourceDealsDamage { .. }
+            | Effect::Draw { .. }
+            | Effect::Pump { .. }
+            | Effect::PairWith { .. }
+            | Effect::Destroy { .. }
+            | Effect::Regenerate { .. }
+            | Effect::RemoveAllDamage { .. }
+            | Effect::Counter { .. }
+            | Effect::CounterAll { .. }
+            | Effect::Token { .. }
+            | Effect::GainLife { .. }
+            | Effect::LoseLife { .. }
+            | Effect::SetTapState { .. }
+            | Effect::RemoveCounter { .. }
+            | Effect::Sacrifice { .. }
+            | Effect::DiscardCard { .. }
+            | Effect::Mill { .. }
+            | Effect::Scry { .. }
+            | Effect::PumpAll { .. }
+            | Effect::DamageAll { .. }
+            | Effect::DamageEachPlayer { .. }
+            | Effect::DestroyAll { .. }
+            | Effect::ChangeZone { .. }
+            | Effect::ChangeZoneAll { .. }
+            | Effect::Dig { .. }
+            | Effect::GainControl { .. }
+            | Effect::GainControlAll { .. }
+            | Effect::ControlNextTurn { .. }
+            | Effect::Attach { .. }
+            | Effect::UnattachAll { .. }
+            | Effect::Surveil { .. }
+            | Effect::Fight { .. }
+            | Effect::Bounce { .. }
+            | Effect::BounceAll { .. }
+            | Effect::Explore
+            | Effect::ExploreAll { .. }
+            | Effect::Investigate
+            | Effect::Tribute { .. }
+            | Effect::TimeTravel
+            | Effect::BecomeMonarch { .. }
+            | Effect::NoOp
+            | Effect::Proliferate
+            | Effect::ProliferateTarget { .. }
+            | Effect::Populate
+            | Effect::Clash
+            | Effect::Behold { .. }
+            | Effect::EndTheTurn
+            | Effect::EndCombatPhase
+            | Effect::Vote { .. }
+            | Effect::SeparateIntoPiles { .. }
+            | Effect::SwitchPT { .. }
+            | Effect::CopySpell { .. }
+            | Effect::EpicCopy { .. }
+            | Effect::CastCopyOfCard { .. }
+            | Effect::CopyTokenOf { .. }
+            | Effect::CreateTokenCopyFromPool { .. }
+            | Effect::Myriad
+            | Effect::Encore
+            | Effect::CombineHost { .. }
+            | Effect::ChooseAugmentAndCombineWithHost { .. }
+            | Effect::Meld { .. }
+            | Effect::ExileHaunting { .. }
+            | Effect::HideawayConceal { .. }
+            | Effect::CopyTokenBlockingAttacker { .. }
+            | Effect::BecomeCopy { .. }
+            | Effect::ChoosePermanent { .. }
+            | Effect::GainActivatedAbilitiesOfTarget { .. }
+            | Effect::ChooseCard { .. }
+            | Effect::PutCounter { .. }
+            | Effect::ChooseCounterKind { .. }
+            | Effect::PutChosenCounter { .. }
+            | Effect::PutCounterAll { .. }
+            | Effect::MultiplyCounter { .. }
+            | Effect::ChooseCounterAdjustment { .. }
+            | Effect::DoublePT { .. }
+            | Effect::DoublePTAll { .. }
+            | Effect::MoveCounters { .. }
+            | Effect::ReproduceEventCounters { .. }
+            | Effect::Animate { .. }
+            | Effect::ReturnAsAura { .. }
+            | Effect::RegisterBending { .. }
+            | Effect::GenericEffect { .. }
+            | Effect::Cleanup { .. }
+            | Effect::Mana { .. }
+            | Effect::Discard { .. }
+            | Effect::Shuffle { .. }
+            | Effect::Transform { .. }
+            | Effect::FlipPermanent { .. }
+            | Effect::SearchLibrary { .. }
+            | Effect::SearchOutsideGame { .. }
+            | Effect::OpenBoosterPack { .. }
+            | Effect::RevealHand { .. }
+            | Effect::RevealFromHand { .. }
+            | Effect::Reveal { .. }
+            | Effect::RevealChosenNumbers { .. }
+            | Effect::RevealTop { .. }
+            | Effect::ExileTop { .. }
+            | Effect::ExileFaceDownPile { .. }
+            | Effect::TargetOnly { .. }
+            | Effect::Choose { .. }
+            | Effect::OpponentGuess { .. }
+            | Effect::SwapChosenLabels { .. }
+            | Effect::ChooseDamageSource { .. }
+            | Effect::Suspect { .. }
+            | Effect::Unsuspect { .. }
+            | Effect::Connive { .. }
+            | Effect::PhaseOut { .. }
+            | Effect::PhaseIn { .. }
+            | Effect::ForceBlock { .. }
+            | Effect::ForceAttack { .. }
+            | Effect::SolveCase
+            | Effect::BecomePrepared { .. }
+            | Effect::BecomeUnprepared { .. }
+            | Effect::BecomeSaddled { .. }
+            | Effect::SetClassLevel { .. }
+            | Effect::CreateDelayedTrigger { .. }
+            | Effect::AddTargetReplacement { .. }
+            | Effect::AddRestriction { .. }
+            | Effect::ReduceNextSpellCost { .. }
+            | Effect::GrantNextSpellAbility { .. }
+            | Effect::AddPendingETBCounters { .. }
+            | Effect::AddPendingEntersModifications { .. }
+            | Effect::CreateEmblem { .. }
+            | Effect::PayCost { .. }
+            | Effect::CastFromZone { .. }
+            | Effect::FreeCastFromZones { .. }
+            | Effect::ExileResolvingSpellInsteadOfGraveyard { .. }
+            | Effect::PreventDamage { .. }
+            | Effect::CreateDamageReplacement { .. }
+            | Effect::CreateDrawReplacement { .. }
+            | Effect::CreatePlaneswalkReplacement { .. }
+            | Effect::LoseTheGame { .. }
+            | Effect::WinTheGame { .. }
+            | Effect::RollDie { .. }
+            | Effect::FlipCoin { .. }
+            | Effect::FlipCoins { .. }
+            | Effect::FlipCoinUntilLose { .. }
+            | Effect::RingTemptsYou
+            | Effect::VentureIntoDungeon
+            | Effect::VentureInto { .. }
+            | Effect::TakeTheInitiative
+            | Effect::ArrangePlanarDeckTop { .. }
+            | Effect::Planeswalk
+            | Effect::ChaosEnsues
+            | Effect::ReverseTurnOrder
+            | Effect::RedistributeLifeTotals
+            | Effect::OpenAttractions { .. }
+            | Effect::RollToVisitAttractions
+            | Effect::AssembleContraptions { .. }
+            | Effect::AssembleContraptionsFromRollDifference
+            | Effect::CrankContraptions { .. }
+            | Effect::ReassembleContraption { .. }
+            | Effect::AssembleContraptionOnSprocket { .. }
+            | Effect::ReassembleContraptionOnSprocket { .. }
+            | Effect::PutSticker { .. }
+            | Effect::ApplySticker { .. }
+            | Effect::ProcessRadCounters
+            | Effect::GrantCastingPermission { .. }
+            | Effect::ChooseFromZone { .. }
+            | Effect::RememberCard { .. }
+            | Effect::NoteManaSpent
+            | Effect::ForEachCategory { .. }
+            | Effect::ChooseObjectsIntoTrackedSet { .. }
+            | Effect::ChooseAndSacrificeRest { .. }
+            | Effect::EachPlayerCopyChosen { .. }
+            | Effect::Exploit { .. }
+            | Effect::GainEnergy { .. }
+            | Effect::GivePlayerCounter { .. }
+            | Effect::LoseAllPlayerCounters { .. }
+            | Effect::ExileFromTopUntil { .. }
+            | Effect::RevealUntil { .. }
+            | Effect::Discover { .. }
+            | Effect::Heist { .. }
+            | Effect::HeistExile
+            | Effect::Cascade
+            | Effect::Ripple { .. }
+            | Effect::MiracleCast { .. }
+            | Effect::MadnessCast { .. }
+            | Effect::PutAtLibraryPosition { .. }
+            | Effect::ChooseDrawnThisTurnPayOrTopdeck { .. }
+            | Effect::PutOnTopOrBottom { .. }
+            | Effect::GiftDelivery { .. }
+            | Effect::Goad { .. }
+            | Effect::GoadAll { .. }
+            | Effect::Detain { .. }
+            | Effect::SetRoomDoorLock { .. }
+            | Effect::ExchangeControl { .. }
+            | Effect::ChangeTargets { .. }
+            | Effect::Manifest { .. }
+            | Effect::ManifestDread
+            | Effect::Cloak { .. }
+            | Effect::TurnFaceUp { .. }
+            | Effect::TurnFaceDown { .. }
+            | Effect::ExtraTurn { .. }
+            | Effect::GrantExtraLoyaltyActivations { .. }
+            | Effect::SkipNextTurn { .. }
+            | Effect::SkipNextStep { .. }
+            | Effect::AdditionalPhase { .. }
+            | Effect::Double { .. }
+            | Effect::RuntimeHandled { .. }
+            | Effect::Incubate { .. }
+            | Effect::Amass { .. }
+            | Effect::EmpowerJace { .. }
+            | Effect::Monstrosity { .. }
+            | Effect::Specialize
+            | Effect::Renown { .. }
+            | Effect::Bolster { .. }
+            | Effect::Adapt { .. }
+            | Effect::Learn
+            | Effect::Forage
+            | Effect::CompletePlayerAction { .. }
+            | Effect::Harness
+            | Effect::CollectEvidence { .. }
+            | Effect::Endure { .. }
+            | Effect::BlightEffect { .. }
+            | Effect::Seek { .. }
+            | Effect::SetLifeTotal { .. }
+            | Effect::ExchangeLifeWithStat { .. }
+            | Effect::ExchangeLifeTotals { .. }
+            | Effect::SetDayNight { .. }
+            | Effect::GiveControl { .. }
+            | Effect::RemoveFromCombat { .. }
+            | Effect::BecomeBlocked { .. }
+            | Effect::Conjure { .. }
+            | Effect::ApplyPerpetual { .. }
+            | Effect::Intensify { .. }
+            | Effect::DraftFromSpellbook { .. }
+            | Effect::ChooseOneOf { .. }
+            | Effect::Unimplemented { .. } => false,
+        }
+    }
+
     pub fn target_filter(&self) -> Option<&TargetFilter> {
         match self {
             // CR 115.1 + CR 601.2c: a `ChooseFromZone` is normally a resolution
@@ -28317,6 +28602,100 @@ impl AbilityCondition {
             | AbilityCondition::AbilityUseCountThisTurn { .. }
             | AbilityCondition::SourceLacksKeyword { .. }
             | AbilityCondition::ScopedPlayerMatches { .. } => false,
+        }
+    }
+
+    /// CR 608.2c + CR 603.12: the "… this way" zone-change head of a clause
+    /// gate — the `ZoneChangedThisWay` condition itself (an "if" head), or the
+    /// trigger-event member of a reflexive creation gate built by
+    /// `when_you_do_with_guard` ("When <zone change> this way"). Lets a body
+    /// rewrite or runtime binder that keys on the zone-change head read both
+    /// connectors.
+    ///
+    /// Contract: a root `ZoneChangedThisWay` member beside `WhenYouDo` is always
+    /// the reflexive's trigger event. The parser refuses a zone-change
+    /// intervening "if" on a reflexive (`has_root_zone_changed_this_way` at the
+    /// "When you do, if …" composition sites), so the role is never ambiguous.
+    pub fn zone_changed_this_way_head(&self) -> Option<&AbilityCondition> {
+        match self {
+            AbilityCondition::ZoneChangedThisWay { .. } => Some(self),
+            AbilityCondition::And { conditions } => {
+                if !self.has_when_you_do_marker() {
+                    return None;
+                }
+                conditions
+                    .iter()
+                    .find(|member| matches!(member, AbilityCondition::ZoneChangedThisWay { .. }))
+            }
+            AbilityCondition::WhenYouDo
+            | AbilityCondition::TriggerEventTargetDamagedBySourceThisTurn
+            | AbilityCondition::TriggerEventTargetExploitedBySource
+            | AbilityCondition::AdditionalCostPaidInstead
+            | AbilityCondition::AlternativeManaCostPaid
+            | AbilityCondition::EffectOutcome { .. }
+            | AbilityCondition::EventOutcomeWon
+            | AbilityCondition::SourceEnteredThisTurn
+            | AbilityCondition::HasMaxSpeed
+            | AbilityCondition::IsMonarch
+            | AbilityCondition::IsInitiative
+            | AbilityCondition::HasCityBlessing
+            | AbilityCondition::HasEnduringStory
+            | AbilityCondition::ControlsCommander { .. }
+            | AbilityCondition::DiscardedCardMatchesFilter { .. }
+            | AbilityCondition::IsRingBearer
+            | AbilityCondition::HasObjectTarget
+            | AbilityCondition::IsYourTurn
+            | AbilityCondition::FirstCombatPhaseOfTurn
+            | AbilityCondition::FirstEndStepOfTurn
+            | AbilityCondition::SourceIsTapped
+            | AbilityCondition::SourceAttachedToCreature
+            | AbilityCondition::DayNightIsNeither
+            | AbilityCondition::AdditionalCostPaid { .. }
+            | AbilityCondition::CoinFlipOutcome { .. }
+            | AbilityCondition::WasCast { .. }
+            | AbilityCondition::CastDuringPhase { .. }
+            | AbilityCondition::CurrentPhaseIs { .. }
+            | AbilityCondition::CastTimingPermission { .. }
+            | AbilityCondition::ManaColorSpent { .. }
+            | AbilityCondition::RevealedHasCardType { .. }
+            | AbilityCondition::ObjectsShareQuality { .. }
+            | AbilityCondition::TargetSharesNameWithOtherExiledThisWay { .. }
+            | AbilityCondition::CastVariantPaid { .. }
+            | AbilityCondition::CastVariantPaidInstead { .. }
+            | AbilityCondition::QuantityCheck { .. }
+            | AbilityCondition::PreviousEffectAmount { .. }
+            | AbilityCondition::CompletedDungeon { .. }
+            | AbilityCondition::TargetHasKeywordInstead { .. }
+            | AbilityCondition::TargetMatchesFilter { .. }
+            | AbilityCondition::TriggeringSpellTargetsFilter { .. }
+            | AbilityCondition::SourceMatchesFilter { .. }
+            | AbilityCondition::PostReplacementDamageSourceMatchesFilter { .. }
+            | AbilityCondition::ZoneChangeObjectMatchesFilter { .. }
+            | AbilityCondition::ControllerControlsMatching { .. }
+            | AbilityCondition::ControllerControlledMatchingAsCast { .. }
+            | AbilityCondition::WasStartingPlayer { .. }
+            | AbilityCondition::SpellCastWithVariantThisTurn { .. }
+            | AbilityCondition::CostPaidObjectMatchesFilter { .. }
+            | AbilityCondition::ConditionInstead { .. }
+            | AbilityCondition::Or { .. }
+            | AbilityCondition::Not { .. }
+            | AbilityCondition::DayNightIs { .. }
+            | AbilityCondition::AbilityUseCountThisTurn { .. }
+            | AbilityCondition::SourceLacksKeyword { .. }
+            | AbilityCondition::ScopedPlayerMatches { .. } => None,
+        }
+    }
+
+    /// Whether `ZoneChangedThisWay` is this condition or a member of its flat
+    /// root `And`. Used to refuse a zone-change guard as a reflexive's
+    /// intervening "if" (see `zone_changed_this_way_head`).
+    pub fn has_root_zone_changed_this_way(&self) -> bool {
+        let is_zone_change = |condition: &AbilityCondition| {
+            matches!(condition, AbilityCondition::ZoneChangedThisWay { .. })
+        };
+        match self {
+            AbilityCondition::And { conditions } => conditions.iter().any(is_zone_change),
+            condition => is_zone_change(condition),
         }
     }
 

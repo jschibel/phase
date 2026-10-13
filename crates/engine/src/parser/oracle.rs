@@ -114,6 +114,7 @@ use super::oracle_modal::{
     strip_flavor_word_with_name, AnchorModeIr, OracleBlockIr, FLAVOR_WORD_COST_LABEL_MAX_WORDS,
 };
 use super::oracle_replacement::{
+    as_long_as_gate_is_unparsed, damage_prevention_fails_closed, enters_with_gate_fails_closed,
     find_copy_verb_present, is_as_self_enters_frame, lower_as_enters_becomes_choice_modal,
     lower_as_enters_or_face_up_counters, lower_replacement_ir,
     parse_as_enters_one_shot_replacement, parse_bidirectional_damage_prevention,
@@ -5723,10 +5724,15 @@ fn parse_normalized_oracle_ir(
                     // CR 702.166a analogue: reduction only applies when the optional
                     // additional cost is declared, not when the player declines it.
                     def.condition = Some(match def.condition {
+                        // CR 701.59c + CR 702.166a: the reduction's own gate already names the
+                        // linked optional additional cost ("if evidence was collected"); wrapping
+                        // it again would only duplicate the same conjunct.
+                        None | Some(StaticCondition::AdditionalCostPaid) => {
+                            StaticCondition::AdditionalCostPaid
+                        }
                         Some(existing) => StaticCondition::And {
                             conditions: vec![existing, StaticCondition::AdditionalCostPaid],
                         },
-                        None => StaticCondition::AdditionalCostPaid,
                     });
                     emitter.static_ir_at(item_line, StaticIr::from_definition(reduction_text, def));
                 }
@@ -6972,6 +6978,37 @@ fn parse_normalized_oracle_ir(
                     i += 1;
                     continue;
                 }
+                // CR 604.2 + CR 611.3a: the replacement parser declined and the printed gate is
+                // one the typed surface cannot carry. Falling through would let the static chain's
+                // terminal "as long as" fallback claim the line as a modification-less static with
+                // the body dropped (fail-open). Land it honestly instead.
+                if as_long_as_gate_is_unparsed(&line, card_name) {
+                    emitter.ability_at(
+                        item_line,
+                        AbilityDefinition::new(
+                            AbilityKind::Spell,
+                            Effect::unimplemented("as_long_as_gate", &line),
+                        )
+                        .description(line.clone()),
+                    );
+                    i += 1;
+                    continue;
+                }
+                // CR 615.1a: the gate parsed, but the prevention shield it gates prints a
+                // part the shield cannot carry (an unreadable "by <subject>" source scope,
+                // a coordinated "and it <verb> …" clause). Same fail-open hazard; land it.
+                if let Some(reason) = damage_prevention_fails_closed(&line, card_name) {
+                    emitter.ability_at(
+                        item_line,
+                        AbilityDefinition::new(
+                            AbilityKind::Spell,
+                            Effect::unimplemented(reason.gap_name(), &line),
+                        )
+                        .description(line.clone()),
+                    );
+                    i += 1;
+                    continue;
+                }
             } else if is_enters_with_counter_replacement_line(&lower) {
                 // CR 614.1c + CR 614.12: distributive "[Other/each] [type] you
                 // control enter(s) with [an additional] [counter] on them [for
@@ -7422,6 +7459,37 @@ fn parse_normalized_oracle_ir(
             // parser can in fact represent.
             if let Some(ir) = parse_windowed_replacement_install_ir(&line) {
                 emitter.ability_ir_at(item_line, ir);
+                i += 1;
+                continue;
+            }
+            // CR 614.1c: "[This permanent] enters with …" is a replacement effect. When the
+            // condition printed on it cannot be represented, the whole line is recorded as an
+            // `Effect::unimplemented` gap rather than shipped as an ungated replacement or left
+            // for a later route (the effect-first `dispatch_line_nom`) to claim.
+            if enters_with_gate_fails_closed(&line, card_name) {
+                emitter.ability_at(
+                    item_line,
+                    AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::unimplemented("enters_with_gate", &line),
+                    )
+                    .description(line.clone()),
+                );
+                i += 1;
+                continue;
+            }
+            // CR 615.1a: a prevention shield whose printed source scope or coordinated
+            // clause cannot be carried is recorded as an `Effect::unimplemented` gap rather
+            // than left for a later route (the effect-first `dispatch_line_nom`) to claim.
+            if let Some(reason) = damage_prevention_fails_closed(&line, card_name) {
+                emitter.ability_at(
+                    item_line,
+                    AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::unimplemented(reason.gap_name(), &line),
+                    )
+                    .description(line.clone()),
+                );
                 i += 1;
                 continue;
             }
@@ -9333,6 +9401,7 @@ fn parse_oracle_pipeline(
     demote_unbound_delayed_sweeps(&mut parsed);
     demote_unenforceable_replacement_lifetimes(&mut parsed);
     demote_unsupported_composite_counter_choice_costs(&mut parsed);
+    demote_crew_history_population_counts(&mut parsed);
     #[cfg(debug_assertions)]
     crate::parser::oracle_effect::debug_assert_exile_top_opponent_sentinel_lifted(
         &parsed, card_name,
@@ -9498,31 +9567,103 @@ fn demote_unreached_granter_references(parsed: &mut ParsedAbilities) {
     demote_granter_references(parsed, granter_reference_unreached);
 }
 
+/// CR 702.122c + CR 400.7: a quantity over a crew-history filter ("for each
+/// creature that crewed it this turn", Luxurious Locomotive) must include
+/// crewers that have since left the battlefield, but every filter-bearing
+/// `QuantityRef` evaluates live membership, and a departed crewer is a new
+/// object that matches no ledger record. No quantity reads the crew ledger's
+/// cardinality, so every definition holding such a quantity lowers to the
+/// unsupported residual rather than undercounting.
+///
+/// Reached on the serialized tree so every nesting position (effect counts,
+/// conditions, sub-abilities, granted statics) is covered by one walk; each
+/// node is judged TYPED — it must decode as a `QuantityRef`, and the shared
+/// `quantity_ref_uses_filter_prop` authority (exhaustive over `QuantityRef`)
+/// decides whether any filter it carries reads the crew relation.
+fn demote_crew_history_population_counts(parsed: &mut ParsedAbilities) {
+    demote_definitions(parsed, "crew_history_population_count", |node| {
+        let tree = match &node {
+            DefinitionNode::Ability(def) => serde_json::to_value(def),
+            DefinitionNode::Trigger(def) => serde_json::to_value(def),
+            DefinitionNode::Static(def) => serde_json::to_value(def),
+            DefinitionNode::Replacement(def) => serde_json::to_value(def),
+        };
+        tree.is_ok_and(|tree| mentions_crew_history(&tree) && holds_crew_history_quantity(&tree))
+    });
+}
+
+/// Cheap prefilter: does the serialized tree name the crew-history prop at all?
+/// Correctness rests on the typed walk below; this only skips trees that cannot
+/// match.
+fn mentions_crew_history(tree: &serde_json::Value) -> bool {
+    match tree {
+        serde_json::Value::Object(map) => {
+            map.get("type").is_some_and(|tag| tag == "CrewedThisTurn")
+                || map.values().any(mentions_crew_history)
+        }
+        serde_json::Value::Array(items) => items.iter().any(mentions_crew_history),
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => false,
+    }
+}
+
+/// Whether any node of `tree` is a `QuantityRef` whose filters read
+/// `FilterProp::CrewedThisTurn`.
+fn holds_crew_history_quantity(tree: &serde_json::Value) -> bool {
+    let reads_crew_history = |prop: &FilterProp| matches!(prop, FilterProp::CrewedThisTurn { .. });
+    match tree {
+        serde_json::Value::Object(map) => {
+            let is_crew_quantity = map.contains_key("type")
+                && <QuantityRef as serde::Deserialize>::deserialize(tree)
+                    .is_ok_and(|qty| quantity_ref_uses_filter_prop(&qty, &reads_crew_history));
+            is_crew_quantity || map.values().any(holds_crew_history_quantity)
+        }
+        serde_json::Value::Array(items) => items.iter().any(holds_crew_history_quantity),
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => false,
+    }
+}
+
 /// Lowers each top-level definition `refuse` selects to the unsupported granter residual,
 /// visiting abilities, triggers, statics and replacements each in order.
 fn demote_granter_references(
     parsed: &mut ParsedAbilities,
+    refuse: impl FnMut(DefinitionNode<'_>) -> bool,
+) {
+    demote_definitions(parsed, "granter_reference_unreached", refuse);
+}
+
+/// Lowers each top-level definition `refuse` selects to an unsupported residual keyed
+/// `gap`, visiting abilities, triggers, statics and replacements each in order.
+fn demote_definitions(
+    parsed: &mut ParsedAbilities,
+    gap: &str,
     mut refuse: impl FnMut(DefinitionNode<'_>) -> bool,
 ) {
+    let residual = |description: &Option<String>| unsupported_residual(gap, description);
     for def in &mut parsed.abilities {
         if refuse(DefinitionNode::Ability(def)) {
-            *def = unreached_granter_residual(&def.description);
+            *def = residual(&def.description);
         }
     }
     let demoted: Vec<AbilityDefinition> = parsed
         .triggers
         .extract_if(.., |def| refuse(DefinitionNode::Trigger(def)))
-        .map(|def| unreached_granter_residual(&def.description))
+        .map(|def| residual(&def.description))
         .collect();
     let demoted_statics: Vec<AbilityDefinition> = parsed
         .statics
         .extract_if(.., |def| refuse(DefinitionNode::Static(def)))
-        .map(|def| unreached_granter_residual(&def.description))
+        .map(|def| residual(&def.description))
         .collect();
     let demoted_replacements: Vec<AbilityDefinition> = parsed
         .replacements
         .extract_if(.., |def| refuse(DefinitionNode::Replacement(def)))
-        .map(|def| unreached_granter_residual(&def.description))
+        .map(|def| residual(&def.description))
         .collect();
     parsed.abilities.extend(
         demoted
@@ -9655,13 +9796,11 @@ fn granter_reference_count(tree: &serde_json::Value) -> usize {
     }
 }
 
-fn unreached_granter_residual(description: &Option<String>) -> AbilityDefinition {
+/// The unsupported residual a demoted top-level definition lowers to, keyed `gap`.
+fn unsupported_residual(gap: &str, description: &Option<String>) -> AbilityDefinition {
     let fragment = description.clone().unwrap_or_default();
-    AbilityDefinition::new(
-        AbilityKind::Spell,
-        Effect::unimplemented("granter_reference_unreached", &fragment),
-    )
-    .description(fragment)
+    AbilityDefinition::new(AbilityKind::Spell, Effect::unimplemented(gap, &fragment))
+        .description(fragment)
 }
 
 /// The decision node: `duration` and `effect` sit on the SAME
