@@ -57,6 +57,7 @@ fn counter_ability_of(build_source: SourceBuilder) -> Armed {
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activating the source's untargeted ability must be accepted");
     assert_eq!(
@@ -235,6 +236,7 @@ fn source_that_left_the_battlefield_is_not_given_the_rider() {
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activation accepted");
     let ability_on_stack = runner.state().stack.back().unwrap().id;
