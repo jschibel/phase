@@ -2599,7 +2599,7 @@ export type WaitingFor =
   | { type: "TriggerTargetSelection"; data: { player: PlayerId; trigger_controller?: PlayerId; trigger_event?: GameEvent; trigger_events?: GameEvent[]; target_slots: TargetSelectionSlot[]; mode_labels?: (string | null)[]; target_constraints?: TargetSelectionConstraint[]; selection: TargetSelectionProgress; source_id?: ObjectId; description?: string } }
   | { type: "BetweenGamesSideboard"; data: { player: PlayerId; game_number: number; score: MatchScore; min_main_deck_size: number; max_sideboard_size: number | null } }
   | { type: "BetweenGamesChoosePlayDraw"; data: { player: PlayerId; game_number: number; score: MatchScore } }
-  | { type: "NamedChoice"; data: { player: PlayerId; choice_type: string | Record<string, unknown>; options: string[]; source?: { prompt: { identity: unknown; controller: PlayerId; display_name: string }; binding: "ResolutionContext" | "ExactObjectAndResolution" }; persist_player?: PlayerId; free_entry?: FreeEntry } }
+  | { type: "NamedChoice"; data: { player: PlayerId; choice_type: string | Record<string, unknown>; options: string[]; source?: { prompt: { identity: unknown; controller: PlayerId; display_name: string }; binding: "ResolutionContext" | "ExactObjectAndResolution" | "PendingEntry" }; persist_player?: PlayerId; free_entry?: FreeEntry } }
   | { type: "OpponentGuess"; data: { player: PlayerId; options: string[]; choice_type: string | Record<string, unknown>; source: { prompt: { identity: unknown; controller: PlayerId; display_name: string } }; proposition_truth?: boolean } }
   | { type: "SpellbookDraft"; data: { player: PlayerId; source_id: ObjectId; options: string[]; destination: Zone; tapped?: boolean } }
   | { type: "DamageSourceChoice"; data: { player: PlayerId; source_filter: TargetFilter; options: ObjectId[] } }
@@ -3379,8 +3379,9 @@ export type GameEvent =
   | { type: "SpellCast"; data: { card_id: CardId; controller: PlayerId; object_id: ObjectId; cast_mana_value?: number } }
   | { type: "XValueChosen"; data: { player: PlayerId; object_id: ObjectId; value: number } }
   // `kind` is the engine's activated-ability kind (CR 605.1a / 606.1); it is
-  // omitted by legacy payloads, which mean "Normal". `departed_source_lki` and
-  // `trigger_state` are engine-internal trigger authority the UI never renders.
+  // omitted by legacy payloads, which mean "Normal". `departed_source_lki`,
+  // `trigger_state` and `stack_entry` are engine-internal trigger authority the
+  // UI never renders.
   | { type: "AbilityActivated"; data: { player_id: PlayerId; source_id: ObjectId; kind?: ActivatedAbilityKind } }
   | { type: "ExhaustAbilityActivated"; data: { player_id: PlayerId; source_id: ObjectId; is_mana_ability: boolean } }
   // `from` is null for an object that enters from no zone (a created token).

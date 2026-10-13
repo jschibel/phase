@@ -103,9 +103,9 @@
 use crate::types::ability::FilterProp;
 use crate::types::ability::{
     AbilityCondition, AbilityDefinition, AttachCardinality, AttachSelection, AttachmentReferent,
-    AttackedYouScope, CardTypeSetSource, ContinuousModification, ControllerRef, Duration, Effect,
-    GuessSubject, KeeperConstraint, ModalChoice, MultiTargetSpec, NameStickerSet, ObjectProperty,
-    ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef,
+    AttackSubject, AttackedYouScope, CardTypeSetSource, ContinuousModification, ControllerRef,
+    Duration, Effect, GuessSubject, KeeperConstraint, ModalChoice, MultiTargetSpec, NameStickerSet,
+    ObjectProperty, ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef,
     ReciprocalZoneChoiceRole, RepeatContinuation, ReplacementDefinition, ResolvedAbility,
     StaticCondition, StaticDefinition, TargetFilter, TriggerCondition, TriggerDefinition,
     TurnJournalKind, TypeFilter, TypedFilter, ZoneChoiceCandidateSource, ZoneRef,
@@ -2540,6 +2540,7 @@ fn legacy_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::Untapped
         | FilterProp::IsSaddled
         | FilterProp::SaddledSource
+        | FilterProp::CrewedThisTurn { .. }
         | FilterProp::ConvokedSource
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
@@ -2838,6 +2839,7 @@ fn member_bound_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::Untapped
         | FilterProp::IsSaddled
         | FilterProp::SaddledSource
+        | FilterProp::CrewedThisTurn { .. }
         | FilterProp::ConvokedSource
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
@@ -7382,7 +7384,6 @@ fn rw_player_filter(x: &PlayerFilter) -> RwProfile {
         | PlayerFilter::Opponent
         | PlayerFilter::DefendingPlayer
         | PlayerFilter::HasLostTheGame
-        | PlayerFilter::OpponentAttacked { .. }
         | PlayerFilter::All
         | PlayerFilter::HighestSpeed
         | PlayerFilter::ZoneChangedThisWay
@@ -7392,6 +7393,12 @@ fn rw_player_filter(x: &PlayerFilter) -> RwProfile {
         // `ControllerRef::TargetPlayer` (no sibling-mutable state).
         | PlayerFilter::TargetPlayer
         | PlayerFilter::ChosenPlayer { .. } => RwProfile::empty(),
+        // CR 603.2: the event attackers are read from the trigger event, like
+        // `OpponentOtherThanTriggering`.
+        PlayerFilter::OpponentAttacked { subject, .. } => match subject {
+            AttackSubject::You | AttackSubject::Source => RwProfile::empty(),
+            AttackSubject::EventAttackers => reads_event_live(),
+        },
     }
 }
 
@@ -7463,12 +7470,26 @@ fn rw_controller_ref(x: &ControllerRef) -> RwProfile {
 mod tests {
     use super::*;
     use crate::types::ability::{
-        AbilityKind, AggregateFunction, ChoiceType, Comparator, CountScope, LetterQuery,
-        PropertyAggregate, PtValue, ReciprocalZoneChoiceRole, TargetSelectionMode,
+        AbilityKind, AggregateFunction, ChoiceType, CombatHistoryScope, Comparator, CountScope,
+        LetterQuery, PropertyAggregate, PtValue, ReciprocalZoneChoiceRole, TargetSelectionMode,
         ZoneChoiceCandidateSource, ZoneChoiceChooser, ZoneOwner,
     };
 
     use crate::game::test_fixtures::mana_fixture_roles;
+
+    /// U-b. CR 603.2: `OpponentAttacked { EventAttackers }` reads the trigger event
+    /// live, like `OpponentOtherThanTriggering`; the controller's attacks read none.
+    #[test]
+    fn opponent_attacked_event_attackers_reads_the_event_live() {
+        let profile = |subject| {
+            rw_player_filter(&PlayerFilter::OpponentAttacked {
+                subject,
+                scope: CombatHistoryScope::ThisCombat,
+            })
+        };
+        assert_eq!(profile(AttackSubject::EventAttackers), reads_event_live());
+        assert_eq!(profile(AttackSubject::You), RwProfile::empty());
+    }
 
     #[test]
     fn property_aggregate_source_rw_profiles_are_exhaustive() {

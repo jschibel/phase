@@ -957,6 +957,7 @@ fn filterprop_reads_only_candidate_fp(p: &FilterProp) -> bool {
         | FilterProp::Another
         | FilterProp::OtherThanTriggerObject
         | FilterProp::SaddledSource
+        | FilterProp::CrewedThisTurn { .. }
         | FilterProp::ConvokedSource
         // CR 701.15b: A live designation may come from a TCE or printed source
         // outside the candidate fingerprint.
