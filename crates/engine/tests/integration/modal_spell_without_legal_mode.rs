@@ -631,23 +631,39 @@ fn directly_submitted_cast_with_a_legal_mode_reaches_mode_choice_and_resolves() 
         runner.state().waiting_for
     );
 
-    // The whole pipeline: 3 damage to a 2/2 is lethal (CR 704.5g).
-    let Some(db) = shared_card_db() else {
-        return;
-    };
-    let mut scenario = GameScenario::new();
-    scenario.at_phase(Phase::PreCombatMain);
-    let abrade = scenario.add_real_card(P0, "Abrade", Zone::Hand, db);
-    for land in ["Mountain", "Mountain"] {
-        scenario.add_real_card(P0, land, Zone::Battlefield, db);
-    }
-    let bear = scenario.add_real_card(P1, "Grizzly Bears", Zone::Battlefield, db);
-    let mut runner = scenario.build();
-    engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
-    let outcome = runner
-        .cast(abrade)
-        .modes(&[0])
-        .target_objects(&[bear])
-        .resolve();
-    outcome.assert_zone(&[bear], Zone::Graveyard);
+    // The whole pipeline on the same runner: choose the damage mode, then
+    // 3 damage to a 2/2 is lethal (CR 704.5g).
+    runner
+        .act(GameAction::SelectModes { indices: vec![0] })
+        .expect("the damage mode is accepted");
+    let bear = runner
+        .state()
+        .objects
+        .iter()
+        .find(|(_, o)| o.name == "Grizzly Bears" && o.controller == P1)
+        .map(|(id, _)| *id)
+        .expect("the opponent's Grizzly Bears");
+    // Observed on the first run: Abrade's damage mode has exactly one legal
+    // target (the opponent's Grizzly Bears), so the engine auto-selects it and
+    // no `TargetSelection` prompt is raised; the cast completes and P0 holds
+    // priority with the spell on the stack. Asserting that exact state means a
+    // regression that skips or mis-routes targeting cannot pass.
+    assert!(
+        matches!(&runner.state().waiting_for, WaitingFor::Priority { player } if *player == P0),
+        "the sole legal target is auto-selected; waiting_for = {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(runner.state().stack.len(), 1, "Abrade is on the stack");
+    runner.pass_both_players();
+    assert_eq!(
+        runner.state().objects[&bear].zone,
+        Zone::Graveyard,
+        "Abrade's 3 damage kills the 2/2"
+    );
+    assert!(runner.state().stack.is_empty(), "the spell resolved");
+    assert_eq!(
+        runner.state().objects[&abrade].zone,
+        Zone::Graveyard,
+        "the resolved instant goes to its owner's graveyard"
+    );
 }
