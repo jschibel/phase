@@ -8138,7 +8138,7 @@ fn sole_attacker_defender(
 /// calls THIS FUNCTION WITH THESE THREE ARGUMENTS AND NOTHING ELSE, so one
 /// anaphor can never bind two different players.
 ///
-/// # The one binding rule (stated once, in `with_bound_attack_event`)
+/// # The one binding rule (implemented in `with_bound_attack_event`)
 ///
 /// An attack event binds a "defending player" reference **if and only if** the
 /// reference is being evaluated inside the scope of a triggered ability — i.e.
