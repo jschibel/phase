@@ -63,7 +63,7 @@ fn stacked_variant(runner: &GameRunner, id: ObjectId) -> Option<CastingVariant> 
         .find_map(|entry| match &entry.kind {
             StackEntryKind::Spell {
                 casting_variant, ..
-            } if entry.id == id => Some(casting_variant.clone()),
+            } if entry.id == id => Some(*casting_variant),
             _ => None,
         })
 }
