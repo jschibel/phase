@@ -106,6 +106,9 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  114 — game_setup and state_update carry GameState whose ability definitions may hold
+ *       TargetFilter AttackedPlayerOrPlaneswalker. Bumped in lockstep with full-game
+ *       protocol 132.
  *  113 — game_setup and state_update carry GameState whose ability player scopes
  *       may hold PlayerFilter AnyOf / TargetPlayer. Bumped in lockstep with
  *       full-game protocol 131.
@@ -653,7 +656,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 113 as const;
+export const WIRE_PROTOCOL_VERSION = 114 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

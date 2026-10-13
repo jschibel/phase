@@ -8138,7 +8138,7 @@ fn sole_attacker_defender(
 /// calls THIS FUNCTION WITH THESE THREE ARGUMENTS AND NOTHING ELSE, so one
 /// anaphor can never bind two different players.
 ///
-/// # The one binding rule (stated once, applied here only)
+/// # The one binding rule (stated once, in `with_bound_attack_event`)
 ///
 /// An attack event binds a "defending player" reference **if and only if** the
 /// reference is being evaluated inside the scope of a triggered ability — i.e.
@@ -8268,8 +8268,7 @@ fn referent_attacker(event: Option<&GameEvent>, entry_id: ObjectId) -> ObjectId 
 }
 
 /// CR 506.3: the attack target recorded when the observer's attacker `referent` left
-/// the battlefield (CR 608.2h last-known information; CR 603.10a look-back at its
-/// departure). The departure row of the DECLARED incarnation is selected, so a
+/// the battlefield (CR 608.2h last-known information). The departure row of the DECLARED incarnation is selected, so a
 /// creature that was blinked since (CR 400.7: a new object) still answers for the
 /// object that was attacking. A legacy declaration that recorded no incarnation falls
 /// back to the object's terminal battlefield departure.

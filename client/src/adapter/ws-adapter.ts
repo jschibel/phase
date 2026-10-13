@@ -210,6 +210,11 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 132 — TargetFilter gains AttackedPlayerOrPlaneswalker (the player or planeswalker an
+ *      attacking creature is attacking, CR 506.3 + CR 115.10a), serialized in the
+ *      ability definitions of GameState. A v131 peer cannot deserialize the tag; the
+ *      exact-match handshake refuses the pairing. Wire 114 moves with it; lobby
+ *      messages are unchanged.
  * 131 — PlayerFilter gains AnyOf (the union of player sets) and TargetPlayer
  *      (the first declared player target), carried in an ability's
  *      player_scope inside GameState — see PROTOCOL_VERSION's own `/// 131`
@@ -828,7 +833,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 131;
+export const PROTOCOL_VERSION = 132;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

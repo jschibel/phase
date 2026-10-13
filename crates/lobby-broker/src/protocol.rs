@@ -60,6 +60,12 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
+/// 132 — `TargetFilter` gains `AttackedPlayerOrPlaneswalker`
+///      (`{"type":"AttackedPlayerOrPlaneswalker"}`, the player or planeswalker an
+///      attacking creature is attacking), serialized inside `GameState` in the
+///      ability definitions. A v131 peer cannot parse the tag. Full-game peers and
+///      P2P move in lockstep (wire 114); no lobby carrier names it.
+///
 /// 131 — `PlayerFilter` gains `AnyOf { filters }`
 ///      (`{"type":"AnyOf","filters":[…]}`, the union of player sets) and
 ///      `TargetPlayer` (`{"type":"TargetPlayer"}`, the first declared player
@@ -1012,7 +1018,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 131;
+pub const PROTOCOL_VERSION: u32 = 132;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2269,12 +2275,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 131);
+        assert_eq!(PROTOCOL_VERSION, 132);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 130);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 131);
     }
 
     #[test]

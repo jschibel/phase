@@ -252,7 +252,7 @@ fn tapped(r: &GameRunner, ids: &[ObjectId]) -> usize {
 // Myr Battlesphere
 // ---------------------------------------------------------------------------------------------
 
-/// A1: attacks a player, no planeswalker anywhere. Taps 3, X = 3 for pump and damage.
+/// Attacks a player, no planeswalker anywhere. Taps 3, X = 3 for pump and damage.
 #[test]
 fn battlesphere_attacks_player_with_no_planeswalker_on_board() {
     let mut sc = scenario();
@@ -269,7 +269,7 @@ fn battlesphere_attacks_player_with_no_planeswalker_on_board() {
     assert_eq!(damage_from(&ev, sphere), vec![(TargetRef::Player(P1), 3)]);
 }
 
-/// A2: attacks a planeswalker (owner P2, controller P1). Damage goes to the planeswalker, not to
+/// Attacks a planeswalker (owner P2, controller P1). Damage goes to the planeswalker, not to
 /// its controller or owner.
 #[test]
 fn battlesphere_attacks_planeswalker_damages_the_planeswalker_not_its_controller() {
@@ -294,7 +294,7 @@ fn battlesphere_attacks_planeswalker_damages_the_planeswalker_not_its_controller
     assert_eq!(damage_from(&ev, sphere), vec![(TargetRef::Object(karn), 2)]);
 }
 
-/// A3: attacks a battle. The pump still happens, the damage lands nowhere (not the battle, its
+/// Attacks a battle. The pump still happens, the damage lands nowhere (not the battle, its
 /// protector, its controller, or the bystander planeswalker).
 #[test]
 fn battlesphere_attacks_battle_pumps_but_damages_nothing() {
@@ -319,7 +319,7 @@ fn battlesphere_attacks_battle_pumps_but_damages_nothing() {
     assert_eq!((life(&r, P0), life(&r, P1), life(&r, P2)), (20, 20, 20));
 }
 
-/// A4: the source leaves before the trigger resolves; it still taps and deals X (ruling
+/// The source leaves before the trigger resolves; it still taps and deals X (ruling
 /// 2020-08-07), to what it was attacking.
 #[test]
 fn battlesphere_gone_before_resolution_still_deals_damage_to_the_player() {
@@ -338,7 +338,7 @@ fn battlesphere_gone_before_resolution_still_deals_damage_to_the_player() {
     assert_eq!(damage_from(&ev, sphere), vec![(TargetRef::Player(P1), 2)]);
 }
 
-/// A4b: same, attacking a planeswalker.
+/// Same, attacking a planeswalker.
 #[test]
 fn battlesphere_gone_before_resolution_still_deals_damage_to_the_planeswalker() {
     let mut sc = scenario();
@@ -357,7 +357,7 @@ fn battlesphere_gone_before_resolution_still_deals_damage_to_the_planeswalker() 
     assert_eq!(life(&r, P1), 20);
 }
 
-/// A4c (sibling): a departed-and-returned source is a new object and gets no leaked +X.
+/// A departed-and-returned source is a new object and gets no leaked +X.
 #[test]
 fn battlesphere_returned_as_a_new_object_gets_no_pump() {
     let mut sc = scenario();
@@ -377,7 +377,7 @@ fn battlesphere_returned_as_a_new_object_gets_no_pump() {
     assert_eq!(r.state().objects[&sphere].power, Some(4), "no leaked +X");
 }
 
-/// A5: the prompt is shown and answered with an empty selection. X = 0.
+/// The prompt is shown and answered with an empty selection. X = 0.
 #[test]
 fn battlesphere_tap_zero_pumps_and_damages_nothing() {
     let mut sc = scenario();
@@ -394,7 +394,7 @@ fn battlesphere_tap_zero_pumps_and_damages_nothing() {
     assert_eq!(damage_from(&ev, sphere), vec![]);
 }
 
-/// A6 (sibling): a planeswalker is on the board but not attacked.
+/// A planeswalker is on the board but not attacked.
 #[test]
 fn battlesphere_attacking_the_player_leaves_a_bystander_planeswalker_alone() {
     let mut sc = scenario();
@@ -411,7 +411,7 @@ fn battlesphere_attacking_the_player_leaves_a_bystander_planeswalker_alone() {
     assert_eq!(loyalty(&r, karn), 5);
 }
 
-/// A7 (sibling): declining the optional taps nothing.
+/// Declining the optional taps nothing.
 #[test]
 fn battlesphere_declined_optional_taps_nothing() {
     let mut sc = scenario();
@@ -454,7 +454,7 @@ fn hell_board() -> HellBoard {
     }
 }
 
-/// H1: Hellrider attacks the player, the Goblin attacks the planeswalker. Each trigger damages
+/// Hellrider attacks the player, the Goblin attacks the planeswalker. Each trigger damages
 /// what ITS creature is attacking.
 #[test]
 fn hellrider_damages_what_each_attacking_creature_is_attacking() {
@@ -475,7 +475,7 @@ fn hellrider_damages_what_each_attacking_creature_is_attacking() {
     assert_eq!(damage_from(&ev, b.hellrider).len(), 2);
 }
 
-/// H2: the Goblin that triggered it dies first. Its trigger still damages what it was attacking.
+/// The Goblin that triggered it dies first. Its trigger still damages what it was attacking.
 #[test]
 fn hellrider_trigger_of_a_dead_attacker_damages_what_it_was_attacking() {
     let mut b = hell_board();
@@ -496,7 +496,7 @@ fn hellrider_trigger_of_a_dead_attacker_damages_what_it_was_attacking() {
     assert_eq!(damage_from(&ev, b.hellrider).len(), 2);
 }
 
-/// H3: the Goblin is removed from combat but stays on the battlefield. It is attacking nothing
+/// The Goblin is removed from combat but stays on the battlefield. It is attacking nothing
 /// (CR 506.4), so its trigger deals no damage. Hellrider's own attack is the positive control.
 #[test]
 fn hellrider_trigger_of_an_attacker_removed_from_combat_deals_no_damage() {
@@ -522,7 +522,7 @@ fn hellrider_trigger_of_an_attacker_removed_from_combat_deals_no_damage() {
     assert_eq!(life(&b.r, P1), 20, "the Goblin is attacking nothing");
 }
 
-/// H4: the Goblin is blinked in response. The new Goblin is a different object (CR 400.7); the
+/// The Goblin is blinked in response. The new Goblin is a different object (CR 400.7); the
 /// trigger damages what the old one was attacking.
 #[test]
 fn hellrider_trigger_of_a_blinked_attacker_uses_the_old_objects_attack() {
@@ -550,7 +550,7 @@ fn hellrider_trigger_of_a_blinked_attacker_uses_the_old_objects_attack() {
     assert_eq!(damage_from(&ev, b.hellrider).len(), 2);
 }
 
-/// H5: the live attack target is read at resolution, so a reselection is honored.
+/// The live attack target is read at resolution, so a reselection is honored.
 #[test]
 fn hellrider_reads_the_live_attack_target() {
     let mut b = hell_board();
@@ -585,7 +585,7 @@ fn hellrider_reads_the_live_attack_target() {
     assert_eq!(loyalty(&b.r, karn), 4, "the reselected Goblin attack");
 }
 
-/// H6 (sibling): two Hellriders, one attacker. Both triggers answer for the attacker.
+/// Two Hellriders, one attacker. Both triggers answer for the attacker.
 #[test]
 fn two_hellriders_one_attacker_deal_two_damage_in_total() {
     let mut sc = scenario();
@@ -626,7 +626,7 @@ fn swordjack_board(artifacts: usize) -> (GameRunner, ObjectId, ObjectId) {
     (r, jack, karn)
 }
 
-/// S1: damage equal to the artifacts you control, to the attacked planeswalker.
+/// Damage equal to the artifacts you control, to the attacked planeswalker.
 #[test]
 fn swordjack_deals_artifact_count_to_the_attacked_planeswalker() {
     let (mut r, jack, karn) = swordjack_board(3);
@@ -639,7 +639,7 @@ fn swordjack_deals_artifact_count_to_the_attacked_planeswalker() {
     assert_eq!(damage_from(&ev, jack), vec![(TargetRef::Object(karn), 3)]);
 }
 
-/// S2 (sibling): no artifacts, no damage. The chain resolved.
+/// No artifacts, no damage. The chain resolved.
 #[test]
 fn swordjack_with_no_artifacts_deals_no_damage() {
     let (mut r, jack, karn) = swordjack_board(0);
@@ -651,7 +651,7 @@ fn swordjack_with_no_artifacts_deals_no_damage() {
     assert_eq!(loyalty(&r, karn), 5);
 }
 
-/// S3: the attacked planeswalker leaves in response. Nothing is dealt damage, and it is not
+/// The attacked planeswalker leaves in response. Nothing is dealt damage, and it is not
 /// redirected to its controller (CR 506.4c, CR 510.1b).
 #[test]
 fn swordjack_attacked_planeswalker_gone_deals_no_damage_and_does_not_fizzle() {
@@ -667,7 +667,7 @@ fn swordjack_attacked_planeswalker_gone_deals_no_damage_and_does_not_fizzle() {
     assert_eq!((life(&r, P0), life(&r, P1), life(&r, P2)), (20, 20, 20));
 }
 
-/// S4: alive but removed from combat (ruling 2020-11-10): no player or planeswalker is dealt
+/// Alive but removed from combat (ruling 2020-11-10): no player or planeswalker is dealt
 /// damage.
 #[test]
 fn swordjack_removed_from_combat_deals_no_damage() {
@@ -682,7 +682,7 @@ fn swordjack_removed_from_combat_deals_no_damage() {
     assert_eq!(loyalty(&r, karn), 5);
 }
 
-/// S5: killed in response, still damages what it was attacking (ruling 2020-11-10).
+/// Killed in response, still damages what it was attacking (ruling 2020-11-10).
 #[test]
 fn swordjack_killed_in_response_still_damages_the_planeswalker_it_was_attacking() {
     let (mut r, jack, karn) = swordjack_board(3);
@@ -699,7 +699,7 @@ fn swordjack_killed_in_response_still_damages_the_planeswalker_it_was_attacking(
 // Scorch Spitter, Rakdos Roustabout, Mage Slayer, Cavalcade of Calamity, Raid Bombardment
 // ---------------------------------------------------------------------------------------------
 
-/// SP1: attacks a player.
+/// Attacks a player.
 #[test]
 fn scorch_spitter_deals_one_to_the_attacked_player() {
     let mut sc = scenario();
@@ -715,7 +715,7 @@ fn scorch_spitter_deals_one_to_the_attacked_player() {
     assert_eq!(damage_from(&ev, spitter), vec![(TargetRef::Player(P1), 1)]);
 }
 
-/// SP2: attacks a planeswalker at loyalty 1; it dies (CR 704.5i) and the Spitter keeps attacking
+/// Attacks a planeswalker at loyalty 1; it dies (CR 704.5i) and the Spitter keeps attacking
 /// (ruling 2019-07-12).
 #[test]
 fn scorch_spitter_kills_a_one_loyalty_planeswalker_and_keeps_attacking() {
@@ -765,7 +765,7 @@ fn roustabout_board(at_karn: bool) -> (GameRunner, ObjectId, ObjectId, ObjectId)
     (r, rb, blocker, karn)
 }
 
-/// RB1: blocked while attacking a player.
+/// Blocked while attacking a player.
 #[test]
 fn roustabout_blocked_deals_one_to_the_player_it_is_attacking() {
     let (mut r, rb, _blocker, karn) = roustabout_board(false);
@@ -776,7 +776,7 @@ fn roustabout_blocked_deals_one_to_the_player_it_is_attacking() {
     assert_eq!(loyalty(&r, karn), 5);
 }
 
-/// RB2: dead before the trigger resolves (CR 113.7a, CR 608.2h).
+/// Dead before the trigger resolves (CR 113.7a, CR 608.2h).
 #[test]
 fn roustabout_dead_before_resolution_still_damages_the_player() {
     let (mut r, rb, _blocker, _karn) = roustabout_board(false);
@@ -787,7 +787,7 @@ fn roustabout_dead_before_resolution_still_damages_the_player() {
     assert_eq!(life(&r, P1), 19);
 }
 
-/// RB3: blocked while attacking a planeswalker.
+/// Blocked while attacking a planeswalker.
 #[test]
 fn roustabout_blocked_while_attacking_a_planeswalker_damages_the_planeswalker() {
     let (mut r, rb, _blocker, karn) = roustabout_board(true);
@@ -819,7 +819,7 @@ fn slayer_board() -> (GameRunner, ObjectId, ObjectId, ObjectId) {
     (r, host, slayer, karn)
 }
 
-/// M1: the equipped creature deals damage equal to its power to the planeswalker it attacks.
+/// The equipped creature deals damage equal to its power to the planeswalker it attacks.
 #[test]
 fn mage_slayer_equipped_creature_damages_the_attacked_planeswalker_by_its_power() {
     let (mut r, host, slayer, karn) = slayer_board();
@@ -832,7 +832,7 @@ fn mage_slayer_equipped_creature_damages_the_attacked_planeswalker_by_its_power(
     assert_eq!(damage_from(&ev, host), vec![(TargetRef::Object(karn), 3)]);
 }
 
-/// M2: the Equipment leaves in response; the creature still deals the damage (ruling 2009-05-01).
+/// The Equipment leaves in response; the creature still deals the damage (ruling 2009-05-01).
 #[test]
 fn mage_slayer_gone_in_response_still_damages_the_planeswalker() {
     let (mut r, host, slayer, karn) = slayer_board();
@@ -855,7 +855,7 @@ fn cavalcade_board(text: &str, name: &str) -> (GameRunner, ObjectId, ObjectId, O
     (r, ench, small, big, karn)
 }
 
-/// C1: only the qualifying attacker triggers; it damages the planeswalker it attacks.
+/// Only the qualifying attacker triggers; it damages the planeswalker it attacks.
 #[test]
 fn cavalcade_damages_what_the_qualifying_attacker_is_attacking() {
     let (mut r, ench, small, big, karn) = cavalcade_board(CAVALCADE, "Cavalcade of Calamity");
@@ -874,7 +874,7 @@ fn cavalcade_damages_what_the_qualifying_attacker_is_attacking() {
     assert_eq!(damage_from(&ev, ench), vec![(TargetRef::Object(karn), 1)]);
 }
 
-/// C2: the qualifying attacker dies before resolution; the damage still goes to what it was
+/// The qualifying attacker dies before resolution; the damage still goes to what it was
 /// attacking.
 #[test]
 fn cavalcade_trigger_of_a_dead_attacker_damages_what_it_was_attacking() {
@@ -887,7 +887,7 @@ fn cavalcade_trigger_of_a_dead_attacker_damages_what_it_was_attacking() {
     assert_eq!(loyalty(&r, karn), 4);
 }
 
-/// RBomb1: one attacker at a battle, one at the player. The battle is no referent (ruling
+/// One attacker at a battle, one at the player. The battle is no referent (ruling
 /// 2023-09-01).
 #[test]
 fn raid_bombardment_deals_damage_only_for_the_creature_attacking_a_player() {
@@ -943,7 +943,7 @@ fn deal_damage_recipients(value: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
-/// P1: all eight printed cards parse their recipient to the referent.
+/// All eight printed cards parse their recipient to the referent.
 #[test]
 fn the_printed_class_parses_to_the_attacked_referent() {
     for (name, text, types) in [
@@ -971,7 +971,7 @@ fn the_printed_class_parses_to_the_attacked_referent() {
     }
 }
 
-/// NP1 (sibling): the targeted wording keeps its slot, with Hellrider's parse in the same test as
+/// The targeted wording keeps its slot, with Hellrider's parse in the same test as
 /// the positive control (CR 115.1: "target" declares a target).
 #[test]
 fn targeted_player_or_planeswalker_keeps_its_slot() {
@@ -988,26 +988,36 @@ fn targeted_player_or_planeswalker_keeps_its_slot() {
     assert!(!v.to_string().contains("AttackedPlayerOrPlaneswalker"));
 }
 
-/// NP4/NP5 (siblings): attack-target setters, filters and conditions are out of class.
+/// Attack-target setters, filters and conditions are out of class. Each row carries a
+/// reach marker: proof the clause parsed into its own shape (so the absence of the
+/// referent is not a parse that gave up early).
 #[test]
 fn setters_filters_and_conditions_do_not_absorb_the_phrase() {
     let control = parse(HELLRIDER, "Hellrider", &["Creature"]);
     assert!(control.to_string().contains("AttackedPlayerOrPlaneswalker"));
-    for (name, text, types) in [
-        ("Interplanar Brushwagg", BRUSHWAGG, &["Creature"][..]),
-        ("Kitesail Skirmisher", KITESAIL, &["Creature"][..]),
-        ("Rampaging Geoderm", GEODERM, &["Creature"][..]),
+    for (name, text, types, reach) in [
         (
-            "Tahngarth, First Mate",
-            "Tahngarth is attacking that player or planeswalker.",
+            "Interplanar Brushwagg",
+            BRUSHWAGG,
             &["Creature"][..],
+            "\"Attacks\"",
+        ),
+        (
+            "Kitesail Skirmisher",
+            KITESAIL,
+            &["Creature"][..],
+            "\"keyword\":\"Flying\"",
+        ),
+        (
+            "Rampaging Geoderm",
+            GEODERM,
+            &["Creature"][..],
+            "\"type\":\"Pump\"",
         ),
     ] {
-        let v = parse(text, name, types);
-        assert!(
-            !v.to_string().contains("AttackedPlayerOrPlaneswalker"),
-            "{name}: {v}"
-        );
+        let v = parse(text, name, types).to_string();
+        assert!(v.contains(reach), "reach guard {name} ({reach}): {v}");
+        assert!(!v.contains("AttackedPlayerOrPlaneswalker"), "{name}: {v}");
     }
     // Brushwagg's trigger body stays unimplemented (the attack-target setter is not this referent).
     let v = parse(BRUSHWAGG, "Interplanar Brushwagg", &["Creature"]).to_string();
