@@ -6,7 +6,6 @@ use crate::types::game_state::{
     WaitingFor,
 };
 use crate::types::identifiers::ObjectId;
-use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
 
@@ -198,12 +197,13 @@ fn enlist_eligible_targets(state: &GameState, attacker: ObjectId) -> Vec<ObjectI
     .collect()
 }
 
-/// CR 701.43a + CR 701.43c: Pay the optional exert cost for an attacking
-/// creature — record it as exerted this turn, add the "doesn't untap during your
-/// next untap step" effect (mirroring the `AbilityCost::Exert` cost path), and
-/// emit `CreatureExerted` so the linked "when you do" trigger (CR 701.43d)
-/// fires. No-op if the creature has left the battlefield since attackers were
-/// declared.
+/// CR 701.43a + CR 701.43d: Pay the optional exert cost for an attacking
+/// creature - exert it through the shared `exert::exert_permanent` authority
+/// (exerted status, the "doesn't untap during your next untap step" effect and
+/// the `CreatureExerted` event) on behalf of its controller, then buffer the
+/// event so the linked "when you do" trigger (CR 701.43d) fires with the rest
+/// of the attack triggers. No-op if the creature has left the battlefield
+/// since attackers were declared (CR 701.43c).
 pub(super) fn apply_attack_exert(
     state: &mut GameState,
     attacker: ObjectId,
@@ -216,38 +216,13 @@ pub(super) fn apply_attack_exert(
         return;
     }
     let controller = obj.controller;
-    let exerted = crate::game::object_state::resolve_and_apply_object_edit(
-        state,
-        attacker,
-        crate::types::resolved_commands::ResolvedObjectStatus::Exerted,
-        true,
-    )
-    .expect("declared attacker must remain a live exact object");
-    if !exerted {
-        return;
+    let exerted = super::exert::exert_permanent(state, attacker, controller, events)
+        .expect("declared attacker must remain a live exact object");
+    if let Some(event) = exerted {
+        // Buffer for deferred trigger matching (CR 508.2); the helper already
+        // surfaced the event to the per-action stream for the frontend.
+        state.pending_attack_trigger_events.push(event);
     }
-    state.add_transient_continuous_effect(
-        attacker,
-        controller,
-        crate::types::ability::Duration::UntilNextStepOf {
-            step: Phase::Untap,
-            player: crate::types::ability::PlayerScope::Controller,
-        },
-        crate::types::ability::TargetFilter::SpecificObject { id: attacker },
-        vec![
-            crate::types::ability::ContinuousModification::AddStaticMode {
-                mode: crate::types::statics::StaticMode::CantUntap,
-            },
-        ],
-        None,
-    );
-    let exerted = GameEvent::CreatureExerted {
-        object_id: attacker,
-    };
-    // Buffer for deferred trigger matching (CR 508.2) and surface to the
-    // per-action event stream for the frontend.
-    state.pending_attack_trigger_events.push(exerted.clone());
-    events.push(exerted);
 }
 
 /// CR 702.154a-c: Pay one Enlist optional attack cost by tapping an eligible
