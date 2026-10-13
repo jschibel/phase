@@ -59,6 +59,18 @@
 //! `GameState` now measures 14,208 B on x86_64-unknown-linux-gnu, under the
 //! 14,336 ceiling.
 //!
+//! Base `GameState` on x86_64-pc-windows-msvc measures 14,336 B at
+//! `nightly-2026-04-19`, exactly at the ceiling. The attacked-player referent
+//! work adds `attack_target: Option<AttackTarget>` to `ZoneChangeCombatStatus`
+//! (7 -> 24 B, align 1 -> 8), so `TriggerSourceContext` grows by 16 B and so does
+//! `WaitingFor::OpponentGuess`, its largest holder, which set the inline size of
+//! `WaitingFor` at 1,760 B. `WaitingFor::OpponentGuess.owner` (an
+//! `OpponentGuessOwner`, 1,656 B, populated only while an opponent guess is
+//! pending) is boxed. On x86_64-pc-windows-msvc `GameState` then measures
+//! 14,208 B, `WaitingFor` 1,632 B and `TriggerSourceContext` 1,496 B, with
+//! `WaitingFor::NamedChoice` (1,631 B) the largest `WaitingFor` variant. The
+//! ceiling is unchanged.
+//!
 //! When one of these fires, re-run the measurement above and change the number
 //! deliberately — do not widen a ceiling to make a build pass.
 //!

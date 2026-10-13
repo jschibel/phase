@@ -12847,10 +12847,10 @@ mod tests {
             source: OpponentGuessSource {
                 prompt: PromptSourceBinding::from_trigger_source(&context),
             },
-            owner: Some(OpponentGuessOwner {
+            owner: Some(Box::new(OpponentGuessOwner {
                 context: context.clone(),
                 committed_choice: Some(ChosenAttribute::Number(7)),
-            }),
+            })),
             proposition_truth: Some(true),
         };
         let config = create_config(AiDifficulty::Medium, Platform::Native);
@@ -12866,10 +12866,10 @@ mod tests {
         else {
             unreachable!("fixture remains an opponent guess");
         };
-        *owner = Some(OpponentGuessOwner {
+        *owner = Some(Box::new(OpponentGuessOwner {
             context,
             committed_choice: Some(ChosenAttribute::Number(1)),
-        });
+        }));
         *proposition_truth = Some(false);
         let mut second_rng = SmallRng::seed_from_u64(71);
         let second = choose_action(&state, PlayerId(0), &config, &mut second_rng)
@@ -16059,10 +16059,10 @@ mod tests {
             source: OpponentGuessSource {
                 prompt: PromptSourceBinding::from_trigger_source(&context),
             },
-            owner: Some(OpponentGuessOwner {
+            owner: Some(Box::new(OpponentGuessOwner {
                 context,
                 committed_choice: Some(ChosenAttribute::Number(7)),
-            }),
+            })),
             proposition_truth: Some(true),
         };
         rows.push(("OpponentGuess", opponent_guess, PlayerId(0)));
