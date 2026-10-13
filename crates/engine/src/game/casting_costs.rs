@@ -22085,11 +22085,12 @@ mod tests {
 
     /// CR 603.2 + CR 603.3b: When discard-for-cost emits graveyard `ZoneChanged`
     /// events but `finish_pending_cost_or_cast` lands on `ManaPayment`, the
-    /// post-action pipeline is skipped and observer triggers must be parked in
-    /// `deferred_triggers` (mirrors `handle_sacrifice_for_cost`). Regression for
+    /// post-action pipeline is skipped and, for an activation, observer triggers
+    /// are left to the action boundary (not parked in `deferred_triggers`). Regression for
     /// Sefris + discard-before-mana activation costs (issue #4267).
     #[test]
-    fn discard_for_cost_parks_graveyard_triggers_when_mana_payment_remains() {
+    fn activation_discard_for_cost_leaves_graveyard_triggers_to_the_boundary_when_mana_payment_remains(
+    ) {
         use crate::parser::oracle::parse_oracle_text;
         use crate::types::mana::{ManaCost, ManaCostShard};
 
@@ -22148,13 +22149,12 @@ mod tests {
             crate::game::trigger_index::reindex_object_triggers(&mut state, observer);
         }
 
-        let mut pending = make_spell_pending(source);
+        let mut pending = make_pending(source);
         pending.cost = ManaCost::Cost {
             generic: 0,
             shards: vec![ManaCostShard::Black],
         };
         pending.payment_mode = CastPaymentMode::Manual;
-        pending.activation_ability_index = Some(0);
 
         let mut events = Vec::new();
         let waiting = handle_discard_for_cost(
@@ -22187,11 +22187,12 @@ mod tests {
         assert_eq!(state.objects[&hand_creature].zone, Zone::Graveyard);
     }
 
-    /// CR 603.2 + CR 603.3b: Replacement-resumed discard-for-cost must park
-    /// observer triggers when the resume finishes on non-Priority (e.g. remaining
+    /// CR 603.2 + CR 603.3b: Replacement-resumed discard-for-cost must stage
+    /// observer triggers into the activation's carrier when the resume finishes on non-Priority (e.g. remaining
     /// `{B}` mana payment). Regression for issue #4267 replacement path.
     #[test]
-    fn replacement_resumed_discard_for_cost_parks_triggers_when_mana_payment_remains() {
+    fn replacement_resumed_activation_discard_stages_triggers_into_the_carrier_when_mana_payment_remains(
+    ) {
         use crate::parser::oracle::parse_oracle_text;
         use crate::types::mana::{ManaCost, ManaCostShard};
 
@@ -22251,13 +22252,12 @@ mod tests {
             crate::game::trigger_index::reindex_object_triggers(&mut state, observer);
         }
 
-        let mut pending = make_spell_pending(source);
+        let mut pending = make_pending(source);
         pending.cost = ManaCost::Cost {
             generic: 0,
             shards: vec![ManaCostShard::Black],
         };
         pending.payment_mode = CastPaymentMode::Manual;
-        pending.activation_ability_index = Some(0);
 
         let mut events = Vec::new();
         let waiting = handle_discard_for_cost(
