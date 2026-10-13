@@ -8428,6 +8428,102 @@ fn casting_variant_candidates(
         .collect()
 }
 
+/// Hand-card alternative-cost casting candidates whose cost is paid INSTEAD of the
+/// printed mana cost and that are announced one-per-keyword (Bestow, Mutate, Awaken,
+/// Cleave, Impending, More Than Meets the Eye, Prototype). Keyword presence plus each
+/// keyword's own legality gate (a bestow/mutate/awaken target, a parsed cleave set, a
+/// complete prototype face) -- affordability is judged later by
+/// `casting_variant_choice_set` / `can_cast_prepared_now`.
+///
+/// CR 118.9 + CR 601.2b: a player may announce an alternative cost whenever it is
+/// payable, so a hand card is a legal cast whenever any one of these routes is
+/// affordable, even if the printed cost is not (Impending 5 Overlords cost less than
+/// their printed cost, CR 702.176a). Called with no `Normal` entry for a card without a
+/// free-cast permission (the Evoke/Dash/Blitz shape: a sole alternative candidate). No
+/// printed card carries two of these keywords.
+fn hand_alternative_cost_keyword_candidates(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    obj: &GameObject,
+) -> Vec<CastingVariant> {
+    let mut out = Vec::new();
+    let effective_keywords = effective_spell_keywords(state, player, object_id);
+
+    // CR 702.103a + CR 303.4a: Bestow — offered only when the bestow keyword
+    // is present AND the bestowed Aura has a legal target, judged on the
+    // bestowed form by the bestow offer's own authority
+    // (`bestowed_aura_targets`, CR 702.103b).
+    if effective_keywords
+        .iter()
+        .any(|k| matches!(k, crate::types::keywords::Keyword::Bestow(_)))
+        && bestowed_form(state, object_id)
+            .is_some_and(|bestowed| !bestowed_aura_targets(&bestowed, player, object_id).is_empty())
+    {
+        out.push(CastingVariant::Bestow);
+    }
+    // CR 702.140a: Mutate — keyword present AND a legal "non-Human creature
+    // you own" merge target exists (parity with the Mutate offer block).
+    if obj
+        .keywords
+        .iter()
+        .any(|k| matches!(k, crate::types::keywords::Keyword::Mutate(_)))
+        && !targeting::find_legal_targets(state, &mutate_target_filter(), player, object_id)
+            .is_empty()
+    {
+        out.push(CastingVariant::Mutate);
+    }
+    // CR 702.113a + CR 702.113b: Awaken — keyword present AND a land you
+    // control exists for the awaken land target (parity with the Awaken
+    // offer block's `has_legal_land` gate).
+    if obj
+        .keywords
+        .iter()
+        .any(|k| matches!(k, crate::types::keywords::Keyword::Awaken { .. }))
+    {
+        let land_filter = TargetFilter::Typed(
+            crate::types::ability::TypedFilter::land()
+                .controller(crate::types::ability::ControllerRef::You),
+        );
+        if !targeting::find_legal_targets(state, &land_filter, player, object_id).is_empty() {
+            out.push(CastingVariant::Awaken);
+        }
+    }
+    // CR 702.148a: Cleave — keyword present AND the bracket-removed ability
+    // set was parsed (parity with the Cleave offer block's
+    // `obj.cleave_variant.is_some()` gate).
+    if obj.cleave_variant.is_some()
+        && obj
+            .keywords
+            .iter()
+            .any(|k| matches!(k, crate::types::keywords::Keyword::Cleave(_)))
+    {
+        out.push(CastingVariant::Cleave);
+    }
+    // CR 702.176a: Impending (keyword presence).
+    if obj
+        .keywords
+        .iter()
+        .any(|k| matches!(k, crate::types::keywords::Keyword::Impending { .. }))
+    {
+        out.push(CastingVariant::Impending);
+    }
+    // CR 702.162a: More Than Meets the Eye (keyword presence).
+    if obj
+        .keywords
+        .iter()
+        .any(|k| matches!(k, crate::types::keywords::Keyword::MoreThanMeetsTheEye(_)))
+    {
+        out.push(CastingVariant::MoreThanMeetsTheEye);
+    }
+    // CR 702.160a: Prototype — offered only when the secondary
+    // characteristics are complete (parity with `prototype_form_from_object`).
+    if prototype_form_from_object(obj).is_some() {
+        out.push(CastingVariant::Prototype);
+    }
+    out
+}
+
 fn casting_candidates(
     state: &GameState,
     player: PlayerId,
@@ -8775,8 +8871,6 @@ fn casting_candidates(
                 candidates.push(CastingVariant::Normal);
             }
 
-            let effective_keywords = effective_spell_keywords(state, player, object_id);
-
             // CR 702.185a: Warp (keyword presence — mirrors the Warp offer block).
             if obj
                 .keywords
@@ -8785,79 +8879,9 @@ fn casting_candidates(
             {
                 candidates.push(CastingVariant::Warp);
             }
-            // CR 702.103a + CR 303.4a: Bestow — offered only when the bestow keyword
-            // is present AND the bestowed Aura has a legal target, judged on the
-            // bestowed form by the bestow offer's own authority
-            // (`bestowed_aura_targets`, CR 702.103b).
-            if effective_keywords
-                .iter()
-                .any(|k| matches!(k, crate::types::keywords::Keyword::Bestow(_)))
-                && bestowed_form(state, object_id).is_some_and(|bestowed| {
-                    !bestowed_aura_targets(&bestowed, player, object_id).is_empty()
-                })
-            {
-                candidates.push(CastingVariant::Bestow);
-            }
-            // CR 702.140a: Mutate — keyword present AND a legal "non-Human creature
-            // you own" merge target exists (parity with the Mutate offer block).
-            if obj
-                .keywords
-                .iter()
-                .any(|k| matches!(k, crate::types::keywords::Keyword::Mutate(_)))
-                && !targeting::find_legal_targets(state, &mutate_target_filter(), player, object_id)
-                    .is_empty()
-            {
-                candidates.push(CastingVariant::Mutate);
-            }
-            // CR 702.113a + CR 702.113b: Awaken — keyword present AND a land you
-            // control exists for the awaken land target (parity with the Awaken
-            // offer block's `has_legal_land` gate).
-            if obj
-                .keywords
-                .iter()
-                .any(|k| matches!(k, crate::types::keywords::Keyword::Awaken { .. }))
-            {
-                let land_filter = TargetFilter::Typed(
-                    crate::types::ability::TypedFilter::land()
-                        .controller(crate::types::ability::ControllerRef::You),
-                );
-                if !targeting::find_legal_targets(state, &land_filter, player, object_id).is_empty()
-                {
-                    candidates.push(CastingVariant::Awaken);
-                }
-            }
-            // CR 702.148a: Cleave — keyword present AND the bracket-removed ability
-            // set was parsed (parity with the Cleave offer block's
-            // `obj.cleave_variant.is_some()` gate).
-            if obj.cleave_variant.is_some()
-                && obj
-                    .keywords
-                    .iter()
-                    .any(|k| matches!(k, crate::types::keywords::Keyword::Cleave(_)))
-            {
-                candidates.push(CastingVariant::Cleave);
-            }
-            // CR 702.176a: Impending (keyword presence).
-            if obj
-                .keywords
-                .iter()
-                .any(|k| matches!(k, crate::types::keywords::Keyword::Impending { .. }))
-            {
-                candidates.push(CastingVariant::Impending);
-            }
-            // CR 702.162a: More Than Meets the Eye (keyword presence).
-            if obj
-                .keywords
-                .iter()
-                .any(|k| matches!(k, crate::types::keywords::Keyword::MoreThanMeetsTheEye(_)))
-            {
-                candidates.push(CastingVariant::MoreThanMeetsTheEye);
-            }
-            // CR 702.160a: Prototype — offered only when the secondary
-            // characteristics are complete (parity with `prototype_form_from_object`).
-            if prototype_form_from_object(obj).is_some() {
-                candidates.push(CastingVariant::Prototype);
-            }
+            candidates.extend(hand_alternative_cost_keyword_candidates(
+                state, player, object_id, obj,
+            ));
             // CR 702.37c / CR 702.168b + CR 708.4: Morph / Megamorph / Disguise
             // face-down cast — offered when an effective face-down keyword is present
             // and the face-down cast is permitted (parity with the FaceDown offer
@@ -8867,6 +8891,14 @@ fn casting_candidates(
             {
                 candidates.push(CastingVariant::FaceDown);
             }
+        } else {
+            // CR 118.9 + CR 601.2b: without a free-cast permission the alternative-cost
+            // keywords are still announceable casts of a hand card (sole candidates, no
+            // `Normal` entry), so a card whose printed cost is unaffordable but whose
+            // alternative cost is affordable stays a legal action.
+            candidates.extend(hand_alternative_cost_keyword_candidates(
+                state, player, object_id, obj,
+            ));
         }
     }
 
@@ -20322,6 +20354,11 @@ fn can_cast_prepared_now_with_probe(
     if matches!(obj.zone, Zone::Hand | Zone::Command)
         && matches!(obj.mana_cost, ManaCost::NoCost)
         && !unlimited_hand_cast_free_applies(state, player, obj, prepared.casting_variant)
+        // CR 702.162a + CR 118.6a + CR 712.8c: a More Than Meets the Eye cast pays its
+        // own cost rather than the mana cost, and `obj` here is the converted spell
+        // (back face, whose mana cost is `NoCost`), not the printed front face whose
+        // cost is what the alternative cost replaces.
+        && prepared.casting_variant != CastingVariant::MoreThanMeetsTheEye
         && !(object_has_effective_face_down_keyword(state, prepared.object_id)
             && can_afford_face_down_cast(
                 state,
