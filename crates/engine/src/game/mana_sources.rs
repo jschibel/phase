@@ -1104,6 +1104,7 @@ pub(crate) fn activate_mana_source_option_with_output(
             player,
             option.object_id,
             crate::types::events::ActivatedAbilityKind::Mana,
+            None,
             crate::types::zones::Zone::Battlefield,
             events,
         );
@@ -1621,6 +1622,41 @@ pub(crate) fn object_mana_ability_penalty(
         },
         None => own,
     }
+}
+
+/// CR 118.1 + CR 605.3b: True when activating this mana-source row costs or does
+/// more than tapping its source for mana. That is a classified penalty
+/// ([`ManaSourcePenalty`]: damage, life, an irreversible rider, a sacrifice), or
+/// any cost component other than `{T}`: a mana sub-cost (filter lands),
+/// exert (CR 701.43a), sacrifice (CR 701.21a), life, energy, counters, tapping
+/// other permanents, and every future cost kind. Deny-by-default: only `{T}`
+/// counts as free, so an unclassified cost is a drawback.
+///
+/// The basic-land intrinsic row (`ability_index: None`, CR 305.6) is free. A row
+/// whose ability no longer exists is treated as a drawback, so it can never
+/// stand in as a source's drawback-free alternative.
+///
+/// Auto-pay uses this to prefer a source's drawback-free row when a plan built
+/// from such rows pays the whole cost (see `casting_costs::choose_auto_tap_plan`).
+pub(crate) fn mana_source_option_has_drawback(
+    state: &GameState,
+    option: &ManaSourceOption,
+) -> bool {
+    if option.penalty != ManaSourcePenalty::None {
+        return true;
+    }
+    let Some(ability_index) = option.ability_index else {
+        return false;
+    };
+    state
+        .objects
+        .get(&option.object_id)
+        .and_then(|object| object.abilities.get(ability_index))
+        .is_none_or(|ability| {
+            ability.cost.as_ref().is_some_and(|cost| {
+                count_leaf_components(cost, &|leaf| !matches!(leaf, AbilityCost::Tap)) > 0
+            })
+        })
 }
 
 /// CR 119.3 (life) / CR 120.3 (damage → life loss): The benefit twin of

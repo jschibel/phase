@@ -3923,17 +3923,20 @@ fn turtle_van_attack_trigger_conditional_double_counters() {
         );
     let trigger = r.triggers.first().expect("attack trigger");
     let execute = trigger.execute.as_deref().expect("execute ability");
-    // CR 115.1 + CR 601.2c: "that crewed it this turn" restricts which creature
-    // is a legal target. No filter expresses the crewer set yet, so the head is
-    // an explicit counter-tail gap instead of a placement onto ANY creature.
-    assert!(
-        matches!(
-            &*execute.effect,
-            Effect::Unimplemented { name, description: Some(fragment) }
-                if name == "put_counter_tail" && fragment.contains("that crewed it")
+    // CR 115.1 + CR 601.2c + CR 702.122c: "that crewed it this turn" restricts
+    // which creature is a legal target — the crewer side of the per-turn crew
+    // relation.
+    let Effect::PutCounter { target, .. } = &*execute.effect else {
+        panic!("expected a PutCounter head, got {:?}", execute.effect);
+    };
+    assert_eq!(
+        *target,
+        TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::CrewedThisTurn {
+                relation: crate::types::ability::CrewRelation::CrewedSource,
+            }])
         ),
-        "head clause must surface the crewer restriction as a gap, got {:?}",
-        execute.effect
+        "the counter's target must be a creature that crewed the Vehicle this turn"
     );
     let sub = execute
         .sub_ability
@@ -3955,6 +3958,49 @@ fn turtle_van_attack_trigger_conditional_double_counters() {
     assert!(
         matches!(filter, TargetFilter::Or { filters } if filters.len() == 3),
         "gate must be an Or of three subtypes, got {filter:?}"
+    );
+}
+
+/// CR 702.122c + CR 400.7: the crew-history quantity guard is typed and
+/// position-independent. A filter-bearing quantity over the crew relation is
+/// refused wherever it sits (here, nested in a trigger condition); the same
+/// relation as a plain TARGET filter is not a quantity and is left alone, and
+/// the same quantity over an unrelated filter is left alone.
+#[test]
+fn crew_history_quantity_guard_is_typed_and_position_independent() {
+    let crew = FilterProp::CrewedThisTurn {
+        relation: crate::types::ability::CrewRelation::CrewedSource,
+    };
+    let crew_filter = TargetFilter::Typed(TypedFilter::creature().properties(vec![crew]));
+    let count = |filter: TargetFilter| QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCount { filter },
+    };
+    let nested_condition = |filter: TargetFilter| TriggerCondition::Not {
+        condition: Box::new(TriggerCondition::QuantityComparison {
+            lhs: count(filter),
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 2 },
+        }),
+    };
+
+    let crew_count = serde_json::to_value(nested_condition(crew_filter.clone())).unwrap();
+    assert!(mentions_crew_history(&crew_count));
+    assert!(holds_crew_history_quantity(&crew_count));
+
+    let plain_count = serde_json::to_value(nested_condition(TargetFilter::Typed(
+        TypedFilter::creature(),
+    )))
+    .unwrap();
+    assert!(!holds_crew_history_quantity(&plain_count));
+
+    let crew_target = serde_json::to_value(&crew_filter).unwrap();
+    assert!(
+        mentions_crew_history(&crew_target),
+        "reach guard: the prefilter sees the relation"
+    );
+    assert!(
+        !holds_crew_history_quantity(&crew_target),
+        "a target filter is not a quantity"
     );
 }
 
@@ -13919,7 +13965,9 @@ fn make_a_splash_tap_cap_counts_us_in_name_stickers_on_self() {
 }
 
 /// SHAPE (negative): Disemvowel counts vowels in the creature's *name* (CR
-/// 201), not on a name sticker (CR 123.6), so it keeps its base parse.
+/// 201), not on a name sticker (CR 123.6), so it is not read as a sticker
+/// count. No count reads "unique vowel in the creature's name", so the life
+/// clause is an honest gap rather than a one-life loss (CR 119.3).
 #[test]
 fn disemvowel_is_not_a_name_sticker_count() {
     let parsed = parse_oracle_text(
@@ -13938,13 +13986,7 @@ fn disemvowel_is_not_a_name_sticker_count() {
     );
     let sub = spell.sub_ability.as_deref().expect("life-loss clause");
     assert!(
-        matches!(
-            sub.effect.as_ref(),
-            Effect::LoseLife {
-                amount: QuantityExpr::Fixed { value: 1 },
-                target: Some(TargetFilter::ParentTargetController),
-            }
-        ),
+        matches!(sub.effect.as_ref(), Effect::Unimplemented { .. }),
         "{:?}",
         sub.effect
     );
@@ -27308,19 +27350,38 @@ fn reflexive_entry_rider_voices_all_stay_on_the_trigger_path() {
          from your graveyard to the battlefield. If a creature is put onto the battlefield \
          this way, it enters with an additional +1/+1 counter on it.";
 
+    // Premise for the Passive Voice row (this is what makes its negative below
+    // non-vacuous and pins the revert): handed the WHOLE line, the replacement
+    // parser really does claim it. Only the head-scoped `enters with` gate keeps
+    // the interceptor from reaching this and dropping the reanimation instruction.
+    assert!(
+        crate::parser::oracle_replacement::parse_replacement_line(
+            PASSIVE_VOICE,
+            "Passive Voice Reanimator"
+        )
+        .is_some(),
+        "Passive Voice Reanimator: premise — the un-scoped line is claimable by the \
+         replacement parser"
+    );
+    // Premise for the Winter Soldier row (#9657): its first "with" belongs to the
+    // reanimated card's filter ("card with mana value less than or equal to …"),
+    // and the enters-with count/type grammar rejects the prose payload that
+    // follows it, so the whole line is no longer claimable by the replacement
+    // parser. The row still pins that the line stays on the trigger path below.
+    assert!(
+        crate::parser::oracle_replacement::parse_replacement_line(
+            WINTER_SOLDIER,
+            "Winter Soldier, Reborn Avenger"
+        )
+        .is_none(),
+        "Winter Soldier, Reborn Avenger: premise — the count/type grammar rejects the \
+         filter prose, so the un-scoped line is not claimable by the replacement parser"
+    );
+
     for (name, oracle) in [
         ("Winter Soldier, Reborn Avenger", WINTER_SOLDIER),
         ("Passive Voice Reanimator", PASSIVE_VOICE),
     ] {
-        // Premise (this is what makes the negative below non-vacuous and pins the
-        // revert): handed the WHOLE line, the replacement parser really does claim
-        // it. Only the head-scoped `enters with` gate keeps the interceptor from
-        // reaching this and dropping the reanimation instruction.
-        assert!(
-            crate::parser::oracle_replacement::parse_replacement_line(oracle, name).is_some(),
-            "{name}: premise — the un-scoped line is claimable by the replacement parser"
-        );
-
         let parsed = parse(oracle, name, &[], &["Creature"], &[]);
 
         // Reach-guard: the line really produced a trigger, so the
@@ -30997,6 +31058,7 @@ fn render_net_reaches_every_nested_description_carrier() {
         target: TargetFilter::Any,
         source_rider: Some(CounterSourceRider::LosesAbilities {
             static_def: Box::new(counter_static),
+            source_filter: None,
             duration: Box::new(Duration::UntilHostLeavesPlay),
         }),
         countered_spell_zone: None,

@@ -195,6 +195,7 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         "triggered_abilities_added_mana_this_turn",
         "crew_activated_this_turn",
         "crew_resolved_this_turn",
+        "crew_history_this_turn",
         "exerted_this_turn",
         "graveyard_cast_permissions_used",
         "graveyard_cast_permissions_used_per_type",
