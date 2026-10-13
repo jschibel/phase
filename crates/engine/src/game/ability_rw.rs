@@ -7236,11 +7236,14 @@ fn rw_target_filter(x: &TargetFilter) -> RwProfile {
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::ChosenDamageSource { .. } => reads_event_live(),
         // CR 506.3 + CR 506.4: the bound attack event picks the attacker (live
-        // event read) and the planeswalker answer is a battlefield-membership
-        // read (is it still there, still a planeswalker).
+        // event read), the planeswalker answer is a battlefield-membership read
+        // (is it still there, still a planeswalker), and the referent reads
+        // `state.combat.attackers`, which `Effect::RemoveFromCombat` writes
+        // (`TurnStructure`).
         TargetFilter::AttackedPlayerOrPlaneswalker => {
             let mut p = reads_event_live();
             p.merge(reads_board_of(StateKind::SetMembership));
+            p.merge(reads_board_of(StateKind::TurnStructure));
             p
         }
         TargetFilter::Not { filter } | TargetFilter::TrackedSetFiltered { filter, .. } => {
@@ -9338,6 +9341,18 @@ mod tests {
             profiles_conflict(&self_conflict, &batch()),
             "TurnStructure read × write ⇒ conflict"
         );
+        // NEG: the attacked-player referent READS combat (`state.combat.attackers`), so a
+        // RemoveFromCombat write alongside it DOES feed ⇒ conflict.
+        let mut referent_vs_removal = ability_rw_profile(&ra(Effect::RemoveFromCombat {
+            target: TargetFilter::Any,
+        }));
+        referent_vs_removal.merge(rw_target_filter(
+            &TargetFilter::AttackedPlayerOrPlaneswalker,
+        ));
+        assert!(
+            profiles_conflict(&referent_vs_removal, &batch()),
+            "RemoveFromCombat write × attacked-referent read ⇒ conflict"
+        );
     }
 
     /// §L14 (CR 500 + CR 500.8): extra turns / additional phases are `TurnStructure`
@@ -9861,6 +9876,10 @@ mod attacked_referent_classification_tests {
         let read = rw_target_filter(&f);
         assert!(read.reads_event_live);
         assert!(read.reads_board.set_membership);
+        assert!(
+            read.reads_board.turn_structure,
+            "the referent reads combat.attackers, which RemoveFromCombat writes"
+        );
         assert!(!read.legacy_batch_prompt);
     }
 }
