@@ -16348,6 +16348,33 @@ fn unless_return_plural_without_count_declines() {
     );
 }
 
+/// A count token followed by a range tail ("two or more") is a quantifier, not
+/// the exact count the token alone would read as: it declines on the unless side.
+/// A guard row, not a discriminator: the object-phrase parse that follows the
+/// splitter already refuses these, so this pins that the splitter change keeps
+/// them declined.
+#[test]
+fn unless_return_range_quantifier_declines() {
+    // Reach guard: the exact count of the same destination lowers.
+    assert!(matches!(
+        parse_unless_alt_cost("you return two forests you control to their owner's hand."),
+        Some(AbilityCost::ReturnToHand { count: 2, .. })
+    ));
+    assert!(
+        parse_unless_return_to_hand("two forests you control to their owner's hand.").is_some()
+    );
+    for text in [
+        "two or more lands you control to their owner's hand.",
+        "one or more lands you control to their owner's hand.",
+        "two or fewer lands you control to their owner's hand.",
+    ] {
+        assert!(
+            parse_unless_return_to_hand(text).is_none(),
+            "{text:?} must decline"
+        );
+    }
+}
+
 /// `parse_hand_possessive` delegates its owner-hand arms to the shared
 /// `parse_owner_hand_possessive` without changing its accepted set or results.
 #[test]
