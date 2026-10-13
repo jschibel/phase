@@ -2647,7 +2647,8 @@ fn cost_move_group_may_form(
 
 /// CR 603.10a: The selected objects that left the battlefield in `events`, each
 /// once, in departure order. Read from the departures themselves so a resumed
-/// call, which holds only the tail of the selection, recomputes the same group.
+/// call, whose events are split across actions (the earlier fragments live in
+/// the ledger), recomputes the same group.
 fn selected_battlefield_departures<'a>(
     chosen: &[ObjectId],
     events: impl Iterator<Item = &'a GameEvent>,
