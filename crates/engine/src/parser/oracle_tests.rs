@@ -27350,19 +27350,38 @@ fn reflexive_entry_rider_voices_all_stay_on_the_trigger_path() {
          from your graveyard to the battlefield. If a creature is put onto the battlefield \
          this way, it enters with an additional +1/+1 counter on it.";
 
+    // Premise for the Passive Voice row (this is what makes its negative below
+    // non-vacuous and pins the revert): handed the WHOLE line, the replacement
+    // parser really does claim it. Only the head-scoped `enters with` gate keeps
+    // the interceptor from reaching this and dropping the reanimation instruction.
+    assert!(
+        crate::parser::oracle_replacement::parse_replacement_line(
+            PASSIVE_VOICE,
+            "Passive Voice Reanimator"
+        )
+        .is_some(),
+        "Passive Voice Reanimator: premise — the un-scoped line is claimable by the \
+         replacement parser"
+    );
+    // Premise for the Winter Soldier row (#9657): its first "with" belongs to the
+    // reanimated card's filter ("card with mana value less than or equal to …"),
+    // and the enters-with count/type grammar rejects the prose payload that
+    // follows it, so the whole line is no longer claimable by the replacement
+    // parser. The row still pins that the line stays on the trigger path below.
+    assert!(
+        crate::parser::oracle_replacement::parse_replacement_line(
+            WINTER_SOLDIER,
+            "Winter Soldier, Reborn Avenger"
+        )
+        .is_none(),
+        "Winter Soldier, Reborn Avenger: premise — the count/type grammar rejects the \
+         filter prose, so the un-scoped line is not claimable by the replacement parser"
+    );
+
     for (name, oracle) in [
         ("Winter Soldier, Reborn Avenger", WINTER_SOLDIER),
         ("Passive Voice Reanimator", PASSIVE_VOICE),
     ] {
-        // Premise (this is what makes the negative below non-vacuous and pins the
-        // revert): handed the WHOLE line, the replacement parser really does claim
-        // it. Only the head-scoped `enters with` gate keeps the interceptor from
-        // reaching this and dropping the reanimation instruction.
-        assert!(
-            crate::parser::oracle_replacement::parse_replacement_line(oracle, name).is_some(),
-            "{name}: premise — the un-scoped line is claimable by the replacement parser"
-        );
-
         let parsed = parse(oracle, name, &[], &["Creature"], &[]);
 
         // Reach-guard: the line really produced a trigger, so the

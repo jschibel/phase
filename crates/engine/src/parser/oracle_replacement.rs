@@ -6,7 +6,9 @@ use crate::parser::oracle_nom::error::{oracle_err, OracleError, OracleResult};
 use nom::branch::alt;
 use nom::bytes::complete::{tag, tag_no_case, take_till, take_until, take_while1};
 use nom::character::complete::{anychar, char, multispace0, multispace1};
-use nom::combinator::{all_consuming, eof, map_opt, map_parser, opt, peek, recognize, rest, value};
+use nom::combinator::{
+    all_consuming, eof, map_opt, map_parser, not, opt, peek, recognize, rest, value,
+};
 use nom::multi::{many_till, separated_list1};
 use nom::sequence::{pair, preceded, terminated};
 use nom::Parser;
@@ -4131,7 +4133,10 @@ fn enters_with_counters_outcome(
         || nom_primitives::scan_contains(work_text, "escape with");
 
     // Find "with [N] [type] counter" to extract count and counter type.
-    // For escape, the "with" follows "escapes"; for enters, it follows "enters".
+    // The payload is cut at the first "with " in the line, which is not
+    // necessarily the one after "enters" / "escapes". The count/type grammar
+    // below rejects the observed invalid payloads; it does not establish that
+    // this "with" belongs to the entry verb.
     let after_with = strip_after(work_text, "with ").ok_or(EntersWithDecline::NotThisShape)?;
     // Skip "an additional" if present
     let after_additional = alt((
@@ -4273,13 +4278,14 @@ fn enters_with_counters_outcome(
     // picks up "an additional +1/+1 counter and a lifelink counter on it", which
     // the strip likewise used to break.
     let counter_entries = parse_enters_counter_entries(after_with);
-    // Detect dynamic count: "a number of [type] counters ... equal to [qty]"
-    let after_prefix = tag::<_, _, OracleError<'_>>("a number of ")
-        .parse(after_additional)
-        .map_or(after_additional, |(rest, _)| rest);
-    let after_prefix = tag::<_, _, OracleError<'_>>("additional ")
-        .parse(after_prefix)
-        .map_or(after_prefix, |(rest, _)| rest);
+    // CR 614.1c + CR 122.6: the clause's count slot — a printed count, the
+    // article of "an additional <type>", or none for the "a number of …
+    // equal to <qty>" / "<type> counters on it equal to <qty>" forms, whose
+    // count is the "equal to" quantity. A clause with no count and no
+    // readable "equal to" quantity fails closed instead of publishing one
+    // counter ("up to two shoe counters", "each of a … counter", "flying and
+    // with X … counters").
+    let (rest, leading_count) = parse_enters_counter_count_head(after_with);
     // CR 107.3 + CR 107.3m + CR 107.1a: Parse the counter count as a full
     // `QuantityExpr`, so "N", "X", "twice X", "three times X", and
     // "half X, rounded up/down" all compose through the same typed arithmetic
@@ -4288,21 +4294,31 @@ fn enters_with_counters_outcome(
     // object's `cost_x_paid` (runtime `Variable("X")` only reads trigger-event
     // sources, not the entering permanent), so rewrite X → `CostXPaid`
     // recursively inside the expression.
-    let (mut count_expr, rest) =
-        parse_count_expr(after_prefix).unwrap_or((QuantityExpr::Fixed { value: 1 }, after_prefix));
+    let mut count_expr = match leading_count {
+        Some(count) => count,
+        None => parse_enters_counter_equal_to_quantity(work_text)
+            .ok_or(EntersWithDecline::NotThisShape)?,
+    };
     rewrite_variable_x_to_cost_x_paid(&mut count_expr);
-    // CR 122.1: "N additional <type> counters" — the count word precedes
-    // "additional", so the leading-`additional` strip above (which only fires
-    // when no count word is present, e.g. "an additional +1/+1 counter") misses
-    // it. Strip it here so "additional" doesn't leak into the counter-type slice
-    // (`Generic("additional +1/+1")` instead of the canonical `Plus1Plus1`).
-    let rest = strip_additional_counter_qualifier(rest);
-    // Next word(s) before "counter" are the counter type
-    let (_, (counter_type_raw, after_counter)) = nom_primitives::split_once_on(rest, "counter")
-        .map_err(|_| EntersWithDecline::NotThisShape)?;
-    let counter_type_raw = counter_type_raw.trim();
-    let counter_type =
-        crate::parser::oracle_effect::counter::normalize_counter_type(counter_type_raw);
+    // CR 122.1: a counter is identified by its name, so the type must be a whole
+    // counter name ending at the counter noun. Prose (a keyword rider, a
+    // quantifier, a choice list, a subject phrase) fails here and the line
+    // falls through to an honest unsupported gap rather than a prose
+    // `CounterType::Generic`.
+    let (after_counter, counter_type) =
+        parse_enters_counter_type_noun(rest).map_err(|_| EntersWithDecline::NotThisShape)?;
+    // CR 614.1c + CR 122.6 + CR 608.2c: the counters this replacement gives
+    // the entering permanent are every placement the clause prints. When the
+    // list reader declined although a further placement follows the first
+    // ("…a +1/+1 counter and a number of charge counters on it…"), publishing
+    // the first placement alone would drop the rest — and the "equal to"
+    // reader below would hand the dropped placement's quantity to the first.
+    // Decline as `NotThisShape`, not `GateFailsClosed`: no gate is involved, and
+    // no later route claims an enters-with counter list, so the line lands as
+    // an `Effect::unimplemented` gap.
+    if counter_entries.is_none() && continues_with_unread_counter_placement(after_counter) {
+        return Err(EntersWithDecline::NotThisShape);
+    }
     if let Some(combined) =
         parse_enters_base_plus_additional_for_each(after_counter, &counter_type, &count_expr)
     {
@@ -4313,30 +4329,8 @@ fn enters_with_counters_outcome(
     // CR 122.6: For "a number of counters equal to [quantity]" and the
     // sibling shorthand "counters on it equal to [quantity]", parse the
     // dynamic expression.
-    if let Ok((_, (_, qty_text))) = nom_primitives::split_once_on(work_text, "equal to ") {
-        // The quantity phrase never spans a sentence boundary, so isolate the
-        // first sentence before parsing — Slumbering Trudge trails a separate
-        // "If X is 2 or less, it enters tapped." clause after "equal to three
-        // minus X.", which would otherwise leave the quantity parsers a dangling
-        // tail and force the `Fixed { 1 }` fallback (only 1 stun counter).
-        let trimmed = qty_text.split('.').next().unwrap_or(qty_text).trim();
-        if let Some(qty_ref) = crate::parser::oracle_quantity::parse_quantity_ref(trimmed) {
-            count_expr = QuantityExpr::Ref { qty: qty_ref };
-        } else if let Some(qty) = crate::parser::oracle_quantity::parse_cda_quantity(trimmed) {
-            count_expr = qty;
-        } else if let Some(qty) =
-            crate::parser::oracle_quantity::parse_event_context_quantity(trimmed)
-        {
-            count_expr = qty;
-        } else if let Some((qty, rest_q)) = crate::parser::oracle_util::parse_count_expr(trimmed) {
-            // CR 107.3a: arithmetic over the cost variable ("three minus X").
-            // `parse_count_expr` emits `Variable("X")`; the rewrite below maps it
-            // to the entering object's `CostXPaid`. Require full consumption so a
-            // partial parse never silently truncates the quantity.
-            if rest_q.trim().is_empty() {
-                count_expr = qty;
-            }
-        }
+    if let Some(qty) = parse_enters_counter_equal_to_quantity(work_text) {
+        count_expr = qty;
     }
     if let Some(qty) = parse_enters_with_where_x_suffix(work_text) {
         count_expr = qty;
@@ -4785,6 +4779,84 @@ fn parse_enters_with_where_x_suffix(text: &str) -> Option<QuantityExpr> {
     crate::parser::oracle_quantity::parse_event_context_quantity(trimmed)
 }
 
+/// CR 122.6: the "equal to <quantity>" amount of an enters-with counter clause;
+/// `None` when absent or unreadable.
+fn parse_enters_counter_equal_to_quantity(work_text: &str) -> Option<QuantityExpr> {
+    let (_, (_, qty_text)) = nom_primitives::split_once_on(work_text, "equal to ").ok()?;
+    // The quantity phrase never spans a sentence boundary, so isolate the
+    // first sentence before parsing — Slumbering Trudge trails a separate
+    // "If X is 2 or less, it enters tapped." clause after "equal to three
+    // minus X.", which would otherwise leave the quantity parsers a dangling
+    // tail and force the `Fixed { 1 }` fallback (only 1 stun counter).
+    let trimmed = qty_text.split('.').next().unwrap_or(qty_text).trim();
+    if let Some(qty_ref) = crate::parser::oracle_quantity::parse_quantity_ref(trimmed) {
+        Some(QuantityExpr::Ref { qty: qty_ref })
+    } else if let Some(qty) = crate::parser::oracle_quantity::parse_cda_quantity(trimmed) {
+        Some(qty)
+    } else if let Some(qty) = crate::parser::oracle_quantity::parse_event_context_quantity(trimmed)
+    {
+        Some(qty)
+    } else {
+        // CR 107.3a: arithmetic over the cost variable ("three minus X").
+        // `parse_count_expr` emits `Variable("X")`; the caller's rewrite maps it
+        // to the entering object's `CostXPaid`. Require full consumption so a
+        // partial parse never silently truncates the quantity.
+        crate::parser::oracle_util::parse_count_expr(trimmed)
+            .filter(|(_, rest_q)| rest_q.trim().is_empty())
+            .map(|(qty, _)| qty)
+    }
+}
+
+/// CR 614.1c + CR 122.6: Read the count slot of an "enters with <count> <type>
+/// counter(s)" clause, returning the text that follows it (the counter type)
+/// and the printed count. The count comes from one of three sources:
+///   * a printed count read by `parse_count_expr` ("two", "X", "twice X"),
+///     optionally preceded by "an additional " / "additional " and optionally
+///     followed by an "additional " qualifier ("X additional +1/+1 counters");
+///   * the article of a bare "an additional <type> counter" (one counter);
+///   * none — "a number of [additional] <type> counters … equal to <qty>" and
+///     the bare-type shorthand "<type> counters on it equal to <qty>", whose
+///     count is the "equal to" quantity the caller must read.
+///
+/// "a number of " is tried before `parse_count_expr`, which would otherwise
+/// read its "a" as a count of 1. The count is tried after the "an additional "
+/// qualifier, so "an additional X +1/+1 counters" (Bloodspore Thrinax) reads
+/// X rather than the article. When no count is read the input is returned
+/// unchanged after any qualifier, with `None`.
+fn parse_enters_counter_count_head(after_with: &str) -> (&str, Option<QuantityExpr>) {
+    if let Ok((rest, _)) = (
+        tag::<_, _, OracleError<'_>>("a number of "),
+        opt(tag("additional ")),
+    )
+        .parse(after_with)
+    {
+        return (rest, None);
+    }
+    let (after_qualifier, article_count) = alt((
+        value(
+            Some(QuantityExpr::Fixed { value: 1 }),
+            tag::<_, _, OracleError<'_>>("an additional "),
+        ),
+        value(None, tag("additional ")),
+    ))
+    .parse(after_with)
+    .unwrap_or((after_with, None));
+    if let Some((count, rest)) = parse_count_expr(after_qualifier) {
+        return (strip_additional_counter_qualifier(rest), Some(count));
+    }
+    (after_qualifier, article_count)
+}
+
+/// CR 122.1 + CR 122.1b: Read the counter type of an enters-with counter clause
+/// as one whole counter name — a P/T modifier, a keyword counter (including
+/// "first strike" / "double strike"), a named counter, or exactly one custom
+/// word — followed by the counter noun. Prose before the noun fails. The
+/// remainder starts right after "counter" (the plural "s" is the caller's).
+/// Sister combinator of `oracle_effect::parse_article_counter_on`.
+fn parse_enters_counter_type_noun(input: &str) -> OracleResult<'_, CounterType> {
+    terminated(nom_primitives::parse_counter_type_typed, tag(" counter")).parse(input)
+}
+
 fn multiply_counter_count_by_for_each(
     count_expr: QuantityExpr,
     for_each_count: QuantityExpr,
@@ -5173,7 +5245,9 @@ fn counter_list_remainder_is_exhausted(rest: &str) -> bool {
 ///     "X charge counters". The count opens with `oracle_util::parse_count_expr`,
 ///     so the whole arithmetic grammar (X, `twice X`, `half X, rounded up`,
 ///     `N plus/minus X`) is available and any surviving `X` is rewritten to the
-///     entering object's `CostXPaid` (CR 614.12).
+///     entering object's `CostXPaid` (CR 614.12). The type must be a whole
+///     counter name ending at the counter noun (CR 122.1); prose before the
+///     noun rejects the element.
 ///   * ELIDED — "…and deathtouch counter on it", where the leading element's
 ///     determiner distributes across the conjunction. Delegated to the shared
 ///     `oracle_effect::parse_countless_counter_element` so this reader and the
@@ -5206,17 +5280,10 @@ fn parse_counted_enters_counter_entry(input: &str) -> Option<((CounterType, Quan
     // ("two additional +1/+1 counters") so it doesn't leak into the type.
     let rest = strip_additional_counter_qualifier(rest);
 
-    let (at_counter, counter_type_raw) = take_until::<_, _, OracleError<'_>>(" counter")
-        .parse(rest)
-        .ok()?;
-    if counter_type_raw.trim().is_empty() {
-        return None;
-    }
-    let counter_type =
-        crate::parser::oracle_effect::counter::normalize_counter_type(counter_type_raw);
-    let (after_space, _) = tag::<_, _, OracleError<'_>>(" ").parse(at_counter).ok()?;
-    let (after_counter_word, _) = alt((tag::<_, _, OracleError<'_>>("counters"), tag("counter")))
-        .parse(after_space)
+    // CR 122.1: same whole-counter-name grammar as the single-counter path.
+    let (after_counter, counter_type) = parse_enters_counter_type_noun(rest).ok()?;
+    let (after_counter_word, _) = opt(tag::<_, _, OracleError<'_>>("s"))
+        .parse(after_counter)
         .ok()?;
 
     Some(((counter_type, count_expr), after_counter_word))
@@ -5228,18 +5295,69 @@ fn parse_counted_enters_counter_entry(input: &str) -> Option<((CounterType, Quan
 /// nom gets for free from `many0(preceded(sep, element))`; it lives here because
 /// this reader's counted element is not a pure combinator.
 fn parse_enters_counter_separator(input: &str) -> Option<&str> {
-    let (after_sep, _) = alt((
-        tag::<_, _, OracleError<'_>>(", and "),
-        tag(" and "),
-        tag(", "),
-    ))
-    .parse(input)
-    .ok()?;
+    let (after_sep, ()) = parse_enters_counter_list_separator(input).ok()?;
 
     // Post-separator position, so the elided-count form is in scope here too.
     parse_enters_counter_entry(after_sep, true)?;
 
     Some(after_sep)
+}
+
+/// The bare list separator of an "enters with" counter list. `", and "` precedes
+/// its prefix `", "` so the Oxford form is consumed whole.
+fn parse_enters_counter_list_separator(input: &str) -> OracleResult<'_, ()> {
+    value((), alt((tag(", and "), tag(" and "), tag(", ")))).parse(input)
+}
+
+/// CR 122.6 + CR 608.2c: whether the text right after a counter noun continues
+/// the counter list with a further placement — a list separator, then either
+/// any element the single-placement head accepts
+/// (`parse_enters_counter_count_head` + `parse_enters_counter_type_noun`: an
+/// optional "a number of [additional]", "[an] additional" or printed count,
+/// then a whole counter name before a singular or plural counter noun —
+/// "wish counter", "charge counters", "additional charge counters", "a number
+/// of charge counters"), or a count (`parse_count_expr`) followed by a counter
+/// noun reached inside the clause, before the recipient's "on", which also
+/// covers a counted element whose type is not a whole counter name. Used once
+/// the strict list reader has declined, to tell an unread later placement from
+/// a genuinely single one. A conjunct that is not a counter placement ("and you
+/// draw a card", "and with haste") does not match: it has no count anchor and
+/// names no counter.
+fn continues_with_unread_counter_placement(after_counter: &str) -> bool {
+    let Ok((after_sep, ())) =
+        preceded(opt(tag("s")), parse_enters_counter_list_separator).parse(after_counter)
+    else {
+        return false;
+    };
+    let (after_head, _count) = parse_enters_counter_count_head(after_sep);
+    parse_enters_counter_type_noun(after_head).is_ok()
+        || parse_count_expr(after_sep)
+            .is_some_and(|(_count, rest)| parse_counter_noun_within_clause(rest).is_ok())
+}
+
+/// Consume whole words up to the counter noun ("counter" / "counters" as a
+/// whole word), failing at the recipient's "on " or at a word ending in
+/// sentence or clause punctuation — the placement must name its counter
+/// before either.
+fn parse_counter_noun_within_clause(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        many_till(
+            preceded(
+                not(tag("on ")),
+                terminated(
+                    take_while1(|c: char| !matches!(c, ' ' | '.' | ',')),
+                    tag(" "),
+                ),
+            ),
+            (
+                tag("counter"),
+                opt(tag("s")),
+                peek(alt((tag(" "), tag("."), tag(","), eof))),
+            ),
+        ),
+    )
+    .parse(input)
 }
 
 /// CR 614.12a: For "your choice of <list> on it", split off the trailing
@@ -7824,7 +7942,8 @@ fn parse_oneshot_target_source_prevent(norm_lower: &str, ctx: &ParseContext) -> 
     let (target_filter, after_subject) = if let Ok((after_prefix, _)) =
         crate::parser::oracle_nom::target::parse_declared_target_prefix(subject)
     {
-        let (filter, rest) = parse_target(after_prefix);
+        let (filter, rest) =
+            parse_target_with_ctx(after_prefix, &mut ctx.clone_player_antecedents());
         if rest.trim().is_empty() {
             (filter, None)
         } else {
@@ -7834,7 +7953,8 @@ fn parse_oneshot_target_source_prevent(norm_lower: &str, ctx: &ParseContext) -> 
         // CR 608.2c: "that creature" in a NON-trigger context is an anaphor
         // to the chosen target creature (Dazzling Reflection). The typed
         // `Typed(creature)` leaf is emitted DIRECTLY rather than routed
-        // through `parse_target`: a ctx-free `parse_target` call resolves the
+        // through `parse_target`: a `parse_target` call, whose context carries
+        // no object antecedent, resolves the
         // demonstrative via `resolve_pronoun_target`'s default branch to
         // `ParentTarget`, which would drop the CR 609.7b recheck leaf and
         // break the exact-shape contract of
@@ -16079,8 +16199,13 @@ mod tests {
     /// fail-closed holds through the `your choice of` branch too.
     #[test]
     fn enters_with_choice_kicker_and_unless_co_occurrence_fails_closed() {
+        // The list is the distributed form ("a +1/+1 counter or a -1/-1
+        // counter"), which the choice branch reads. The elided "a +1/+1 or a
+        // -1/-1 counter" is no counter-choice list shape, so it never reached
+        // the choice branch: it fell through to the single-counter path as a
+        // prose `Generic` type (#9657) and now fails closed there.
         let both = parse_replacement_line(
-            "If this creature was kicked, it enters with your choice of a +1/+1 or a \
+            "If this creature was kicked, it enters with your choice of a +1/+1 counter or a \
              -1/-1 counter on it unless you've cast another spell this turn.",
             "Fake Choice Card",
         );
@@ -16091,13 +16216,50 @@ mod tests {
 
         // Reach-guard: the choice-branch unless-only path is live.
         let unless_only = parse_replacement_line(
-            "This creature enters with your choice of a +1/+1 or a -1/-1 counter on it \
+            "This creature enters with your choice of a +1/+1 counter or a -1/-1 counter on it \
              unless you've cast another spell this turn.",
             "Fake Choice Card",
+        )
+        .expect("choice-branch unless-only path must parse");
+        assert!(
+            matches!(
+                *unless_only.execute.as_deref().expect("execute").effect,
+                Effect::ChooseOneOf { .. }
+            ),
+            "the choice branch built the replacement, got {:?}",
+            unless_only.execute
         );
         assert!(
-            unless_only.is_some(),
-            "choice-branch unless-only path must parse"
+            unless_only.condition.is_some(),
+            "the unless gate reaches the condition slot"
+        );
+
+        // Reach-guard: the kicker+choice shape reaches the choice branch, so the
+        // co-occurrence negative is not vacuous.
+        let kicker_only = parse_replacement_line(
+            "If this creature was kicked, it enters with your choice of a +1/+1 counter or a \
+             -1/-1 counter on it.",
+            "Fake Choice Card",
+        )
+        .expect("choice-branch kicker-only path must parse");
+        assert!(
+            matches!(
+                *kicker_only.execute.as_deref().expect("execute").effect,
+                Effect::ChooseOneOf { .. }
+            ),
+            "the choice branch built the replacement, got {:?}",
+            kicker_only.execute
+        );
+        assert!(
+            matches!(
+                kicker_only.condition,
+                Some(ReplacementCondition::CastViaKicker {
+                    variant: None,
+                    kicker_cost: None
+                })
+            ),
+            "the kicker gate reaches the condition slot, got {:?}",
+            kicker_only.condition
         );
     }
 
@@ -19898,14 +20060,19 @@ mod tests {
     ///   * a non-counter conjunct after the list ("and you draw a card")
     ///   * a conjunct naming something that is not a counter type — the guard
     ///     against `parse_strict_counter_type`'s absent `Generic` fallback
-    ///   * a PLURAL elided conjunct, which is ambiguous about whether the head
-    ///     count distributes and so fails closed rather than guessing
+    ///
+    /// A PLURAL elided conjunct ("two +1/+1 counters and trample counters on
+    /// it") is ambiguous about whether the head count distributes, so the list
+    /// reader does not read it. The whole line declines to an unsupported gap
+    /// rather than publishing only the first placement (CR 608.2c: the second
+    /// placement can't be dropped); `conjoined_counter_list_rejects_prose_element`
+    /// pins that line.
     #[test]
     fn elided_count_conjunct_does_not_over_claim() {
         // The expected leading COUNT travels with each fixture. Matching the
-        // type alone with `..` on `count` left the third row provable by a
-        // single +1/+1 — the quantity is exactly what the elided-count work
-        // touches, so it has to be asserted, not elided in the pattern.
+        // type alone with `..` on `count` would leave the quantity unasserted —
+        // the quantity is exactly what the elided-count work touches, so it has
+        // to be asserted, not elided in the pattern.
         for (text, expected_count) in [
             (
                 "This creature enters with an additional +1/+1 counter and you draw a card.",
@@ -19914,10 +20081,6 @@ mod tests {
             (
                 "This creature enters with an additional +1/+1 counter and haste on it.",
                 1,
-            ),
-            (
-                "This creature enters with two +1/+1 counters and trample counters on it.",
-                2,
             ),
         ] {
             // Every fixture is REQUIRED to parse. An earlier revision skipped a
@@ -20381,6 +20544,467 @@ mod tests {
             }
             other => panic!("Expected PutCounter, got {other:?}"),
         }
+    }
+
+    // ── #9657: enters-with counter count and type slots are read by grammar ──
+
+    /// Every `PutCounter` in an execute chain (outer link first).
+    fn put_counters_in_chain(def: &ReplacementDefinition) -> Vec<(CounterType, QuantityExpr)> {
+        let mut found = Vec::new();
+        let mut cursor = def.execute.as_deref();
+        while let Some(node) = cursor {
+            if let Effect::PutCounter {
+                counter_type,
+                count,
+                ..
+            } = &*node.effect
+            {
+                found.push((counter_type.clone(), count.clone()));
+            }
+            cursor = node.sub_ability.as_deref();
+        }
+        found
+    }
+
+    /// CR 122.1 + CR 122.1b: the type slot accepts one whole counter name ending
+    /// at the counter noun — a P/T modifier, a keyword counter (two-word ones
+    /// included), a named counter, or one custom word — and nothing else.
+    #[test]
+    fn enters_counter_type_noun_requires_whole_counter_name() {
+        assert_eq!(
+            parse_enters_counter_type_noun("+1/+1 counters on it").unwrap(),
+            ("s on it", CounterType::Plus1Plus1)
+        );
+        assert_eq!(
+            parse_enters_counter_type_noun("shoe counter on it").unwrap(),
+            (" on it", CounterType::Generic("shoe".to_string()))
+        );
+        assert_eq!(
+            parse_enters_counter_type_noun("first strike counter")
+                .unwrap()
+                .1,
+            CounterType::Keyword(crate::types::keywords::KeywordKind::FirstStrike)
+        );
+        assert_eq!(
+            parse_enters_counter_type_noun("lore counters").unwrap(),
+            ("s", CounterType::Lore)
+        );
+        assert_eq!(
+            parse_enters_counter_type_noun("+1/+0 counters").unwrap().1,
+            CounterType::PowerToughness {
+                power: 1,
+                toughness: 0
+            }
+        );
+        for prose in [
+            "up to two shoe counters on it",
+            "flying and with x +1/+1 counters on it",
+            "+2/+0, +1/+1, or +0/+2 counter on it",
+            "each of a vigilance, reach, trample, and hexproof counter on it",
+            "counter of that kind on it",
+            "number of charge counters on it",
+            "trample. the token enters with x +1/+1 counters on it",
+        ] {
+            assert!(
+                parse_enters_counter_type_noun(prose).is_err(),
+                "prose must not be read as a counter type: {prose:?}"
+            );
+        }
+    }
+
+    /// CR 614.1c + CR 122.6: the count head reads a printed count, the article
+    /// of "an additional <type>", or no count (the "equal to" forms) — and
+    /// never invents a count for text it cannot read.
+    #[test]
+    fn enters_counter_count_head_reads_each_count_source() {
+        let fixed = |value| Some(QuantityExpr::Fixed { value });
+        let x = || {
+            Some(QuantityExpr::Ref {
+                qty: QuantityRef::Variable {
+                    name: "X".to_string(),
+                },
+            })
+        };
+        assert_eq!(
+            parse_enters_counter_count_head("two +1/+1 counters on it"),
+            ("+1/+1 counters on it", fixed(2))
+        );
+        assert_eq!(
+            parse_enters_counter_count_head("an additional +1/+1 counter on it"),
+            ("+1/+1 counter on it", fixed(1))
+        );
+        // Bloodspore Thrinax: the count follows the qualifier.
+        assert_eq!(
+            parse_enters_counter_count_head("an additional x +1/+1 counters on it"),
+            ("+1/+1 counters on it", x())
+        );
+        assert_eq!(
+            parse_enters_counter_count_head("x additional +1/+1 counters on it"),
+            ("+1/+1 counters on it", x())
+        );
+        assert_eq!(
+            parse_enters_counter_count_head(
+                "a number of additional +1/+1 counters on it equal to ~'s power"
+            ),
+            ("+1/+1 counters on it equal to ~'s power", None)
+        );
+        assert_eq!(
+            parse_enters_counter_count_head("+1/+1 counters on it equal to the amount of mana"),
+            ("+1/+1 counters on it equal to the amount of mana", None)
+        );
+        assert_eq!(
+            parse_enters_counter_count_head("up to two shoe counters on it"),
+            ("up to two shoe counters on it", None)
+        );
+    }
+
+    /// The issue's repro lines carry prose in the count or type slot; each must
+    /// fail closed rather than publish a prose `CounterType::Generic`. Reverts
+    /// to BASE's `Some` with a prose `Generic` counter type.
+    #[test]
+    fn enters_with_prose_counter_clause_fails_closed() {
+        for (card, line) in [
+            (
+                "Dralnu's Pet",
+                "If this creature was kicked, it enters with flying and with X +1/+1 counters on it, where X is the discarded card's mana value.",
+            ),
+            (
+                "Shoe Tree",
+                "This creature enters with up to two shoe counters on it. Use your shoes as counters.",
+            ),
+            (
+                "Muzzio's Preparations",
+                "Each creature you control with the chosen name enters with an additional +1/+1 counter on it.",
+            ),
+            (
+                "Frankenstein's Monster",
+                "For each creature card exiled this way, this creature enters with a +2/+0, +1/+1, or +0/+2 counter on it.",
+            ),
+            (
+                "Oozeavite",
+                "Oozeavite enters with each of a vigilance, reach, trample, and hexproof counter on it. These are also +1/+1 counters.",
+            ),
+            (
+                "Blue, Loyal Raptor",
+                "For each kind of counter on Blue, Loyal Raptor, each other Dinosaur you control enters with a counter of that kind on it.",
+            ),
+        ] {
+            assert!(
+                parse_replacement_line(line, card).is_none(),
+                "{card}: a prose counter clause must fail closed, got {:?}",
+                parse_replacement_line(line, card)
+            );
+        }
+
+        // Reach guards: whole counter names with a printed count still parse.
+        let shoe_rack =
+            parse_replacement_line("This creature enters with two shoe counters on it.", "Rack")
+                .expect("a custom one-word counter name parses");
+        assert!(matches!(
+            &*shoe_rack.execute.as_deref().expect("execute").effect,
+            Effect::PutCounter {
+                counter_type: CounterType::Generic(name),
+                count: QuantityExpr::Fixed { value: 2 },
+                target: TargetFilter::SelfRef,
+            } if name == "shoe"
+        ));
+        let kicked = parse_replacement_line(
+            "If this creature was kicked with its {1}{R} kicker, it enters with two +1/+1 counters on it and with first strike.",
+            "Cetavolver",
+        )
+        .expect("kicked enters-with parses");
+        assert!(matches!(
+            kicked.condition,
+            Some(ReplacementCondition::CastViaKicker { .. })
+        ));
+        assert_eq!(
+            put_counters_in_chain(&kicked),
+            vec![(CounterType::Plus1Plus1, QuantityExpr::Fixed { value: 2 })]
+        );
+        let thrinax = parse_replacement_line(
+            "Each other creature you control enters with an additional X +1/+1 counters on it, where X is the number of +1/+1 counters on this creature.",
+            "Bloodspore Thrinax",
+        )
+        .expect("an additional X +1/+1 counters parses");
+        let thrinax_counters = put_counters_in_chain(&thrinax);
+        assert!(
+            matches!(
+                thrinax_counters.as_slice(),
+                [(
+                    CounterType::Plus1Plus1,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::CountersOn { .. }
+                    }
+                )]
+            ),
+            "got {thrinax_counters:?}"
+        );
+        let cactus = parse_replacement_line(
+            "The Spike Cactus enters the battlefield with +1/+1 counters on it equal to the amount of mana spent to cast it.",
+            "The Spike Cactus",
+        )
+        .expect("bare-type equal-to form parses");
+        let cactus_counters = put_counters_in_chain(&cactus);
+        assert!(
+            matches!(
+                cactus_counters.as_slice(),
+                [(CounterType::Plus1Plus1, count)] if !matches!(count, QuantityExpr::Fixed { .. })
+            ),
+            "got {cactus_counters:?}"
+        );
+    }
+
+    /// CR 122.6: a clause with no printed count takes its count from "equal to
+    /// <quantity>"; when that quantity is unreadable the clause fails closed
+    /// instead of placing one counter (BASE: `Fixed 1`).
+    #[test]
+    fn enters_with_numberless_count_requires_equal_to_quantity() {
+        for (card, line) in [
+            (
+                "Thought Sponge",
+                "This creature enters with a number of +1/+1 counters on it equal to the greatest number of cards an opponent has drawn this turn.",
+            ),
+            (
+                "Master Biomancer",
+                "Each other creature you control enters with a number of additional +1/+1 counters on it equal to this creature's power and as a Mutant in addition to its other types.",
+            ),
+        ] {
+            assert!(
+                parse_replacement_line(line, card).is_none(),
+                "{card}: an unreadable equal-to count must fail closed, got {:?}",
+                parse_replacement_line(line, card)
+            );
+        }
+
+        // Reach guards: readable equal-to quantities still parse.
+        let gyrus = parse_replacement_line(
+            "Gyrus enters with a number of +1/+1 counters on it equal to the amount of mana spent to cast it.",
+            "Gyrus, Waker of Corpses",
+        )
+        .expect("readable equal-to quantity parses");
+        let gyrus_counters = put_counters_in_chain(&gyrus);
+        assert!(
+            matches!(
+                gyrus_counters.as_slice(),
+                [(CounterType::Plus1Plus1, count)] if !matches!(count, QuantityExpr::Fixed { .. })
+            ),
+            "got {gyrus_counters:?}"
+        );
+        assert!(parse_replacement_line(
+            "Each other creature you control enters with a number of additional +1/+1 counters on it equal to Arwen's toughness.",
+            "Arwen, Weaver of Hope",
+        )
+        .is_some());
+    }
+
+    /// CR 122.1: the conjoined-list reader's counted element uses the same
+    /// whole-counter-name grammar, so "a number of charge counters" is not an
+    /// element (BASE: `Generic("number of charge")`).
+    #[test]
+    fn conjoined_counter_list_rejects_prose_element() {
+        assert!(parse_counted_enters_counter_entry("a number of charge counters on it").is_none());
+        assert_eq!(
+            parse_counted_enters_counter_entry("a lifelink counter on it"),
+            Some((
+                (
+                    CounterType::Keyword(crate::types::keywords::KeywordKind::Lifelink),
+                    QuantityExpr::Fixed { value: 1 }
+                ),
+                " on it"
+            ))
+        );
+
+        // CR 122.6 + CR 608.2c: the issue comment's synthetic line, and a
+        // companion with a printed head count. The list reader rejects the
+        // second element, so the single-counter path must not publish the first
+        // placement alone — that would be one +1/+1 placement counted by the
+        // second placement's "equal to" quantity, and `[(P1P1, 2)]` for the
+        // companion. The third line's elided "flying counter" element reads,
+        // but its recipient is not the list's "on it" terminator, so the list
+        // is rejected there too. The last three second placements carry no
+        // count: a plural bare type, a singular one-word custom type, and a
+        // plural elided keyword type, none of which the list reader's elided
+        // element accepts. The two "additional" lines' second placements open
+        // with the single-placement head's own qualifiers ("additional", "a
+        // number of additional"), which the list reader's counted element does
+        // not read. Each whole line lands as an unsupported gap.
+        for line in [
+            "This creature enters with a +1/+1 counter and a number of charge counters on it equal to the number of creatures you control.",
+            "This creature enters with two +1/+1 counters and a number of charge counters on it.",
+            "This creature enters with a +1/+1 counter and flying counter on this creature.",
+            "This creature enters with a +1/+1 counter and charge counters on it equal to the number of creatures you control.",
+            "This creature enters with a +1/+1 counter and wish counter on it.",
+            "This creature enters with two +1/+1 counters and trample counters on it.",
+            "This creature enters with a +1/+1 counter and additional charge counters on it equal to the number of creatures you control.",
+            "This creature enters with a +1/+1 counter and a number of additional charge counters on it equal to the number of creatures you control.",
+        ] {
+            assert_eq!(
+                parse_replacement_line(line, "Synthetic Charge Line"),
+                None,
+                "{line:?}: an unread second placement must not publish the first alone"
+            );
+            let parsed = parse_oracle_text(
+                line,
+                "Synthetic Charge Line",
+                &[],
+                &["Creature".to_string()],
+                &[],
+            );
+            assert!(
+                !parsed
+                    .replacements
+                    .iter()
+                    .any(|r| r.event == ReplacementEvent::Moved),
+                "{line:?}: no enters-with replacement, got {:?}",
+                parsed.replacements
+            );
+            assert!(
+                parsed
+                    .abilities
+                    .iter()
+                    .any(|a| matches!(*a.effect, Effect::Unimplemented { .. })),
+                "{line:?}: the line is an unsupported gap, got {:?}",
+                parsed.abilities
+            );
+        }
+
+        // An "an additional" second placement is a counted element the list
+        // reader does read, so that line publishes both placements.
+        let additional_charge = parse_replacement_line(
+            "This creature enters with a +1/+1 counter and an additional charge counter on it.",
+            "Synthetic Charge Line",
+        )
+        .expect("a counted \"an additional\" second element is a readable list");
+        assert_eq!(
+            put_counters_in_chain(&additional_charge),
+            vec![
+                (CounterType::Plus1Plus1, QuantityExpr::Fixed { value: 1 }),
+                (
+                    crate::types::counter::parse_counter_type("charge"),
+                    QuantityExpr::Fixed { value: 1 }
+                ),
+            ]
+        );
+
+        // Reach guard: a real conjoined list still reads both elements, and the
+        // full parse publishes it as the enters-with replacement.
+        let dust_animus_line = "If you control five or more untapped lands, this creature enters with two +1/+1 counters and a lifelink counter on it.";
+        let dust_animus =
+            parse_replacement_line(dust_animus_line, "Dust Animus").expect("Dust Animus parses");
+        assert_eq!(
+            put_counters_in_chain(&dust_animus),
+            vec![
+                (CounterType::Plus1Plus1, QuantityExpr::Fixed { value: 2 }),
+                (
+                    CounterType::Keyword(crate::types::keywords::KeywordKind::Lifelink),
+                    QuantityExpr::Fixed { value: 1 }
+                ),
+            ]
+        );
+        let dust_animus_full = parse_oracle_text(
+            dust_animus_line,
+            "Dust Animus",
+            &[],
+            &["Creature".to_string()],
+            &["Spirit".to_string()],
+        );
+        assert!(
+            dust_animus_full
+                .replacements
+                .iter()
+                .any(|r| r.event == ReplacementEvent::Moved),
+            "got {:?}",
+            dust_animus_full.replacements
+        );
+        assert!(
+            !dust_animus_full
+                .abilities
+                .iter()
+                .any(|a| matches!(*a.effect, Effect::Unimplemented { .. })),
+            "got {:?}",
+            dust_animus_full.abilities
+        );
+    }
+
+    /// Printlifter Ooze: the cut at the first "with" (the token's "with
+    /// trample") no longer publishes a self replacement with a prose counter
+    /// type, so the line reaches the trigger route and the token carries the
+    /// printed rider (BASE: one `Moved` replacement and no trigger).
+    #[test]
+    fn printlifter_ooze_rider_reaches_the_token() {
+        let parsed = parse_oracle_text(
+            "Deathtouch\nWhenever this creature or another creature you control is turned face up, create a 0/0 green Ooze creature token with trample. The token enters with X +1/+1 counters on it, where X is the number of other creatures you control.\nDisguise {3}{G}",
+            "Printlifter Ooze",
+            &["Deathtouch".to_string(), "Disguise".to_string()],
+            &["Creature".to_string()],
+            &["Ooze".to_string()],
+        );
+        assert!(
+            parsed.replacements.is_empty(),
+            "no self replacement, got {:?}",
+            parsed.replacements
+        );
+        let trigger = parsed
+            .triggers
+            .iter()
+            .find(|t| t.mode == crate::types::triggers::TriggerMode::TurnFaceUp)
+            .expect("turned-face-up trigger");
+        let Effect::Token {
+            enter_with_counters,
+            ..
+        } = &*trigger.execute.as_deref().expect("trigger execute").effect
+        else {
+            panic!("expected a Token effect, got {:?}", trigger.execute);
+        };
+        assert_eq!(
+            enter_with_counters,
+            &vec![(
+                CounterType::Plus1Plus1,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(
+                            TypedFilter::creature()
+                                .controller(ControllerRef::You)
+                                .properties(vec![FilterProp::Another]),
+                        ),
+                    },
+                },
+            )]
+        );
+    }
+
+    /// Dralnu's Pet: the keyword-first rider fails closed as an honest gap
+    /// instead of a prose `Generic` replacement.
+    #[test]
+    fn dralnus_pet_keyword_first_rider_is_unsupported() {
+        let parsed = parse_oracle_text(
+            "Kicker—{2}{B}, Discard a creature card. (You may pay {2}{B} and discard a creature card in addition to any other costs as you cast this spell.)\nIf this creature was kicked, it enters with flying and with X +1/+1 counters on it, where X is the discarded card's mana value.",
+            "Dralnu's Pet",
+            &["Kicker".to_string()],
+            &["Creature".to_string()],
+            &["Shapeshifter".to_string()],
+        );
+        assert!(
+            parsed.replacements.is_empty(),
+            "got {:?}",
+            parsed.replacements
+        );
+        assert!(
+            parsed
+                .abilities
+                .iter()
+                .any(|a| matches!(*a.effect, Effect::Unimplemented { .. })),
+            "the rider line must surface as an unsupported gap, got {:?}",
+            parsed.abilities
+        );
+        assert!(
+            matches!(
+                parsed.additional_cost,
+                Some(crate::types::ability::AdditionalCost::Kicker { .. })
+            ),
+            "reach guard: the kicker line parsed, got {:?}",
+            parsed.additional_cost
+        );
     }
 
     #[test]
