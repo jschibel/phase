@@ -245,9 +245,11 @@ fn ensnare_alternative_cost_prompts_for_two_islands() {
             kind: PayCostKind::ReturnToHand,
             choices,
             count,
+            min_count,
             ..
         } => {
             assert_eq!(*count, 2);
+            assert_eq!(*min_count, 2, "the prompt requires the exact count");
             assert!(choices.contains(&a) && choices.contains(&b));
             assert!(
                 !choices.contains(&opp_island),
@@ -843,6 +845,264 @@ fn counted_return_activation_group_survives_a_replacement_pause() {
             "{label}: the persisted records stay mutual"
         );
         assert_eq!(life, 3, "{label}: CR 603.10a observer sees both lands");
+    }
+}
+
+/// A target-bearing counted-return activation (the Flooded Shoreline shape:
+/// "Return two lands you control to their owner's hand: Destroy target
+/// creature"), with the first land carrying the departure observer and the
+/// listed lands each carrying two competing replacements. Returns (life
+/// gained, persisted departure records of the lands, pauses taken, the
+/// opposing creature's zone).
+fn targeted_counted_return_activation_with_pauses(
+    redirect: &[usize],
+) -> (i32, Vec<(ObjectId, Vec<ObjectId>)>, usize, Zone) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario
+        .add_creature(P0, "Targeted Counted Return Witness", 1, 1)
+        .with_ability_definition(
+            AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Destroy {
+                    target: TargetFilter::Typed(
+                        TypedFilter::creature().controller(ControllerRef::Opponent),
+                    ),
+                    cant_regenerate: false,
+                },
+            )
+            .cost(parse_oracle_cost(
+                "Return two lands you control to their owner's hand",
+            )),
+        )
+        .id();
+    let victim = scenario.add_creature(P1, "Opposing Victim", 2, 2).id();
+    let lands: Vec<ObjectId> = (0..2)
+        .map(|_| scenario.add_basic_land(P0, ManaColor::Green))
+        .collect();
+    for &index in redirect {
+        for name in ["First Redirect", "Second Redirect"] {
+            scenario
+                .add_creature(P0, &format!("{name} {index}"), 0, 0)
+                .as_enchantment()
+                .with_replacement_definition(redirect_land_to_exile(lands[index]));
+        }
+    }
+    let mut runner = scenario.build();
+    attach_land_departure_observer(&mut runner, lands[0]);
+    let life0 = runner.life(P0);
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: source,
+            ability_index: 0,
+        })
+        .expect("activate the targeted counted-return ability");
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::TargetSelection { .. }
+    ) {
+        runner
+            .act(GameAction::SelectTargets {
+                targets: vec![engine::types::ability::TargetRef::Object(victim)],
+            })
+            .expect("announce the target");
+    }
+    runner
+        .act(GameAction::SelectCards {
+            cards: lands.clone(),
+        })
+        .expect("select both lands");
+    let mut pauses = 0;
+    while matches!(
+        runner.state().waiting_for,
+        WaitingFor::ReplacementChoice { .. }
+    ) {
+        pauses += 1;
+        runner
+            .act(GameAction::ChooseReplacement { index: 0 })
+            .expect("choose the replacement");
+    }
+    runner.advance_until_stack_empty();
+
+    let mut records: Vec<(ObjectId, Vec<ObjectId>)> = runner
+        .state()
+        .zone_changes_this_turn
+        .iter()
+        .filter(|record| {
+            record.from_zone == Some(Zone::Battlefield) && lands.contains(&record.object_id)
+        })
+        .map(|record| (record.object_id, record.co_departed.clone()))
+        .collect();
+    records.sort();
+    let mut expected = lands.clone();
+    expected.sort();
+    assert_eq!(
+        records.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        expected,
+        "reach guard: both lands left the battlefield"
+    );
+    let victim_zone = runner.state().objects[&victim].zone;
+    (runner.life(P0) - life0, records, pauses, victim_zone)
+}
+
+#[test]
+fn targeted_counted_return_activation_group_survives_a_replacement_pause() {
+    // CR 603.10a + CR 603.2c: the observer on the first land triggers once for
+    // each of the two lands that left together, however the departures were
+    // split across actions by a replacement choice.
+    let (life, records, pauses, victim) = targeted_counted_return_activation_with_pauses(&[]);
+    assert_eq!(pauses, 0);
+    assert_eq!(life, 2, "unpaused: the observer sees both lands");
+    assert_eq!(victim, Zone::Graveyard, "the announced target is destroyed");
+    let (a, b) = (records[0].0, records[1].0);
+    assert_eq!(records, vec![(a, vec![b]), (b, vec![a])]);
+
+    for (label, redirect, expected_pauses) in [("second", vec![1], 1), ("both", vec![0, 1], 2)] {
+        let (life, records, pauses, victim) =
+            targeted_counted_return_activation_with_pauses(&redirect);
+        assert_eq!(
+            pauses, expected_pauses,
+            "{label}: pause count (reach guard)"
+        );
+        let (a, b) = (records[0].0, records[1].0);
+        assert_eq!(
+            records,
+            vec![(a, vec![b]), (b, vec![a])],
+            "{label}: the persisted records stay mutual"
+        );
+        assert_eq!(life, 2, "{label}: the observer triggers once per land");
+        assert_eq!(victim, Zone::Graveyard, "{label}: the ability resolved");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The payer leaves the game while a counted return is paused (CR 800.4a).
+// ---------------------------------------------------------------------------
+
+/// A three-player board: P0 activates the target-bearing counted-return
+/// ability, the second land carries two competing replacements (the pause),
+/// and P1's observer gains life whenever any land leaves the battlefield.
+/// Pauses on the second land, optionally round-trips the paused state through
+/// serde, then P0 concedes. Returns (P1 life gained, stack depth after the
+/// triggers settle, the first land's zone, the second land's zone).
+fn concede_during_counted_return_pause(round_trip: bool) -> (i32, usize, Zone, Zone) {
+    let mut scenario = GameScenario::new_n_player(3, 7);
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario
+        .add_creature(P0, "Targeted Counted Return Witness", 1, 1)
+        .with_ability_definition(
+            AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Destroy {
+                    target: TargetFilter::Typed(
+                        TypedFilter::creature().controller(ControllerRef::Opponent),
+                    ),
+                    cant_regenerate: false,
+                },
+            )
+            .cost(parse_oracle_cost(
+                "Return two lands you control to their owner's hand",
+            )),
+        )
+        .id();
+    let victim = scenario.add_creature(P1, "Opposing Victim", 2, 2).id();
+    let observer_host = scenario
+        .add_creature(P1, "Land Departure Watcher", 1, 1)
+        .id();
+    let lands: Vec<ObjectId> = (0..2)
+        .map(|_| scenario.add_basic_land(P0, ManaColor::Green))
+        .collect();
+    for name in ["First Redirect", "Second Redirect"] {
+        scenario
+            .add_creature(P0, name, 0, 0)
+            .as_enchantment()
+            .with_replacement_definition(redirect_land_to_exile(lands[1]));
+    }
+    let mut runner = scenario.build();
+    attach_land_departure_observer(&mut runner, observer_host);
+    let life0 = runner.life(P1);
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: source,
+            ability_index: 0,
+        })
+        .expect("activate the targeted counted-return ability");
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::TargetSelection { .. }
+    ) {
+        runner
+            .act(GameAction::SelectTargets {
+                targets: vec![engine::types::ability::TargetRef::Object(victim)],
+            })
+            .expect("announce the target");
+    }
+    runner
+        .act(GameAction::SelectCards {
+            cards: lands.clone(),
+        })
+        .expect("select both lands");
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ),
+        "reach guard: the second land's move paused, got {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(
+        runner.state().objects[&lands[0]].zone,
+        Zone::Hand,
+        "reach guard: the first land already left"
+    );
+    if round_trip {
+        let json = serde_json::to_string(runner.state()).expect("serialize the paused state");
+        assert!(
+            json.contains("deferred_cost_events"),
+            "reach guard: the Cast root carries the completed prefix"
+        );
+        runner = GameRunner::from_state(
+            serde_json::from_str(&json).expect("deserialize the paused state"),
+        );
+    }
+
+    runner
+        .act(GameAction::Concede { player_id: P0 })
+        .expect("P0 concedes during the replacement choice");
+    assert!(runner.state().players[0].is_eliminated);
+    runner.advance_until_stack_empty();
+    (
+        runner.life(P1) - life0,
+        runner.state().stack.len(),
+        // The conceding player's objects have left the game with them; zone
+        // reads fall back to the recorded zone.
+        runner
+            .state()
+            .objects
+            .get(&lands[0])
+            .map_or(Zone::Exile, |o| o.zone),
+        runner
+            .state()
+            .objects
+            .get(&lands[1])
+            .map_or(Zone::Exile, |o| o.zone),
+    )
+}
+
+#[test]
+fn conceding_during_a_counted_return_pause_publishes_the_completed_prefix_once() {
+    // CR 800.4a + CR 603.2: the first land's departure already happened, so a
+    // surviving player's leaves-the-battlefield observer triggers for it once,
+    // although the payer then leaves and the paused move is abandoned.
+    for round_trip in [false, true] {
+        let (gained, stack, _, _) = concede_during_counted_return_pause(round_trip);
+        assert_eq!(
+            gained, 1,
+            "round_trip={round_trip}: P1's observer triggers exactly once"
+        );
+        assert_eq!(stack, 0, "round_trip={round_trip}: the stack settled");
     }
 }
 

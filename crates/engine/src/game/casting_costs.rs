@@ -3890,26 +3890,48 @@ pub(crate) fn settle_sacrifice_for_cost_events(
     if let Some(collection) =
         pending.and_then(|pending| pending.activation_trigger_collection.as_mut())
     {
-        // Earlier action fragments carry no ordinal in THIS buffer, so the
-        // consumed journal — whose ordinals are absolute within the current
-        // action — must not be applied to them. The queued-context witness is
-        // occurrence-exact independently of any buffer; `turn_zone_change_index`
-        // separates distinct occurrences within a turn.
-        let unclaimed_cost_events =
+        // Two occurrence bases, filtered separately and never rebased into each
+        // other (see below): the carried fragments against the buffer-independent
+        // queued-context witness, the current fragment against this action's
+        // buffer and the consumed journal.
+        let carried_cost_events =
             crate::game::triggers::filter_already_collected_trigger_events_from(
                 state,
                 &deferred_cost_events,
                 0,
                 &[],
             );
-        // CR 602.2b + CR 603.2: an announced target-bearing activation owns
-        // replacement-paused cost events until its stack commit. Earlier action
-        // fragments are not present in this action's event buffer, while the
-        // current fragment is collected once by the eventual stack boundary (or
-        // the next pending-action staging pass).
-        if !unclaimed_cost_events.is_empty() {
-            collection.collect(state, &unclaimed_cost_events);
+        let current_cost_events: Vec<GameEvent> =
+            crate::game::triggers::filter_already_collected_trigger_events_from(
+                state,
+                &events[..current_end],
+                current_start,
+                &state.consumed_before_priority_trigger_events,
+            )
+            .into_iter()
+            .filter(|event| !matches!(event, GameEvent::PhaseChanged { .. }))
+            .collect();
+        // CR 602.2b + CR 603.2 + CR 603.10a: an announced target-bearing
+        // activation owns replacement-paused cost events until its stack commit.
+        // The carried and current fragments are one simultaneous departure
+        // group, so they enter the carrier as ONE slice: a co-departing
+        // observer's look-back source context needs its own stamped
+        // `ZoneChanged` record in the slice it is collected from.
+        let group: Vec<GameEvent> = carried_cost_events
+            .into_iter()
+            .chain(current_cost_events)
+            .collect();
+        if !group.is_empty() {
+            collection.collect(state, &group);
         }
+        // CR 603.2c: the current fragment is collected; neither the stack
+        // commit nor the next announcement staging pass collects it again.
+        super::announcement_triggers::claim_ordinary_collected_span(
+            state,
+            events,
+            current_start,
+            current_end,
+        );
         return;
     }
 
@@ -6399,7 +6421,7 @@ fn surface_next_interactive_activation_cost_leg(
             kind: PayCostKind::ReturnToHand,
             choices: eligible,
             count: count as usize,
-            min_count: 0,
+            min_count: count as usize,
             resume: CostResume::Spell {
                 spell: Box::new(pending.clone()),
             },
@@ -7369,7 +7391,16 @@ pub(super) fn push_ability_entry(
         events,
     );
     if let Some(mut collection) = activation_trigger_collection {
-        collection.collect(state, events);
+        // CR 603.2c: an occurrence a cost settlement already collected into this
+        // carrier (the fragment of a replacement-paused counted cost) is claimed
+        // and is not collected a second time.
+        let unclaimed_events = crate::game::triggers::filter_consumed_trigger_events_from(
+            events,
+            0,
+            crate::game::triggers::TriggerCollectionRequester::Ordinary,
+            &state.consumed_before_priority_trigger_events,
+        );
+        collection.collect(state, &unclaimed_events);
         let mut deferred_contexts = std::mem::take(&mut state.deferred_triggers);
         collection.commit_into(state, &mut deferred_contexts);
         state.deferred_triggers = deferred_contexts;
@@ -9963,7 +9994,7 @@ fn pay_additional_cost_with_source(
                 kind: PayCostKind::ReturnToHand,
                 choices: eligible,
                 count: count as usize,
-                min_count: 0,
+                min_count: count as usize,
                 resume: CostResume::Spell {
                     spell: Box::new(pending),
                 },
