@@ -18868,6 +18868,7 @@ mod tests {
                 attacking_alone: true,
                 blocking_alone: false,
                 defending_player: Some(PlayerId(0)),
+                attack_target: None,
             },
             ..ZoneChangeRecord::test_minimal(ObjectId(42), Some(Zone::Battlefield), Zone::Graveyard)
         };
@@ -18879,6 +18880,7 @@ mod tests {
                 attacking_alone: false,
                 blocking_alone: true,
                 defending_player: None,
+                attack_target: None,
             },
             ..ZoneChangeRecord::test_minimal(ObjectId(43), Some(Zone::Battlefield), Zone::Graveyard)
         };
@@ -18950,6 +18952,7 @@ mod tests {
                 attacking_alone: false,
                 blocking_alone: false,
                 defending_player: Some(PlayerId(0)),
+                attack_target: None,
             },
             ..ZoneChangeRecord::test_minimal(ObjectId(44), Some(Zone::Battlefield), Zone::Graveyard)
         };
