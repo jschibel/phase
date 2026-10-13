@@ -2351,6 +2351,7 @@ pub struct SpellCast<'a> {
     effect_zone_cards: Vec<ObjectId>,
     copy_target: Option<ObjectId>,
     spellbook_pick: Option<String>,
+    payment_mode: CastPaymentMode,
 }
 
 impl<'a> SpellCast<'a> {
@@ -2380,7 +2381,16 @@ impl<'a> SpellCast<'a> {
             effect_zone_cards: Vec::new(),
             copy_target: None,
             spellbook_pick: None,
+            payment_mode: CastPaymentMode::Auto,
         }
+    }
+
+    /// CR 601.2g-h: announce the cast with `mode` — `Auto` pays from the pool at
+    /// announcement; `Manual` surfaces the interactive mana-payment window, which
+    /// the driver finalizes. Default `Auto`.
+    pub fn payment_mode(mut self, mode: CastPaymentMode) -> Self {
+        self.payment_mode = mode;
+        self
     }
 
     /// Submit the first legal candidates at any `SearchChoice` during
@@ -2612,6 +2622,7 @@ impl<'a> SpellCast<'a> {
             effect_zone_cards,
             copy_target,
             spellbook_pick,
+            payment_mode,
         } = self;
 
         // CR 119.3: snapshot life totals before the cast so `life_delta` reads a
@@ -2632,7 +2643,7 @@ impl<'a> SpellCast<'a> {
                 card_id,
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode,
             },
             &mut events,
         )?;

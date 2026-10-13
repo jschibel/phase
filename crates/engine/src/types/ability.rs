@@ -3124,20 +3124,6 @@ pub enum EventCounterReproductionCount {
     PerKind(u32),
 }
 
-/// CR 701.6 + CR 608.2c: A follow-up instruction carried by `Effect::Counter`
-/// that acts on the *source permanent* of an ability countered by the effect.
-///
-/// The rider only fires when the countered object was an activated or triggered
-/// ability — per CR 701.8a / CR 110.1 a spell is not a permanent, so when a
-/// spell is countered there is no permanent for the rider to act on and it is
-/// skipped (the conditional "if a permanent's ability is countered this way" is
-/// encoded structurally by this spell-vs-ability gate, not by a separate
-/// `AbilityCondition`).
-///
-/// Both variants share one categorical axis — "an effect applied to the
-/// countered ability's source permanent" — so they live on a single enum rather
-/// than as sibling `Option` fields on `Effect::Counter` (parameterize, don't
-/// proliferate).
 /// serde default for `CounterSourceRider::LosesAbilities::duration` — keeps
 /// card-data serialized before the field was added deserializing correctly.
 /// Deliberately the OLD reading: before the field existed the resolver
@@ -3150,6 +3136,22 @@ fn duration_until_host_leaves_play() -> Box<Duration> {
     Box::new(Duration::UntilHostLeavesPlay)
 }
 
+/// CR 701.6 + CR 608.2c: A follow-up instruction carried by `Effect::Counter`
+/// that acts on the *source permanent* of an ability countered by the effect.
+///
+/// The rider only fires when the countered object was an activated or triggered
+/// ability — per CR 110.1 (a permanent is on the battlefield) + CR 113.1c (a stack ability is an object whose source can be a permanent) a spell is not a permanent, so when a
+/// spell is countered there is no permanent for the rider to act on and it is
+/// skipped (the conditional "if a permanent's ability is countered this way" is
+/// encoded structurally by this spell-vs-ability gate, not by a separate
+/// `AbilityCondition`). A type-restricted conditional ("if an ability of an
+/// artifact, creature, or planeswalker is countered this way") adds a typed
+/// gate on the source permanent: `LosesAbilities::source_filter`.
+///
+/// Both variants share one categorical axis — "an effect applied to the
+/// countered ability's source permanent" — so they live on a single enum rather
+/// than as sibling `Option` fields on `Effect::Counter` (parameterize, don't
+/// proliferate).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum CounterSourceRider {
@@ -3166,8 +3168,18 @@ pub enum CounterSourceRider {
     /// an explicit field (rather than hard-coded in the resolver) so the
     /// "as long as" clause is visible in the serialized AST and threaded to
     /// the transient continuous effect.
+    ///
+    /// CR 608.2c + CR 109.2: `source_filter` is the printed type condition on
+    /// the countered ability's source ("an ability of an artifact, creature, or
+    /// planeswalker is countered this way" — a description with a card type and
+    /// no zone means a permanent of that type). `None` is the untyped "a
+    /// permanent's ability" reading (and pre-field card data). It is evaluated
+    /// live at resolution against the source's current characteristics
+    /// (CR 608.2h), so a land or enchantment source is left untouched.
     LosesAbilities {
         static_def: Box<StaticDefinition>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_filter: Option<Box<TargetFilter>>,
         // Boxed: `Duration` is a large enum, and this rider is embedded in the
         // frequently-constructed `ZoneCounterImperativeAst`/`Effect::Counter`
         // holders — boxing keeps `CounterSourceRider` small (clippy
@@ -9585,7 +9597,10 @@ pub enum QuantityRef {
     /// `StaticCondition::QuantityComparison` rather than requiring a dedicated variant.
     CardsExiledBySource,
     /// CR 607.2b: The power of a specific card exiled by the source, indexed by order.
-    /// Used by The Mimeoplasm to read the second exiled card's power for counter placement.
+    /// Its only producer is The Mimeoplasm's entry replacement, which reads the second
+    /// card exiled "this way" (the per-turn ledger) for counter placement. Readers of
+    /// "the power of the exiled card" use
+    /// `PropertyAggregate(Sum, Power, CardTypeSetSource::ExiledBySource)` instead.
     ExiledCardPower { index: u32 },
     /// CR 400.1: Count cards in a zone matching optional type filters.
     /// Empty card_types means all cards. Multiple entries = OR (any match).
@@ -21897,6 +21912,31 @@ impl TargetFilter {
         }
     }
 
+    /// CR 303.4b + CR 301.5f: this filter with its "enchanted/equipped by the
+    /// source" relation removed, leaving the constraints the attachment host must
+    /// still meet ("enchanted *creature*", "equipped creature *you control*").
+    /// Pairs with [`Self::contains_source_attachment_host`]: callers that have
+    /// already established the host from the attachment relation itself check
+    /// the host against what remains. Covers the same shapes that predicate does.
+    pub fn without_source_attachment_host(&self) -> TargetFilter {
+        match self {
+            TargetFilter::Typed(typed) => {
+                let mut typed = typed.clone();
+                typed.properties.retain(|prop| {
+                    !matches!(prop, FilterProp::EnchantedBy | FilterProp::EquippedBy)
+                });
+                TargetFilter::Typed(typed)
+            }
+            TargetFilter::And { filters } => TargetFilter::And {
+                filters: filters
+                    .iter()
+                    .map(TargetFilter::without_source_attachment_host)
+                    .collect(),
+            },
+            other => other.clone(),
+        }
+    }
+
     /// CR 603.7c + CR 400.7: Returns true when this filter names ONE object that
     /// is already BOUND — a specific permanent or an anaphor to one — rather than
     /// a CLASS of objects re-matched against the live board on every check.
@@ -22333,6 +22373,20 @@ impl fmt::Debug for Effect {
     }
 }
 
+/// CR 115.10a + CR 303.4b + CR 301.5f: what a resolution-bound "enchanted /
+/// equipped X" slot is to an effect ([`Effect::attachment_host_slot`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttachmentHostSlot {
+    /// The effect resolves the slot through its bound target occurrence: it
+    /// acts on the host, or (a token copy) copies it in place.
+    Operand,
+    /// The slot supplies characteristics or abilities to a different recipient
+    /// (the copy source of "becomes a copy of", the donor of "gains all
+    /// activated abilities of"). Host binding does not establish a donor's
+    /// identity contract, so such an instruction keeps its stack-time target.
+    Donor,
+}
+
 impl Effect {
     /// Single authority for constructing the "parser couldn't handle this"
     /// effect. Parser code must use this instead of a literal
@@ -22664,6 +22718,251 @@ impl Effect {
             | Effect::DraftFromSpellbook { .. }
             | Effect::ChooseOneOf { .. }
             | Effect::Unimplemented { .. } => false,
+        }
+    }
+
+    /// CR 115.10a + CR 303.4b + CR 301.5f + CR 707.2: what this effect's slot is
+    /// when it names a resolution-bound host. Exhaustive and wildcard-free on
+    /// purpose: a new variant must answer here. Only "becomes a copy of" and
+    /// "gains all activated abilities of" take their slot as a donor for a
+    /// different recipient; every other effect resolves it as its operand.
+    pub(crate) fn attachment_host_slot(&self) -> AttachmentHostSlot {
+        match self {
+            Effect::BecomeCopy { .. } | Effect::GainActivatedAbilitiesOfTarget { .. } => {
+                AttachmentHostSlot::Donor
+            }
+            Effect::StartYourEngines { .. }
+            | Effect::ChangeSpeed { .. }
+            | Effect::DealDamage { .. }
+            | Effect::ApplyPostReplacementDamage { .. }
+            | Effect::EachDealsDamageEqualToPower { .. }
+            | Effect::EachSourceDealsDamage { .. }
+            | Effect::Draw { .. }
+            | Effect::Pump { .. }
+            | Effect::PairWith { .. }
+            | Effect::Destroy { .. }
+            | Effect::Regenerate { .. }
+            | Effect::RemoveAllDamage { .. }
+            | Effect::Counter { .. }
+            | Effect::CounterAll { .. }
+            | Effect::Token { .. }
+            | Effect::GainLife { .. }
+            | Effect::LoseLife { .. }
+            | Effect::SetTapState { .. }
+            | Effect::RemoveCounter { .. }
+            | Effect::Sacrifice { .. }
+            | Effect::DiscardCard { .. }
+            | Effect::Mill { .. }
+            | Effect::Scry { .. }
+            | Effect::PumpAll { .. }
+            | Effect::DamageAll { .. }
+            | Effect::DamageEachPlayer { .. }
+            | Effect::DestroyAll { .. }
+            | Effect::ChangeZone { .. }
+            | Effect::ChangeZoneAll { .. }
+            | Effect::Dig { .. }
+            | Effect::GainControl { .. }
+            | Effect::GainControlAll { .. }
+            | Effect::ControlNextTurn { .. }
+            | Effect::Attach { .. }
+            | Effect::UnattachAll { .. }
+            | Effect::Surveil { .. }
+            | Effect::Fight { .. }
+            | Effect::Bounce { .. }
+            | Effect::BounceAll { .. }
+            | Effect::Explore
+            | Effect::ExploreAll { .. }
+            | Effect::Investigate
+            | Effect::Tribute { .. }
+            | Effect::TimeTravel
+            | Effect::BecomeMonarch { .. }
+            | Effect::NoOp
+            | Effect::Proliferate
+            | Effect::ProliferateTarget { .. }
+            | Effect::Populate
+            | Effect::Clash
+            | Effect::Behold { .. }
+            | Effect::EndTheTurn
+            | Effect::EndCombatPhase
+            | Effect::Vote { .. }
+            | Effect::SeparateIntoPiles { .. }
+            | Effect::SwitchPT { .. }
+            | Effect::CopySpell { .. }
+            | Effect::EpicCopy { .. }
+            | Effect::CastCopyOfCard { .. }
+            | Effect::CopyTokenOf { .. }
+            | Effect::CreateTokenCopyFromPool { .. }
+            | Effect::Myriad
+            | Effect::Encore
+            | Effect::CombineHost { .. }
+            | Effect::ChooseAugmentAndCombineWithHost { .. }
+            | Effect::Meld { .. }
+            | Effect::ExileHaunting { .. }
+            | Effect::HideawayConceal { .. }
+            | Effect::CopyTokenBlockingAttacker { .. }
+            | Effect::ChoosePermanent { .. }
+            | Effect::ChooseCard { .. }
+            | Effect::PutCounter { .. }
+            | Effect::ChooseCounterKind { .. }
+            | Effect::PutChosenCounter { .. }
+            | Effect::PutCounterAll { .. }
+            | Effect::MultiplyCounter { .. }
+            | Effect::ChooseCounterAdjustment { .. }
+            | Effect::DoublePT { .. }
+            | Effect::DoublePTAll { .. }
+            | Effect::MoveCounters { .. }
+            | Effect::ReproduceEventCounters { .. }
+            | Effect::Animate { .. }
+            | Effect::ReturnAsAura { .. }
+            | Effect::RegisterBending { .. }
+            | Effect::GenericEffect { .. }
+            | Effect::Cleanup { .. }
+            | Effect::Mana { .. }
+            | Effect::Discard { .. }
+            | Effect::Shuffle { .. }
+            | Effect::Transform { .. }
+            | Effect::FlipPermanent { .. }
+            | Effect::SearchLibrary { .. }
+            | Effect::SearchOutsideGame { .. }
+            | Effect::OpenBoosterPack { .. }
+            | Effect::RevealHand { .. }
+            | Effect::RevealFromHand { .. }
+            | Effect::Reveal { .. }
+            | Effect::RevealChosenNumbers { .. }
+            | Effect::RevealTop { .. }
+            | Effect::ExileTop { .. }
+            | Effect::ExileFaceDownPile { .. }
+            | Effect::TargetOnly { .. }
+            | Effect::Choose { .. }
+            | Effect::OpponentGuess { .. }
+            | Effect::SwapChosenLabels { .. }
+            | Effect::ChooseDamageSource { .. }
+            | Effect::Suspect { .. }
+            | Effect::Unsuspect { .. }
+            | Effect::Connive { .. }
+            | Effect::PhaseOut { .. }
+            | Effect::PhaseIn { .. }
+            | Effect::ForceBlock { .. }
+            | Effect::ForceAttack { .. }
+            | Effect::SolveCase
+            | Effect::BecomePrepared { .. }
+            | Effect::BecomeUnprepared { .. }
+            | Effect::BecomeSaddled { .. }
+            | Effect::SetClassLevel { .. }
+            | Effect::CreateDelayedTrigger { .. }
+            | Effect::AddTargetReplacement { .. }
+            | Effect::AddRestriction { .. }
+            | Effect::ReduceNextSpellCost { .. }
+            | Effect::GrantNextSpellAbility { .. }
+            | Effect::AddPendingETBCounters { .. }
+            | Effect::AddPendingEntersModifications { .. }
+            | Effect::CreateEmblem { .. }
+            | Effect::PayCost { .. }
+            | Effect::CastFromZone { .. }
+            | Effect::FreeCastFromZones { .. }
+            | Effect::ExileResolvingSpellInsteadOfGraveyard { .. }
+            | Effect::PreventDamage { .. }
+            | Effect::CreateDamageReplacement { .. }
+            | Effect::CreateDrawReplacement { .. }
+            | Effect::CreatePlaneswalkReplacement { .. }
+            | Effect::LoseTheGame { .. }
+            | Effect::WinTheGame { .. }
+            | Effect::RollDie { .. }
+            | Effect::FlipCoin { .. }
+            | Effect::FlipCoins { .. }
+            | Effect::FlipCoinUntilLose { .. }
+            | Effect::RingTemptsYou
+            | Effect::VentureIntoDungeon
+            | Effect::VentureInto { .. }
+            | Effect::TakeTheInitiative
+            | Effect::ArrangePlanarDeckTop { .. }
+            | Effect::Planeswalk
+            | Effect::ChaosEnsues
+            | Effect::ReverseTurnOrder
+            | Effect::RedistributeLifeTotals
+            | Effect::OpenAttractions { .. }
+            | Effect::RollToVisitAttractions
+            | Effect::AssembleContraptions { .. }
+            | Effect::AssembleContraptionsFromRollDifference
+            | Effect::CrankContraptions { .. }
+            | Effect::ReassembleContraption { .. }
+            | Effect::AssembleContraptionOnSprocket { .. }
+            | Effect::ReassembleContraptionOnSprocket { .. }
+            | Effect::PutSticker { .. }
+            | Effect::ApplySticker { .. }
+            | Effect::ProcessRadCounters
+            | Effect::GrantCastingPermission { .. }
+            | Effect::ChooseFromZone { .. }
+            | Effect::RememberCard { .. }
+            | Effect::NoteManaSpent
+            | Effect::ForEachCategory { .. }
+            | Effect::ChooseObjectsIntoTrackedSet { .. }
+            | Effect::ChooseAndSacrificeRest { .. }
+            | Effect::EachPlayerCopyChosen { .. }
+            | Effect::Exploit { .. }
+            | Effect::GainEnergy { .. }
+            | Effect::GivePlayerCounter { .. }
+            | Effect::LoseAllPlayerCounters { .. }
+            | Effect::ExileFromTopUntil { .. }
+            | Effect::RevealUntil { .. }
+            | Effect::Discover { .. }
+            | Effect::Heist { .. }
+            | Effect::HeistExile
+            | Effect::Cascade
+            | Effect::Ripple { .. }
+            | Effect::MiracleCast { .. }
+            | Effect::MadnessCast { .. }
+            | Effect::PutAtLibraryPosition { .. }
+            | Effect::ChooseDrawnThisTurnPayOrTopdeck { .. }
+            | Effect::PutOnTopOrBottom { .. }
+            | Effect::GiftDelivery { .. }
+            | Effect::Goad { .. }
+            | Effect::GoadAll { .. }
+            | Effect::Detain { .. }
+            | Effect::SetRoomDoorLock { .. }
+            | Effect::ExchangeControl { .. }
+            | Effect::ChangeTargets { .. }
+            | Effect::Manifest { .. }
+            | Effect::ManifestDread
+            | Effect::Cloak { .. }
+            | Effect::TurnFaceUp { .. }
+            | Effect::TurnFaceDown { .. }
+            | Effect::ExtraTurn { .. }
+            | Effect::GrantExtraLoyaltyActivations { .. }
+            | Effect::SkipNextTurn { .. }
+            | Effect::SkipNextStep { .. }
+            | Effect::AdditionalPhase { .. }
+            | Effect::Double { .. }
+            | Effect::RuntimeHandled { .. }
+            | Effect::Incubate { .. }
+            | Effect::Amass { .. }
+            | Effect::EmpowerJace { .. }
+            | Effect::Monstrosity { .. }
+            | Effect::Specialize
+            | Effect::Renown { .. }
+            | Effect::Bolster { .. }
+            | Effect::Adapt { .. }
+            | Effect::Learn
+            | Effect::Forage
+            | Effect::CompletePlayerAction { .. }
+            | Effect::Harness
+            | Effect::CollectEvidence { .. }
+            | Effect::Endure { .. }
+            | Effect::BlightEffect { .. }
+            | Effect::Seek { .. }
+            | Effect::SetLifeTotal { .. }
+            | Effect::ExchangeLifeWithStat { .. }
+            | Effect::ExchangeLifeTotals { .. }
+            | Effect::SetDayNight { .. }
+            | Effect::GiveControl { .. }
+            | Effect::RemoveFromCombat { .. }
+            | Effect::BecomeBlocked { .. }
+            | Effect::Conjure { .. }
+            | Effect::ApplyPerpetual { .. }
+            | Effect::Intensify { .. }
+            | Effect::DraftFromSpellbook { .. }
+            | Effect::ChooseOneOf { .. }
+            | Effect::Unimplemented { .. } => AttachmentHostSlot::Operand,
         }
     }
 

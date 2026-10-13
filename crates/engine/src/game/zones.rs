@@ -696,7 +696,7 @@ pub(crate) fn apply_zone_exit_cleanup(
         // object's "exiled with" linkage (Pit of Offerings, Bojuka Bog, etc.).
         // `UntilSourceLeaves` links are intentionally preserved here because
         // `check_exile_returns` runs later in the priority loop and consumes
-        // them to return the exiled cards (CR 610.3a).
+        // them to return the exiled cards (CR 610.3).
         // CR 702.55b + CR 702.55c: `Haunt` links are likewise preserved — the haunted
         // creature leaving the battlefield (its death) is exactly when the
         // card's haunt-payoff trigger reads the link to fire from exile. The
@@ -735,6 +735,25 @@ pub(crate) fn apply_zone_exit_cleanup(
                         crate::types::game_state::ExileLinkKind::TrackedBySource
                     ))
         });
+        // CR 400.7 + CR 607.2a: the cards exiled with this object this turn are the
+        // departed object's; a later object under the same id starts with none. Both
+        // leaves-the-battlefield records (`move_to_zone_with_entry_flags`,
+        // `move_to_library_at_index`) have already synced this list
+        // (`sync_trigger_source_exiled_cards`), so their readers keep it.
+        state.cards_exiled_with_source_this_turn.remove(&object_id);
+        // CR 400.7: a permission source's "once each turn" belongs to the
+        // departed object; a later object under the same id has its own.
+        state.graveyard_cast_permissions_used.remove(&object_id);
+        state
+            .graveyard_cast_permissions_used_per_type
+            .retain(|(source, _)| *source != object_id);
+        state.hand_cast_free_permissions_used.remove(&object_id);
+        state.alt_cost_grant_permissions_used.remove(&object_id);
+        state.exile_play_permissions_used.remove(&object_id);
+        state.exile_cast_permissions_used.remove(&object_id);
+        state
+            .top_of_library_cast_permissions_used
+            .remove(&object_id);
 
         // PR-7 Phase 4c (B5 defuse): CR 104.4b / CR 110.1 / CR 700.4 — an enabling
         // permanent leaving the battlefield revokes the revocable-∞ capability it
@@ -2111,8 +2130,9 @@ pub fn stamp_simultaneous_from_slice(state: &GameState, slice: &mut [GameEvent])
 /// is_some()` branch). Every `ExileLinkKind` is kind-agnostically readable via
 /// `ExiledBySource` (`HideawayLookable`'s and `CraftMaterial`'s own doc
 /// comments say so explicitly) and the LIVE lookup
-/// (`players::linked_exile_cards_for_source`) reads the same
-/// `exile_links::live_links_for_source` accessor —
+/// (`players::linked_exile_cards_for_source`) reads
+/// `exile_links::links_for_reader`, which for the live object is this
+/// `live_links_for_source` surface —
 /// this snapshot must match that surface exactly, or a card whose "play the
 /// exiled card" clause resolves via a TRIGGERED ability (Fight Rigging's
 /// begin-of-combat trigger, as opposed to Windbrisk Heights' activated
@@ -2128,17 +2148,7 @@ pub(crate) fn capture_linked_exile_snapshot(
     }
 
     crate::game::exile_links::live_links_for_source(state, source_id)
-        .filter_map(|link| {
-            state.objects.get(&link.exiled_id).and_then(|obj| {
-                (obj.zone == Zone::Exile).then(|| crate::types::game_state::LinkedExileSnapshot {
-                    exiled_id: link.exiled_id,
-                    owner: obj.owner,
-                    // CR 202.3d + CR 709.4b: the exiled card is off the stack, so
-                    // a split card records its combined mana value.
-                    mana_value: obj.effective_mana_value(),
-                })
-            })
-        })
+        .filter_map(|link| crate::game::exile_links::exiled_card_snapshot(state, link.exiled_id))
         .collect()
 }
 
@@ -6232,6 +6242,108 @@ mod tests {
                 )
             }),
             "SBA zone movement must still publish the unattach event for triggers"
+        );
+    }
+
+    /// CR 400.7: the per-turn exile list and the seven once-each-turn usage sets
+    /// drop the departing source's entries on its battlefield exit and keep
+    /// every other source's.
+    #[test]
+    fn battlefield_departure_ends_the_sources_per_turn_entries() {
+        let mut state = setup();
+        let [departing, staying] = [CardId(1), CardId(2)].map(|card_id| {
+            create_object(
+                &mut state,
+                card_id,
+                PlayerId(0),
+                "Source".into(),
+                Zone::Battlefield,
+            )
+        });
+        for source in [departing, staying] {
+            state
+                .cards_exiled_with_source_this_turn
+                .insert(source, vec![ObjectId(99)]);
+            state.graveyard_cast_permissions_used.insert(source);
+            state
+                .graveyard_cast_permissions_used_per_type
+                .extend([(source, CoreType::Creature), (source, CoreType::Land)]);
+            state.hand_cast_free_permissions_used.insert(source);
+            state.alt_cost_grant_permissions_used.insert(source);
+            state.exile_play_permissions_used.insert(source);
+            state.exile_cast_permissions_used.insert(source);
+            state.top_of_library_cast_permissions_used.insert(source);
+        }
+
+        move_to_zone(&mut state, departing, Zone::Graveyard, &mut Vec::new());
+
+        let holds = |state: &GameState, source: ObjectId| {
+            [
+                state
+                    .cards_exiled_with_source_this_turn
+                    .contains_key(&source),
+                state.graveyard_cast_permissions_used.contains(&source),
+                state
+                    .graveyard_cast_permissions_used_per_type
+                    .contains(&(source, CoreType::Creature)),
+                state
+                    .graveyard_cast_permissions_used_per_type
+                    .contains(&(source, CoreType::Land)),
+                state.hand_cast_free_permissions_used.contains(&source),
+                state.alt_cost_grant_permissions_used.contains(&source),
+                state.exile_play_permissions_used.contains(&source),
+                state.exile_cast_permissions_used.contains(&source),
+                state.top_of_library_cast_permissions_used.contains(&source),
+            ]
+        };
+        assert_eq!(holds(&state, departing), [false; 9]);
+        assert_eq!(holds(&state, staying), [true; 9]);
+    }
+
+    /// CR 603.10a + CR 607.2a: the departure record keeps the departed
+    /// source's "exiled with it this turn" list after the live entry ends.
+    #[test]
+    fn departure_record_keeps_the_sources_exiled_this_turn_list() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".into(),
+            Zone::Battlefield,
+        );
+        let exiled = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Exiled".into(),
+            Zone::Exile,
+        );
+        state
+            .cards_exiled_with_source_this_turn
+            .insert(source, vec![exiled]);
+
+        let mut events = Vec::new();
+        move_to_zone(&mut state, source, Zone::Graveyard, &mut events);
+
+        assert!(!state
+            .cards_exiled_with_source_this_turn
+            .contains_key(&source));
+        let record = events
+            .iter()
+            .find_map(|event| match event {
+                GameEvent::ZoneChanged {
+                    object_id, record, ..
+                } if *object_id == source => Some(record),
+                _ => None,
+            })
+            .expect("the departure emits its zone-change record");
+        assert_eq!(
+            record
+                .trigger_source_context()
+                .expect("the departure record carries its source context")
+                .cards_exiled_this_turn,
+            vec![exiled]
         );
     }
 }

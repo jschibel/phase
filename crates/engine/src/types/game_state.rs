@@ -2631,10 +2631,9 @@ impl Clone for CounterAddedRecord {
 }
 
 /// CR 607.2a + CR 406.6: Tracks the link between an exiling source and the exiled card.
-/// When the source leaves the battlefield, the exiled card returns (CR 610.3a).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExileLinkKind {
-    /// CR 610.3a: Return the exiled object when the source leaves the battlefield.
+    /// CR 610.3: Return the exiled object when the source leaves the battlefield.
     UntilSourceLeaves { return_zone: Zone },
     /// CR 610.3: Return the exiled object immediately after an opponent of
     /// `controller` becomes the monarch.
@@ -19511,7 +19510,8 @@ pub enum CastingVariant {
     Disturb,
     /// CR 601.2a: Cast from graveyard via a static permission source (e.g. Lurrus).
     /// Stores the granting permanent's ObjectId for per-turn tracking.
-    /// CR 400.7: Zone change creates new ObjectId, naturally resetting permission.
+    /// CR 400.7: the source's per-turn entry ends when it leaves the battlefield
+    /// (`zones::apply_zone_exit_cleanup`), so an object that returns has its own.
     GraveyardPermission {
         source: ObjectId,
         /// CR 601.2a: When `OncePerTurn`, casting consumes this source's slot in
@@ -19537,7 +19537,8 @@ pub enum CastingVariant {
     /// per-turn tracking. Omniscience's unconditional silent path does not use
     /// this variant — it short-circuits the mana cost to NoCost while leaving
     /// `casting_variant = Normal`.
-    /// CR 400.7: Zone change creates new ObjectId, naturally resetting permission.
+    /// CR 400.7: the source's per-turn entry ends when it leaves the battlefield
+    /// (`zones::apply_zone_exit_cleanup`), so an object that returns has its own.
     HandPermission {
         source: ObjectId,
         /// CR 601.2b: When `OncePerTurn`, casting consumes this source's slot in
@@ -19552,8 +19553,8 @@ pub enum CastingVariant {
     /// resolution-time routing matches a normal cast — no on-resolve exile
     /// behavior — so this is treated as a casting-context tag, not as an
     /// alternative cost.
-    /// CR 400.7: Zone change creates a new source `ObjectId`, naturally
-    /// resetting the per-turn slot when the source leaves and re-enters play.
+    /// CR 400.7: the source's per-turn slot ends when it leaves the battlefield
+    /// (`zones::apply_zone_exit_cleanup`), so an object that returns has its own.
     ExilePermission {
         source: ObjectId,
         /// CR 601.2a: When `OncePerTurn`, casting consumes this source's slot
@@ -22343,7 +22344,9 @@ declare_game_state! {
     pub ability_resolutions_this_turn: im::HashMap<(ObjectId, usize), u32>,
     /// CR 601.2a: Tracks which graveyard-cast permission sources have been
     /// used this turn. Keyed by the granting permanent's ObjectId.
-    /// CR 400.7: Zone change creates new ObjectId, naturally resetting.
+    /// CR 400.7: a source's entry also ends when that source leaves the
+    /// battlefield (`zones::apply_zone_exit_cleanup`), so an object that
+    /// returns has its own.
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub graveyard_cast_permissions_used: HashSet<ObjectId>,
@@ -22355,8 +22358,9 @@ declare_game_state! {
     /// is the canonical user: each permanent type acts as an independent
     /// per-turn slot, so a single source may credit one cast per permanent
     /// type per turn.
-    /// CR 400.7: Zone change creates a new source `ObjectId`, naturally
-    /// resetting all slots.
+    /// CR 400.7: a source's entry also ends when that source leaves the
+    /// battlefield (`zones::apply_zone_exit_cleanup`), so an object that
+    /// returns has its own.
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub graveyard_cast_permissions_used_per_type: HashSet<(ObjectId, super::card_type::CoreType)>,
@@ -22368,7 +22372,9 @@ declare_game_state! {
     /// CR 601.2b: Tracks which `CastFromHandFree` once-per-turn permission sources
     /// have been used this turn (Zaffai and the Tempests). Keyed by the granting
     /// permanent's ObjectId. Unlimited sources (Omniscience) never populate this.
-    /// CR 400.7: Zone change creates new ObjectId, naturally resetting.
+    /// CR 400.7: a source's entry also ends when that source leaves the
+    /// battlefield (`zones::apply_zone_exit_cleanup`), so an object that
+    /// returns has its own.
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub hand_cast_free_permissions_used: HashSet<ObjectId>,
@@ -22376,8 +22382,9 @@ declare_game_state! {
     /// grant sources (As Foretold) have already had their alternative cost applied
     /// to a spell this turn. Keyed by the granting permanent's ObjectId. Unlimited
     /// grants (Fist of Suns, Rooftop Storm, Jodah) never populate this.
-    /// CR 400.7: Zone change creates a new ObjectId, so the permission naturally
-    /// resets when the source leaves and returns.
+    /// CR 400.7: a source's entry also ends when that source leaves the
+    /// battlefield (`zones::apply_zone_exit_cleanup`), so an object that
+    /// returns has its own.
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub alt_cost_grant_permissions_used: HashSet<ObjectId>,
@@ -22400,6 +22407,9 @@ declare_game_state! {
         Box<HashMap<PlayerId, im::Vector<AbilityActivationRecord>>>,
     /// CR 601.2a: Tracks once-per-turn `PlayFromExile` permission sources
     /// consumed this turn. Keyed by the granting source's ObjectId.
+    /// CR 400.7: a source's entry also ends when that source leaves the
+    /// battlefield (`zones::apply_zone_exit_cleanup`), so an object that
+    /// returns has its own.
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub exile_play_permissions_used: HashSet<ObjectId>,
@@ -22421,8 +22431,9 @@ declare_game_state! {
     /// the granting permanent's ObjectId. `Unlimited` frequency permissions
     /// never populate this set. Cleared at the start of each turn alongside
     /// the other per-turn cast-permission slots.
-    /// CR 400.7: Zone change creates a new source `ObjectId`, naturally
-    /// resetting the slot when the source leaves and re-enters play.
+    /// CR 400.7: a source's entry also ends when that source leaves the
+    /// battlefield (`zones::apply_zone_exit_cleanup`), so an object that
+    /// returns has its own.
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub exile_cast_permissions_used: HashSet<ObjectId>,
@@ -22434,8 +22445,9 @@ declare_game_state! {
     /// frequency permissions (Realmwalker, Future Sight, Bolas's Citadel) never
     /// populate this set. Cleared at the start of each turn alongside the other
     /// per-turn cast-permission slots.
-    /// CR 400.7: Zone change creates a new source `ObjectId`, naturally
-    /// resetting the slot when the source leaves and re-enters play.
+    /// CR 400.7: a source's entry also ends when that source leaves the
+    /// battlefield (`zones::apply_zone_exit_cleanup`), so an object that
+    /// returns has its own.
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub top_of_library_cast_permissions_used: HashSet<ObjectId>,
@@ -22446,7 +22458,9 @@ declare_game_state! {
     /// `exile_links::push_exiled_with_source_this_turn` whenever a tracked
     /// exile happens; cleared at the start of each turn so "cards exiled with
     /// ~ this turn" cast permissions (Maralen, Fae Ascendant) only see the
-    /// current turn's pool.
+    /// current turn's pool. CR 400.7: a source's entry also ends when that
+    /// source leaves the battlefield (`zones::apply_zone_exit_cleanup`), so an
+    /// object that returns starts with none.
     ///
     /// Distinct from `exile_links`: those persist for the lifetime of the
     /// source-link contract (CR 610.3) and back the open-ended "cards exiled

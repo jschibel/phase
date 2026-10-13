@@ -18,11 +18,13 @@ use super::super::oracle_nom::bridge::nom_on_lower;
 use super::super::oracle_nom::primitives as nom_primitives;
 use super::super::oracle_nom::quantity as nom_quantity;
 use super::super::oracle_target::{
-    parse_target, parse_target_with_ctx, parse_type_phrase_folding,
-    parse_type_phrase_folding_with_ctx,
+    parse_target, parse_target_with_ctx, parse_type_phrase_folding_with_ctx,
 };
 use super::super::oracle_util::{parse_count_expr, parse_number};
-use super::lower::{parse_for_each_multiplier_prefix, strip_optional_target_prefix};
+use super::lower::{
+    parse_bounded_target_cardinality, parse_for_each_multiplier_prefix,
+    strip_optional_target_prefix,
+};
 use super::{resolve_it_pronoun, ParseContext};
 #[cfg(debug_assertions)]
 use crate::parser::oracle_ir::ast::assert_no_compound_remainder;
@@ -372,6 +374,28 @@ fn resolve_counter_placement_target<'a>(
     }) {
         let on_offset = lower.len() - after_target.len();
         (&text[on_offset..], Some(MultiTargetSpec::exact(count)))
+    } else if let Some((spec, after_bounded)) = nom_on_lower(on_rest, on_rest, |i| {
+        // CR 115.1a + CR 601.2c + CR 122.1: "[each of ]one or two target …" / "[each of ]one, two, or
+        // three target …" announce a bounded target set (Predictive
+        // Preparations). The stem recognition is `parse_bounded_target_cardinality`
+        // (lower.rs), the single authority shared with the damage grammar; the
+        // trailing `space1` + `peek("<article> target ")` leaves the "target …"
+        // span unconsumed for the downstream `parse_target_with_ctx` and declines
+        // article-less ("one or two creatures") and zero-space ("one or twotarget")
+        // text. min is 1, so CR 115.6 (zero-target legality) does not apply.
+        let (i, _) = opt(tag::<_, _, OracleError<'_>>("each of ")).parse(i)?;
+        let (after_stem, spec) = parse_bounded_target_cardinality(i)?;
+        let (after_ws, _) = space1::<_, OracleError<'_>>(after_stem)?;
+        peek(alt((
+            tag::<_, _, OracleError<'_>>("target "),
+            tag("other target "),
+            tag("another target "),
+        )))
+        .parse(after_ws)?;
+        Ok((after_ws, spec))
+    }) {
+        let on_offset = lower.len() - after_bounded.len();
+        (&text[on_offset..], Some(spec))
     } else {
         let on_offset = lower.len() - on_rest.len();
         (&text[on_offset..], None)
@@ -1233,10 +1257,10 @@ fn resolve_counter_target(text: &str, ctx: &mut ParseContext) -> TargetFilter {
         // CR 608.2k + CR 301.5a: Trigger-context "that creature" → triggering source.
         return TargetFilter::TriggeringSource;
     }
-    // The fallback parses with a fresh `ParseContext` so it stays byte-for-byte
-    // equivalent to a bare `parse_target(text)` call — the shared `ctx` is read
-    // only by the anaphor guards above.
-    let (t, _rem) = parse_target(text);
+    // CR 608.2c: the fallback reads only the caller's player antecedents, so a
+    // "that player controls" suffix binds to the player the ability already
+    // named. Object anaphors are settled by the guards above, never here.
+    let (t, _rem) = ctx.with_player_antecedents(|scoped| parse_target_with_ctx(text, scoped));
     #[cfg(debug_assertions)]
     assert_no_compound_remainder(_rem, text);
     t
@@ -1337,7 +1361,8 @@ pub(super) fn try_parse_move_counters<'a>(
 
     // Compute byte offset into original `text` for parse_target.
     let offset_in_text = text.len() - after_on.len();
-    let (parsed_target, remainder) = parse_target(&text[offset_in_text..]);
+    let (parsed_target, remainder) =
+        parse_target_with_ctx(&text[offset_in_text..], &mut ctx.clone_player_antecedents());
     let target =
         counter_anaphor_created_token_binding(after_on.trim(), ctx).unwrap_or(parsed_target);
 
@@ -1654,7 +1679,8 @@ pub(super) fn try_parse_double_effect(lower: &str, ctx: &mut ParseContext) -> Op
         if nom_on_lower(rest, rest, |i| value((), tag("target ")).parse(i)).is_some()
             && rest.contains("life total")
         {
-            let (target, _) = parse_target(rest);
+            let (target, _) =
+                ctx.with_player_antecedents(|scoped| parse_target_with_ctx(rest, scoped));
             return Some(Effect::Double {
                 target_kind: DoubleTarget::LifeTotal,
                 target,
@@ -1730,7 +1756,8 @@ pub(super) fn try_parse_multiply_pt_effect(lower: &str, ctx: &mut ParseContext) 
         })
         .is_some();
         if !owned_by_sibling {
-            let (target, rem) = parse_target(after_word);
+            let (target, rem) =
+                parse_target_with_ctx(after_word, &mut ctx.clone_player_antecedents());
             if !matches!(target, TargetFilter::Any) {
                 let rem_lower = rem.to_lowercase();
                 let mode = nom_on_lower(&rem_lower, &rem_lower, |i| {
@@ -1806,7 +1833,8 @@ pub(super) fn try_parse_multiply_pt_effect(lower: &str, ctx: &mut ParseContext) 
     })
     .is_some()
     {
-        let (target, tail) = parse_target(after_mode);
+        let (target, tail) =
+            ctx.with_player_antecedents(|scoped| parse_target_with_ctx(after_mode, scoped));
         return Some(finish_multiply_pt(
             Effect::DoublePT {
                 mode,
@@ -1822,7 +1850,8 @@ pub(super) fn try_parse_multiply_pt_effect(lower: &str, ctx: &mut ParseContext) 
     let ((), filter_text) = nom_on_lower(after_mode, after_mode, |i| {
         value((), alt((tag("each "), tag("all ")))).parse(i)
     })?;
-    let (target, tail) = parse_type_phrase_folding(filter_text);
+    let (target, tail) = ctx
+        .with_player_antecedents(|scoped| parse_type_phrase_folding_with_ctx(filter_text, scoped));
     Some(finish_multiply_pt(
         Effect::DoublePTAll {
             mode,
@@ -1861,6 +1890,7 @@ fn parse_mana_color_from_text(text: &str) -> Option<ManaColor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
     use crate::types::ability::TargetChoiceTiming;
     use crate::types::{ControllerRef, FilterProp, TypeFilter, TypedFilter};
 
@@ -4424,5 +4454,57 @@ mod tests {
             TargetFilter::SelfRef,
             "explicit 'this creature' after a token creator must stay SelfRef"
         );
+    }
+
+    fn target_player_scope_ctx() -> ParseContext {
+        ParseContext {
+            relative_player_scope: Some(ControllerRef::TargetPlayer),
+            ..ParseContext::default()
+        }
+    }
+
+    /// CR 608.2c: the counter-target fallback binds "that player" to the
+    /// caller's player antecedent instead of a fresh context's default.
+    #[test]
+    fn counter_target_fallback_binds_that_player_to_the_callers_antecedent() {
+        let filter = resolve_remove_counter_from_target(
+            "permanents that player controls",
+            &mut target_player_scope_ctx(),
+        );
+        let TargetFilter::Typed(typed) = filter else {
+            panic!("expected a typed permanent filter, got {filter:?}");
+        };
+        assert!(typed.type_filters.contains(&TypeFilter::Permanent));
+        assert_eq!(typed.controller, Some(ControllerRef::TargetPlayer));
+    }
+
+    /// CR 109.5: a seeded player antecedent never rebinds a literal "you".
+    #[test]
+    fn counter_target_fallback_keeps_you_under_a_seeded_scope() {
+        let filter = resolve_remove_counter_from_target(
+            "permanents you control",
+            &mut target_player_scope_ctx(),
+        );
+        let TargetFilter::Typed(typed) = filter else {
+            panic!("expected a typed permanent filter, got {filter:?}");
+        };
+        assert_eq!(typed.controller, Some(ControllerRef::You));
+    }
+
+    /// The counter-target fallback is a committed sub-parse, so its
+    /// `TargetFallback` diagnostic reaches the caller's context, once.
+    #[test]
+    fn counter_target_fallback_reports_its_diagnostic_to_the_caller() {
+        let expected = vec![OracleDiagnostic::TargetFallback {
+            context: "parse_target could not classify".into(),
+            text: "among all permanents".into(),
+            line_index: 0,
+        }];
+        let mut ctx = default_ctx();
+        let filter = resolve_remove_counter_from_target("among all permanents", &mut ctx);
+        assert_eq!(filter, TargetFilter::Any, "the fallback must fire");
+        assert_eq!(ctx.diagnostics, expected);
+        resolve_remove_counter_from_target("among all permanents", &mut ctx);
+        assert_eq!(ctx.diagnostics, expected, "push_diagnostic deduplicates");
     }
 }
