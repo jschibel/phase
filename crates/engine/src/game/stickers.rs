@@ -526,7 +526,7 @@ fn apply_ability_stickers(obj: &mut GameObject) {
     }
 }
 
-fn apply_power_toughness_stickers(obj: &mut GameObject) {
+pub(crate) fn apply_power_toughness_stickers(obj: &mut GameObject) {
     for sticker in &obj.stickers {
         let AppliedSticker::PowerToughness {
             power, toughness, ..

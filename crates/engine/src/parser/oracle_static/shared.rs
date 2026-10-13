@@ -1081,6 +1081,13 @@ fn bind_anaphoric_counters(expr: &mut QuantityExpr, bound: ObjectScope) {
 /// multiple zones (Eminence: "in the command zone or on the battlefield").
 /// When ALL collected zones happen to be `Battlefield`, `active_zones` is left
 /// empty so the standard battlefield-default applies.
+///
+/// CR 113.6c: an ability that states which zones it doesn't function in
+/// functions everywhere except the specified zones, so a negated source-zone
+/// expression ("as long as ~ isn't on the battlefield") declares the
+/// complement of its zones, not the zones it names. Only a pure source-zone
+/// expression (`SourceInZone` under `And`/`Or`/`Not`) has a derivable
+/// complement; a negation that also tests anything else contributes no zone.
 pub(crate) fn populate_active_zones_from_condition(def: &mut StaticDefinition) {
     use crate::types::zones::Zone;
     let mut zones: Vec<Zone> = Vec::new();
@@ -1118,8 +1125,62 @@ pub(crate) fn collect_source_in_zones(
                 collect_source_in_zones(c, out);
             }
         }
-        StaticCondition::Not { condition } => collect_source_in_zones(condition, out),
+        // CR 113.6c: a negated pure source-zone expression functions in the complement
+        // of the zones it names. A non-pure negation contributes nothing: whether it
+        // holds elsewhere depends on a non-zone leaf the zone walker cannot evaluate.
+        StaticCondition::Not { .. } => {
+            if let Some(zones) = pure_source_zone_set(cond) {
+                for zone in zones {
+                    if !out.contains(&zone) {
+                        out.push(zone);
+                    }
+                }
+            }
+        }
         _ => {}
+    }
+}
+
+/// The zones, in `Zone::ALL` order, in which a pure source-zone expression is true,
+/// or `None` when any node outside {`SourceInZone`, `And`, `Or`, `Not`} appears.
+/// `And` intersects (identity: every zone), `Or` unions, `Not` complements against
+/// `Zone::ALL` (CR 400.1).
+fn pure_source_zone_set(cond: &StaticCondition) -> Option<Vec<crate::types::zones::Zone>> {
+    use crate::types::zones::Zone;
+    // The wildcard arm is the definition of "pure": any other node is not a zone test.
+    match cond {
+        StaticCondition::SourceInZone { zone } => Some(vec![*zone]),
+        StaticCondition::And { conditions } => {
+            let mut set: Vec<Zone> = Zone::ALL.to_vec();
+            for c in conditions {
+                let inner = pure_source_zone_set(c)?;
+                set.retain(|z| inner.contains(z));
+            }
+            Some(set)
+        }
+        StaticCondition::Or { conditions } => {
+            let mut set: Vec<Zone> = Vec::new();
+            for c in conditions {
+                let inner = pure_source_zone_set(c)?;
+                for z in inner {
+                    if !set.contains(&z) {
+                        set.push(z);
+                    }
+                }
+            }
+            set.sort();
+            Some(set)
+        }
+        StaticCondition::Not { condition } => {
+            let inner = pure_source_zone_set(condition)?;
+            Some(
+                Zone::ALL
+                    .into_iter()
+                    .filter(|z| !inner.contains(z))
+                    .collect(),
+            )
+        }
+        _ => None,
     }
 }
 
