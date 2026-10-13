@@ -16,8 +16,7 @@
 //! assertion with a `Some` observed in the same test, so a `None` is never
 //! vacuous.
 //!
-//! This file proves the record only. No reader exists yet: the consumer lands
-//! with the attacked player-or-planeswalker referent.
+//! This file covers the record; the resolver that reads it is tested with the referent.
 
 use engine::game::combat::AttackTarget;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
@@ -193,7 +192,7 @@ fn zone_changed_record(
         .expect("the move emitted a ZoneChanged record")
 }
 
-/// L1: a self-attack trigger placed against a player latches the declared
+/// A self-attack trigger placed against a player latches the declared
 /// target (producer: `capture_combat_status` via `trigger_source_context_for_latch`).
 #[test]
 fn attack_trigger_latches_player_target() {
@@ -207,7 +206,7 @@ fn attack_trigger_latches_player_target() {
     assert_eq!(latch.attack_target, Some(AttackTarget::Player(P1)));
 }
 
-/// L2: attacking a planeswalker latches the planeswalker itself, while
+/// Attacking a planeswalker latches the planeswalker itself, while
 /// `defending_player` keeps collapsing to its controller (CR 508.5).
 #[test]
 fn attack_trigger_latches_planeswalker_target_not_its_controller() {
@@ -223,7 +222,7 @@ fn attack_trigger_latches_planeswalker_target_not_its_controller() {
     ));
 }
 
-/// L3: attacking a battle latches the battle, while `defending_player` is the
+/// Attacking a battle latches the battle, while `defending_player` is the
 /// protector, not the controller (CR 310.9b, CR 310.9d).
 #[test]
 fn attack_trigger_latches_battle_target_not_its_protector() {
@@ -236,7 +235,7 @@ fn attack_trigger_latches_battle_target_not_its_protector() {
     assert!(matches!(latch.attack_target, Some(AttackTarget::Battle(_))));
 }
 
-/// L4: a non-attacking observer's trigger latches nothing, paired with the
+/// A non-attacking observer's trigger latches nothing, paired with the
 /// attacker's own trigger in the same fixture, which latches the target.
 #[test]
 fn non_attacking_observer_latches_no_target() {
@@ -257,7 +256,7 @@ fn non_attacking_observer_latches_no_target() {
     assert_eq!(latch.attack_target, None);
 }
 
-/// L4 second sibling: a trigger placed outside combat has no attack target,
+/// A trigger placed outside combat has no attack target,
 /// (the sibling of the attack-trigger rows above, where the same field is `Some`).
 #[test]
 fn trigger_outside_combat_latches_no_target() {
@@ -282,7 +281,7 @@ fn trigger_outside_combat_latches_no_target() {
     assert_eq!(latch.attack_target, None);
 }
 
-/// L5: the latch is a snapshot. Retargeting the live `AttackerInfo` afterwards
+/// The latch is a snapshot. Retargeting the live `AttackerInfo` afterwards
 /// (synthetic mutation) does not move the stored value.
 #[test]
 fn latch_is_a_snapshot_not_a_live_read() {
@@ -324,7 +323,7 @@ fn latch_is_a_snapshot_not_a_live_read() {
     );
 }
 
-/// L6: the stored latch survives its source leaving the battlefield, and is
+/// The stored latch survives its source leaving the battlefield, and is
 /// not recomputed: a fresh latch of the departed object holds nothing.
 #[test]
 fn latch_survives_source_leaving_the_battlefield() {
@@ -352,7 +351,7 @@ fn latch_survives_source_leaving_the_battlefield() {
     assert_eq!(fresh.combat_status.attack_target, None);
 }
 
-/// L7: the latch rides every clause of a chained trigger.
+/// The latch rides every clause of a chained trigger.
 #[test]
 fn latch_propagates_to_sub_abilities() {
     let (mut b, _) = board(CHAIN_TEXT, Kind::Planeswalker, None);
@@ -371,7 +370,7 @@ fn latch_propagates_to_sub_abilities() {
     assert_eq!(latch.defending_player, Some(b.defender));
 }
 
-/// L8: the zone-exit record, its projected source context and the
+/// The zone-exit record, its projected source context and the
 /// `zone_changes_this_turn` row (the row a battlefield-departure look-back
 /// reads) all hold the target, for each kind of attack target. A non-attacker
 /// and a blocker leaving hold none.
@@ -429,7 +428,7 @@ fn zone_exit_records_latch_attack_target() {
     assert_eq!(record.combat_status.attack_target, None);
 }
 
-/// L8 blocker sibling: a blocker leaving holds no attack target even while the
+/// A blocker leaving holds no attack target even while the
 /// creature it blocks is attacking a target.
 #[test]
 fn blocker_zone_exit_holds_no_attack_target() {
@@ -473,7 +472,7 @@ fn blocker_zone_exit_holds_no_attack_target() {
     assert_eq!(record.combat_status.defending_player, None);
 }
 
-/// L9: the library-move record holds the target too.
+/// The library-move record holds the target too.
 #[test]
 fn library_move_record_latches_attack_target() {
     for kind in [Kind::Player, Kind::Planeswalker, Kind::Battle] {
