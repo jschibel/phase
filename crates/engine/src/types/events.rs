@@ -1125,11 +1125,14 @@ pub enum GameEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         incarnation: Option<u64>,
     },
-    /// CR 701.43a + CR 701.43d: A creature was exerted as it attacked. Fires the
-    /// linked `TriggerMode::Exerted` "when you do" trigger (Combat Celebrant,
-    /// Glory-Bound Initiate, ...).
+    /// CR 701.43a: A permanent was exerted by `player`, either as an optional
+    /// attack cost (CR 701.43d) or as part of an activated ability's cost.
+    /// Fires the linked `TriggerMode::Exerted` "when you do" trigger (Combat
+    /// Celebrant, Glory-Bound Initiate, ...) and "whenever you exert a creature"
+    /// observers, which key on `player`.
     CreatureExerted {
         object_id: ObjectId,
+        player: PlayerId,
     },
     /// CR 702.154c: A creature enlisted another creature as it attacked. Fires
     /// the linked `TriggerMode::Enlisted` "when you do" trigger and carries the
