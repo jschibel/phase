@@ -142,7 +142,7 @@ fn cast_and_accept_alt(runner: &mut GameRunner, gush: ObjectId) -> (usize, Vec<O
             choices,
             count,
             ..
-        } => (count as usize, choices),
+        } => (count, choices),
         other => panic!("expected PayCost ReturnToHand, got {other:?}"),
     }
 }
