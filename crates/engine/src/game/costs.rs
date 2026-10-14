@@ -1830,7 +1830,13 @@ fn pay_ability_cost_inner(
                     "Cannot exert: source is not on the battlefield",
                 ));
             }
-            super::exert::exert_permanent(state, source_id, player, events)?;
+            super::exert::exert_permanent(
+                state,
+                source_id,
+                player,
+                crate::types::events::ExertOrigin::AbilityCost,
+                events,
+            )?;
         }
         // CR 118.3 + CR 602.2b + CR 601.2h: Self-return costs such as
         // Recurring Nightmare and Maze's End are automatic once chosen;

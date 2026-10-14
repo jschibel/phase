@@ -3346,6 +3346,13 @@ mod tests {
         }
     }
 
+    /// v141: CR 701.43 `GameEvent::CreatureExerted` gains `origin` and an
+    /// optional `player`, carried in a stack trigger's `trigger_event` and in
+    /// `pending_attack_trigger_events` inside `GameState`; a v140 peer drops
+    /// both silently and would let an activated-ability exert satisfy an
+    /// attack-linked "when you do" trigger, so it must be refused before it
+    /// receives v141 state.
+    ///
     /// v140: `AttackSubject` gains `EventAttackers` (the players a trigger's
     /// attack event's attackers attacked), carried in a resolving or pending
     /// ability's `player_scope` inside `GameState`; a v139 peer cannot parse the
@@ -3544,8 +3551,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_140_for_event_attackers() {
-        assert_eq!(PROTOCOL_VERSION, 140);
+    fn protocol_version_is_141_for_exert_origin() {
+        assert_eq!(PROTOCOL_VERSION, 141);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3556,7 +3563,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_140_for_event_attackers` stays
+    /// `protocol_version_is_141_for_exert_origin` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

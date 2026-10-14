@@ -216,8 +216,14 @@ pub(super) fn apply_attack_exert(
         return;
     }
     let controller = obj.controller;
-    let exerted = super::exert::exert_permanent(state, attacker, controller, events)
-        .expect("declared attacker must remain a live exact object");
+    let exerted = super::exert::exert_permanent(
+        state,
+        attacker,
+        controller,
+        crate::types::events::ExertOrigin::AttackCost,
+        events,
+    )
+    .expect("declared attacker must remain a live exact object");
     if let Some(event) = exerted {
         // Buffer for deferred trigger matching (CR 508.2); the helper already
         // surfaced the event to the per-action stream for the frontend.
