@@ -70,6 +70,8 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // confirmed period's reach and the periodic delta's cleanup pair.
 // v131 moves the CR 608.2n owed final part of a paused spell onto the resolution
 // carrier (`GameState.resolving_spell_final_part`; `deferred_spell_delivery` removed).
+// v133 adds `GameEvent::CreatureExerted.origin` and `.player` (CR 701.43) to GameState's
+// trigger events.
 // Keep the measured base so a future merge cannot collapse independent wire
 // changes onto one number.
 const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
@@ -145,7 +147,8 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +60: v131 adds the TargetFilter::AttackedPlayerOrPlaneswalker reference.
 // +61: v132 moves the owed final part of a paused spell onto the resolution carrier
 //      (`GameState.resolving_spell_final_part`; `deferred_spell_delivery` removed).
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 61;
+// +62: v133 adds `GameEvent::CreatureExerted.origin`/`.player` (CR 701.43) to GameState's trigger events.
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 62;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
@@ -234,7 +237,8 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 // +58: wire 112 moves with full-game v130 for the incarnation-bounded linked-exile LKI.
 // +59: wire 113 moves with full-game v131 for TargetFilter::AttackedPlayerOrPlaneswalker.
 // +60: wire 114 moves with full-game v132 for the carrier-owned final-part marker.
-const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 60;
+// +61: wire 115 moves with full-game v133 for `CreatureExerted.origin`/`.player`.
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 61;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse

@@ -96,11 +96,11 @@ describe("openPhaseSocket", () => {
   it("resolves with serverInfo once ServerHello arrives and sends ClientHello", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
-    ws.deliverMessage(helloFrame({ protocol_version: 132 }));
+    ws.deliverMessage(helloFrame({ protocol_version: 133 }));
 
     const socket = await promise;
     expect(socket.serverInfo.mode).toBe("Full");
-    expect(socket.serverInfo.protocolVersion).toBe(132);
+    expect(socket.serverInfo.protocolVersion).toBe(133);
     expect(ws.send).toHaveBeenCalledWith(
       expect.stringContaining('"type":"ClientHello"'),
     );

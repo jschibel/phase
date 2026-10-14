@@ -3346,7 +3346,14 @@ mod tests {
         }
     }
 
-    /// The bump this number is at: `GameState::deferred_spell_delivery` is gone
+    /// v133: CR 701.43 `GameEvent::CreatureExerted` gains `origin` and an
+    /// optional `player`, carried in a stack trigger's `trigger_event` and in
+    /// `pending_attack_trigger_events` inside `GameState`; a v132 peer drops
+    /// both silently and would let an activated-ability exert satisfy an
+    /// attack-linked "when you do" trigger, so it must be refused before it
+    /// receives v133 state.
+    ///
+    /// v132: `GameState::deferred_spell_delivery` is gone
     /// and `GameState::resolving_spell_final_part` marks the CR 608.2n final part
     /// a paused instant or sorcery still owes; a v131 peer drops the key and would
     /// move the spell before its paused instructions finish, so it must be refused
@@ -3522,8 +3529,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_132_for_owed_spell_final_part() {
-        assert_eq!(PROTOCOL_VERSION, 132);
+    fn protocol_version_is_133_for_exert_origin() {
+        assert_eq!(PROTOCOL_VERSION, 133);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3534,7 +3541,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_132_for_owed_spell_final_part` stays
+    /// `protocol_version_is_133_for_exert_origin` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

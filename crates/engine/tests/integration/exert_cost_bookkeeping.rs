@@ -22,8 +22,11 @@ use engine::game::combat::AttackTarget;
 use engine::game::scenario::{CastOutcome, GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{AbilityCost, ContinuousModification, TargetFilter};
 use engine::types::actions::GameAction;
-use engine::types::events::GameEvent;
-use engine::types::game_state::{CastPaymentMode, ManaChoice, WaitingFor};
+use engine::types::events::{ExertOrigin, GameEvent};
+use engine::types::game_state::{
+    CastPaymentMode, ExileLink, ExileLinkKind, ManaChoice, PersistedGameState,
+    PersistedRestoreFinalization, WaitingFor,
+};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType};
 use engine::types::phase::Phase;
@@ -61,7 +64,11 @@ fn exerted_events(events: &[GameEvent]) -> Vec<(ObjectId, PlayerId)> {
     events
         .iter()
         .filter_map(|event| match event {
-            GameEvent::CreatureExerted { object_id, player } => Some((*object_id, *player)),
+            GameEvent::CreatureExerted {
+                object_id,
+                player: Some(player),
+                ..
+            } => Some((*object_id, *player)),
             _ => None,
         })
         .collect()
@@ -578,4 +585,195 @@ fn autopay_plain_row_does_not_exert() {
     assert!(exerted_events(outcome.events()).is_empty());
     assert_eq!(outcome.life_delta(P0), 1);
     assert_eq!(outcome.life_delta(P1), 0);
+}
+
+const AGATHAS_SOUL_CAULDRON: &str = "Creatures you control with +1/+1 counters on them have all \
+activated abilities of all creature cards exiled with Agatha's Soul Cauldron.";
+
+/// CR 701.43d + CR 607.2h: Bitterblade Warrior (a +1/+1 counter on it) holds
+/// Fervent Paincaster's `{T}, Exert` activation through Agatha's Soul Cauldron.
+/// Returns the runner, the Warrior and an opposing creature to aim it at.
+fn warrior_with_granted_exert_activation(with_survivors: bool) -> (GameRunner, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let cauldron = scenario
+        .add_artifact_from_oracle(P0, "Agatha's Soul Cauldron", AGATHAS_SOUL_CAULDRON)
+        .id();
+    let mut paincaster = scenario.add_creature_to_exile(P0, "Fervent Paincaster", 2, 2);
+    paincaster.from_oracle_text(FERVENT_PAINCASTER);
+    let paincaster_card = paincaster.id();
+    let mut warrior_builder =
+        scenario.add_creature_from_oracle(P0, "Bitterblade Warrior", 2, 2, BITTERBLADE_WARRIOR);
+    warrior_builder.with_plus_counters(1);
+    let warrior = warrior_builder.id();
+    if with_survivors {
+        scenario.add_creature_from_oracle(P0, "Resolute Survivors", 3, 3, RESOLUTE_SURVIVORS);
+    }
+    let bear = scenario.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    let mut runner = scenario.build();
+    runner.state_mut().exile_links.push(ExileLink {
+        exiled_id: paincaster_card,
+        source_id: cauldron,
+        kind: ExileLinkKind::TrackedBySource,
+    });
+    runner.state_mut().layers_dirty.mark_full();
+    engine::game::layers::evaluate_layers(runner.state_mut());
+    untap(&mut runner, &[warrior]);
+    (runner, warrior, bear)
+}
+
+/// Activate the granted `{T}, Exert` ability on the Warrior, aimed at `bear`.
+fn activate_granted_exert(
+    runner: &mut GameRunner,
+    warrior: ObjectId,
+    bear: ObjectId,
+) -> Vec<GameEvent> {
+    let idx = composite_index(runner, warrior);
+    let events = runner
+        .activate(warrior, idx)
+        .target_object(bear)
+        .resolve()
+        .events()
+        .to_vec();
+    // Reach guard: the Cauldron grant put an exert-cost activation on the
+    // Warrior and it resolved and exerted.
+    assert_eq!(
+        runner.state().objects[&bear].damage_marked,
+        1,
+        "ability resolved"
+    );
+    assert!(runner.state().exerted_this_turn.contains(&warrior));
+    events
+}
+
+fn first_exert_origin(events: &[GameEvent]) -> Option<ExertOrigin> {
+    events.iter().find_map(|event| match event {
+        GameEvent::CreatureExerted { origin, .. } => Some(*origin),
+        _ => None,
+    })
+}
+
+/// An exert paid as the cost of an activated ability the Warrior was granted is
+/// not the attack cost its "when you do" trigger is linked to (CR 701.43d,
+/// CR 607.2h): no +1/+0, no deathtouch.
+#[test]
+fn granted_exert_cost_activation_does_not_fire_the_attack_linked_trigger() {
+    let (mut runner, warrior, bear) = warrior_with_granted_exert_activation(false);
+    let power_before = runner.state().objects[&warrior].power;
+
+    let events = activate_granted_exert(&mut runner, warrior, bear);
+
+    assert_eq!(first_exert_origin(&events), Some(ExertOrigin::AbilityCost));
+    assert_eq!(runner.state().objects[&warrior].power, power_before);
+    assert!(runner.state().stack.is_empty());
+    assert!(!runner.state().objects[&warrior]
+        .has_keyword(&engine::types::keywords::Keyword::Deathtouch));
+}
+
+/// Generic-observer control: the same granted activation does fire a "whenever
+/// you exert a creature" observer, so the refusal above is the linked trigger's
+/// origin, not a dead event.
+#[test]
+fn granted_exert_cost_activation_still_fires_a_generic_observer() {
+    let (mut runner, warrior, bear) = warrior_with_granted_exert_activation(true);
+    let power_before = runner.state().objects[&warrior].power;
+
+    activate_granted_exert(&mut runner, warrior, bear);
+    runner.advance_until_stack_empty();
+
+    assert_eq!(life(&runner, P1), 19);
+    assert_eq!(life(&runner, P0), 21);
+    assert_eq!(runner.state().objects[&warrior].power, power_before);
+}
+
+/// Positive control: with the grant in play, the Warrior's own attack exert
+/// still fires its linked trigger.
+#[test]
+fn attack_exert_still_fires_the_linked_trigger_with_the_grant_in_play() {
+    let (mut runner, warrior, _bear) = warrior_with_granted_exert_activation(false);
+    let power_before = runner.state().objects[&warrior].power.unwrap();
+
+    let events = attack_with_exert(&mut runner, P0, warrior, true);
+
+    assert_eq!(first_exert_origin(&events), Some(ExertOrigin::AttackCost));
+    assert_eq!(
+        runner.state().objects[&warrior].power,
+        Some(power_before + 1)
+    );
+}
+
+/// Restore the state `runner` holds through the production persisted path after
+/// `edit` has rewritten its serialized JSON.
+fn restore_after(
+    runner: &GameRunner,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> Result<engine::types::game_state::GameState, String> {
+    let mut json = serde_json::to_value(PersistedGameState::capture(runner.state().clone()))
+        .expect("serialize state");
+    edit(&mut json);
+    serde_json::from_value::<PersistedGameState>(json)
+        .map_err(|e| e.to_string())?
+        .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+        .map_err(|e| e.to_string())?
+        .finalize_after_rehydration(|_| Ok(()))
+        .map_err(|e| e.to_string())
+}
+
+fn push_pending_attack_event(json: &mut serde_json::Value, event: serde_json::Value) {
+    let state = if json.get("state").is_some() {
+        &mut json["state"]
+    } else {
+        json
+    };
+    // An empty buffer is left out of the serialized state, so create it.
+    state
+        .as_object_mut()
+        .expect("state serializes as an object")
+        .entry("pending_attack_trigger_events")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .expect("pending_attack_trigger_events is an array")
+        .push(event);
+}
+
+/// A save written before `CreatureExerted` carried an actor and an origin holds
+/// only `object_id`. It restores: the actor stays unknown (none is invented) and
+/// the origin is the attack cost, the only exert the old engine emitted.
+#[test]
+fn legacy_exert_event_shape_restores_without_inventing_an_actor() {
+    let (runner, warrior, _bear) = warrior_with_granted_exert_activation(false);
+    let legacy = serde_json::json!({
+        "type": "CreatureExerted",
+        "data": { "object_id": warrior }
+    });
+
+    let restored = restore_after(&runner, |json| push_pending_attack_event(json, legacy))
+        .expect("a legacy exert event must restore");
+
+    assert_eq!(
+        restored.pending_attack_trigger_events,
+        vec![GameEvent::CreatureExerted {
+            object_id: warrior,
+            player: None,
+            origin: ExertOrigin::AttackCost,
+        }]
+    );
+}
+
+/// Current-shape control: an event that records its actor and origin round-trips
+/// through the same restore path unchanged.
+#[test]
+fn current_exert_event_shape_restores_with_its_actor_and_origin() {
+    let (runner, warrior, _bear) = warrior_with_granted_exert_activation(false);
+    let current = GameEvent::CreatureExerted {
+        object_id: warrior,
+        player: Some(P0),
+        origin: ExertOrigin::AbilityCost,
+    };
+    let value = serde_json::to_value(&current).unwrap();
+
+    let restored = restore_after(&runner, |json| push_pending_attack_event(json, value))
+        .expect("a current exert event must restore");
+
+    assert_eq!(restored.pending_attack_trigger_events, vec![current]);
 }

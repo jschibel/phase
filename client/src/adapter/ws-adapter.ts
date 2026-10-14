@@ -210,6 +210,13 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 133 — GameEvent::CreatureExerted gains origin (attack cost or activated-ability
+ *      cost) and an optional player (who exerted), carried in GameState's trigger
+ *      events (a stack trigger's trigger_event, pending_attack_trigger_events) —
+ *      see PROTOCOL_VERSION's own `/// 133` entry in
+ *      crates/lobby-broker/src/protocol.rs. A v132 peer drops both silently; the
+ *      exact-match version check at connect refuses the pairing. Wire 115 moves
+ *      with it.
  * 132 — The CR 608.2n final part of a spell's resolution is owed on the
  *      resolution carrier: `GameState::deferred_spell_delivery` (v110) is removed
  *      and `GameState::resolving_spell_final_part` (`{ spell,
@@ -835,7 +842,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 132;
+export const PROTOCOL_VERSION = 133;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

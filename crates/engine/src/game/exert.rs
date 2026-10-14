@@ -1,7 +1,7 @@
 //! Exert bookkeeping shared by every way a permanent is exerted (CR 701.43a).
 
 use crate::types::ability::{ContinuousModification, Duration, PlayerScope, TargetFilter};
-use crate::types::events::GameEvent;
+use crate::types::events::{ExertOrigin, GameEvent};
 use crate::types::game_state::GameState;
 use crate::types::identifiers::ObjectId;
 use crate::types::phase::Phase;
@@ -24,12 +24,16 @@ use super::engine::EngineError;
 /// "changed" result is deliberately ignored: the effect and the event happen on
 /// every exert (this engine reads "exert" in CR 701.43a as an event each time).
 ///
+/// `origin` says which exert this was, so the attack-linked "when you do"
+/// trigger (CR 607.2h) can refuse an exert paid as an activated ability's cost.
+///
 /// CR 701.43c: returns `Ok(None)` without effect if the permanent is not on the
 /// battlefield.
 pub(crate) fn exert_permanent(
     state: &mut GameState,
     object_id: ObjectId,
     actor: PlayerId,
+    origin: ExertOrigin,
     events: &mut Vec<GameEvent>,
 ) -> Result<Option<GameEvent>, EngineError> {
     let Some(obj) = state.objects.get(&object_id) else {
@@ -61,7 +65,8 @@ pub(crate) fn exert_permanent(
     );
     let event = GameEvent::CreatureExerted {
         object_id,
-        player: actor,
+        player: Some(actor),
+        origin,
     };
     events.push(event.clone());
     Ok(Some(event))
