@@ -5730,8 +5730,17 @@ fn project_action_payload(
                 cast_payment_mode_code(*payment_mode),
             );
         }
-        GameAction::ActivateAbility { ability_index, .. } => {
-            push_value_surface(surfaces, InteractionRoleCode::AbilityIndex, ability_index)
+        GameAction::ActivateAbility {
+            ability_index,
+            payment_mode,
+            ..
+        } => {
+            push_value_surface(surfaces, InteractionRoleCode::AbilityIndex, ability_index);
+            push_value_surface(
+                surfaces,
+                InteractionRoleCode::PaymentMode,
+                cast_payment_mode_code(*payment_mode),
+            );
         }
         GameAction::DeclareAttackers { attacks, bands } => {
             for (index, (attacker, target)) in attacks.iter().enumerate() {
