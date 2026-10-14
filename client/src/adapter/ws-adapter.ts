@@ -214,7 +214,9 @@ export class NativeEngineVersionMismatchError extends Error {
  *      attacking creature is attacking, CR 506.3 + CR 115.10a), serialized in the
  *      ability definitions of GameState. A v141 peer cannot deserialize the tag; the
  *      exact-match handshake refuses the pairing. Wire 124 moves with it; lobby
- *      messages are unchanged.
+ *      messages are unchanged; ZoneChangeCombatStatus gains `attack_target`
+ *      (Option<AttackTarget>, the attacker's last-known declared attack target)
+ *      in zone-change records and trigger-source contexts of GameState.
  * 141 — ExileLinkKind gains CastCost (CR 607.2q: a card exiled to pay a cost
  *      of casting a permanent spell, linked to the permanent it becomes),
  *      carried in GameState.exile_links — see PROTOCOL_VERSION's own `/// 141`

@@ -7,8 +7,8 @@
 //! derived from the card text, its rulings and CR 506.3 / 506.4 / 510.1b, not from
 //! `DefendingPlayer` (CR 508.5 collapses a planeswalker to its controller; this referent does not).
 //!
-//! Parse-shape assertions go through `serde_json` so the file compiles before the change and every
-//! row fails by assertion there. Each "nothing is damaged" assertion is paired with reach guards in
+//! Parse-shape assertions go through `serde_json`, reading the parsed ability shape without naming
+//! the variant's Rust type. Each "nothing is damaged" assertion is paired with reach guards in
 //! the same test: the trigger was on the stack with no declared target, and an
 //! `EffectResolved { kind: DealDamage }` was emitted for it. The same chain damages in the sibling
 //! rows whenever the referent is live.

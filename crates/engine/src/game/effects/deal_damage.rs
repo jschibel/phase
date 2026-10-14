@@ -80,7 +80,7 @@ fn player_context_target(
         );
     }
     if matches!(target_filter, TargetFilter::AttackedPlayerOrPlaneswalker) {
-        // CR 506.3 + CR 608.2b: "the player or planeswalker it's attacking" is read from
+        // CR 506.3 + CR 608.2h: "the player or planeswalker it's attacking" is read from
         // combat at resolution by the single combat authority. No referent (a battle, a
         // creature that is no longer attacking, a planeswalker that is gone) is dealt
         // nothing: it must not fall through to the node's targets, nor to a controller
@@ -8033,7 +8033,7 @@ mod attacked_referent_recipient_tests {
     use crate::types::player::PlayerId;
     use crate::types::zones::Zone;
 
-    /// CR 506.3 + CR 608.2b: no referent is `NoReferent`, so the recipient list is empty
+    /// CR 506.3 + CR 608.2h: no referent is `NoReferent`, so the recipient list is empty
     /// even when the node carries propagated targets; with a referent it is exactly that.
     #[test]
     fn attacked_referent_recipient_binds_or_deals_nothing() {

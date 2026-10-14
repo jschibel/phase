@@ -3136,8 +3136,8 @@ mod diagnostic_snapshots {
     fn diagnostic_ignored_remainder() {
         // The Swordjack clause with a TARGETED recipient: "target player or planeswalker"
         // consumes only up to the noun, leaving the trailing "it's attacking" ignored.
-        // (The printed untargeted phrase is now fully consumed; see
-        // `diagnostic_attacked_referent_leaves_no_remainder`.)
+        // (The printed untargeted phrase is consumed whole by the attacked-referent
+        // combinator; see `diagnostic_attacked_referent_leaves_no_remainder`.)
         let diagnostics = parse_diagnostics(
             "Whenever this creature attacks, it deals damage to target player or planeswalker it's attacking equal to the number of artifacts you control.",
             "Synthetic Swordjack",
@@ -3157,8 +3157,8 @@ mod diagnostic_snapshots {
     #[test]
     fn diagnostic_attacked_referent_leaves_no_remainder() {
         // CR 506.3: the printed Fathom Fleet Swordjack text. "the player or planeswalker
-        // it's attacking" is consumed whole by the attacked-referent combinator, where
-        // it used to leave an ignored-remainder "it's attacking". Reach guard: the
+        // it's attacking" is consumed whole by the attacked-referent combinator, leaving
+        // no ignored-remainder "it's attacking". Reach guard: the
         // targeted spelling of the same clause still reports the remainder.
         let printed = parse_diagnostics(
             "Whenever this creature attacks, it deals damage to the player or planeswalker it's attacking equal to the number of artifacts you control.\nEncore {5}{R} ({5}{R}, Exile this card from your graveyard: For each opponent, create a token copy that attacks that opponent this turn if able. They gain haste. Sacrifice them at the beginning of the next end step. Activate only as a sorcery.)",

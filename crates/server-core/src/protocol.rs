@@ -3349,7 +3349,9 @@ mod tests {
     /// The bump this number is at: `TargetFilter` gains
     /// `AttackedPlayerOrPlaneswalker`, carried in the ability definitions inside
     /// `GameState`; a v141 peer cannot parse the tag, so it must be refused before
-    /// it receives v142 state.
+    /// it receives v142 state; `ZoneChangeCombatStatus` gains `attack_target`
+    /// (`Option<AttackTarget>`, the attacker's last-known declared attack target)
+    /// in zone-change records and trigger-source contexts of `GameState`.
     ///
     /// v141: `ExileLinkKind` gains `CastCost` (CR 607.2q cast-cost exile links),
     /// carried in `GameState::exile_links`; a v140 peer cannot parse the tag, so

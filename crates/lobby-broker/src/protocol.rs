@@ -64,7 +64,10 @@ pub struct TournamentRequestId(pub u64);
 ///      (`{"type":"AttackedPlayerOrPlaneswalker"}`, the player or planeswalker an
 ///      attacking creature is attacking), serialized inside `GameState` in the
 ///      ability definitions. A v141 peer cannot parse the tag. Full-game peers and
-///      P2P move in lockstep (wire 124); no lobby carrier names it.
+///      P2P move in lockstep (wire 124); no lobby carrier names it;
+///      `ZoneChangeCombatStatus` gains `attack_target` (`Option<AttackTarget>`, the
+///      attacker's last-known declared attack target) in zone-change records and
+///      trigger-source contexts of `GameState`.
 ///
 /// 141 — `ExileLinkKind` gains `CastCost` (`"CastCost"`, CR 607.2q: a card
 ///      exiled to pay a cost of casting a permanent spell, linked to that spell

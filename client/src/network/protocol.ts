@@ -108,7 +108,9 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * Bumps to date:
  *  124 — game_setup and state_update carry GameState whose ability definitions may hold
  *       TargetFilter AttackedPlayerOrPlaneswalker. Bumped in lockstep with full-game
- *       protocol 142.
+ *       protocol 142; ZoneChangeCombatStatus gains `attack_target`
+ *       (Option<AttackTarget>, the attacker's last-known declared attack target)
+ *       in zone-change records and trigger-source contexts of GameState.
  *  123 — game_setup and state_update carry GameState whose exile_links may hold
  *       ExileLinkKind CastCost (CR 607.2q). Bumped in lockstep with full-game
  *       protocol 141.

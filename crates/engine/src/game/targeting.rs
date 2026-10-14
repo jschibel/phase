@@ -1109,7 +1109,7 @@ pub fn resolved_targets(
             Vec::new()
         };
     }
-    // CR 506.3 + CR 115.10a + CR 608.2b: the attacked player-or-planeswalker is read from
+    // CR 506.3 + CR 115.10a + CR 608.2h: the attacked player-or-planeswalker is read from
     // combat at resolution by the single combat authority. An absent referent (a battle,
     // a creature that is not attacking, a planeswalker that is gone) is the empty set; it
     // must not fall through to `ability.targets`, the source, or a controller.
@@ -8761,7 +8761,7 @@ mod attacked_referent_targeting_tests {
         )
     }
 
-    /// CR 506.3 + CR 115.10a + CR 608.2b: the combat authority's answer is the whole
+    /// CR 506.3 + CR 115.10a + CR 608.2h: the combat authority's answer is the whole
     /// answer. An absent referent is the empty set; it does not fall through to
     /// propagated `ability.targets`, the source, or a controller.
     #[test]

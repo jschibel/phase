@@ -1844,7 +1844,7 @@ fn mishra_production_meld_entry_attack_destination_matrix() {
             Some(P1),
             "ETB observers must see the result already attacking"
         );
-        // CR 506.3 + CR 603.10a: the entry record also holds the declared
+        // CR 506.3 + CR 508.4: the entry record also holds the declared
         // destination itself, not the player it collapses to.
         assert_eq!(
             entry_record.combat_status.attack_target,
