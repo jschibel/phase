@@ -56,7 +56,6 @@ fn recurring_nightmare_returns_itself_to_hand_when_activating() {
         .act(GameAction::ActivateAbility {
             source_id: nightmare,
             ability_index,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("begin activation");
 

@@ -1519,7 +1519,6 @@ fn activation_and_prompted_declarations_keep_event_counts() {
             GameAction::ActivateAbility {
                 source_id: engine_card,
                 ability_index: 0,
-                payment_mode: CastPaymentMode::Auto,
             },
             &answers,
         );

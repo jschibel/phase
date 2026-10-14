@@ -104,7 +104,6 @@ fn announce(runner: &mut GameRunner, artifact: ObjectId, target: ObjectId) {
         .act(GameAction::ActivateAbility {
             source_id: artifact,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("announce the printed activated ability");
     let WaitingFor::TargetSelection {
@@ -373,7 +372,6 @@ fn regalia_activation_uses_controller_not_owner_for_its_creature_target() {
         .act(GameAction::ActivateAbility {
             source_id: regalia,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .unwrap();
     let WaitingFor::TargetSelection {
@@ -436,8 +434,7 @@ fn regalia_without_a_targetable_controlled_creature_cannot_activate() {
         assert!(runner
             .act(GameAction::ActivateAbility {
                 source_id: regalia,
-                ability_index: 0,
-                payment_mode: engine::types::game_state::CastPaymentMode::Auto
+                ability_index: 0
             })
             .is_err());
         assert_eq!(mana(&runner, P0), 3);

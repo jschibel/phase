@@ -96,7 +96,6 @@ fn cryptex_collect_evidence_mana_ability_produces_mana_and_counter() {
         .act(GameAction::ActivateAbility {
             source_id: cryptex,
             ability_index: idx,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activation accepted");
 
@@ -181,7 +180,6 @@ fn cryptex_collect_evidence_not_payable_below_threshold() {
     let result = runner.act(GameAction::ActivateAbility {
         source_id: cryptex,
         ability_index: idx,
-        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
     });
     // CR 701.59b: cannot collect evidence 3 with only MV 1 in graveyard — the
     // mana ability is not payable, so activation is rejected and no mana is

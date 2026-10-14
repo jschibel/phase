@@ -156,7 +156,6 @@ fn drive_activation(
         .act(GameAction::ActivateAbility {
             source_id: board.coin,
             ability_index: index,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("Coin's ability must be activatable with the cost available");
 

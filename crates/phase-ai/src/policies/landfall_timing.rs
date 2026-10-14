@@ -135,7 +135,6 @@ fn is_fetch_shaped_activation(ctx: &PolicyContext<'_>) -> bool {
     let GameAction::ActivateAbility {
         source_id,
         ability_index,
-        ..
     } = &ctx.candidate.action
     else {
         return false;
@@ -327,7 +326,6 @@ mod tests {
             action: GameAction::ActivateAbility {
                 source_id,
                 ability_index,
-                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             },
             metadata: ActionMetadata::for_actor(Some(AI), TacticalClass::Ability),
         }

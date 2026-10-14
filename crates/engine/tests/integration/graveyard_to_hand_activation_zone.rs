@@ -143,7 +143,6 @@ fn sanitarium_skeleton_not_activatable_from_battlefield() {
             .act(GameAction::ActivateAbility {
                 source_id: skeleton,
                 ability_index: 0,
-                payment_mode: engine::types::game_state::CastPaymentMode::Auto
             })
             .is_err(),
         "the submit path must reject the activation too (casting.rs zone gate)"
@@ -246,7 +245,6 @@ fn attached_bestial_bloodline_aura_not_activatable_from_battlefield() {
             .act(GameAction::ActivateAbility {
                 source_id: aura,
                 ability_index: 0,
-                payment_mode: engine::types::game_state::CastPaymentMode::Auto
             })
             .is_err(),
         "the submit path must reject the activation too"

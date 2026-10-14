@@ -83,7 +83,6 @@ fn oft_nabbed_goat_controller_cannot_activate() {
     let err = runner.act(GameAction::ActivateAbility {
         source_id: goat,
         ability_index: 0,
-        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
     });
     assert!(
         err.is_err(),
@@ -168,7 +167,6 @@ fn oft_nabbed_goat_opponent_rejected_at_instant_speed() {
     let err = runner.act(GameAction::ActivateAbility {
         source_id: goat,
         ability_index: 0,
-        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
     });
     assert!(
         err.is_err(),

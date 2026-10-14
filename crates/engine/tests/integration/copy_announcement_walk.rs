@@ -478,7 +478,6 @@ fn zemo_batch(vanilla_first: bool) {
     r.act(GameAction::ActivateAbility {
         source_id: zemo,
         ability_index: index,
-        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
     })
     .expect("activate Boast");
     r.act(GameAction::SelectCards {

@@ -4508,7 +4508,6 @@ pub(crate) fn priority_actions_with_probe(
                                 GameAction::ActivateAbility {
                                     source_id: obj_id,
                                     ability_index: i,
-                                    payment_mode: CastPaymentMode::Auto,
                                 },
                                 TacticalClass::Ability,
                                 Some(player),
@@ -4565,7 +4564,6 @@ pub(crate) fn priority_actions_with_probe(
                                     GameAction::ActivateAbility {
                                         source_id: obj_id,
                                         ability_index: i,
-                                        payment_mode: CastPaymentMode::Auto,
                                     },
                                     TacticalClass::Ability,
                                     Some(player),
@@ -4638,7 +4636,6 @@ pub(crate) fn priority_actions_with_probe(
                                 GameAction::ActivateAbility {
                                     source_id: obj_id,
                                     ability_index: i,
-                                    payment_mode: CastPaymentMode::Auto,
                                 },
                                 TacticalClass::Ability,
                                 Some(player),
@@ -4686,7 +4683,6 @@ pub(crate) fn priority_actions_with_probe(
                                 GameAction::ActivateAbility {
                                     source_id: obj_id,
                                     ability_index: i,
-                                    payment_mode: CastPaymentMode::Auto,
                                 },
                                 TacticalClass::Ability,
                                 Some(player),
@@ -4723,7 +4719,6 @@ pub(crate) fn priority_actions_with_probe(
                             GameAction::ActivateAbility {
                                 source_id: obj_id,
                                 ability_index: i,
-                                payment_mode: CastPaymentMode::Auto,
                             },
                             TacticalClass::Mana,
                             Some(player),
@@ -4759,7 +4754,6 @@ pub(crate) fn priority_actions_with_probe(
                             GameAction::ActivateAbility {
                                 source_id: obj_id,
                                 ability_index: i,
-                                payment_mode: CastPaymentMode::Auto,
                             },
                             TacticalClass::Mana,
                             Some(player),
@@ -4857,7 +4851,6 @@ pub(crate) fn priority_actions_with_probe(
                         GameAction::ActivateAbility {
                             source_id: top_id,
                             ability_index: i,
-                            payment_mode: CastPaymentMode::Auto,
                         },
                         TacticalClass::Ability,
                         Some(player),
@@ -7511,7 +7504,7 @@ mod tests {
                 candidate.action,
                 GameAction::ActivateAbility {
                     source_id,
-                    ability_index, ..
+                    ability_index,
                 } if source_id == hand_sliver && ability_index == printed_len
             )
         }));
@@ -8379,7 +8372,7 @@ mod tests {
                 candidate.action,
                 GameAction::ActivateAbility {
                     source_id,
-                    ability_index: 0, ..
+                    ability_index: 0,
                 } if source_id == source
             )
         }));
@@ -8653,7 +8646,7 @@ mod tests {
                 candidate.action,
                 GameAction::ActivateAbility {
                     source_id,
-                    ability_index: 0, ..
+                    ability_index: 0,
                 } if source_id == altar
             )
         }));
@@ -8733,7 +8726,7 @@ mod tests {
         assert!(
             candidates.iter().any(|c| matches!(
                 c.action,
-                GameAction::ActivateAbility { source_id, ability_index: 0, .. } if source_id == kci
+                GameAction::ActivateAbility { source_id, ability_index: 0 } if source_id == kci
             )),
             "candidate_actions must include KCI activation during ManaPayment",
         );
@@ -8744,7 +8737,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                GameAction::ActivateAbility { source_id, ability_index: 0, .. } if *source_id == kci
+                GameAction::ActivateAbility { source_id, ability_index: 0 } if *source_id == kci
             )),
             "legal_actions must expose KCI activation during ManaPayment (#562)",
         );
@@ -8757,7 +8750,7 @@ mod tests {
         assert!(
             kci_actions.iter().any(|a| matches!(
                 a,
-                GameAction::ActivateAbility { source_id, ability_index: 0, .. } if *source_id == kci
+                GameAction::ActivateAbility { source_id, ability_index: 0 } if *source_id == kci
             )),
             "grouped legal_actions_full[KCI] must include the KCI activation (#562)",
         );
@@ -9491,7 +9484,7 @@ mod tests {
                 c.action,
                 GameAction::ActivateAbility {
                     source_id,
-                    ability_index: 0, ..
+                    ability_index: 0,
                 } if source_id == pest
             )
         });
@@ -9516,7 +9509,7 @@ mod tests {
                 c.action,
                 GameAction::ActivateAbility {
                     source_id,
-                    ability_index: 0, ..
+                    ability_index: 0,
                 } if source_id == pest2
             )
         });
@@ -9599,7 +9592,6 @@ mod tests {
                 GameAction::ActivateAbility {
                     source_id,
                     ability_index: 0,
-                    ..
                 } if source_id == lantern => Some(c.metadata.tactical_class),
                 _ => None,
             });

@@ -57,7 +57,6 @@ fn adnate_offers(from_oracle: bool) -> (Vec<&'static str>, Vec<String>) {
         GameAction::ActivateAbility {
             source_id: adnate,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         },
     )
     .expect("Soldevi Adnate activates");

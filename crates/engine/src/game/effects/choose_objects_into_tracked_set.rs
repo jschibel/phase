@@ -217,7 +217,6 @@ mod tests {
             .act(GameAction::ActivateAbility {
                 source_id: host,
                 ability_index: 0,
-                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             })
             .expect("activate required-choice ability");
         runner.advance_until_stack_empty();
@@ -371,7 +370,6 @@ mod tests {
             .act(GameAction::ActivateAbility {
                 source_id: host,
                 ability_index: 0,
-                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             })
             .expect("activate exact counter-removal choice");
         runner.advance_until_stack_empty();
@@ -460,7 +458,6 @@ mod tests {
             .act(GameAction::ActivateAbility {
                 source_id: host,
                 ability_index: 0,
-                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             })
             .expect("activate the chapter IV ability");
         runner.advance_until_stack_empty();

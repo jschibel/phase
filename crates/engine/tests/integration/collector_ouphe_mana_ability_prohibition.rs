@@ -149,7 +149,6 @@ impl Fixture {
             .act(GameAction::ActivateAbility {
                 source_id: self.source,
                 ability_index: 0,
-                payment_mode: CastPaymentMode::Auto,
             })
             .map(|_| ())
             .map_err(|e| format!("{e:?}"))

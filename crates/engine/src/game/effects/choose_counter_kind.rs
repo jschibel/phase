@@ -655,7 +655,6 @@ mod tests {
             .act(GameAction::ActivateAbility {
                 source_id: host,
                 ability_index: 0,
-                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             })
             .expect("activate the Caves chapter ability");
 
@@ -748,7 +747,6 @@ mod tests {
             .act(GameAction::ActivateAbility {
                 source_id: host,
                 ability_index: 0,
-                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             })
             .expect("activate the Caves chapter ability");
 
@@ -860,7 +858,6 @@ mod tests {
             .act(GameAction::ActivateAbility {
                 source_id: host,
                 ability_index: 0,
-                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             })
             .expect("activate the Caves chapter ability");
 

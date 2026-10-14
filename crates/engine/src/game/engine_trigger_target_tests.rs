@@ -365,7 +365,6 @@ fn triggered_modal_modes_with_targets_wait_for_target_selection() {
         ability_cost: None,
         activation_cost_snapshot: None,
         unavailable_modes: vec![],
-        activation_payment_mode: crate::types::game_state::CastPaymentMode::Auto,
     };
 
     let result = apply_as_current(
@@ -660,7 +659,6 @@ fn triggered_modal_modes_without_targets_consume_pending_trigger() {
         ability_cost: None,
         activation_cost_snapshot: None,
         unavailable_modes: vec![],
-        activation_payment_mode: crate::types::game_state::CastPaymentMode::Auto,
     };
 
     let result =
@@ -1149,7 +1147,6 @@ fn triggered_modal_modes_reject_unsatisfiable_target_constraints() {
         ability_cost: None,
         activation_cost_snapshot: None,
         unavailable_modes: vec![],
-        activation_payment_mode: crate::types::game_state::CastPaymentMode::Auto,
     };
 
     let result = apply_as_current(

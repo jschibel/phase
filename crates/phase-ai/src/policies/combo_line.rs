@@ -121,12 +121,10 @@ fn action_matches_step(candidate: &GameAction, step: &GameAction) -> bool {
             GameAction::ActivateAbility {
                 source_id: c_src,
                 ability_index: c_idx,
-                ..
             },
             GameAction::ActivateAbility {
                 source_id: s_src,
                 ability_index: s_idx,
-                ..
             },
         ) => c_src == s_src && c_idx == s_idx,
         (
@@ -308,7 +306,6 @@ mod tests {
             action: GameAction::ActivateAbility {
                 source_id: heliod_id,
                 ability_index: 0,
-                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             },
             metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Ability),
         };
@@ -341,7 +338,6 @@ mod tests {
             action: GameAction::ActivateAbility {
                 source_id: ballista_id,
                 ability_index: 1,
-                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             },
             metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Ability),
         };

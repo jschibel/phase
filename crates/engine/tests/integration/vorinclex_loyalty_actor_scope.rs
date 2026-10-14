@@ -90,7 +90,6 @@ fn opponent_vorinclex_halves_own_loyalty_activation() {
         .act(GameAction::ActivateAbility {
             source_id: pw,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate the +2 loyalty ability");
 
@@ -160,7 +159,6 @@ fn own_vorinclex_doubles_own_loyalty_activation() {
         .act(GameAction::ActivateAbility {
             source_id: pw,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate the +2 loyalty ability");
 

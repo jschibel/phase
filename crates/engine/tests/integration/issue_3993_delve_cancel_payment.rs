@@ -362,7 +362,6 @@ fn cancel_after_signet_activation_leaves_selected_fuel_in_graveyard() {
         .act(GameAction::ActivateAbility {
             source_id: signet,
             ability_index: 0,
-            payment_mode: CastPaymentMode::Auto,
         })
         .expect("activate Dimir Signet");
 
@@ -934,7 +933,6 @@ fn a_mana_ability_before_cancel_keeps_pool_order_for_choices_and_graveyard_order
             .act(GameAction::ActivateAbility {
                 source_id,
                 ability_index,
-                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             })
             .unwrap_or_else(|error| panic!("{name}'s mana ability: {error:?}"));
     }

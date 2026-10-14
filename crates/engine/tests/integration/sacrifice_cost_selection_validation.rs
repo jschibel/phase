@@ -161,7 +161,6 @@ fn public_concession_refuses_stale_sacrifice_before_any_payment() {
                 .act(GameAction::ActivateAbility {
                     source_id: source,
                     ability_index: 0,
-                    payment_mode: CastPaymentMode::Auto,
                 })
                 .unwrap();
             assert!(prompt(&runner, (1, 1)).contains(&fodder));
@@ -263,7 +262,6 @@ fn unselected_advertised_control_loss_keeps_lawful_full_selection() {
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index: 0,
-            payment_mode: CastPaymentMode::Auto,
         })
         .unwrap();
     let advertised = prompt(&runner, (1, 1));
@@ -313,7 +311,6 @@ fn selected_sacrifice_preserves_bound_zero_fixed_and_variable_counts() {
                 .act(GameAction::ActivateAbility {
                     source_id: source,
                     ability_index: 0,
-                    payment_mode: CastPaymentMode::Auto,
                 })
                 .unwrap();
             let bounds = if count == u32::MAX {
@@ -374,8 +371,7 @@ fn selected_sacrifice_preserves_bound_zero_fixed_and_variable_counts() {
     assert!(runner
         .act(GameAction::ActivateAbility {
             source_id: source,
-            ability_index: 0,
-            payment_mode: CastPaymentMode::Auto
+            ability_index: 0
         })
         .is_err());
     assert_eq!(serde_json::to_value(runner.state()).unwrap(), before);
@@ -425,7 +421,6 @@ fn current_sacrifice_leaf_and_selected_oneof_pay_in_order() {
                     .act(GameAction::ActivateAbility {
                         source_id: source,
                         ability_index: 0,
-                        payment_mode: CastPaymentMode::Auto,
                     })
                     .unwrap();
                 if oneof {
@@ -628,7 +623,6 @@ fn normal_and_replacement_sacrifice_settle_once_and_survive_checked_restore() {
                     .act(GameAction::ActivateAbility {
                         source_id: source,
                         ability_index: 0,
-                        payment_mode: CastPaymentMode::Auto,
                     })
                     .unwrap()
                     .events;
@@ -756,7 +750,6 @@ fn fixed_mana_source_loss_identity_positive_controls() {
             .act(GameAction::ActivateAbility {
                 source_id: source,
                 ability_index: 0,
-                payment_mode: CastPaymentMode::Auto,
             })
             .unwrap();
         let advertised = prompt(&runner, (1, 1));
@@ -819,7 +812,6 @@ fn x_mana_activation_pays_both_selected_sacrifices() {
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index: 0,
-            payment_mode: CastPaymentMode::Auto,
         })
         .unwrap();
     assert!(matches!(

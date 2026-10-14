@@ -141,7 +141,6 @@ pub(crate) fn drive_one_live_cycle(state: &mut GameState, ids: &LoopIds) {
         GameAction::ActivateAbility {
             source_id: ids.relic,
             ability_index: RELIC_TAP_MANA,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         },
     )
     .expect("activate Relic's tap-a-legendary mana ability");
@@ -200,7 +199,6 @@ pub(crate) fn drive_one_live_cycle(state: &mut GameState, ids: &LoopIds) {
                         GameAction::ActivateAbility {
                             source_id: ids.freed,
                             ability_index: FREED_UNTAP,
-                            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
                         },
                     )
                     .expect("activate Freed's {U}: untap Kilo");
@@ -275,7 +273,6 @@ fn kilo_migrated_dump_fires_object_growth_offer() {
         Some(GameAction::ActivateAbility {
             source_id: RELIC,
             ability_index: RELIC_TAP_MANA,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         }),
         "the window's first play is the Relic mana activation"
     );
@@ -307,7 +304,6 @@ fn kilo_migrated_dump_fires_object_growth_offer() {
                         GameAction::ActivateAbility {
                             source_id: RELIC,
                             ability_index: RELIC_TAP_MANA,
-                            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
                         }
                     ),
                     (
@@ -315,7 +311,6 @@ fn kilo_migrated_dump_fires_object_growth_offer() {
                         GameAction::ActivateAbility {
                             source_id: FREED,
                             ability_index: FREED_UNTAP,
-                            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
                         }
                     ),
                 ],

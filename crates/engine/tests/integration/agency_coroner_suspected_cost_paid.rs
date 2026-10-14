@@ -71,7 +71,6 @@ fn run(suspect_victim: bool) -> usize {
         .act(GameAction::ActivateAbility {
             source_id: coroner,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate Agency Coroner");
 

@@ -264,7 +264,6 @@ fn deterministic_discard_cost_publishes_a_live_snapshot() {
         .act(GameAction::ActivateAbility {
             source_id: harnfel,
             ability_index: index,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("Harnfel's discard ability must be activatable");
     assert!(
@@ -349,7 +348,6 @@ fn random_discard_cost_publishes_a_live_snapshot() {
         .act(GameAction::ActivateAbility {
             source_id: pyromancy,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("Pyromancy's random-discard ability must be activatable");
     runner
@@ -473,7 +471,6 @@ fn pay_pyromancy_random_discard(hidden_redirect: bool) -> RandomDiscardFixture {
         .act(GameAction::ActivateAbility {
             source_id: pyromancy,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("Pyromancy's random-discard ability must be activatable");
     runner
@@ -692,7 +689,6 @@ fn pay_harnfel_discard(hidden_redirect: bool) -> DeterministicDiscardFixture {
         .act(GameAction::ActivateAbility {
             source_id: harnfel,
             ability_index: index,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("Harnfel's discard ability must be activatable");
     assert!(
@@ -914,7 +910,6 @@ fn sacrifice_cost_publishes_a_live_snapshot() {
         .act(GameAction::ActivateAbility {
             source_id: good,
             ability_index: index,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("Greater Good's sacrifice ability must be activatable");
     assert!(
@@ -1025,7 +1020,6 @@ fn pay_greater_good_sacrifice(hidden_redirect: bool) -> SacrificeFixture {
         .act(GameAction::ActivateAbility {
             source_id: good,
             ability_index: index,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("Greater Good's sacrifice ability must be activatable");
     assert!(
@@ -1255,7 +1249,6 @@ fn coin_board() -> CoinBoard {
         .act(GameAction::ActivateAbility {
             source_id: coin,
             ability_index: index,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("Coin of Fate's ability must be activatable with the cost available");
     CoinBoard {

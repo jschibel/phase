@@ -107,7 +107,6 @@ fn activate_onto_stack(
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index: index,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activation is accepted");
     for _ in 0..8 {
@@ -908,7 +907,6 @@ fn activate_krumar_onto_stack(
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index: index,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .unwrap();
     assert!(matches!(

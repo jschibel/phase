@@ -171,7 +171,6 @@ fn activate_and_pay(runner: &mut GameRunner, source: ObjectId, discard: Option<O
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("the copy ability is activatable");
     for _ in 0..16 {

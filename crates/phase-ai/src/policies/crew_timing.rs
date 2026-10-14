@@ -642,7 +642,6 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: vehicle,
                 ability_index,
-                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("the self-animate activated ability must be announced and pushed to the stack");

@@ -120,7 +120,6 @@ impl TacticalPolicy for EquipmentPriorityPolicy {
             GameAction::ActivateAbility {
                 source_id,
                 ability_index,
-                ..
             } => {
                 let Some(equip) = ctx.state.objects.get(source_id) else {
                     return na();
@@ -302,7 +301,6 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: equip,
                 ability_index: 0,
-                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             },
         )
     }

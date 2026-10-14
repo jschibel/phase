@@ -209,7 +209,6 @@ fn activate_firebreathing(runner: &mut GameRunner, obj: ObjectId, ability_index:
         .act(GameAction::ActivateAbility {
             source_id: obj,
             ability_index,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activating firebreathing must be accepted");
 

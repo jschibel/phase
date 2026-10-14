@@ -288,7 +288,6 @@ fn granted_mana_ability_activates_on_a_ready_creature() {
         .act(GameAction::ActivateAbility {
             source_id: b.own_creature,
             ability_index: idx,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("a ready creature may tap for the granted mana ability");
     assert_eq!(green_in_pool(&b.runner), 1);
@@ -312,7 +311,6 @@ fn summoning_sick_steward_cannot_use_granted_mana_ability() {
         .act(GameAction::ActivateAbility {
             source_id: b.steward,
             ability_index: idx,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect_err("summoning-sick Steward must not activate a granted mana ability");
     assert!(
@@ -328,7 +326,6 @@ fn summoning_sick_steward_cannot_use_granted_mana_ability() {
         .act(GameAction::ActivateAbility {
             source_id: b.own_creature,
             ability_index: ready_idx,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("ready recipient may use the same granted mana ability");
     assert!(b.runner.state().objects[&b.own_creature].tapped);
@@ -357,7 +354,6 @@ fn newly_cast_hasty_creature_can_activate_mana_ability() {
         .act(GameAction::ActivateAbility {
             source_id: creature,
             ability_index: idx,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("haste permits tapping the newly cast mana creature");
     assert!(runner.state().objects[&creature].tapped);
@@ -381,7 +377,6 @@ fn noncreature_land_mana_activation_ignores_summoning_sickness() {
         .act(GameAction::ActivateAbility {
             source_id: land,
             ability_index: idx,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("a noncreature land may tap immediately");
     assert!(runner.state().objects[&land].tapped);
@@ -407,7 +402,6 @@ fn summoning_sick_steward_cannot_use_granted_tap_ability() {
     let result = b.runner.act(GameAction::ActivateAbility {
         source_id: b.steward,
         ability_index: sick_idx,
-        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
     });
     let err = result.expect_err("summoning-sick creature must be refused");
     assert!(
@@ -421,7 +415,6 @@ fn summoning_sick_steward_cannot_use_granted_tap_ability() {
         .act(GameAction::ActivateAbility {
             source_id: b.own_creature,
             ability_index: ready_idx,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("a ready creature may activate the granted {T} ability");
 }

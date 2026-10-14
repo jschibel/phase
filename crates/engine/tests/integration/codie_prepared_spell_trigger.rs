@@ -1195,7 +1195,6 @@ fn drive_activation(
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("the activation must be accepted");
     let mut visited = Vec::new();

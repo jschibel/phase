@@ -152,7 +152,6 @@ fn repeat_offender_suspected_gets_counter() {
         .act(GameAction::ActivateAbility {
             source_id: offender,
             ability_index: 0,
-            payment_mode: CastPaymentMode::Auto,
         })
         .expect("activating Repeat Offender must succeed");
     drain_priority(&mut runner);
@@ -191,7 +190,6 @@ fn repeat_offender_unsuspected_is_suspected_not_countered() {
         .act(GameAction::ActivateAbility {
             source_id: offender,
             ability_index: 0,
-            payment_mode: CastPaymentMode::Auto,
         })
         .expect("activating Repeat Offender must succeed");
     drain_priority(&mut runner);

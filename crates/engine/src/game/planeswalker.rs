@@ -1,8 +1,7 @@
 use crate::types::card_type::CoreType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    CastPaymentMode, GameState, PendingCast, PendingCostMoveResume, StackEntry, StackEntryKind,
-    WaitingFor,
+    GameState, PendingCast, PendingCostMoveResume, StackEntry, StackEntryKind, WaitingFor,
 };
 use crate::types::identifiers::ObjectId;
 use crate::types::mana::ManaCost;
@@ -165,27 +164,6 @@ pub fn handle_activate_loyalty(
     ability_index: usize,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
-    handle_activate_loyalty_with_payment_mode(
-        state,
-        player,
-        pw_id,
-        ability_index,
-        CastPaymentMode::Auto,
-        events,
-    )
-}
-
-/// CR 606.2 + CR 602.2b: [`handle_activate_loyalty`] with the activation's
-/// mana-payment mode. Only a loyalty ability a raise gave a mana component
-/// pays mana, through the general activation flow, which honors the mode.
-pub fn handle_activate_loyalty_with_payment_mode(
-    state: &mut GameState,
-    player: PlayerId,
-    pw_id: ObjectId,
-    ability_index: usize,
-    payment_mode: CastPaymentMode,
-    events: &mut Vec<GameEvent>,
-) -> Result<WaitingFor, EngineError> {
     if !can_activate_loyalty_ability(state, pw_id, player, ability_index) {
         return Err(EngineError::ActionNotAllowed(
             "Cannot activate loyalty ability".to_string(),
@@ -231,12 +209,11 @@ pub fn handle_activate_loyalty_with_payment_mode(
     // re-enforces the once-per-turn gate. Untaxed loyalty abilities fall through
     // to the unchanged fast path.
     if super::casting::loyalty_ability_gains_mana_tax(state, &ability_def, player, pw_id) {
-        return super::casting::handle_activate_ability_with_payment_mode(
+        return super::casting::handle_activate_ability(
             state,
             player,
             pw_id,
             ability_index,
-            payment_mode,
             events,
         );
     }
@@ -327,14 +304,8 @@ pub fn handle_activate_loyalty_with_payment_mode(
         // CR 606.1: the mana-free loyalty fast path carries no cost-modifier
         // snapshot — no reduction can touch a bare loyalty cost, and any raise
         // routes the ability to the general flow instead.
-        let mut pending = PendingCast::for_activation(
-            pw_id,
-            resolved,
-            ManaCost::NoCost,
-            ability_index,
-            None,
-            payment_mode,
-        );
+        let mut pending =
+            PendingCast::for_activation(pw_id, resolved, ManaCost::NoCost, ability_index, None);
         pending.target_constraints = target_constraints;
         // CR 606.4: Loyalty cost is paid after targets are chosen.
         // Stored here so handle_select_targets can call pay_ability_cost and
@@ -715,7 +686,6 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: pw,
                 ability_index: 0,
-                payment_mode: CastPaymentMode::Auto,
             },
         )
         .expect("activation must be accepted");
@@ -794,7 +764,6 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: pw,
                 ability_index: 0,
-                payment_mode: CastPaymentMode::Auto,
             },
         )
         .expect("first loyalty activation must be accepted");
@@ -806,7 +775,6 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: pw,
                 ability_index: 1,
-                payment_mode: CastPaymentMode::Auto,
             },
         );
 

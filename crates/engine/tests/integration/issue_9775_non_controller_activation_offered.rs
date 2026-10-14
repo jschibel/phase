@@ -32,7 +32,6 @@ fn activate(source_id: ObjectId) -> GameAction {
     GameAction::ActivateAbility {
         source_id,
         ability_index: 0,
-        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
     }
 }
 

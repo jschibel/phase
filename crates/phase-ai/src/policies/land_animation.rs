@@ -57,7 +57,6 @@ impl TacticalPolicy for LandAnimationPolicy {
         let GameAction::ActivateAbility {
             source_id,
             ability_index,
-            ..
         } = &ctx.candidate.action
         else {
             return PolicyVerdict::Score {
@@ -354,7 +353,6 @@ mod tests {
             action: GameAction::ActivateAbility {
                 source_id,
                 ability_index: 0,
-                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             },
             metadata: ActionMetadata::for_actor(Some(AI), TacticalClass::Ability),
         };

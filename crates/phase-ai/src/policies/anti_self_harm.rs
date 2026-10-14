@@ -270,7 +270,6 @@ fn action_ability_definitions<'a>(ctx: &'a PolicyContext<'_>) -> Vec<&'a Ability
         GameAction::ActivateAbility {
             source_id,
             ability_index,
-            ..
         } => ctx
             .state
             .objects

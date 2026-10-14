@@ -201,7 +201,6 @@ fn rhys_activated_ability_removes_chosen_counter_subset() {
         .act(GameAction::ActivateAbility {
             source_id: rhys,
             ability_index: idx,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate Rhys's remove-counter ability");
 
@@ -287,7 +286,6 @@ fn rhys_empty_selection_removes_nothing_and_finishes() {
         .act(GameAction::ActivateAbility {
             source_id: rhys,
             ability_index: idx,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate");
 
@@ -361,7 +359,6 @@ fn rhys_ability_rejected_at_instant_speed() {
     let result = runner.act(GameAction::ActivateAbility {
         source_id: rhys,
         ability_index: idx,
-        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
     });
     assert!(
         result.is_err(),

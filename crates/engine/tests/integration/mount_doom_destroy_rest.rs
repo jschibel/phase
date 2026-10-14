@@ -192,7 +192,6 @@ fn choose_objects_runtime_rejects_fewer_than_required_minimum() {
         .act(GameAction::ActivateAbility {
             source_id: host,
             ability_index: 0,
-            payment_mode: CastPaymentMode::Auto,
         })
         .expect("activate required-choice ability");
     runner.advance_until_stack_empty();

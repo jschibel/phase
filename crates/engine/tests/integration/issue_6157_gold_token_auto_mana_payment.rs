@@ -360,7 +360,6 @@ fn check_instant_only_mana_ability_cannot_pay_for_cast() {
         .act(GameAction::ActivateAbility {
             source_id: led,
             ability_index,
-            payment_mode: CastPaymentMode::Auto,
         })
         .expect_err("Diamond cannot activate during mana payment");
     assert!(
@@ -391,7 +390,6 @@ fn check_instant_only_mana_ability_cannot_pay_for_cast() {
         .act(GameAction::ActivateAbility {
             source_id: gold,
             ability_index: gold_ability_index,
-            payment_mode: CastPaymentMode::Auto,
         })
         .expect("Gold may activate during the same mana-payment window");
     assert!(matches!(
@@ -521,7 +519,6 @@ fn check_instant_only_mana_ability_activates_with_priority() {
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index,
-            payment_mode: CastPaymentMode::Auto,
         })
         .expect("instant-only mana must be activatable with priority");
     assert!(runner.state().objects[&source].tapped);
@@ -563,7 +560,6 @@ fn check_lions_eye_diamond_activates_with_priority() {
         .act(GameAction::ActivateAbility {
             source_id: diamond,
             ability_index,
-            payment_mode: CastPaymentMode::Auto,
         })
         .expect("Diamond must activate while its controller has priority");
     assert!(matches!(
@@ -643,7 +639,6 @@ fn diamond_priority_uses_controller_not_owner_or_active_player() {
             .act(GameAction::ActivateAbility {
                 source_id: diamond,
                 ability_index: 0,
-                payment_mode: CastPaymentMode::Auto,
             })
             .expect_err("the owner cannot activate another player's permanent");
         assert_eq!(runner.state().objects[&diamond].zone, Zone::Battlefield);
@@ -653,7 +648,6 @@ fn diamond_priority_uses_controller_not_owner_or_active_player() {
             .act(GameAction::ActivateAbility {
                 source_id: diamond,
                 ability_index: 0,
-                payment_mode: CastPaymentMode::Auto,
             })
             .expect("the controller can activate Diamond with an empty hand");
         assert!(matches!(
@@ -785,7 +779,7 @@ fn instant_only_sources_do_not_inflate_x_limit_or_manual_capacity() {
                 .is_empty());
             } else {
                 assert!(engine::game::mana_sources::activatable_mana_actions_for_player(runner.state(), P0)
-                    .iter().any(|action| matches!(action, GameAction::ActivateAbility { source_id, ability_index: 0, .. } if *source_id == source)));
+                    .iter().any(|action| matches!(action, GameAction::ActivateAbility { source_id, ability_index: 0 } if *source_id == source)));
             }
             let card_id = runner.state().objects[&spell].card_id;
             runner

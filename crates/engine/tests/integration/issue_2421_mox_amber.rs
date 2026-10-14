@@ -47,7 +47,6 @@ fn mox_amber_offers_only_legendary_creature_colors() {
         .act(GameAction::ActivateAbility {
             source_id: mox_id,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate Mox Amber");
 
@@ -86,7 +85,6 @@ fn mox_amber_with_no_legendary_creatures_or_planeswalkers_produces_no_mana() {
         .act(GameAction::ActivateAbility {
             source_id: mox_id,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate Mox Amber with no eligible legendaries");
 
@@ -121,7 +119,6 @@ fn mox_amber_does_not_count_itself_as_a_color_source() {
         .act(GameAction::ActivateAbility {
             source_id: mox_id,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate Mox Amber alone");
 
@@ -153,7 +150,6 @@ fn mox_amber_chosen_color_produces_mana() {
         .act(GameAction::ActivateAbility {
             source_id: mox_id,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate Mox Amber");
 

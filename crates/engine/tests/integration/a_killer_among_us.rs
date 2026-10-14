@@ -333,7 +333,6 @@ fn target_requires_an_attacking_token() {
     let announce = runner.act(GameAction::ActivateAbility {
         source_id: killer,
         ability_index: 0,
-        payment_mode: CastPaymentMode::Auto,
     });
 
     match &runner.state().waiting_for {

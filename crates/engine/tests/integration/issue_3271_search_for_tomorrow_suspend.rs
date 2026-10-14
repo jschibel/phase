@@ -27,7 +27,6 @@ fn suspend_ability_index(state: &engine::types::game_state::GameState, card: Obj
             GameAction::ActivateAbility {
                 source_id,
                 ability_index,
-                ..
             } if source_id == card => Some(ability_index),
             _ => None,
         })

@@ -64,7 +64,6 @@ fn cauldron_of_essence_activation_pays_mana_and_resolves() {
         GameAction::ActivateAbility {
             source_id: cauldron,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         },
     )
     .expect("activating Cauldron of Essence should be legal with lands and a sacrifice target");
@@ -149,7 +148,6 @@ fn cauldron_of_essence_rejects_sacrificed_creature_as_its_own_return_target() {
         GameAction::ActivateAbility {
             source_id: cauldron,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         },
     );
 

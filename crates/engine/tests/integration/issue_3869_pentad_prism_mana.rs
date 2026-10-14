@@ -37,7 +37,6 @@ fn pentad_prism_remove_charge_counter_adds_mana() {
         .act(GameAction::ActivateAbility {
             source_id: prism,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate Pentad Prism mana ability");
 

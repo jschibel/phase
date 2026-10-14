@@ -2134,7 +2134,6 @@ mod tests {
                 .act(GameAction::ActivateAbility {
                     source_id: source,
                     ability_index: 0,
-                    payment_mode: crate::types::game_state::CastPaymentMode::Auto,
                 })
                 .expect("activate the keyword-choice ability");
             runner.advance_until_stack_empty();

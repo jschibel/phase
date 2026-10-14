@@ -2711,7 +2711,6 @@ pub fn convert_available_action(
         GameAction::ActivateAbility {
             source_id,
             ability_index,
-            ..
         } => AvailableActionConversion::Available(AvailableAction {
             id,
             kind: AvailableActionKind::ActivateAbility(ActivatableAbilityInfo {
@@ -4013,7 +4012,6 @@ pub fn convert_payment_action(action: &GameAction, id: String) -> PaymentActionC
         GameAction::ActivateAbility {
             source_id,
             ability_index,
-            ..
         } => PaymentActionConversion::Available(PaymentAction {
             id,
             kind: PaymentActionKind::ActivateManaAbility(ActivatableAbilityInfo {
@@ -9219,7 +9217,6 @@ mod tests {
             .act(GameAction::ActivateAbility {
                 source_id: source,
                 ability_index: 0,
-                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             })
             .expect("the activation reaches its election");
         let state = runner.state().clone();

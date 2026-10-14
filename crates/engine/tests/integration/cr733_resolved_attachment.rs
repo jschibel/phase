@@ -56,7 +56,6 @@ fn equip_journals_an_exact_resolved_attachment() {
         .act(GameAction::ActivateAbility {
             source_id: equipment,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("Equip {0} is activatable at sorcery speed with a legal host");
     runner.advance_until_stack_empty();
@@ -185,7 +184,6 @@ fn unattach_journals_a_host_removal_without_a_timestamp_draw() {
         .act(GameAction::ActivateAbility {
             source_id: equipment,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("Equip {0} is activatable at sorcery speed with a legal host");
     runner.advance_until_stack_empty();

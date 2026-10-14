@@ -69,7 +69,6 @@ fn announce_targeted(
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("announce the printed activation");
     let WaitingFor::TargetSelection {

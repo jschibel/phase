@@ -67,7 +67,6 @@ fn xantcha_chooses_entry_controller_before_battlefield_delivery() {
         .act(GameAction::ActivateAbility {
             source_id: xantcha,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("P1 may activate Xantcha from priority");
     runner.advance_until_stack_empty();
@@ -95,7 +94,6 @@ fn xantcha_chooses_entry_controller_before_battlefield_delivery() {
         .act(GameAction::ActivateAbility {
             source_id: xantcha,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("Xantcha activation must reach the stack before priority passes");
 

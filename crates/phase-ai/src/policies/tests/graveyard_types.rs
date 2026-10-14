@@ -198,7 +198,6 @@ fn activate_candidate(source_id: ObjectId, ability_index: usize) -> CandidateAct
         action: GameAction::ActivateAbility {
             source_id,
             ability_index,
-            payment_mode: CastPaymentMode::Auto,
         },
         metadata: ActionMetadata::for_actor(Some(AI), TacticalClass::Ability),
     }

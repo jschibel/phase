@@ -83,7 +83,6 @@ fn ajani_returns_transformed_when_cat_token_sacrificed_to_outlet() {
         .act(GameAction::ActivateAbility {
             source_id: bombardment,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activating Goblin Bombardment must succeed");
 

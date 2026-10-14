@@ -164,7 +164,6 @@ fn ajani_unqualified_loyalty_trigger_uses_production_activation_scope() {
         .act(GameAction::ActivateAbility {
             source_id: ajani,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("Ajani's parsed +1 loyalty ability must activate through apply");
     assert_eq!(
@@ -220,7 +219,6 @@ fn activate_and_target(runner: &mut GameRunner, pw: ObjectId, target: ObjectId) 
         .act(GameAction::ActivateAbility {
             source_id: pw,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activation announced");
 

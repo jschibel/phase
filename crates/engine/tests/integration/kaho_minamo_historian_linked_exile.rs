@@ -151,7 +151,6 @@ fn activate_kaho(runner: &mut GameRunner, kaho: ObjectId) {
         .act(GameAction::ActivateAbility {
             source_id: kaho,
             ability_index,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate Kaho");
     runner

@@ -767,7 +767,6 @@ fn priority_action_is_safe_to_defer_on_own_stack(state: &GameState, action: &Gam
         GameAction::ActivateAbility {
             source_id,
             ability_index,
-            ..
         } => activated_ability_is_safe_to_defer(state, *source_id, *ability_index),
         _ => false,
     }
@@ -779,7 +778,6 @@ fn priority_action_is_safe_to_defer_empty_stack(state: &GameState, action: &Game
         GameAction::ActivateAbility {
             source_id,
             ability_index,
-            ..
         } => empty_stack_activation_is_low_value(state, *source_id, *ability_index),
         _ => false,
     }
@@ -791,7 +789,6 @@ fn priority_action_is_pass_or_mana(state: &GameState, action: &GameAction) -> bo
         GameAction::ActivateAbility {
             source_id,
             ability_index,
-            ..
         } => activated_ability_definition(state, *source_id, *ability_index)
             .is_some_and(engine::game::mana_abilities::is_mana_ability),
         _ => false,
@@ -2741,7 +2738,6 @@ fn priority_action_is_allowed_by_loop_guards(
         GameAction::ActivateAbility {
             source_id,
             ability_index,
-            ..
         } => {
             !state.cancelled_casts.contains(source_id)
                 && !state
@@ -5515,7 +5511,6 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: equip,
                 ability_index: 0,
-                payment_mode: CastPaymentMode::Auto,
             },
         )
         .expect("free equip activation must announce");
@@ -5645,7 +5640,7 @@ mod tests {
         let issued = engine::ai_support::legal_actions(&state);
         assert!(
             issued.iter().any(
-                |a| matches!(a, GameAction::ActivateAbility { source_id, ability_index, .. }
+                |a| matches!(a, GameAction::ActivateAbility { source_id, ability_index }
                     if *source_id == equip && *ability_index == 0)
             ),
             "reach guard: the equip activation must be a legal action at priority"
@@ -5654,7 +5649,6 @@ mod tests {
             action: GameAction::ActivateAbility {
                 source_id: equip,
                 ability_index: 0,
-                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Ability),
         };
@@ -7980,7 +7974,6 @@ mod tests {
         let activation = GameAction::ActivateAbility {
             source_id: cycler,
             ability_index: 0,
-            payment_mode: CastPaymentMode::Auto,
         };
 
         let config = create_config(AiDifficulty::VeryHard, Platform::Native).into_measurement(1);
@@ -8019,7 +8012,6 @@ mod tests {
         let activation = GameAction::ActivateAbility {
             source_id: cycler,
             ability_index: 0,
-            payment_mode: CastPaymentMode::Auto,
         };
 
         let config = create_config(AiDifficulty::VeryHard, Platform::Native).into_measurement(2);
@@ -8057,7 +8049,6 @@ mod tests {
         let activation = GameAction::ActivateAbility {
             source_id: cycler,
             ability_index: 0,
-            payment_mode: CastPaymentMode::Auto,
         };
 
         let mut ai_session = AiSession::empty();
@@ -8782,7 +8773,6 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id,
                 ability_index,
-                payment_mode: CastPaymentMode::Auto,
             },
         ];
 
@@ -8804,7 +8794,6 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id,
                 ability_index,
-                payment_mode: CastPaymentMode::Auto,
             },
         ];
 
@@ -8882,7 +8871,6 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id,
                 ability_index,
-                payment_mode: CastPaymentMode::Auto,
             },
         ];
 
@@ -8911,7 +8899,6 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id,
                 ability_index,
-                payment_mode: CastPaymentMode::Auto,
             },
         ];
 
@@ -8932,7 +8919,6 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id,
                 ability_index,
-                payment_mode: CastPaymentMode::Auto,
             },
         ];
 
@@ -8959,7 +8945,6 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id,
                 ability_index,
-                payment_mode: CastPaymentMode::Auto,
             },
         ];
 
@@ -8985,7 +8970,6 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id,
                 ability_index,
-                payment_mode: CastPaymentMode::Auto,
             },
             GameAction::CastSpell {
                 object_id: spell,
@@ -11009,7 +10993,6 @@ mod tests {
             .act(GameAction::ActivateAbility {
                 source_id: source,
                 ability_index: 0,
-                payment_mode: CastPaymentMode::Auto,
             })
             .expect("the real mana ability opens its colour prompt");
         assert!(matches!(
@@ -11100,7 +11083,6 @@ mod tests {
             .act(GameAction::ActivateAbility {
                 source_id: source,
                 ability_index: 0,
-                payment_mode: CastPaymentMode::Auto,
             })
             .expect("the real mana ability opens its red-first colour prompt");
         assert!(matches!(
@@ -11501,7 +11483,6 @@ mod tests {
             action: GameAction::ActivateAbility {
                 source_id: creature,
                 ability_index: 0,
-                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Ability),
         };
@@ -11520,7 +11501,6 @@ mod tests {
                 GameAction::ActivateAbility {
                     source_id,
                     ability_index,
-                    ..
                 } => {
                     !state.cancelled_casts.contains(source_id)
                         && !state
@@ -11560,7 +11540,6 @@ mod tests {
             action: GameAction::ActivateAbility {
                 source_id: creature,
                 ability_index: 0,
-                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Ability),
         };
@@ -11571,7 +11550,6 @@ mod tests {
                 GameAction::ActivateAbility {
                     source_id,
                     ability_index,
-                    ..
                 } => {
                     !state.cancelled_casts.contains(source_id)
                         && !state
@@ -13954,7 +13932,6 @@ mod tests {
             action: GameAction::ActivateAbility {
                 source_id: ObjectId(99999),
                 ability_index: 0,
-                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Mana),
         };
@@ -17369,7 +17346,6 @@ one on the bottom of your library.";
             action: GameAction::ActivateAbility {
                 source_id: field,
                 ability_index,
-                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Ability),
         };

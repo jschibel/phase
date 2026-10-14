@@ -54,7 +54,6 @@ impl TacticalPolicy for PlusOneCountersPolicy {
             GameAction::ActivateAbility {
                 source_id,
                 ability_index,
-                ..
             } => (*source_id, *ability_index),
             GameAction::CastSpell { object_id, .. } => (*object_id, 0),
             _ => {
@@ -334,7 +333,6 @@ mod tests {
             action: GameAction::ActivateAbility {
                 source_id,
                 ability_index,
-                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             },
             metadata: ActionMetadata::for_actor(Some(AI), TacticalClass::Ability),
         }

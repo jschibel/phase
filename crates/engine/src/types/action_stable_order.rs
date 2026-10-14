@@ -109,12 +109,10 @@ fn cmp_payload(a: &GameAction, b: &GameAction) -> Ordering {
         GameAction::ActivateAbility {
             source_id: a0,
             ability_index: a1,
-            ..
         } => {
             let GameAction::ActivateAbility {
                 source_id: b0,
                 ability_index: b1,
-                ..
             } = b
             else {
                 unreachable!("cmp_payload: same-variant invariant");

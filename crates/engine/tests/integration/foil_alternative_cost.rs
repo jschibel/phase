@@ -281,7 +281,6 @@ fn activated_two_discard_leg_cost_pays_both_legs_or_is_not_offered() {
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index: 0,
-            payment_mode: CastPaymentMode::Auto,
         })
         .expect("activation with enough cards is offered")
         .waiting_for;
@@ -311,8 +310,7 @@ fn activated_two_discard_leg_cost_pays_both_legs_or_is_not_offered() {
     assert!(runner
         .act(GameAction::ActivateAbility {
             source_id: source,
-            ability_index: 0,
-            payment_mode: CastPaymentMode::Auto
+            ability_index: 0
         })
         .is_err());
 }

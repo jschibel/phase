@@ -414,7 +414,6 @@ fn paused_mana_cost_settlement_journals_consumed_occurrences_without_recollectin
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("the mana cost reaches its real replacement choice after its tap prefix");
     assert!(matches!(
@@ -511,7 +510,6 @@ fn paused_sacrifice_cost_settlement_journals_consumed_occurrences_without_recoll
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("the sacrifice-cost activation begins");
     let paused = runner

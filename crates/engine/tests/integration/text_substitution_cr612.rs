@@ -573,7 +573,6 @@ fn mana_symbols_are_not_words_but_the_color_word_is() {
         .act(GameAction::ActivateAbility {
             source_id: monument,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate the mana ability");
     let WaitingFor::ChooseManaColor { choice, .. } = &runner.state().waiting_for else {

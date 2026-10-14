@@ -47,7 +47,6 @@ fn bloodthorn_flail_equip_offers_disjunctive_cost_and_pays_mana_branch() {
         .act(GameAction::ActivateAbility {
             source_id: flail,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("equip activation must be legal when {3} is available");
 
@@ -105,7 +104,6 @@ fn bloodthorn_flail_equip_pays_discard_branch_without_mana_and_attaches() {
         .act(GameAction::ActivateAbility {
             source_id: flail,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("equip activation must be legal when discard is available");
 
@@ -185,7 +183,6 @@ fn bloodthorn_flail_from_card_db_equip_accepts_disjunctive_cost() {
         .act(GameAction::ActivateAbility {
             source_id: flail,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("card-db Bloodthorn Flail equip must be activatable");
 
@@ -232,7 +229,6 @@ fn bloodthorn_flail_from_card_db_equip_accepts_discard_without_mana() {
         .act(GameAction::ActivateAbility {
             source_id: flail,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("card-db Bloodthorn Flail equip must be activatable via discard");
 
@@ -321,7 +317,7 @@ fn bloodthorn_flail_from_card_db_equip_is_legal_action_without_mana() {
             action,
             GameAction::ActivateAbility {
                 source_id,
-                ability_index: 0, ..
+                ability_index: 0,
             } if *source_id == flail
         )),
         "legal actions must offer card-db Bloodthorn Flail equip when discard is affordable"

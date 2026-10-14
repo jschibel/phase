@@ -109,7 +109,6 @@ fn activate_emblem(
         .act(GameAction::ActivateAbility {
             source_id: emblem_id,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activating the Momir emblem must be accepted");
 
@@ -254,7 +253,6 @@ fn momir_emblem_only_once_each_turn() {
     let err = runner.act(GameAction::ActivateAbility {
         source_id: emblem_id,
         ability_index: 0,
-        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
     });
     assert!(
         err.is_err(),
@@ -687,7 +685,6 @@ fn momir_emblem_copying_tribute_creature_runs_entry_chain_and_enters() {
         .act(GameAction::ActivateAbility {
             source_id: emblem_id,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activating the Momir emblem must be accepted");
     events.extend(result.events.iter().cloned());

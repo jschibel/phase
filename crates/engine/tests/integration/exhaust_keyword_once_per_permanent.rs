@@ -133,7 +133,6 @@ fn exhaust_ability_cannot_be_activated_a_second_time() {
     let second = runner.act(GameAction::ActivateAbility {
         source_id: id,
         ability_index: idx,
-        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
     });
     assert!(
         second.is_err(),
@@ -197,7 +196,6 @@ fn x_cost_exhaust_ability_is_also_once_per_permanent() {
     let second = runner.act(GameAction::ActivateAbility {
         source_id: id,
         ability_index: idx,
-        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
     });
     assert!(
         second.is_err(),

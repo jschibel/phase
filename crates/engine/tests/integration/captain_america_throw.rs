@@ -258,7 +258,6 @@ fn throw_resolves_as_activated_ability_not_spell() {
         .act(GameAction::ActivateAbility {
             source_id: cap,
             ability_index: idx,
-            payment_mode: CastPaymentMode::Auto,
         })
         .expect("activate Throw");
 
@@ -366,7 +365,6 @@ fn chosen_equipment_mana_value_drives_damage() {
             .act(GameAction::ActivateAbility {
                 source_id: cap,
                 ability_index: idx,
-                payment_mode: CastPaymentMode::Auto,
             })
             .expect("activate Throw");
         runner
@@ -439,7 +437,6 @@ fn unpayable_when_mana_value_below_target_count() {
         .act(GameAction::ActivateAbility {
             source_id: cap,
             ability_index: idx,
-            payment_mode: CastPaymentMode::Auto,
         })
         .expect("activate Throw");
     // Announce TWO targets: division requires the MV to be at least 2.
@@ -485,7 +482,6 @@ fn throw_unpayable_with_insufficient_mana() {
         .act(GameAction::ActivateAbility {
             source_id: cap,
             ability_index: idx,
-            payment_mode: CastPaymentMode::Auto,
         })
         .expect("activate Throw");
     // One target — MV-3 Equipment covers the division, so the unattach leg is

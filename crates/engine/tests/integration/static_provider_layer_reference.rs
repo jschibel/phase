@@ -143,7 +143,6 @@ fn march_animation_updates_marvins_live_activated_ability_providers() {
         .act(GameAction::ActivateAbility {
             source_id: marvin,
             ability_index: *ability_index,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("Marvin must activate Sol Ring's donated mana ability");
     assert!(runner.state().objects[&marvin].tapped);

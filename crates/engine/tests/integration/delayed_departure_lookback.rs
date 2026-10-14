@@ -1086,7 +1086,6 @@ fn counter_threshold_activation_upper_bound_uses_exact_total() {
         !legal_actions(runner.state()).contains(&GameAction::ActivateAbility {
             source_id: artifact,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto
         }),
         "u32::MAX + 1 counters exceeds the upper bound"
     );
@@ -1096,7 +1095,6 @@ fn counter_threshold_activation_upper_bound_uses_exact_total() {
         legal_actions(runner.state()).contains(&GameAction::ActivateAbility {
             source_id: artifact,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto
         }),
         "exactly u32::MAX counters satisfies the upper bound"
     );

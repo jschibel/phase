@@ -339,7 +339,6 @@ fn announce_riptide(runner: &mut GameRunner, source: ObjectId, target: ObjectId)
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate exact Riptide");
     choose(runner, TargetRef::Object(target));
@@ -391,7 +390,6 @@ fn riptide_forced_retarget_uses_magnitude_slot_legality() {
             .act(GameAction::ActivateAbility {
                 source_id: spellskite,
                 ability_index: 0,
-                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             })
             .expect("activate exact Spellskite");
         let WaitingFor::PhyrexianPayment { player, shards, .. } = &runner.state().waiting_for
@@ -863,7 +861,6 @@ fn companion_player_recheck_ignores_a_later_triggers_damage_batch() {
         .act(GameAction::ActivateAbility {
             source_id: pyromancer,
             ability_index: 0,
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activate Pyromancer");
     choose(&mut runner, TargetRef::Player(P1));

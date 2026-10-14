@@ -182,7 +182,6 @@ fn tchaka_monarch_activation_gated_on_owning_commander() {
             .act(GameAction::ActivateAbility {
                 source_id: tchaka,
                 ability_index: 0,
-                payment_mode: engine::types::game_state::CastPaymentMode::Auto
             })
             .is_err(),
         "the apply path must also reject activation with only a stolen commander"
@@ -216,7 +215,6 @@ fn tchaka_monarch_activation_gated_on_owning_commander() {
             .act(GameAction::ActivateAbility {
                 source_id: tchaka,
                 ability_index: 0,
-                payment_mode: engine::types::game_state::CastPaymentMode::Auto
             })
             .is_err(),
         "the apply path must also reject activation with the commander in the command zone"

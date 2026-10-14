@@ -29,7 +29,6 @@ fn offered_indices(runner: &GameRunner, id: ObjectId) -> Vec<usize> {
             GameAction::ActivateAbility {
                 source_id,
                 ability_index,
-                ..
             } if *source_id == id => Some(*ability_index),
             _ => None,
         })

@@ -185,7 +185,6 @@ impl<'a> PolicyContext<'a> {
             GameAction::ActivateAbility {
                 ability_index,
                 source_id,
-                ..
             } => {
                 return self
                     .state
@@ -627,7 +626,6 @@ mod tests {
                 ability_cost: None,
                 activation_cost_snapshot: None,
                 unavailable_modes: Vec::new(),
-                activation_payment_mode: CastPaymentMode::Auto,
             },
             candidates: Vec::new(),
         };
@@ -758,7 +756,6 @@ mod tests {
             action: GameAction::ActivateAbility {
                 source_id,
                 ability_index: 0,
-                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Ability),
         };
@@ -788,7 +785,6 @@ mod tests {
                 ability_cost: None,
                 activation_cost_snapshot: None,
                 unavailable_modes: Vec::new(),
-                activation_payment_mode: CastPaymentMode::Auto,
             },
             candidates: Vec::new(),
         };
