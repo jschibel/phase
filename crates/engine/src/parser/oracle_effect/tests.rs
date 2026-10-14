@@ -80554,8 +80554,9 @@ fn repeat_directive_is_the_ungated_tail_of_its_gated_clause() {
 }
 
 /// CR 608.2c fail closed: a directive whose parent is ungated would loop until a
-/// zone runs dry, so it is dropped (and with it the root loop); the same sentence
-/// behind an outer "if" keeps both. Hand-built chains cover the non-tail case.
+/// zone runs dry, so it is replaced by an `Unimplemented` gap (and no root loop is
+/// stamped); the same sentence behind an outer "if" keeps the directive and the
+/// loop. Hand-built chains cover the non-tail case.
 #[test]
 fn repeat_directive_without_a_gate_or_with_successors_is_removed() {
     let ungated = parse_effect_chain("Draw a card and repeat this process.", AbilityKind::Spell);
@@ -80570,6 +80571,14 @@ fn repeat_directive_without_a_gate_or_with_successors_is_removed() {
         "{ungated:?}"
     );
     assert!(ungated.repeat_until.is_none(), "{ungated:?}");
+    // The dropped directive leaves an honest gap, not a clean supported parse.
+    assert!(
+        collect_chain_effects(&ungated).iter().any(|e| {
+            matches!(e, Effect::Unimplemented { .. })
+                && e.unimplemented_description() == Some("repeat this process")
+        }),
+        "{ungated:?}"
+    );
 
     let gated = parse_effect_chain(
         "If you control a land, draw a card and repeat this process.",
@@ -80610,14 +80619,22 @@ fn repeat_directive_without_a_gate_or_with_successors_is_removed() {
     // Gated parent, directive is the tail: survives.
     let mut tail = step().condition(gate.clone()).sub_ability(directive());
     assert!(bind_repeat_directives(&mut tail));
-    // A directive with a successor is not a tail: removed, the successor stays linked.
+    // A directive with a successor is not a tail: replaced by an honest gap in its
+    // position, the successor stays linked.
     let mut mid = step()
         .condition(gate)
         .sub_ability(directive().sub_ability(step()));
     assert!(!bind_repeat_directives(&mut mid));
+    assert!(mid.repeat_until.is_none(), "{mid:?}");
     let chain = collect_chain_effects(&mid);
-    assert_eq!(chain.len(), 2, "{mid:?}");
+    assert_eq!(chain.len(), 3, "{mid:?}");
     assert!(!chain.iter().any(|e| e.is_repeat_directive()), "{mid:?}");
+    assert!(
+        matches!(chain[1], Effect::Unimplemented { .. })
+            && chain[1].unimplemented_description() == Some("repeat this process"),
+        "{mid:?}"
+    );
+    assert!(matches!(chain[2], Effect::Shuffle { .. }), "{mid:?}");
 }
 
 /// CR 608.2c: the `Bare` arm of the repeat-directive recognizer fires only for the

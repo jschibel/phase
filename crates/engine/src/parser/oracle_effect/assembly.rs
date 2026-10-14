@@ -4369,9 +4369,10 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
 /// A directive is meaningful only as the TAIL child of a GATED clause: the gate
 /// is what decides whether the process repeats, and a gated sub is skipped
 /// together with its continuation children. An ungated parent or a directive
-/// with successors cannot express that, so the directive is removed (fail
-/// closed) rather than left to loop until a zone runs dry. Validation lives at
-/// assembly because an outer "if" scope is applied after the nested body parse.
+/// with successors cannot express that, so the directive is replaced by an
+/// `Effect::unimplemented` gap (fail closed: no loop is stamped, and coverage
+/// stays honest) rather than left to loop until a zone runs dry. Validation lives
+/// at assembly because an outer "if" scope is applied after the nested body parse.
 pub(super) fn bind_repeat_directives(root: &mut AbilityDefinition) -> bool {
     let mut survives = false;
     let mut node = root;
@@ -4381,12 +4382,12 @@ pub(super) fn bind_repeat_directives(root: &mut AbilityDefinition) -> bool {
             sub.effect.is_repeat_directive() && (!gated || sub.sub_ability.is_some())
         });
         if invalid {
-            // Splice the invalid directive out, keeping its successors linked.
-            let tail = node
-                .sub_ability
-                .take()
-                .and_then(|mut sub| sub.sub_ability.take());
-            node.sub_ability = tail;
+            // Replace the invalid directive in place with an honest gap, keeping
+            // its position and successors linked: the clause must not read as a
+            // clean supported parse with its "repeat this process" dropped.
+            if let Some(sub) = node.sub_ability.as_deref_mut() {
+                *sub.effect = super::gap_diagnosis::clause_gap_unimplemented("repeat this process");
+            }
             continue;
         }
         if node
