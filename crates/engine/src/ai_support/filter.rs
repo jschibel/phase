@@ -351,6 +351,7 @@ fn structurally_valid_priority_activation(state: &GameState, action: &GameAction
         GameAction::ActivateAbility {
             source_id,
             ability_index,
+            ..
         },
     ) = (&state.waiting_for, action)
     else {
@@ -1413,6 +1414,7 @@ fn legality_equivalence_key(
         GameAction::ActivateAbility {
             source_id,
             ability_index,
+            ..
         } => {
             if poison.has_activation {
                 return None;
@@ -2275,10 +2277,12 @@ mod tests {
             cand(GameAction::ActivateAbility {
                 source_id: a,
                 ability_index: 0,
+                payment_mode: CastPaymentMode::Auto,
             }),
             cand(GameAction::ActivateAbility {
                 source_id: b,
                 ability_index: 0,
+                payment_mode: CastPaymentMode::Auto,
             }),
         ];
         crate::game::perf_counters::reset();
@@ -2324,10 +2328,12 @@ mod tests {
             cand(GameAction::ActivateAbility {
                 source_id: a,
                 ability_index: 0,
+                payment_mode: CastPaymentMode::Auto,
             }),
             cand(GameAction::ActivateAbility {
                 source_id: b,
                 ability_index: 0,
+                payment_mode: CastPaymentMode::Auto,
             }),
         ];
         crate::game::perf_counters::reset();
@@ -2412,6 +2418,7 @@ mod tests {
             &GameAction::ActivateAbility {
                 source_id: a,
                 ability_index: 0,
+                payment_mode: CastPaymentMode::Auto,
             },
             &poison,
             &mut interner,
@@ -2421,6 +2428,7 @@ mod tests {
             &GameAction::ActivateAbility {
                 source_id: b,
                 ability_index: 0,
+                payment_mode: CastPaymentMode::Auto,
             },
             &poison,
             &mut interner,
@@ -2453,6 +2461,7 @@ mod tests {
             &GameAction::ActivateAbility {
                 source_id: a,
                 ability_index: 0,
+                payment_mode: CastPaymentMode::Auto,
             },
             &poison,
             &mut interner,
@@ -2462,6 +2471,7 @@ mod tests {
             &GameAction::ActivateAbility {
                 source_id: b,
                 ability_index: 0,
+                payment_mode: CastPaymentMode::Auto,
             },
             &poison,
             &mut interner,

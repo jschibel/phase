@@ -5874,6 +5874,7 @@ pub(crate) fn finish_activated_ability_at_payment_boundary(
         pending.crime_candidate,
         pending.activation_cost_snapshot.as_deref(),
         pending.activation_cost_committed,
+        pending.payment_mode,
         events,
     )
 }
@@ -6841,6 +6842,9 @@ pub(super) fn push_activated_ability_to_stack(
     // the unpaid suffix keeps that commitment, so the suffix's prompt still
     // refuses a cancel.
     activation_cost_committed: bool,
+    // CR 602.2b + CR 601.2g-h: the activation's payment mode, likewise handed
+    // to every root this function rebuilds.
+    payment_mode: CastPaymentMode,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     super::casting::require_locked_activation_cost(
@@ -6866,6 +6870,7 @@ pub(super) fn push_activated_ability_to_stack(
                     ManaCost::NoCost,
                     ability_index,
                     carrier(),
+                    payment_mode,
                 );
                 pending.activation_residual = activation_residual;
                 pending.activation_cost = remaining_cost.cloned();
@@ -6975,6 +6980,7 @@ pub(super) fn push_activated_ability_to_stack(
             ManaCost::NoCost,
             ability_index,
             carrier(),
+            payment_mode,
         );
         pending_interactive.activation_cost = Some(cost.clone());
         if recognized_count {
@@ -7028,6 +7034,7 @@ pub(super) fn push_activated_ability_to_stack(
                 target_selection,
                 carrier(),
                 activation_trigger_collection.clone(),
+                payment_mode,
             ));
         }
         // CR 606.3: A `[−X]` loyalty ability is modeled as a chosen-X removal of
@@ -7070,6 +7077,7 @@ pub(super) fn push_activated_ability_to_stack(
                 ManaCost::NoCost,
                 ability_index,
                 carrier(),
+                payment_mode,
             );
             pending.activation_cost = remaining_cost;
             pending.pending_loyalty_activation_player = should_record_loyalty
@@ -16612,6 +16620,7 @@ pub fn finalize_mana_payment_with_phyrexian_choices(
                 pending.crime_candidate,
                 pending.activation_cost_snapshot.as_deref(),
                 pending.activation_cost_committed,
+                pending.payment_mode,
                 events,
             );
         }
@@ -22878,6 +22887,7 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: treasure,
                 ability_index: 0,
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .expect("activation succeeds");
@@ -23015,6 +23025,7 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: treasure,
                 ability_index: 0,
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .expect("activation succeeds");
@@ -25671,6 +25682,7 @@ battlefield, then shuffle.";
                 .act(GameAction::ActivateAbility {
                     source_id: island,
                     ability_index: 0,
+                    payment_mode: CastPaymentMode::Auto,
                 })
                 .expect("tapping an Island for {U} must be accepted");
         }
@@ -26001,6 +26013,7 @@ battlefield, then shuffle.";
             .act(GameAction::ActivateAbility {
                 source_id: island,
                 ability_index: 0,
+                payment_mode: CastPaymentMode::Auto,
             })
             .expect("tapping the Island for {U} must be accepted");
         // Pay the {2} generic by Convoke-tapping the 2 dorks.
@@ -28422,6 +28435,7 @@ its replicate cost was paid.)\nDraw a card.";
             false,
             None,
             false,
+            CastPaymentMode::Auto,
             &mut events,
         )
         .expect("concrete Count sacrifice must reach payment");
@@ -28540,6 +28554,7 @@ its replicate cost was paid.)\nDraw a card.";
                 false,
                 None,
                 false,
+                CastPaymentMode::Auto,
                 &mut events,
             );
             assert!(matches!(
@@ -28819,6 +28834,7 @@ its replicate cost was paid.)\nDraw a card.";
                     false,
                     None,
                     false,
+                    CastPaymentMode::Auto,
                     &mut events,
                 )
             }));
@@ -28943,6 +28959,7 @@ its replicate cost was paid.)\nDraw a card.";
                     false,
                     None,
                     false,
+                    CastPaymentMode::Auto,
                     &mut events,
                 )
             }));
@@ -29040,6 +29057,7 @@ its replicate cost was paid.)\nDraw a card.";
                     false,
                     None,
                     false,
+                    CastPaymentMode::Auto,
                     &mut Vec::new(),
                 )
                 .unwrap();
@@ -29206,6 +29224,7 @@ its replicate cost was paid.)\nDraw a card.";
                 false,
                 None,
                 false,
+                CastPaymentMode::Auto,
                 &mut Vec::new(),
             )
             .expect("unsettled defensive root must request targets");
@@ -29327,6 +29346,7 @@ its replicate cost was paid.)\nDraw a card.";
                         false,
                         None,
                         false,
+                        CastPaymentMode::Auto,
                         &mut events,
                     )
                 };
@@ -29479,6 +29499,7 @@ its replicate cost was paid.)\nDraw a card.";
                 false,
                 None,
                 false,
+                CastPaymentMode::Auto,
                 &mut Vec::new(),
             )
             .expect("non-X defensive target root");
@@ -29540,6 +29561,7 @@ its replicate cost was paid.)\nDraw a card.";
             false,
             None,
             false,
+            CastPaymentMode::Auto,
             &mut events,
         )
         .expect("direct activation root must enter target selection");
@@ -30825,6 +30847,7 @@ its replicate cost was paid.)\nDraw a card.";
                 .act(GameAction::ActivateAbility {
                     source_id: board.source,
                     ability_index: index,
+                    payment_mode: CastPaymentMode::Auto,
                 })
                 .expect("the activation is legal");
             while matches!(

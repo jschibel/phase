@@ -110,6 +110,7 @@ fn activate(r: &mut GameRunner, source: ObjectId) -> WaitingFor {
         GameAction::ActivateAbility {
             source_id: source,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
 }
@@ -876,4 +877,554 @@ fn guard_mana_ability_sacrifice_is_not_an_announcement() {
     );
     assert_eq!(stack_triggers_from(&r, zulaport), 1);
     assert_eq!(stack_triggers_from(&r, construct), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Manual payment: the window between the announcement's prompts
+// ---------------------------------------------------------------------------
+//
+// CR 602.2b + CR 601.2g: a Manual activation stops in `ManaPayment` for its
+// mana leg. Every row below has its Auto reference on the same board, derived
+// from the card text: the prompts and the trigger set are the same, and the
+// window is the only difference. The cards are all printed cards. Where the
+// window falls follows the engine's order for the announcement: a non-self
+// sacrifice is removed LAST (CR 601.2g puts mana first), so its window comes
+// before the sacrifice prompt and a cancel there is accepted; a discard is paid
+// FIRST, so its window comes after the discard prompt and a cancel there is
+// refused (a paid cost is committed; see the cancel rows above).
+
+fn real_activate(r: &mut GameRunner, source: ObjectId, mode: CastPaymentMode) -> WaitingFor {
+    let (_, _, grouped) = engine::ai_support::legal_actions_full(r.state());
+    let ability_index = grouped
+        .get(&source)
+        .into_iter()
+        .flatten()
+        .find_map(|action| match action {
+            GameAction::ActivateAbility { ability_index, .. } => Some(*ability_index),
+            _ => None,
+        })
+        .expect("the source's non-mana ability is offered");
+    act(
+        r,
+        GameAction::ActivateAbility {
+            source_id: source,
+            ability_index,
+            payment_mode: mode,
+        },
+    )
+}
+
+fn tap_land(r: &mut GameRunner, land: ObjectId) {
+    let (_, _, grouped) = engine::ai_support::legal_actions_full(r.state());
+    let selection = grouped
+        .get(&land)
+        .into_iter()
+        .flatten()
+        .find_map(|action| match action {
+            GameAction::TapLandForMana { selection } => Some(selection.clone()),
+            _ => None,
+        })
+        .expect("the land's mana ability is offered while paying");
+    act(r, GameAction::TapLandForMana { selection });
+}
+
+fn is_tapped(r: &GameRunner, id: ObjectId) -> bool {
+    r.state().objects[&id].tapped
+}
+
+fn in_zone(r: &GameRunner, id: ObjectId, zone: Zone) -> bool {
+    r.state().objects[&id].zone == zone
+}
+
+fn is_window(wf: &WaitingFor) -> bool {
+    matches!(wf, WaitingFor::ManaPayment { player, .. } if *player == P0)
+}
+
+fn is_cost_prompt(wf: &WaitingFor, kind: engine::types::game_state::PayCostKind) -> bool {
+    matches!(wf, WaitingFor::PayCost { kind: k, .. } if *k == kind)
+}
+
+fn add_card(scenario: &mut GameScenario, owner: PlayerId, name: &str, zone: Zone) -> ObjectId {
+    let db = shared_card_db().expect("card db");
+    scenario.add_real_card(owner, name, zone, db)
+}
+
+fn valiant_counters(r: &GameRunner, id: ObjectId) -> u32 {
+    r.state().objects[&id]
+        .counters
+        .get(&engine::types::counter::CounterType::Plus1Plus1)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Shidako, Broodmistress ("{G}, Sacrifice a creature: Target creature gets
+/// +3/+3 until end of turn."), aimed at Heartfire Hero (Valiant), with Grizzly
+/// Bears as the fodder, Crackdown Construct, Zulaport Cutthroat and two
+/// Forests.
+struct ShidakoBoard {
+    r: GameRunner,
+    shidako: ObjectId,
+    hero: ObjectId,
+    bears: ObjectId,
+    construct: ObjectId,
+    zulaport: ObjectId,
+    forest_a: ObjectId,
+    forest_b: ObjectId,
+}
+
+fn shidako_board() -> ShidakoBoard {
+    let mut scenario = board(2);
+    let shidako = add_card(
+        &mut scenario,
+        P0,
+        "Shidako, Broodmistress",
+        Zone::Battlefield,
+    );
+    let hero = add_card(&mut scenario, P0, "Heartfire Hero", Zone::Battlefield);
+    let bears = add_card(&mut scenario, P0, "Grizzly Bears", Zone::Battlefield);
+    let construct = add_card(&mut scenario, P0, "Crackdown Construct", Zone::Battlefield);
+    let zulaport = add_card(&mut scenario, P0, "Zulaport Cutthroat", Zone::Battlefield);
+    let forest_a = add_card(&mut scenario, P0, "Forest", Zone::Battlefield);
+    let forest_b = add_card(&mut scenario, P0, "Forest", Zone::Battlefield);
+    ShidakoBoard {
+        r: build(scenario),
+        shidako,
+        hero,
+        bears,
+        construct,
+        zulaport,
+        forest_a,
+        forest_b,
+    }
+}
+
+fn aim_at(r: &mut GameRunner, target: ObjectId) -> WaitingFor {
+    act(
+        r,
+        GameAction::SelectTargets {
+            targets: vec![TargetRef::Object(target)],
+        },
+    )
+}
+
+/// Auto reference of M-V5: the lone {G} is choice-free, so the target is
+/// followed by the sacrifice prompt and its batch.
+#[test]
+fn m_v5_auto_reference_targeted_sacrifice_batch() {
+    use engine::types::game_state::PayCostKind;
+    let mut b = shidako_board();
+    let wf = real_activate(&mut b.r, b.shidako, CastPaymentMode::Auto);
+    assert!(matches!(wf, WaitingFor::TargetSelection { .. }), "{wf:?}");
+    let wf = aim_at(&mut b.r, b.hero);
+    assert!(is_cost_prompt(&wf, PayCostKind::Sacrifice), "{wf:?}");
+    assert!(in_zone(&b.r, b.bears, Zone::Battlefield));
+    let wf = select_cards(&mut b.r, vec![b.bears]);
+    assert_eq!(
+        prompt_sources(&wf, P0),
+        sorted(vec![b.hero, b.construct, b.zulaport])
+    );
+    order_in_listed_order(&mut b.r);
+    assert_eq!(stack(&b.r)[0], (Kind::Activated, b.shidako, P0));
+    assert_eq!(b.r.state().stack.len(), 4);
+}
+
+/// M-V5, Manual: the window comes after the target and before the sacrifice
+/// (CR 601.2g: mana first, removal last). The fodder is still on the
+/// battlefield and nothing is on the stack at the window (CR 603.3: the valiant
+/// trigger waits for the activation to finish); the trigger set is the Auto
+/// reference's, each trigger once.
+#[test]
+fn m_v5_manual_targeted_sacrifice_window_precedes_the_removal() {
+    use engine::types::game_state::PayCostKind;
+    let mut b = shidako_board();
+    real_activate(&mut b.r, b.shidako, CastPaymentMode::Manual);
+    let wf = aim_at(&mut b.r, b.hero);
+    assert!(is_window(&wf), "{wf:?}");
+    assert!(
+        in_zone(&b.r, b.bears, Zone::Battlefield),
+        "removal comes last"
+    );
+    assert!(b.r.state().stack.is_empty(), "CR 603.3");
+    assert!(!is_tapped(&b.r, b.forest_a) && !is_tapped(&b.r, b.forest_b));
+
+    tap_land(&mut b.r, b.forest_a);
+    let wf = act(&mut b.r, GameAction::PassPriority);
+    assert!(is_cost_prompt(&wf, PayCostKind::Sacrifice), "{wf:?}");
+    let wf = select_cards(&mut b.r, vec![b.bears]);
+    assert_eq!(
+        prompt_sources(&wf, P0),
+        sorted(vec![b.hero, b.construct, b.zulaport]),
+        "valiant, Construct and Zulaport in one batch"
+    );
+    order_in_listed_order(&mut b.r);
+    assert_eq!(stack(&b.r)[0], (Kind::Activated, b.shidako, P0));
+    assert_eq!(
+        b.r.state().stack.len(),
+        4,
+        "the activation and three triggers"
+    );
+    for source in [b.hero, b.construct, b.zulaport] {
+        assert_eq!(stack_triggers_from(&b.r, source), 1, "{source:?} once");
+    }
+    assert!(in_zone(&b.r, b.bears, Zone::Graveyard));
+    assert!(is_tapped(&b.r, b.forest_a) && !is_tapped(&b.r, b.forest_b));
+}
+
+/// M-V5c: nothing is paid at the window, so the cancel is accepted and the
+/// activation, its staged valiant trigger and its triggers vanish (CR 733.1);
+/// doing it again fires valiant once, not twice.
+#[test]
+fn m_v5_manual_cancel_at_the_window_is_accepted_and_triggers_nothing() {
+    use engine::types::game_state::PayCostKind;
+    let mut b = shidako_board();
+    real_activate(&mut b.r, b.shidako, CastPaymentMode::Manual);
+    let wf = aim_at(&mut b.r, b.hero);
+    assert!(is_window(&wf), "{wf:?}");
+
+    let wf = act(&mut b.r, GameAction::CancelCast);
+    assert!(matches!(wf, WaitingFor::Priority { .. }), "{wf:?}");
+    assert!(in_zone(&b.r, b.bears, Zone::Battlefield));
+    assert!(b.r.state().stack.is_empty());
+    assert_eq!(valiant_counters(&b.r, b.hero), 0);
+    b.r.advance_until_stack_empty();
+    assert_eq!(
+        valiant_counters(&b.r, b.hero),
+        0,
+        "no trigger was left behind"
+    );
+
+    real_activate(&mut b.r, b.shidako, CastPaymentMode::Manual);
+    aim_at(&mut b.r, b.hero);
+    tap_land(&mut b.r, b.forest_a);
+    let wf = act(&mut b.r, GameAction::PassPriority);
+    assert!(is_cost_prompt(&wf, PayCostKind::Sacrifice), "{wf:?}");
+    let wf = select_cards(&mut b.r, vec![b.bears]);
+    assert_eq!(
+        prompt_sources(&wf, P0),
+        sorted(vec![b.hero, b.construct, b.zulaport]),
+        "valiant fires once after the undone attempt"
+    );
+}
+
+/// Transmogrant Altar's second ability ("{2}, {T}, Sacrifice a creature: Create
+/// a 3/3 colorless Zombie artifact creature token. Activate only as a
+/// sorcery."), its first being a mana ability. Crackdown Construct (the Altar is
+/// an artifact), Zulaport Cutthroat and Drake Haven watch; two Mountains and
+/// Sol Ring pay.
+struct AltarBoard {
+    r: GameRunner,
+    altar: ObjectId,
+    bears: ObjectId,
+    construct: ObjectId,
+    zulaport: ObjectId,
+    haven: ObjectId,
+    mountains: [ObjectId; 2],
+    sol_ring: ObjectId,
+}
+
+fn altar_board() -> AltarBoard {
+    let mut scenario = board(2);
+    let altar = add_card(&mut scenario, P0, "Transmogrant Altar", Zone::Battlefield);
+    let bears = add_card(&mut scenario, P0, "Grizzly Bears", Zone::Battlefield);
+    let mountains = [
+        add_card(&mut scenario, P0, "Mountain", Zone::Battlefield),
+        add_card(&mut scenario, P0, "Mountain", Zone::Battlefield),
+    ];
+    let sol_ring = add_card(&mut scenario, P0, "Sol Ring", Zone::Battlefield);
+    let construct = add_card(&mut scenario, P0, "Crackdown Construct", Zone::Battlefield);
+    let zulaport = add_card(&mut scenario, P0, "Zulaport Cutthroat", Zone::Battlefield);
+    let haven = add_card(&mut scenario, P0, "Drake Haven", Zone::Battlefield);
+    AltarBoard {
+        r: build(scenario),
+        altar,
+        bears,
+        construct,
+        zulaport,
+        haven,
+        mountains,
+        sol_ring,
+    }
+}
+
+/// Auto reference of M-S2: the sacrifice is the only prompt.
+#[test]
+fn m_s2_auto_reference_untargeted_sacrifice_batch() {
+    use engine::types::game_state::PayCostKind;
+    let mut b = altar_board();
+    let wf = real_activate(&mut b.r, b.altar, CastPaymentMode::Auto);
+    assert!(is_cost_prompt(&wf, PayCostKind::Sacrifice), "{wf:?}");
+    let wf = select_cards(&mut b.r, vec![b.bears]);
+    assert_eq!(
+        prompt_sources(&wf, P0),
+        sorted(vec![b.construct, b.zulaport])
+    );
+    order_in_listed_order(&mut b.r);
+    assert_eq!(b.r.state().stack.len(), 3);
+}
+
+/// M-S2, Manual: the CR 601.2g mana-first hoist puts the window before the
+/// sacrifice; the batch is Construct and Zulaport, once each, and Drake Haven
+/// (nothing was discarded) is absent. Sol Ring, which alone could pay {2},
+/// stays untapped.
+#[test]
+fn m_s2_manual_untargeted_sacrifice_window_comes_first() {
+    use engine::types::game_state::PayCostKind;
+    let mut b = altar_board();
+    let wf = real_activate(&mut b.r, b.altar, CastPaymentMode::Manual);
+    assert!(is_window(&wf), "{wf:?}");
+    assert!(
+        in_zone(&b.r, b.bears, Zone::Battlefield),
+        "removal comes last"
+    );
+    assert!(!is_tapped(&b.r, b.altar), "{{T}} is paid after the window");
+    assert!(b.r.state().stack.is_empty());
+
+    for mountain in b.mountains {
+        tap_land(&mut b.r, mountain);
+    }
+    let wf = act(&mut b.r, GameAction::PassPriority);
+    assert!(is_cost_prompt(&wf, PayCostKind::Sacrifice), "{wf:?}");
+    let wf = select_cards(&mut b.r, vec![b.bears]);
+    assert_eq!(
+        prompt_sources(&wf, P0),
+        sorted(vec![b.construct, b.zulaport]),
+        "Haven is absent: nothing was discarded"
+    );
+    order_in_listed_order(&mut b.r);
+    assert_eq!(stack(&b.r)[0], (Kind::Activated, b.altar, P0));
+    assert_eq!(
+        b.r.state().stack.len(),
+        3,
+        "the activation and two triggers"
+    );
+    assert_eq!(stack_triggers_from(&b.r, b.construct), 1);
+    assert_eq!(stack_triggers_from(&b.r, b.zulaport), 1);
+    assert_eq!(stack_triggers_from(&b.r, b.haven), 0);
+    assert!(!is_tapped(&b.r, b.sol_ring), "Sol Ring was not used to pay");
+    assert!(is_tapped(&b.r, b.altar));
+}
+
+/// M-S2, Manual cancel: nothing was paid at the window (the Altar's {T} comes
+/// after it), so the cancel is accepted and leaves no trigger behind.
+#[test]
+fn m_s2_manual_cancel_at_the_window_is_accepted() {
+    let mut b = altar_board();
+    let wf = real_activate(&mut b.r, b.altar, CastPaymentMode::Manual);
+    assert!(is_window(&wf), "{wf:?}");
+
+    let wf = act(&mut b.r, GameAction::CancelCast);
+    assert!(matches!(wf, WaitingFor::Priority { .. }), "{wf:?}");
+    assert!(in_zone(&b.r, b.bears, Zone::Battlefield));
+    assert!(!is_tapped(&b.r, b.altar));
+    assert!(b.r.state().stack.is_empty());
+
+    // Redone, the batch holds each trigger once.
+    real_activate(&mut b.r, b.altar, CastPaymentMode::Manual);
+    for mountain in b.mountains {
+        tap_land(&mut b.r, mountain);
+    }
+    act(&mut b.r, GameAction::PassPriority);
+    let wf = select_cards(&mut b.r, vec![b.bears]);
+    assert_eq!(
+        prompt_sources(&wf, P0),
+        sorted(vec![b.construct, b.zulaport])
+    );
+}
+
+/// Mindless Automaton ("This creature enters with two +1/+1 counters on it.
+/// {1}, Discard a card: Put a +1/+1 counter on this creature."), Grizzly Bears
+/// in hand, two Islands, Drake Haven, Crackdown Construct and Zulaport
+/// Cutthroat.
+struct AutomatonBoard {
+    r: GameRunner,
+    automaton: ObjectId,
+    bears: ObjectId,
+    haven: ObjectId,
+    construct: ObjectId,
+    zulaport: ObjectId,
+    islands: [ObjectId; 2],
+}
+
+fn automaton_board() -> AutomatonBoard {
+    let mut scenario = board(2);
+    let automaton = add_card(&mut scenario, P0, "Mindless Automaton", Zone::Battlefield);
+    let bears = add_card(&mut scenario, P0, "Grizzly Bears", Zone::Hand);
+    let islands = [
+        add_card(&mut scenario, P0, "Island", Zone::Battlefield),
+        add_card(&mut scenario, P0, "Island", Zone::Battlefield),
+    ];
+    let haven = add_card(&mut scenario, P0, "Drake Haven", Zone::Battlefield);
+    let construct = add_card(&mut scenario, P0, "Crackdown Construct", Zone::Battlefield);
+    let zulaport = add_card(&mut scenario, P0, "Zulaport Cutthroat", Zone::Battlefield);
+    let r = build(scenario);
+    // Setup precondition: a 0/0 would die to state-based actions.
+    assert!(in_zone(&r, automaton, Zone::Battlefield));
+    assert_eq!(valiant_counters(&r, automaton), 2);
+    AutomatonBoard {
+        r,
+        automaton,
+        bears,
+        haven,
+        construct,
+        zulaport,
+        islands,
+    }
+}
+
+/// Auto reference of M-D1: the discard is the only prompt, and its batch is
+/// Drake Haven and Crackdown Construct.
+#[test]
+fn m_d1_auto_reference_untargeted_discard_batch() {
+    use engine::types::game_state::PayCostKind;
+    let mut b = automaton_board();
+    let wf = real_activate(&mut b.r, b.automaton, CastPaymentMode::Auto);
+    assert!(is_cost_prompt(&wf, PayCostKind::Discard), "{wf:?}");
+    let wf = select_cards(&mut b.r, vec![b.bears]);
+    assert_eq!(prompt_sources(&wf, P0), sorted(vec![b.haven, b.construct]));
+    order_in_listed_order(&mut b.r);
+    assert_eq!(b.r.state().stack.len(), 3);
+}
+
+/// M-D1, Manual: the discard is paid BEFORE the window (the engine's order for
+/// a discard, as for a spell, V25), so the window follows the discard prompt,
+/// the cost is committed and the cancel is refused with the prompt kept and
+/// Drake Haven's trigger still staged.
+#[test]
+fn m_d1_manual_untargeted_discard_is_paid_before_the_window() {
+    use engine::types::game_state::PayCostKind;
+    let mut b = automaton_board();
+    let wf = real_activate(&mut b.r, b.automaton, CastPaymentMode::Manual);
+    assert!(is_cost_prompt(&wf, PayCostKind::Discard), "{wf:?}");
+    let window = select_cards(&mut b.r, vec![b.bears]);
+    assert!(is_window(&window), "{window:?}");
+    assert!(
+        in_zone(&b.r, b.bears, Zone::Graveyard),
+        "the discard is paid"
+    );
+    assert!(b.r.state().stack.is_empty());
+
+    let refused = b.r.act(GameAction::CancelCast);
+    assert!(refused.is_err(), "a paid cost is committed: cancel refused");
+    assert_eq!(b.r.state().waiting_for, window, "the prompt is preserved");
+
+    tap_land(&mut b.r, b.islands[1]);
+    let wf = act(&mut b.r, GameAction::PassPriority);
+    assert_eq!(
+        prompt_sources(&wf, P0),
+        sorted(vec![b.haven, b.construct]),
+        "Haven's staged trigger joined the batch; Zulaport is absent"
+    );
+    order_in_listed_order(&mut b.r);
+    assert_eq!(stack(&b.r)[0], (Kind::Activated, b.automaton, P0));
+    assert_eq!(
+        b.r.state().stack.len(),
+        3,
+        "the activation and two triggers"
+    );
+    assert_eq!(stack_triggers_from(&b.r, b.haven), 1);
+    assert_eq!(stack_triggers_from(&b.r, b.construct), 1);
+    assert_eq!(stack_triggers_from(&b.r, b.zulaport), 0);
+    assert!(!is_tapped(&b.r, b.islands[0]) && is_tapped(&b.r, b.islands[1]));
+}
+
+/// Deepwood Drummer ("{G}, {T}, Discard a card: Target creature gets +2/+2
+/// until end of turn."), Grizzly Bears in hand, a Forest, Heartfire Hero as the
+/// target, Drake Haven, Crackdown Construct and Zulaport Cutthroat.
+struct DrummerBoard {
+    r: GameRunner,
+    drummer: ObjectId,
+    hero: ObjectId,
+    bears: ObjectId,
+    haven: ObjectId,
+    construct: ObjectId,
+    zulaport: ObjectId,
+    forest: ObjectId,
+}
+
+fn drummer_board() -> DrummerBoard {
+    let mut scenario = board(2);
+    let drummer = add_card(&mut scenario, P0, "Deepwood Drummer", Zone::Battlefield);
+    let bears = add_card(&mut scenario, P0, "Grizzly Bears", Zone::Hand);
+    let hero = add_card(&mut scenario, P0, "Heartfire Hero", Zone::Battlefield);
+    let forest = add_card(&mut scenario, P0, "Forest", Zone::Battlefield);
+    let haven = add_card(&mut scenario, P0, "Drake Haven", Zone::Battlefield);
+    let construct = add_card(&mut scenario, P0, "Crackdown Construct", Zone::Battlefield);
+    let zulaport = add_card(&mut scenario, P0, "Zulaport Cutthroat", Zone::Battlefield);
+    DrummerBoard {
+        r: build(scenario),
+        drummer,
+        hero,
+        bears,
+        haven,
+        construct,
+        zulaport,
+        forest,
+    }
+}
+
+/// Auto reference of M-D2: target, then the discard; the batch is valiant,
+/// Haven and Construct.
+#[test]
+fn m_d2_auto_reference_targeted_discard_batch() {
+    use engine::types::game_state::PayCostKind;
+    let mut b = drummer_board();
+    let wf = real_activate(&mut b.r, b.drummer, CastPaymentMode::Auto);
+    assert!(matches!(wf, WaitingFor::TargetSelection { .. }), "{wf:?}");
+    let wf = aim_at(&mut b.r, b.hero);
+    assert!(is_cost_prompt(&wf, PayCostKind::Discard), "{wf:?}");
+    let wf = select_cards(&mut b.r, vec![b.bears]);
+    assert_eq!(
+        prompt_sources(&wf, P0),
+        sorted(vec![b.hero, b.haven, b.construct])
+    );
+    order_in_listed_order(&mut b.r);
+    assert_eq!(b.r.state().stack.len(), 4);
+}
+
+/// M-D2, Manual: target, discard, then the window with Drummer still untapped
+/// ({T} is paid with the mana), a refused cancel keeping all three staged
+/// triggers, and the batch {valiant, Haven, Construct} once each.
+#[test]
+fn m_d2_manual_targeted_discard_is_paid_before_the_window() {
+    use engine::types::game_state::PayCostKind;
+    let mut b = drummer_board();
+    real_activate(&mut b.r, b.drummer, CastPaymentMode::Manual);
+    let wf = aim_at(&mut b.r, b.hero);
+    assert!(is_cost_prompt(&wf, PayCostKind::Discard), "{wf:?}");
+    let window = select_cards(&mut b.r, vec![b.bears]);
+    assert!(is_window(&window), "{window:?}");
+    assert!(in_zone(&b.r, b.bears, Zone::Graveyard));
+    assert!(
+        !is_tapped(&b.r, b.drummer),
+        "Drummer is untapped at the window"
+    );
+    assert!(!is_tapped(&b.r, b.forest));
+    assert!(b.r.state().stack.is_empty());
+
+    let refused = b.r.act(GameAction::CancelCast);
+    assert!(refused.is_err(), "a paid cost is committed: cancel refused");
+    assert_eq!(b.r.state().waiting_for, window, "the prompt is preserved");
+
+    tap_land(&mut b.r, b.forest);
+    let wf = act(&mut b.r, GameAction::PassPriority);
+    assert_eq!(
+        prompt_sources(&wf, P0),
+        sorted(vec![b.hero, b.haven, b.construct]),
+        "valiant, Haven and Construct; Zulaport is absent"
+    );
+    order_in_listed_order(&mut b.r);
+    assert_eq!(stack(&b.r)[0], (Kind::Activated, b.drummer, P0));
+    assert_eq!(
+        b.r.state().stack.len(),
+        4,
+        "the activation and three triggers"
+    );
+    for source in [b.hero, b.haven, b.construct] {
+        assert_eq!(stack_triggers_from(&b.r, source), 1, "{source:?} once");
+    }
+    assert_eq!(stack_triggers_from(&b.r, b.zulaport), 0);
+    assert!(
+        is_tapped(&b.r, b.drummer),
+        "{{T}} was paid after the window"
+    );
 }
