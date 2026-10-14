@@ -210,6 +210,10 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 134 — The "repeat this process" directive adds two serialized tags to ability
+ *      trees: `RuntimeHandler::RepeatProcess` and
+ *      `EffectOutcomeSignal::RepeatDirectiveReached`; a v133 peer cannot parse
+ *      either. Wire 116 moves with it; no lobby frame names them.
  * 133 — GameEvent::CreatureExerted gains origin (attack cost or activated-ability
  *      cost) and an optional player (who exerted), carried in GameState's trigger
  *      events (a stack trigger's trigger_event, pending_attack_trigger_events) —
@@ -842,7 +846,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 133;
+export const PROTOCOL_VERSION = 134;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

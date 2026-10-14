@@ -96,11 +96,11 @@ describe("openPhaseSocket", () => {
   it("resolves with serverInfo once ServerHello arrives and sends ClientHello", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
-    ws.deliverMessage(helloFrame({ protocol_version: 133 }));
+    ws.deliverMessage(helloFrame({ protocol_version: 134 }));
 
     const socket = await promise;
     expect(socket.serverInfo.mode).toBe("Full");
-    expect(socket.serverInfo.protocolVersion).toBe(133);
+    expect(socket.serverInfo.protocolVersion).toBe(134);
     expect(ws.send).toHaveBeenCalledWith(
       expect.stringContaining('"type":"ClientHello"'),
     );
@@ -283,6 +283,17 @@ describe("openPhaseSocket", () => {
     ws.deliverMessage(helloFrame({ protocol_version: PROTOCOL_VERSION + 1 }));
 
     await expect(promise).rejects.toBeInstanceOf(HandshakeError);
+    expect(ws.close).toHaveBeenCalled();
+  });
+
+  it("rejects Full v133 before it can read the repeat-process directive tags", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: 133 }));
+
+    await expect(promise).rejects.toMatchObject({
+      kind: "protocol_mismatch",
+    });
     expect(ws.close).toHaveBeenCalled();
   });
 

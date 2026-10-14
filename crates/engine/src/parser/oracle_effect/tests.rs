@@ -18,8 +18,8 @@ use crate::types::ability::{
     AbilityUseTally, ActivationRestriction, AttachSelection, AttachmentKind, CardSelectionMode,
     CastCostModifier, CastManaObjectScope, CastManaSpentMetric, CommanderOwnership, CountBinding,
     CounterTransferMode, DigRestOrder, ExcessRecipient, ForEachCategoryAction,
-    MassLibraryShuffleMode, ModalChoice, PerpetualModification, PileSource, SeatDirection,
-    TurnJournalKind, VoteTally, VoteVisibility, VoterScope,
+    MassLibraryShuffleMode, ModalChoice, PerpetualModification, PileSource, RepeatContinuation,
+    RuntimeHandler, SeatDirection, TurnJournalKind, VoteTally, VoteVisibility, VoterScope,
 };
 use crate::types::card::CardFace;
 use crate::types::card_type::CoreType;
@@ -80369,8 +80369,10 @@ fn repeat_process_directive_unconditional_cap_is_a_counted_repeat() {
 }
 
 /// Paired negative reach guard for the counted form above: a conditional cap keeps
-/// its loop predicate, and an uncapped directive stays consume-only, so neither is
-/// silently promoted to an unconditional fixed repeat.
+/// its loop predicate, and neither the bare directive nor "any number of times" is
+/// promoted to an unconditional fixed repeat. The bare directive is the structural
+/// `Bare` outcome (CR 608.2c: reached through its clause's gate); "any number of
+/// times" and "if you do" stay consume-only; "you may" stays the controller's choice.
 #[test]
 fn repeat_process_directive_conditional_or_uncapped_is_not_a_counted_repeat() {
     let mut ctx = ParseContext::default();
@@ -80381,9 +80383,13 @@ fn repeat_process_directive_conditional_or_uncapped_is_not_a_counted_repeat() {
         ),
         Some(RepeatProcessOutcome::Continuation(_))
     ));
+    assert!(matches!(
+        try_parse_repeat_process_directive("repeat this process", &mut ctx),
+        Some(RepeatProcessOutcome::Bare)
+    ));
     for text in [
-        "repeat this process",
         "repeat this process any number of times",
+        "if you do, repeat this process",
     ] {
         assert!(
             matches!(
@@ -80393,6 +80399,303 @@ fn repeat_process_directive_conditional_or_uncapped_is_not_a_counted_repeat() {
             "{text}"
         );
     }
+    assert!(matches!(
+        try_parse_repeat_process_directive("you may repeat this process", &mut ctx),
+        Some(RepeatProcessOutcome::Continuation(
+            RepeatContinuation::ControllerChoice
+        ))
+    ));
+}
+
+/// CR 608.2c: the splitter cuts only the terminal bare directive, so counted /
+/// open-ended / "for <X>" tails are not newly split into their own clause.
+#[test]
+fn bare_and_splitter_cuts_only_the_terminal_repeat_directive() {
+    use super::sequence::starts_bare_and_clause;
+    assert!(
+        starts_bare_and_clause("draw a card"),
+        "reach guard: the splitter works"
+    );
+    for text in ["repeat this process.", "repeat this process"] {
+        assert!(starts_bare_and_clause(text), "{text}");
+    }
+    for text in [
+        "repeat this process for first strike",
+        "repeat this process once",
+        "repeat this process any number of times",
+    ] {
+        assert!(!starts_bare_and_clause(text), "{text}");
+    }
+}
+
+fn repeat_directive_chains(
+    text: &str,
+    name: &str,
+    types: &[&str],
+    subtypes: &[&str],
+) -> Vec<AbilityDefinition> {
+    let types: Vec<String> = types.iter().map(|s| s.to_string()).collect();
+    let subtypes: Vec<String> = subtypes.iter().map(|s| s.to_string()).collect();
+    let parsed = parse_oracle_text(text, name, &[], &types, &subtypes);
+    let bodies = parsed.abilities.iter().cloned().chain(
+        parsed
+            .triggers
+            .iter()
+            .filter_map(|t| t.execute.as_deref().cloned()),
+    );
+    bodies
+        .filter(|def| {
+            collect_chain_effects(def)
+                .iter()
+                .any(|e| e.is_repeat_directive())
+        })
+        .collect()
+}
+
+fn repeat_directive_loop() -> RepeatContinuation {
+    RepeatContinuation::WhileCondition {
+        condition: Box::new(AbilityCondition::EffectOutcome {
+            signal: EffectOutcomeSignal::RepeatDirectiveReached,
+        }),
+        max_iterations: None,
+    }
+}
+
+const TAMIYO_ORACLE: &str = "I, II, III \u{2014} Mill two cards. If two cards that share a card type were milled this way, draw a card and repeat this process.";
+
+/// CR 608.2c: "If C, do A and repeat this process" parses to A gated by C with the
+/// repeat directive as A's ungated tail child, and the root loops on the directive
+/// being reached. Verbatim Oracle text; no `Unimplemented` remains.
+#[test]
+fn repeat_directive_is_the_ungated_tail_of_its_gated_clause() {
+    struct Card {
+        text: &'static str,
+        name: &'static str,
+        types: &'static [&'static str],
+        subtypes: &'static [&'static str],
+        bodies: usize,
+    }
+    let cards = [
+        Card {
+            text: "+1: Create a 1/1 black and green Insect creature token, then mill a card. If an Insect card was milled this way, put a loyalty counter on Grist and repeat this process.",
+            name: "Grist, the Hunger Tide",
+            types: &["Planeswalker"],
+            subtypes: &["Grist"],
+            bodies: 1,
+        },
+        Card {
+            text: "When this creature enters, you may put a land card from your hand onto the battlefield tapped. If you do, draw a card and repeat this process.",
+            name: "Cultivator Colossus",
+            types: &["Creature"],
+            subtypes: &["Plant", "Wall"],
+            bodies: 1,
+        },
+        Card {
+            text: "At the beginning of your upkeep, reveal the top card of your library. If it's a land card, put it into your graveyard and repeat this process.",
+            name: "Countryside Crusher",
+            types: &["Creature"],
+            subtypes: &["Giant", "Warrior"],
+            bodies: 1,
+        },
+        Card {
+            text: TAMIYO_ORACLE,
+            name: "The Tale of Tamiyo",
+            types: &["Enchantment"],
+            subtypes: &["Saga"],
+            bodies: 3,
+        },
+    ];
+    for Card {
+        text,
+        name,
+        types,
+        subtypes,
+        bodies: expected,
+    } in cards
+    {
+        let chains = repeat_directive_chains(text, name, types, subtypes);
+        assert_eq!(
+            chains.len(),
+            expected,
+            "{name}: bodies carrying the directive"
+        );
+        for def in &chains {
+            let effects = collect_chain_effects(def);
+            assert!(
+                !effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::Unimplemented { .. })),
+                "{name}: {def:?}"
+            );
+            assert!(
+                effects.last().is_some_and(|e| e.is_repeat_directive()),
+                "{name}: the directive is the tail"
+            );
+            let mut node = def;
+            while node
+                .sub_ability
+                .as_ref()
+                .is_some_and(|sub| !sub.effect.is_repeat_directive())
+            {
+                node = node.sub_ability.as_deref().unwrap();
+            }
+            let directive_def = node.sub_ability.as_deref().expect("directive node");
+            assert!(
+                directive_def.condition.is_none(),
+                "{name}: the directive is ungated"
+            );
+            assert!(
+                node.condition.is_some(),
+                "{name}: its parent carries the gate"
+            );
+            assert_eq!(def.repeat_until, Some(repeat_directive_loop()), "{name}");
+        }
+    }
+}
+
+/// CR 608.2c fail closed: a directive whose parent is ungated would loop until a
+/// zone runs dry, so it is dropped (and with it the root loop); the same sentence
+/// behind an outer "if" keeps both. Hand-built chains cover the non-tail case.
+#[test]
+fn repeat_directive_without_a_gate_or_with_successors_is_removed() {
+    let ungated = parse_effect_chain("Draw a card and repeat this process.", AbilityKind::Spell);
+    assert!(
+        matches!(*ungated.effect, Effect::Draw { .. }),
+        "reach guard: the Draw parsed: {ungated:?}"
+    );
+    assert!(
+        !collect_chain_effects(&ungated)
+            .iter()
+            .any(|e| e.is_repeat_directive()),
+        "{ungated:?}"
+    );
+    assert!(ungated.repeat_until.is_none(), "{ungated:?}");
+
+    let gated = parse_effect_chain(
+        "If you control a land, draw a card and repeat this process.",
+        AbilityKind::Spell,
+    );
+    assert!(
+        collect_chain_effects(&gated)
+            .iter()
+            .any(|e| e.is_repeat_directive()),
+        "{gated:?}"
+    );
+    assert_eq!(
+        gated.repeat_until,
+        Some(repeat_directive_loop()),
+        "{gated:?}"
+    );
+
+    use super::assembly::bind_repeat_directives;
+    let directive = || {
+        AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::RuntimeHandled {
+                handler: RuntimeHandler::RepeatProcess,
+            },
+        )
+    };
+    let step = || {
+        AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Shuffle {
+                target: TargetFilter::Controller,
+            },
+        )
+    };
+    let gate = AbilityCondition::EffectOutcome {
+        signal: EffectOutcomeSignal::OptionalEffectPerformed,
+    };
+    // Gated parent, directive is the tail: survives.
+    let mut tail = step().condition(gate.clone()).sub_ability(directive());
+    assert!(bind_repeat_directives(&mut tail));
+    // A directive with a successor is not a tail: removed, the successor stays linked.
+    let mut mid = step()
+        .condition(gate)
+        .sub_ability(directive().sub_ability(step()));
+    assert!(!bind_repeat_directives(&mut mid));
+    let chain = collect_chain_effects(&mid);
+    assert_eq!(chain.len(), 2, "{mid:?}");
+    assert!(!chain.iter().any(|e| e.is_repeat_directive()), "{mid:?}");
+}
+
+/// CR 701.17c + CR 608.2c: the milled-shared-quality gate is recognized by the
+/// general clause cascade, so The Tale of Tamiyo's draw is conditional, while
+/// Grindstone (whose repeat chunk takes it first) keeps its `WhileCondition` loop.
+#[test]
+fn milled_shared_quality_gate_is_recognized_by_the_general_cascade() {
+    let tamiyo = repeat_directive_chains(
+        TAMIYO_ORACLE,
+        "The Tale of Tamiyo",
+        &["Enchantment"],
+        &["Saga"],
+    );
+    let def = tamiyo.first().expect("a chapter body");
+    let draw = collect_chain_effects(def)
+        .into_iter()
+        .position(|e| matches!(e, Effect::Draw { .. }))
+        .expect("the draw");
+    let mut node = def;
+    for _ in 0..draw {
+        node = node.sub_ability.as_deref().unwrap();
+    }
+    assert!(
+        matches!(node.condition, Some(AbilityCondition::QuantityCheck { .. })),
+        "{node:?}"
+    );
+    let grindstone = parse_oracle_text(
+        "{3}, {T}: Target player mills two cards. If two cards that share a color were milled this way, repeat this process.",
+        "Grindstone",
+        &[],
+        &["Artifact".to_string()],
+        &[],
+    );
+    assert!(
+        matches!(
+            grindstone.abilities.first().map(|a| a.repeat_until.clone()),
+            Some(Some(RepeatContinuation::WhileCondition { .. }))
+        ),
+        "{grindstone:?}"
+    );
+}
+
+/// The new wire tags round-trip, and the new transient state slot serializes only
+/// while set (every serialized state is byte-identical while it is false).
+#[test]
+fn repeat_directive_wire_shapes_round_trip() {
+    let effect = Effect::RuntimeHandled {
+        handler: RuntimeHandler::RepeatProcess,
+    };
+    let json = serde_json::to_string(&effect).unwrap();
+    assert_eq!(serde_json::from_str::<Effect>(&json).unwrap(), effect);
+    let signal = AbilityCondition::EffectOutcome {
+        signal: EffectOutcomeSignal::RepeatDirectiveReached,
+    };
+    let json = serde_json::to_string(&signal).unwrap();
+    assert_eq!(
+        serde_json::from_str::<AbilityCondition>(&json).unwrap(),
+        signal
+    );
+
+    let mut state = crate::types::game_state::GameState::new_two_player(42);
+    let value = serde_json::to_value(&state).unwrap();
+    assert!(
+        value.get("repeat_process_requested").is_none(),
+        "a default state omits the slot"
+    );
+    state.repeat_process_requested = true;
+    let mut value = serde_json::to_value(&state).unwrap();
+    assert_eq!(value["repeat_process_requested"], serde_json::json!(true));
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("repeat_process_requested");
+    let restored: crate::types::game_state::GameState = serde_json::from_value(value).unwrap();
+    assert!(
+        !restored.repeat_process_requested,
+        "a payload without it reads false"
+    );
 }
 
 /// A multi-clause process is never stamped on the root: the runtime repeats only

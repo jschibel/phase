@@ -148,7 +148,9 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +61: v132 moves the owed final part of a paused spell onto the resolution carrier
 //      (`GameState.resolving_spell_final_part`; `deferred_spell_delivery` removed).
 // +62: v133 adds `GameEvent::CreatureExerted.origin`/`.player` (CR 701.43) to GameState's trigger events.
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 62;
+// +63: v134 adds the RuntimeHandler::RepeatProcess and
+//      EffectOutcomeSignal::RepeatDirectiveReached tags (the repeat directive).
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 63;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
@@ -238,7 +240,8 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 // +59: wire 113 moves with full-game v131 for TargetFilter::AttackedPlayerOrPlaneswalker.
 // +60: wire 114 moves with full-game v132 for the carrier-owned final-part marker.
 // +61: wire 115 moves with full-game v133 for `CreatureExerted.origin`/`.player`.
-const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 61;
+// +62: wire 116 moves with full-game v134 for the repeat-process directive tags.
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 62;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse

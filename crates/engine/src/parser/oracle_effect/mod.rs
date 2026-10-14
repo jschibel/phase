@@ -1338,6 +1338,11 @@ fn merge_clause_conditions(
 }
 
 fn apply_outer_condition_to_clause(outer: &AbilityCondition, clause: &mut ClauseIr) {
+    // CR 608.2c: the repeat directive takes no condition of its own; it is
+    // reached through the gate on the clause it trails.
+    if clause.parsed.effect.is_repeat_directive() {
+        return;
+    }
     let inner = clause
         .condition
         .take()
@@ -38213,14 +38218,21 @@ fn try_parse_repeat_until_stop_conditions(
 ///   `repeat_for` root together with its own unless-payment / player-scope gate,
 ///   while a following sentence is an independent sibling that runs once after the
 ///   loop. A multi-clause process therefore keeps the consume-only outcome.
-/// - `ConsumeOnly` — the bare / "if you do" form (Primal Surge) is recognized so
-///   the directive is consumed rather than producing an `Unimplemented` gap, but
-///   it sets no predicate (its game-state-predicate semantics stay deferred).
+/// - `Bare` — the unconditional, uncapped directive with no "if you do" and no
+///   cap token ("If an Insect card was milled this way, put a loyalty counter on
+///   Grist and repeat this process"). The chunk loop emits the structural
+///   repeat-directive node when the directive trails a comma-joined clause, so
+///   it is reached only through that clause's gate (CR 608.2c).
+/// - `ConsumeOnly` — the "if you do" form (Primal Surge) and "any number of
+///   times" are recognized so the directive is consumed rather than producing an
+///   `Unimplemented` gap, but they set no predicate (their game-state-predicate
+///   semantics stay deferred).
 #[derive(Debug)]
 enum RepeatProcessOutcome {
     Continuation(crate::types::ability::RepeatContinuation),
     FixedCount(QuantityExpr),
     CappedRepeat(QuantityExpr),
+    Bare,
     ConsumeOnly,
 }
 
@@ -38305,13 +38317,25 @@ fn try_parse_repeat_process_directive(
             value(None, tag(" any number of times")),
         )))
         .parse(i)?;
+        // `cap_token` distinguishes "no cap token" (`None`) from "any number of
+        // times" (`Some(None)`): only the former is the `Bare` directive.
+        let cap_token = cap.is_some();
         let cap = cap.flatten();
         let (i, _) = opt(tag(".")).parse(i)?;
         eof(i)?;
-        Ok((i, (cap, you_may.is_some(), if_you_do.is_some(), more_times)))
+        Ok((
+            i,
+            (
+                cap,
+                cap_token,
+                you_may.is_some(),
+                if_you_do.is_some(),
+                more_times,
+            ),
+        ))
     })?;
 
-    let (cap, you_may, if_you_do, more_times) = parsed_directive;
+    let (cap, cap_token, you_may, if_you_do, more_times) = parsed_directive;
     if let Some(condition) = condition {
         return Some(RepeatProcessOutcome::Continuation(
             RepeatContinuation::WhileCondition {
@@ -38344,6 +38368,10 @@ fn try_parse_repeat_process_directive(
             }),
             offset: 1,
         }));
+    }
+    // CR 608.2c: the unconditional, uncapped directive without "if you do".
+    if !if_you_do && !cap_token {
+        return Some(RepeatProcessOutcome::Bare);
     }
     Some(RepeatProcessOutcome::ConsumeOnly)
 }
@@ -41383,6 +41411,32 @@ fn parse_effect_chain_ir_body(
                                     "repeat_process_multi_clause",
                                     normalized_text.to_string(),
                                 )),
+                                chunk.boundary_after,
+                                ClauseDisposition::Emit {
+                                    followup: None,
+                                    intrinsic: None,
+                                },
+                            )
+                            .push();
+                    }
+                }
+                // CR 608.2c: "<A> and repeat this process" — the " and " split
+                // inside one sentence (previous clause bounded by a comma) makes
+                // the directive a tail child of A's clause, so it is reached
+                // only when A's gate held. After a sentence break it stays
+                // consume-only, as before.
+                RepeatProcessOutcome::Bare => {
+                    if builder
+                        .clauses()
+                        .last()
+                        .is_some_and(|c| c.boundary == Some(ClauseBoundary::Comma))
+                    {
+                        builder
+                            .clause(
+                                normalized_text,
+                                parsed_clause(Effect::RuntimeHandled {
+                                    handler: crate::types::ability::RuntimeHandler::RepeatProcess,
+                                }),
                                 chunk.boundary_after,
                                 ClauseDisposition::Emit {
                                     followup: None,

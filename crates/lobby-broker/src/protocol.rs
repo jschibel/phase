@@ -60,6 +60,13 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
+/// 134 — The "repeat this process" directive of "If C, do A and repeat this
+///      process" (CR 608.2c) is two new serialized tags in ability trees:
+///      `RuntimeHandler::RepeatProcess` (an `Effect::RuntimeHandled` node) and
+///      `EffectOutcomeSignal::RepeatDirectiveReached` (the loop predicate on
+///      the chain root). A v133 peer cannot parse either. Full-game peers and
+///      P2P move in lockstep (wire 116); no lobby carrier names them.
+///
 /// 133 — CR 701.43: `GameEvent::CreatureExerted` gains `origin` (attack cost
 ///      or activated-ability cost) and an optional `player` (who exerted),
 ///      carried in `GameState`'s trigger events (a stack trigger's
@@ -1036,7 +1043,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 133;
+pub const PROTOCOL_VERSION: u32 = 134;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2293,12 +2300,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 133);
+        assert_eq!(PROTOCOL_VERSION, 134);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 132);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 133);
     }
 
     #[test]

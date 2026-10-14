@@ -3346,6 +3346,11 @@ mod tests {
         }
     }
 
+    /// v134: the "repeat this process" directive adds two serialized tags to
+    /// ability trees, `RuntimeHandler::RepeatProcess` and
+    /// `EffectOutcomeSignal::RepeatDirectiveReached` (CR 608.2c); a v133 peer
+    /// cannot parse either, so it must be refused before it receives v134 state.
+    ///
     /// v133: CR 701.43 `GameEvent::CreatureExerted` gains `origin` and an
     /// optional `player`, carried in a stack trigger's `trigger_event` and in
     /// `pending_attack_trigger_events` inside `GameState`; a v132 peer drops
@@ -3529,8 +3534,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_133_for_exert_origin() {
-        assert_eq!(PROTOCOL_VERSION, 133);
+    fn protocol_version_is_134_for_repeat_process_directive() {
+        assert_eq!(PROTOCOL_VERSION, 134);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3541,7 +3546,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_133_for_exert_origin` stays
+    /// `protocol_version_is_134_for_repeat_process_directive` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
