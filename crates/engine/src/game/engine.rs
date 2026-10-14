@@ -1970,6 +1970,10 @@ fn recover_ownerless_post_replacement_completion_at_priority_boundary(
         // CR 608.2n: a carrier still owing its spell's final part is live work
         // for the ordinary drain, not a stale rest.
         || super::stack::resolving_spell_owes_final_part(state)
+        // CR 608.2n: an instant or sorcery still on the stack has not made its
+        // move to the graveyard; settling its carrier would strand it in the
+        // stack zone, so the shape is not a stale rest.
+        || super::stack::resolving_instant_or_sorcery_on_stack(state).is_some()
     {
         return false;
     }
@@ -2001,6 +2005,10 @@ fn is_orphaned_devour_completion_at_priority_boundary(state: &GameState) -> bool
         // CR 608.2n: a carrier still owing its spell's final part is live work
         // for the final part's authority, not a terminal rest.
         && !super::stack::resolving_spell_owes_final_part(state)
+        // CR 608.2n: an instant or sorcery still on the stack has not made its
+        // move to the graveyard; settling its carrier would strand it in the
+        // stack zone, so the frame is not a terminal rest.
+        && super::stack::resolving_instant_or_sorcery_on_stack(state).is_none()
 }
 
 fn is_orphaned_spell_resolution_at_priority_boundary(state: &GameState) -> bool {
