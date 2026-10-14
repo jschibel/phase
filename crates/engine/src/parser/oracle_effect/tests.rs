@@ -80620,6 +80620,120 @@ fn repeat_directive_without_a_gate_or_with_successors_is_removed() {
     assert!(!chain.iter().any(|e| e.is_repeat_directive()), "{mid:?}");
 }
 
+/// CR 608.2c: the `Bare` arm of the repeat-directive recognizer fires only for the
+/// comma-joined form ("..., put a loyalty counter on this planeswalker and repeat this
+/// process"), whose directive trails the gate of its own clause. The same instruction
+/// followed by an own-sentence "Repeat this process." stays as it was: no directive and
+/// no root loop (and no `Unimplemented`), rather than looping on an earlier gate.
+#[test]
+fn bare_repeat_directive_needs_the_comma_joined_form() {
+    let comma = parse_effect_chain(
+        "Mill a card. If an Insect card was milled this way, put a loyalty counter on this planeswalker and repeat this process.",
+        AbilityKind::Spell,
+    );
+    assert!(
+        collect_chain_effects(&comma)
+            .iter()
+            .any(|e| e.is_repeat_directive()),
+        "reach guard: the comma form carries the directive: {comma:?}"
+    );
+    assert_eq!(
+        comma.repeat_until,
+        Some(repeat_directive_loop()),
+        "{comma:?}"
+    );
+
+    let own_sentence = parse_effect_chain(
+        "Mill a card. If an Insect card was milled this way, put a loyalty counter on this planeswalker. Repeat this process.",
+        AbilityKind::Spell,
+    );
+    let effects = collect_chain_effects(&own_sentence);
+    assert!(
+        effects.len() > 1,
+        "reach guard: the gated clause parsed: {own_sentence:?}"
+    );
+    assert!(
+        !effects.iter().any(|e| e.is_repeat_directive()),
+        "{own_sentence:?}"
+    );
+    assert!(own_sentence.repeat_until.is_none(), "{own_sentence:?}");
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::Unimplemented { .. })),
+        "{own_sentence:?}"
+    );
+}
+
+/// CR 608.2c preservation: neighbouring "repeat this process" cards whose shape is not
+/// the gated comma-joined one keep parsing without a repeat directive and without a
+/// root `RepeatDirectiveReached` loop, exactly as at the phase base (pinned MTGJSON
+/// Oracle text; no `Unimplemented` count is asserted).
+#[test]
+fn neighbouring_repeat_this_process_cards_gain_no_directive() {
+    let cards: [(&str, &str, &[&str], &[&str]); 5] = [
+        (
+            "Crooked Scales",
+            "{4}, {T}: Flip a coin. If you win the flip, destroy target creature an opponent controls. If you lose the flip, destroy target creature you control unless you pay {3} and repeat this process.",
+            &["Artifact"],
+            &[],
+        ),
+        (
+            "Primal Surge",
+            "Exile the top card of your library. If it's a permanent card, you may put it onto the battlefield. If you do, repeat this process.",
+            &["Sorcery"],
+            &[],
+        ),
+        (
+            "Insatiable Frugivore",
+            "When this creature enters, create a Food token, then you may exile three cards from your graveyard. If you do, repeat this process.
+{3}{B}, Sacrifice X Foods: Creatures you control get +X/+0 and gain menace until end of turn.",
+            &["Creature"],
+            &["Rat", "Berserker"],
+        ),
+        (
+            "Sphinx's Tutelage",
+            "Whenever you draw a card, target opponent mills two cards. If two nonland cards that share a color were milled this way, repeat this process.
+{5}{U}: Draw a card, then discard a card.",
+            &["Enchantment"],
+            &[],
+        ),
+        (
+            "Demonic Covenant",
+            "Whenever one or more Demons you control attack a player, you draw a card and lose 1 life.
+At the beginning of your end step, create a 5/5 black Demon creature token with flying, then mill two cards. If two cards that share all their card types were milled this way, sacrifice this enchantment.",
+            &["Kindred", "Enchantment"],
+            &["Demon"],
+        ),
+    ];
+    for (name, text, types, subtypes) in cards {
+        let types: Vec<String> = types.iter().map(|s| s.to_string()).collect();
+        let subtypes: Vec<String> = subtypes.iter().map(|s| s.to_string()).collect();
+        let parsed = parse_oracle_text(text, name, &[], &types, &subtypes);
+        let bodies: Vec<AbilityDefinition> = parsed
+            .abilities
+            .iter()
+            .cloned()
+            .chain(
+                parsed
+                    .triggers
+                    .iter()
+                    .filter_map(|t| t.execute.as_deref().cloned()),
+            )
+            .collect();
+        assert!(!bodies.is_empty(), "{name}: reach guard: parsed bodies");
+        for def in &bodies {
+            assert!(
+                !collect_chain_effects(def)
+                    .iter()
+                    .any(|e| e.is_repeat_directive()),
+                "{name}: {def:?}"
+            );
+            assert_ne!(def.repeat_until, Some(repeat_directive_loop()), "{name}");
+        }
+    }
+}
+
 /// CR 701.17c + CR 608.2c: the milled-shared-quality gate is recognized by the
 /// general clause cascade, so The Tale of Tamiyo's draw is conditional, while
 /// Grindstone (whose repeat chunk takes it first) keeps its `WhileCondition` loop.
