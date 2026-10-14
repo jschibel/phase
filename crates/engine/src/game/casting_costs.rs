@@ -3783,12 +3783,26 @@ pub(crate) fn settle_sacrifice_for_cost_events(
             &events[..current_end],
             current_start,
         );
+        // CR 603.7b: the retained fragment's delayed observers are scanned here,
+        // once, because no later scan can reach it: the stack push scans only the
+        // current action buffer, and the ordinary claim below is
+        // `OrdinaryCollectorsOnly`, so the CURRENT fragment's delayed scan is
+        // left to that push (scanning it here too would double-fire a
+        // repeating delayed trigger). The context joins the deferred queue the
+        // push commits the collection into, so it is one batch (CR 603.3b).
+        let carried_for_delayed = carried_cost_events.clone();
         let group: Vec<GameEvent> = carried_cost_events
             .into_iter()
             .chain(current_cost_events)
             .collect();
         if !group.is_empty() {
             collection.collect(state, &group);
+        }
+        if !carried_for_delayed.is_empty() {
+            crate::game::triggers::collect_delayed_trigger_contexts_into_deferred(
+                state,
+                &carried_for_delayed,
+            );
         }
         super::announcement_triggers::claim_ordinary_collected_span(
             state,
@@ -5857,6 +5871,7 @@ pub(crate) fn finish_activated_ability_at_payment_boundary(
         pending.activation_trigger_collection.clone(),
         pending.crime_candidate,
         pending.activation_cost_snapshot.as_deref(),
+        pending.activation_cost_committed,
         events,
     )
 }
@@ -6819,6 +6834,10 @@ pub(super) fn push_activated_ability_to_stack(
     // CR 601.2f + CR 602.2b: the activation's cost-modifier carrier, handed to
     // every root this function rebuilds.
     activation_cost_snapshot: Option<&crate::types::casting_costs::ActivationCostSnapshot>,
+    // CR 601.2h + CR 602.2b: whether a component of this activation's cost is
+    // already paid. Every root this function rebuilds for the unpaid suffix
+    // keeps that commitment, so the suffix's prompt still refuses a cancel.
+    activation_cost_committed: bool,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     super::casting::require_locked_activation_cost(
@@ -6849,6 +6868,9 @@ pub(super) fn push_activated_ability_to_stack(
                 pending.activation_cost = remaining_cost.cloned();
                 pending.pending_loyalty_activation_player = pending_loyalty_activation_player;
                 pending.activation_trigger_collection = activation_trigger_collection.clone();
+                if activation_cost_committed {
+                    pending.mark_activation_cost_committed();
+                }
                 pending
             };
 
@@ -6959,6 +6981,9 @@ pub(super) fn push_activated_ability_to_stack(
         pending_interactive.pending_loyalty_activation_player = pending_loyalty_activation_player;
         pending_interactive.activation_target_selection = target_selection;
         pending_interactive.activation_trigger_collection = activation_trigger_collection.clone();
+        if activation_cost_committed {
+            pending_interactive.mark_activation_cost_committed();
+        }
         if let Some(waiting_for) = surface_next_unpaid_interactive_activation_cost(
             state,
             player,
@@ -7049,6 +7074,9 @@ pub(super) fn push_activated_ability_to_stack(
                 .or(pending_loyalty_activation_player);
             pending.activation_target_selection = target_selection;
             pending.activation_trigger_collection = activation_trigger_collection.clone();
+            if activation_cost_committed {
+                pending.mark_activation_cost_committed();
+            }
             if let Some(pending) = attach_pending_cast_to_cost_move(state, Box::new(pending)) {
                 state.pending_cast = Some(pending);
             }
@@ -16580,6 +16608,7 @@ pub fn finalize_mana_payment_with_phyrexian_choices(
                 pending.activation_trigger_collection.clone(),
                 pending.crime_candidate,
                 pending.activation_cost_snapshot.as_deref(),
+                pending.activation_cost_committed,
                 events,
             );
         }
@@ -22486,7 +22515,7 @@ mod tests {
         );
         // CR 602.2a-b + CR 603.3b: an activation's cost events are the action
         // boundary's to stage into the activation's carrier (see
-        // `replacement_resumed_discard_for_cost_parks_triggers_when_mana_payment_remains`,
+        // `replacement_resumed_activation_discard_stages_triggers_into_the_carrier_when_mana_payment_remains`,
         // which crosses that boundary): the handler neither parks nor claims them.
         assert!(state.deferred_triggers.is_empty());
         assert!(state.consumed_before_priority_trigger_events.is_empty());
@@ -28389,6 +28418,7 @@ its replicate cost was paid.)\nDraw a card.";
             None,
             false,
             None,
+            false,
             &mut events,
         )
         .expect("concrete Count sacrifice must reach payment");
@@ -28506,6 +28536,7 @@ its replicate cost was paid.)\nDraw a card.";
                 None,
                 false,
                 None,
+                false,
                 &mut events,
             );
             assert!(matches!(
@@ -28784,6 +28815,7 @@ its replicate cost was paid.)\nDraw a card.";
                     None,
                     false,
                     None,
+                    false,
                     &mut events,
                 )
             }));
@@ -28907,6 +28939,7 @@ its replicate cost was paid.)\nDraw a card.";
                     None,
                     false,
                     None,
+                    false,
                     &mut events,
                 )
             }));
@@ -29003,6 +29036,7 @@ its replicate cost was paid.)\nDraw a card.";
                     None,
                     false,
                     None,
+                    false,
                     &mut Vec::new(),
                 )
                 .unwrap();
@@ -29168,6 +29202,7 @@ its replicate cost was paid.)\nDraw a card.";
                 None,
                 false,
                 None,
+                false,
                 &mut Vec::new(),
             )
             .expect("unsettled defensive root must request targets");
@@ -29288,6 +29323,7 @@ its replicate cost was paid.)\nDraw a card.";
                         None,
                         false,
                         None,
+                        false,
                         &mut events,
                     )
                 };
@@ -29439,6 +29475,7 @@ its replicate cost was paid.)\nDraw a card.";
                 None,
                 false,
                 None,
+                false,
                 &mut Vec::new(),
             )
             .expect("non-X defensive target root");
@@ -29499,6 +29536,7 @@ its replicate cost was paid.)\nDraw a card.";
             None,
             false,
             None,
+            false,
             &mut events,
         )
         .expect("direct activation root must enter target selection");

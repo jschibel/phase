@@ -375,28 +375,81 @@ fn n2b_discard_triggers_exactly_once() {
     }
 }
 
-/// An activation cancelled after its discard was paid (the engine accepts the
-/// cancel at the second cost prompt, and the discarded card stays in the
-/// graveyard): the activation's carrier is dropped whole, so no trigger of the
-/// undone announcement reaches the stack in either shape (CR 733.1). Before the
-/// stand-down an untargeted activation left Drake Haven's trigger on the stack
-/// and a targeted one lost it; both now agree.
+/// CR 601.2h + CR 602.2b: once an activation's discard is paid the cost is
+/// committed. The engine refuses the cancel at the next cost prompt (a paid
+/// cost is not a free undo), the prompt, the discarded card and the discard's
+/// pending trigger all stay, and finishing the sacrifice puts the whole batch on
+/// the stack exactly once (CR 603.2 + CR 603.3b), in either shape. The control
+/// is the cancel BEFORE any payment, which is still accepted and puts nothing
+/// on the stack.
 #[test]
-fn n1_cancel_after_a_paid_discard_drops_the_undone_announcements_triggers() {
+fn n1_cancel_after_a_paid_discard_is_refused_and_keeps_its_triggers() {
     for (text, targeted) in [(TWO_COSTS_TARGETED, true), (TWO_COSTS_UNTARGETED, false)] {
         let mut b = cost_board(text, 2);
         let wf = activate_and_discard(&mut b, targeted);
         // Reach guard: the discard is paid; the sacrifice prompt is pending.
         assert!(matches!(wf, WaitingFor::PayCost { .. }), "{wf:?}");
         assert_eq!(b.r.state().objects[&b.card].zone, Zone::Graveyard);
+
+        let refused = b.r.act(GameAction::CancelCast);
+        assert!(
+            refused.is_err(),
+            "targeted={targeted}: a paid cost is committed, the cancel is refused"
+        );
+        assert_eq!(
+            b.r.state().waiting_for,
+            wf,
+            "targeted={targeted}: the sacrifice prompt is preserved"
+        );
+        assert_eq!(b.r.state().objects[&b.card].zone, Zone::Graveyard);
+        assert!(b.r.state().stack.is_empty());
+
+        let wf = select_cards(&mut b.r, vec![b.fodder]);
+        assert_eq!(
+            prompt_sources(&wf, P0),
+            sorted(vec![b.haven, b.construct, b.zulaport]),
+            "targeted={targeted}"
+        );
+        order_in_listed_order(&mut b.r);
+        assert_eq!(stack(&b.r)[0], (Kind::Activated, b.src, P0));
+        assert_eq!(stack_triggers_from(&b.r, b.haven), 1, "targeted={targeted}");
+        assert_eq!(
+            stack_triggers_from(&b.r, b.construct),
+            1,
+            "targeted={targeted}"
+        );
+        assert_eq!(
+            stack_triggers_from(&b.r, b.zulaport),
+            1,
+            "targeted={targeted}"
+        );
+        assert_eq!(b.r.state().stack.len(), 4, "targeted={targeted}");
+    }
+}
+
+/// Control for the above: cancelling at the FIRST prompt, before anything is
+/// paid, is still accepted and leaves nothing behind.
+#[test]
+fn n1_cancel_before_any_payment_is_accepted() {
+    for (text, targeted) in [(TWO_COSTS_TARGETED, true), (TWO_COSTS_UNTARGETED, false)] {
+        let mut b = cost_board(text, 2);
+        activate(&mut b.r, b.src);
+        if targeted {
+            act(
+                &mut b.r,
+                GameAction::SelectTargets {
+                    targets: vec![TargetRef::Player(P1)],
+                },
+            );
+        }
+        assert!(matches!(
+            b.r.state().waiting_for,
+            WaitingFor::PayCost { .. }
+        ));
         let wf = act(&mut b.r, GameAction::CancelCast);
         assert!(matches!(wf, WaitingFor::Priority { .. }), "{wf:?}");
-        assert_eq!(b.r.state().objects[&b.src].zone, Zone::Battlefield);
-        assert!(
-            b.r.state().stack.is_empty(),
-            "targeted={targeted}: {:?}",
-            stack(&b.r)
-        );
+        assert_eq!(b.r.state().objects[&b.card].zone, Zone::Hand);
+        assert!(b.r.state().stack.is_empty(), "targeted={targeted}");
     }
 }
 
@@ -600,6 +653,94 @@ fn v21_reference_unpaused_group_yields_one_observer_trigger() {
     assert_observer_batch(&r, observer, first, second);
 }
 
+/// CR 603.7b + CR 603.3b: an untargeted activation whose paid discard precedes
+/// a count-two sacrifice paused at a replacement choice. A delayed "when this
+/// dies" ability on the FIRST sacrificed creature (whose zone change was retained
+/// from before the pause) triggers exactly once, in the activation's batch.
+#[test]
+fn v21b_delayed_observer_of_a_retained_sacrifice_fragment_triggers_once() {
+    for targeted in [false, true] {
+        v21b_case(targeted);
+    }
+}
+
+fn v21b_case(targeted: bool) {
+    use engine::types::ability::{DelayedTriggerCondition, ResolvedAbility};
+    use engine::types::game_state::DelayedTrigger;
+
+    let db = shared_card_db().expect("card db");
+    let mut scenario = board(2);
+    let source = scenario
+        .add_creature(P0, "Src", 1, 1)
+        .from_oracle_text(if targeted {
+            "Discard a card, Sacrifice two creatures: This creature deals 1 damage to any target."
+        } else {
+            "Discard a card, Sacrifice two creatures: You gain 1 life."
+        })
+        .id();
+    let (first, second, observer) = sacrifice_pair(&mut scenario, true);
+    let card = scenario.add_real_card(P0, "Grizzly Bears", Zone::Hand, db);
+    let marker = scenario
+        .add_creature(P0, "Marker", 0, 0)
+        .as_enchantment()
+        .id();
+    let mut r = build(scenario);
+    install_observer(&mut r, observer);
+    r.state_mut().delayed_triggers.push(DelayedTrigger::new(
+        DelayedTriggerCondition::WhenDiesOrExiled {
+            filter: TargetFilter::SpecificObject { id: first },
+        },
+        Box::new(ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            marker,
+            P0,
+        )),
+        P0,
+        marker,
+        true,
+    ));
+
+    activate(&mut r, source);
+    if targeted {
+        act(
+            &mut r,
+            GameAction::SelectTargets {
+                targets: vec![TargetRef::Player(P1)],
+            },
+        );
+    }
+    let wf = select_cards(&mut r, vec![card]);
+    // Reach guard: the discard is paid and the count-two sacrifice is asked.
+    assert!(matches!(wf, WaitingFor::PayCost { .. }), "{wf:?}");
+    assert_eq!(r.state().objects[&card].zone, Zone::Graveyard);
+    let wf = select_cards(&mut r, vec![first, second]);
+    // Reach guard: the group is paused at the replacement choice.
+    assert!(matches!(wf, WaitingFor::ReplacementChoice { .. }), "{wf:?}");
+    assert!(r.state().stack.is_empty());
+
+    let mut wf = act(&mut r, GameAction::ChooseReplacement { index: 0 });
+    if matches!(wf, WaitingFor::OrderTriggers { .. }) {
+        order_in_listed_order(&mut r);
+        wf = r.state().waiting_for.clone();
+    }
+    assert!(matches!(wf, WaitingFor::Priority { .. }), "{wf:?}");
+    assert_eq!(stack(&r)[0], (Kind::Activated, source, P0));
+    assert_eq!(
+        stack_triggers_from(&r, marker),
+        1,
+        "targeted={targeted}: the delayed ability of the retained fragment triggers once: {:?}",
+        stack(&r)
+    );
+    assert!(
+        r.state().delayed_triggers.is_empty(),
+        "the one-shot delayed trigger is consumed"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // V25: a spell keeps its paid discard's trigger when it is cancelled
 // ---------------------------------------------------------------------------
@@ -706,9 +847,10 @@ fn guard_untargeted_exile_cost_trigger_is_in_the_stack_push_batch() {
     assert_eq!(r.state().stack.len(), 3);
 }
 
-/// A mana ability's sacrifice pauses at its choice and triggers nothing for the
-/// stack (CR 605.3a): Ashnod's Altar with Crackdown Construct, which ignores
-/// mana abilities, and Zulaport, which sees the sacrifice and is parked, not lost.
+/// A mana ability's sacrifice does not use the stack (CR 605.3b), so Crackdown
+/// Construct, which ignores mana abilities, does not trigger, but Zulaport
+/// Cutthroat still sees the sacrifice and its trigger is on the stack at the
+/// first priority boundary.
 #[test]
 fn guard_mana_ability_sacrifice_is_not_an_announcement() {
     let db = shared_card_db().expect("card db");
@@ -717,6 +859,7 @@ fn guard_mana_ability_sacrifice_is_not_an_announcement() {
     let bears = scenario.add_real_card(P0, "Grizzly Bears", Zone::Battlefield, db);
     scenario.add_real_card(P0, "Grizzly Bears", Zone::Battlefield, db);
     let construct = scenario.add_real_card(P0, "Crackdown Construct", Zone::Battlefield, db);
+    let zulaport = scenario.add_real_card(P0, "Zulaport Cutthroat", Zone::Battlefield, db);
     let mut r = build(scenario);
 
     let wf = activate(&mut r, altar);
@@ -724,8 +867,13 @@ fn guard_mana_ability_sacrifice_is_not_an_announcement() {
         matches!(wf, WaitingFor::PayCost { .. }),
         "reach guard: the mana ability's sacrifice is a player choice, got {wf:?}"
     );
-    select_cards(&mut r, vec![bears]);
+    let wf = select_cards(&mut r, vec![bears]);
     assert_eq!(r.state().objects[&bears].zone, Zone::Graveyard);
-    assert!(r.state().stack.is_empty(), "a mana ability uses no stack");
+    assert!(matches!(wf, WaitingFor::Priority { .. }), "{wf:?}");
+    assert!(
+        stack(&r).iter().all(|(kind, ..)| *kind != Kind::Activated),
+        "a mana ability uses no stack"
+    );
+    assert_eq!(stack_triggers_from(&r, zulaport), 1);
     assert_eq!(stack_triggers_from(&r, construct), 0);
 }
