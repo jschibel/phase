@@ -175,6 +175,7 @@ fn grist_plus_one_continues_after_grist_leaves_the_battlefield() {
         .act(GameAction::ActivateAbility {
             source_id: grist,
             ability_index: 0,
+            payment_mode: Default::default(),
         })
         .unwrap();
     assert_eq!(
