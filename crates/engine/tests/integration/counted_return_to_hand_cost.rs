@@ -908,6 +908,19 @@ fn targeted_counted_return_activation_with_pauses(
             })
             .expect("announce the target");
     }
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::PayCost {
+                kind: PayCostKind::ReturnToHand,
+                count: 2,
+                min_count: 2,
+                ..
+            }
+        ),
+        "the activation prompt requires the exact count, got {:?}",
+        runner.state().waiting_for
+    );
     runner
         .act(GameAction::SelectCards {
             cards: lands.clone(),
