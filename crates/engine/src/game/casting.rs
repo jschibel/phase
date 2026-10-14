@@ -8427,6 +8427,104 @@ fn casting_variant_candidates(
         .collect()
 }
 
+/// Hand-card alternative-cost casting candidates whose cost is paid INSTEAD of the
+/// printed mana cost and that are announced one-per-keyword (Bestow, Mutate, Awaken,
+/// Cleave, Impending, More Than Meets the Eye, Prototype). Keyword presence plus each
+/// keyword's own legality gate (a bestow/mutate/awaken target, a parsed cleave set, a
+/// complete prototype face) -- affordability is judged later by
+/// `casting_variant_choice_set` / `can_cast_prepared_now`.
+///
+/// CR 118.9 + CR 601.2b: a player may announce an alternative cost whenever it is
+/// payable, so a hand card is a legal cast whenever any one of these routes is
+/// affordable, even if the printed cost is not (Impending 5 Overlords cost less than
+/// their printed cost, CR 702.176a). Called with no `Normal` entry for a card without a
+/// free-cast permission; `casting_candidates` adds `Normal` afterwards whenever these
+/// join another alternative (granted Blitz, printed Evoke, ...), so the N-way election
+/// keeps the printed-cost cast (CR 118.9b). A sole alternative stays the legacy
+/// Normal-vs-alternative prompt.
+fn hand_alternative_cost_keyword_candidates(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    obj: &GameObject,
+) -> Vec<CastingVariant> {
+    let mut out = Vec::new();
+    let effective_keywords = effective_spell_keywords(state, player, object_id);
+
+    // CR 702.103a + CR 303.4a: Bestow — offered only when the bestow keyword
+    // is present AND the bestowed Aura has a legal target, judged on the
+    // bestowed form by the bestow offer's own authority
+    // (`bestowed_aura_targets`, CR 702.103b).
+    if effective_keywords
+        .iter()
+        .any(|k| matches!(k, crate::types::keywords::Keyword::Bestow(_)))
+        && bestowed_form(state, object_id)
+            .is_some_and(|bestowed| !bestowed_aura_targets(&bestowed, player, object_id).is_empty())
+    {
+        out.push(CastingVariant::Bestow);
+    }
+    // CR 702.140a: Mutate — keyword present AND a legal "non-Human creature
+    // you own" merge target exists (parity with the Mutate offer block).
+    if obj
+        .keywords
+        .iter()
+        .any(|k| matches!(k, crate::types::keywords::Keyword::Mutate(_)))
+        && !targeting::find_legal_targets(state, &mutate_target_filter(), player, object_id)
+            .is_empty()
+    {
+        out.push(CastingVariant::Mutate);
+    }
+    // CR 702.113a + CR 702.113b: Awaken — keyword present AND a land you
+    // control exists for the awaken land target (parity with the Awaken
+    // offer block's `has_legal_land` gate).
+    if obj
+        .keywords
+        .iter()
+        .any(|k| matches!(k, crate::types::keywords::Keyword::Awaken { .. }))
+    {
+        let land_filter = TargetFilter::Typed(
+            crate::types::ability::TypedFilter::land()
+                .controller(crate::types::ability::ControllerRef::You),
+        );
+        if !targeting::find_legal_targets(state, &land_filter, player, object_id).is_empty() {
+            out.push(CastingVariant::Awaken);
+        }
+    }
+    // CR 702.148a: Cleave — keyword present AND the bracket-removed ability
+    // set was parsed (parity with the Cleave offer block's
+    // `obj.cleave_variant.is_some()` gate).
+    if obj.cleave_variant.is_some()
+        && obj
+            .keywords
+            .iter()
+            .any(|k| matches!(k, crate::types::keywords::Keyword::Cleave(_)))
+    {
+        out.push(CastingVariant::Cleave);
+    }
+    // CR 702.176a: Impending (keyword presence).
+    if obj
+        .keywords
+        .iter()
+        .any(|k| matches!(k, crate::types::keywords::Keyword::Impending { .. }))
+    {
+        out.push(CastingVariant::Impending);
+    }
+    // CR 702.162a: More Than Meets the Eye (keyword presence).
+    if obj
+        .keywords
+        .iter()
+        .any(|k| matches!(k, crate::types::keywords::Keyword::MoreThanMeetsTheEye(_)))
+    {
+        out.push(CastingVariant::MoreThanMeetsTheEye);
+    }
+    // CR 702.160a: Prototype — offered only when the secondary
+    // characteristics are complete (parity with `prototype_form_from_object`).
+    if prototype_form_from_object(obj).is_some() {
+        out.push(CastingVariant::Prototype);
+    }
+    out
+}
+
 fn casting_candidates(
     state: &GameState,
     player: PlayerId,
@@ -8774,8 +8872,6 @@ fn casting_candidates(
                 candidates.push(CastingVariant::Normal);
             }
 
-            let effective_keywords = effective_spell_keywords(state, player, object_id);
-
             // CR 702.185a: Warp (keyword presence — mirrors the Warp offer block).
             if obj
                 .keywords
@@ -8784,79 +8880,9 @@ fn casting_candidates(
             {
                 candidates.push(CastingVariant::Warp);
             }
-            // CR 702.103a + CR 303.4a: Bestow — offered only when the bestow keyword
-            // is present AND the bestowed Aura has a legal target, judged on the
-            // bestowed form by the bestow offer's own authority
-            // (`bestowed_aura_targets`, CR 702.103b).
-            if effective_keywords
-                .iter()
-                .any(|k| matches!(k, crate::types::keywords::Keyword::Bestow(_)))
-                && bestowed_form(state, object_id).is_some_and(|bestowed| {
-                    !bestowed_aura_targets(&bestowed, player, object_id).is_empty()
-                })
-            {
-                candidates.push(CastingVariant::Bestow);
-            }
-            // CR 702.140a: Mutate — keyword present AND a legal "non-Human creature
-            // you own" merge target exists (parity with the Mutate offer block).
-            if obj
-                .keywords
-                .iter()
-                .any(|k| matches!(k, crate::types::keywords::Keyword::Mutate(_)))
-                && !targeting::find_legal_targets(state, &mutate_target_filter(), player, object_id)
-                    .is_empty()
-            {
-                candidates.push(CastingVariant::Mutate);
-            }
-            // CR 702.113a + CR 702.113b: Awaken — keyword present AND a land you
-            // control exists for the awaken land target (parity with the Awaken
-            // offer block's `has_legal_land` gate).
-            if obj
-                .keywords
-                .iter()
-                .any(|k| matches!(k, crate::types::keywords::Keyword::Awaken { .. }))
-            {
-                let land_filter = TargetFilter::Typed(
-                    crate::types::ability::TypedFilter::land()
-                        .controller(crate::types::ability::ControllerRef::You),
-                );
-                if !targeting::find_legal_targets(state, &land_filter, player, object_id).is_empty()
-                {
-                    candidates.push(CastingVariant::Awaken);
-                }
-            }
-            // CR 702.148a: Cleave — keyword present AND the bracket-removed ability
-            // set was parsed (parity with the Cleave offer block's
-            // `obj.cleave_variant.is_some()` gate).
-            if obj.cleave_variant.is_some()
-                && obj
-                    .keywords
-                    .iter()
-                    .any(|k| matches!(k, crate::types::keywords::Keyword::Cleave(_)))
-            {
-                candidates.push(CastingVariant::Cleave);
-            }
-            // CR 702.176a: Impending (keyword presence).
-            if obj
-                .keywords
-                .iter()
-                .any(|k| matches!(k, crate::types::keywords::Keyword::Impending { .. }))
-            {
-                candidates.push(CastingVariant::Impending);
-            }
-            // CR 702.162a: More Than Meets the Eye (keyword presence).
-            if obj
-                .keywords
-                .iter()
-                .any(|k| matches!(k, crate::types::keywords::Keyword::MoreThanMeetsTheEye(_)))
-            {
-                candidates.push(CastingVariant::MoreThanMeetsTheEye);
-            }
-            // CR 702.160a: Prototype — offered only when the secondary
-            // characteristics are complete (parity with `prototype_form_from_object`).
-            if prototype_form_from_object(obj).is_some() {
-                candidates.push(CastingVariant::Prototype);
-            }
+            candidates.extend(hand_alternative_cost_keyword_candidates(
+                state, player, object_id, obj,
+            ));
             // CR 702.37c / CR 702.168b + CR 708.4: Morph / Megamorph / Disguise
             // face-down cast — offered when an effective face-down keyword is present
             // and the face-down cast is permitted (parity with the FaceDown offer
@@ -8865,6 +8891,25 @@ fn casting_candidates(
                 && face_down_cast_is_permitted(state, player, object_id)
             {
                 candidates.push(CastingVariant::FaceDown);
+            }
+        } else {
+            // CR 118.9 + CR 601.2b: without a free-cast permission the alternative-cost
+            // keywords are still announceable casts of a hand card (sole candidates, no
+            // `Normal` entry), so a card whose printed cost is unaffordable but whose
+            // alternative cost is affordable stays a legal action.
+            candidates.extend(hand_alternative_cost_keyword_candidates(
+                state, player, object_id, obj,
+            ));
+            // CR 118.9b: an alternative cost is optional, so once the hand cast has
+            // two or more alternative methods -- counting the granted/printed ones
+            // pushed above (Blitz, Evoke, Dash, ...) together with the keyword
+            // alternatives just added -- the N-way election must keep the printed-cost
+            // cast too. `casting_variant_choice_set` drops this `Normal` when its
+            // printed cost is unpreparable or unaffordable. A single alternative keeps
+            // its legacy Normal-vs-alternative prompt, and the Fuse block's `Normal`
+            // is not duplicated.
+            if candidates.len() >= 2 && !candidates.contains(&CastingVariant::Normal) {
+                candidates.insert(0, CastingVariant::Normal);
             }
         }
     }
@@ -20321,6 +20366,11 @@ fn can_cast_prepared_now_with_probe(
     if matches!(obj.zone, Zone::Hand | Zone::Command)
         && matches!(obj.mana_cost, ManaCost::NoCost)
         && !unlimited_hand_cast_free_applies(state, player, obj, prepared.casting_variant)
+        // CR 702.162a + CR 118.6a + CR 712.8c: a More Than Meets the Eye cast pays its
+        // own cost rather than the mana cost, and `obj` here is the converted spell
+        // (back face, whose mana cost is `NoCost`), not the printed front face whose
+        // cost is what the alternative cost replaces.
+        && prepared.casting_variant != CastingVariant::MoreThanMeetsTheEye
         && !(object_has_effective_face_down_keyword(state, prepared.object_id)
             && can_afford_face_down_cast(
                 state,
@@ -21516,6 +21566,7 @@ pub(super) fn can_feasibly_pay_mana_cost(
     can_feasibly_pay_mana_cost_with_probe(state, player, source_id, cost, None)
 }
 
+#[cfg(test)]
 pub(crate) fn has_manual_mana_ability_for_spell_payment(
     state: &GameState,
     player: PlayerId,
@@ -21531,21 +21582,42 @@ pub(crate) fn has_manual_mana_ability_for_spell_payment(
     )
 }
 
-/// Returns whether a cast that cannot be fully auto-paid has an engine-proven
-/// route into the normal mana-payment interaction.
+/// CR 601.2g-h + CR 605.3a: Whether the caster can pay a residual mana cost by
+/// activating mana abilities the Auto payer can't (choice-bearing or non-tap
+/// ones, or the exact filter-land route).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManualPaymentRoute {
+    /// The castability planner finds such a payment: the exact filter-land
+    /// witness, or a choice-bearing mana ability with activatable mana that
+    /// covers the residual cost.
+    Feasible,
+    /// It finds none.
+    Infeasible,
+}
+
+/// CR 601.2g + CR 605.3a: The manual mana route for an Auto-mode spell payment
+/// the Auto payer can't complete on its own. When a route exists the caster
+/// activates those mana abilities at the mana-payment step (CR 117.1d).
 ///
-/// CR 117.1d + CR 601.2g: In addition to the legacy manual non-tap ability
-/// path, a producer can fund a distinct costed-tap mana ability before the
-/// spell's remaining payment. The latter is admitted only when the bounded
-/// reducer witness proves the final cost is payable.
-pub(crate) fn has_manual_mana_payment_path_for_spell(
+/// The single authority, read by two consumers: the castability gate
+/// ([`can_feasibly_pay_mana_cost_without_x_with_probe`]: auto-tap or
+/// `Feasible`), and the reducer (`casting_costs::pay_and_push_adventure`),
+/// which carries an Auto cast the Auto payer can't finish into
+/// `WaitingFor::ManaPayment` exactly when the route is `Feasible`.
+pub(crate) fn spell_payment_manual_route(
     state: &GameState,
     player: PlayerId,
     source_id: ObjectId,
     cost: &ManaCost,
-) -> bool {
-    has_manual_mana_ability_for_spell_payment(state, player, source_id)
-        || has_exact_filter_land_payment_witness(state, player, source_id, cost, None)
+) -> ManualPaymentRoute {
+    // CR 601.2f + CR 107.1b: as in the feasibility gate, X = 0 is the cheapest
+    // concrete probe of a cost whose X is not yet announced.
+    if super::casting_costs::cost_has_x(cost) {
+        let mut concrete = cost.clone();
+        concrete.concretize_x(0);
+        return manual_mana_payment_route(state, player, Some(source_id), &concrete, None);
+    }
+    manual_mana_payment_route(state, player, Some(source_id), cost, None)
 }
 
 /// CR 601.2g-h: Choose the payment mode for an already-prepared spell cost.
@@ -21978,43 +22050,73 @@ fn can_feasibly_pay_mana_cost_without_x_with_probe(
         return true;
     };
 
-    // Reduce the cost by the current floating mana pool. `reduce_cost_by_pool`
-    // is the dry-run twin of the real payment path — it respects spell
-    // restrictions and any-color permissions exactly as the real pay does.
-    let Some(player_data) = state.players.iter().find(|p| p.id == player) else {
-        return false;
-    };
-
     let spell_meta = source_id.and_then(|sid| build_spell_meta(state, player, sid));
     let spell_ctx = spell_meta.as_ref().map(PaymentContext::Spell);
+    match spell_cost_residual_after_pool(state, player, source_id, cost, spell_ctx.as_ref()) {
+        None => return false,
+        Some(crate::types::mana::ManaCost::Cost { .. }) => {}
+        Some(
+            crate::types::mana::ManaCost::NoCost
+            | crate::types::mana::ManaCost::SelfManaCost
+            | crate::types::mana::ManaCost::SelfManaValue
+            | crate::types::mana::ManaCost::SelfManaCostReduced { .. },
+        ) => return true,
+    }
+
+    manual_mana_payment_route(state, player, source_id, cost, probe) == ManualPaymentRoute::Feasible
+}
+
+/// CR 601.2h: The unpaid part of `cost` once the caster's floating mana is
+/// applied, or `None` when `player` is not in the game.
+///
+/// `reduce_cost_by_pool` is the dry-run twin of the real payment path — it
+/// respects spell restrictions and any-color permissions exactly as the real
+/// pay does.
+fn spell_cost_residual_after_pool(
+    state: &GameState,
+    player: PlayerId,
+    source_id: Option<ObjectId>,
+    cost: &ManaCost,
+    spell_ctx: Option<&PaymentContext<'_>>,
+) -> Option<ManaCost> {
+    let player_data = state.players.iter().find(|p| p.id == player)?;
     let mana_spend_permission = source_id.and_then(|sid| {
-        player_mana_spend_permission_for_payment(state, player, Some(sid), spell_ctx.as_ref())
+        player_mana_spend_permission_for_payment(state, player, Some(sid), spell_ctx)
     });
-    let residual = mana_payment::reduce_cost_by_pool(
+    Some(mana_payment::reduce_cost_by_pool(
         &player_data.mana_pool,
         cost,
-        spell_ctx.as_ref(),
+        spell_ctx,
         mana_spend_permission,
         None,
-    );
+    ))
+}
 
-    let (residual_shards, residual_generic) = match &residual {
-        crate::types::mana::ManaCost::NoCost
-        | crate::types::mana::ManaCost::SelfManaCost
-        | crate::types::mana::ManaCost::SelfManaValue
-        | crate::types::mana::ManaCost::SelfManaCostReduced { .. } => return true,
-        crate::types::mana::ManaCost::Cost { shards, generic } => (shards, *generic),
-    };
-
+/// CR 117.1d + CR 601.2g + CR 605.3a: The manual leg of the castability
+/// feasibility gate: whether `cost` can be paid once the caster activates mana
+/// abilities the Auto payer can't (a choice-bearing or non-tap mana ability,
+/// or the exact producer -> filter-land route). It never asks whether the Auto
+/// payer alone would finish; [`can_feasibly_pay_mana_cost_without_x_with_probe`]
+/// tries that first.
+fn manual_mana_payment_route(
+    state: &GameState,
+    player: PlayerId,
+    source_id: Option<ObjectId>,
+    cost: &ManaCost,
+    probe: Option<&PriorityCastProbe>,
+) -> ManualPaymentRoute {
     // CR 117.1d + CR 601.2g + CR 605.3a + CR 605.3b: Before the residual approximation
     // rejects the cast for lacking a manually activated non-tap source, prove
     // the narrow producer -> filter-land route by executing both abilities on
     // a clone through their normal reducer actions and exact choice prompts.
     if let Some(sid) = source_id {
         if has_exact_filter_land_payment_witness(state, player, sid, cost, probe) {
-            return true;
+            return ManualPaymentRoute::Feasible;
         }
     }
+
+    let spell_meta = source_id.and_then(|sid| build_spell_meta(state, player, sid));
+    let spell_ctx = spell_meta.as_ref().map(PaymentContext::Spell);
 
     // CR 601.2g: Once the exact auto-tap payment probe has failed, only a
     // mana ability that requires a manual choice can make the cast reachable.
@@ -22026,8 +22128,23 @@ fn can_feasibly_pay_mana_cost_without_x_with_probe(
         source_id,
         spell_ctx.as_ref(),
     ) {
-        return false;
+        return ManualPaymentRoute::Infeasible;
     }
+
+    let Some(residual) =
+        spell_cost_residual_after_pool(state, player, source_id, cost, spell_ctx.as_ref())
+    else {
+        return ManualPaymentRoute::Infeasible;
+    };
+    let (residual_shards, residual_generic) = match &residual {
+        crate::types::mana::ManaCost::NoCost
+        | crate::types::mana::ManaCost::SelfManaCost
+        | crate::types::mana::ManaCost::SelfManaValue
+        | crate::types::mana::ManaCost::SelfManaCostReduced { .. } => {
+            return ManualPaymentRoute::Feasible
+        }
+        crate::types::mana::ManaCost::Cost { shards, generic } => (shards, *generic),
+    };
 
     // CR 117.1d + CR 601.2g: Residual shard feasibility under non-tap mana
     // sources (issue #583: Vivi Ornitier {0} combination mana; extends #1234).
@@ -22040,10 +22157,10 @@ fn can_feasibly_pay_mana_cost_without_x_with_probe(
             residual_shards,
         );
     if !residual_shards.is_empty() && !shards_covered {
-        return false;
+        return ManualPaymentRoute::Infeasible;
     }
     if residual_generic == 0 {
-        return true;
+        return ManualPaymentRoute::Feasible;
     }
 
     // CR 117.1d + CR 605.3a: Sum the per-permanent feasible mana capacity
@@ -22075,7 +22192,11 @@ fn can_feasibly_pay_mana_cost_without_x_with_probe(
         .sum::<u32>()
         .saturating_sub(shard_charge);
 
-    capacity >= residual_generic
+    if capacity >= residual_generic {
+        ManualPaymentRoute::Feasible
+    } else {
+        ManualPaymentRoute::Infeasible
+    }
 }
 
 /// Returns true if the player can pay this activated-ability mana cost after
@@ -24126,8 +24247,29 @@ pub(super) fn find_targeted_remove_counter_cost(
     }
 }
 
+/// CR 601.2a + CR 601.2g: Whether `object_id` is a spell being cast right now.
+/// Announcing a spell moves it to the stack, but its object keeps its origin
+/// zone (and its place in that zone's card list) until the cast finalizes
+/// (CR 601.2i, `casting_costs`' finalizer), so effects that granted castability keep
+/// applying. Such a card is no longer in its hand or graveyard: it can't be
+/// chosen to pay a cost from that zone, whether its own or a mana ability's
+/// activated while paying for it. Identified by its spell announcement (its
+/// incarnation as a spell) and the stack entry that announcement pushed.
+///
+/// The single authority every hand/graveyard cost-fodder enumeration consults.
+pub(crate) fn is_spell_being_cast(state: &GameState, object_id: ObjectId) -> bool {
+    state
+        .objects
+        .get(&object_id)
+        .is_some_and(|obj| obj.zone != Zone::Stack && obj.spell_announcement.is_some())
+        && state.stack.iter().any(|entry| {
+            entry.id == object_id && matches!(entry.kind, StackEntryKind::Spell { .. })
+        })
+}
+
 /// Shared eligibility helper for hand-card cost payments — returns every card
-/// in `player`'s hand matching `filter` (if any), excluding the cast source.
+/// in `player`'s hand matching `filter` (if any), excluding the cast source
+/// and any spell being cast ([`is_spell_being_cast`]).
 /// Used by both discard-as-cost (CR 601.2b) and exile-from-hand-as-cost
 /// (Force of Will family). The destination zone (graveyard vs exile) is the
 /// caller's concern; the eligibility set is identical.
@@ -24152,6 +24294,7 @@ fn find_eligible_hand_cost_targets(
                 .copied()
                 .filter(|&id| {
                     id != source
+                        && !is_spell_being_cast(state, id)
                         && filter_ref.is_none_or(|f| {
                             super::filter::matches_target_filter(state, id, f, &ctx)
                         })
@@ -24192,6 +24335,7 @@ pub(crate) fn find_eligible_discard_targets_for_ability(
                 .copied()
                 .filter(|&id| {
                     id != source
+                        && !is_spell_being_cast(state, id)
                         && filter.is_none_or(|filter| {
                             super::filter::matches_target_filter(state, id, filter, &ctx)
                         })
@@ -28033,6 +28177,8 @@ pub fn handle_cancel_cast(
         if let Some(obj) = state.objects.get_mut(&pending.object_id) {
             obj.spell_announcement = None;
         }
+        // CR 733.1 + CR 400.7: the undone cast's cost links end with its announcement.
+        super::exile_links::end_cast_cost_links(state, pending.object_id);
         // CR 601.2i: Remove the placeholder stack entry pushed at announcement.
         // No other player can interject between announce and cancel, so the
         // entry is still the topmost object for this cast.
