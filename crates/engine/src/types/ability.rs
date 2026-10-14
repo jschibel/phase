@@ -28844,6 +28844,11 @@ pub struct SpellContext {
     /// Used by AbilityCondition::effect_performed() to gate dependent sub_abilities.
     #[serde(default)]
     pub optional_effect_performed: bool,
+    /// CR 608.2c + CR 608.2d: the root of this `WhileCondition` loop is an optional
+    /// ("you may") instruction whose gate was answered this pass. The next pass
+    /// re-follows the whole instruction, "you may" included.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loop_root_was_optional: bool,
     /// CR 118.12: A mandatory instruction of this run ("sacrifice it and attach …")
     /// that did nothing, so a later member's "if you do" is false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -36666,6 +36671,33 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<SpellContext>(wire).expect("attachment bindings round-trip"),
             populated
+        );
+    }
+
+    #[test]
+    fn loop_root_was_optional_wire_compatibility() {
+        // CR 608.2c + CR 608.2d: the loop-root flag rides `SpellContext` without
+        // changing any serialized state in which it is unset.
+        let key = "loop_root_was_optional";
+        let default_wire = serde_json::to_value(SpellContext::default()).unwrap();
+        assert!(
+            default_wire.get(key).is_none(),
+            "a false flag is not serialized"
+        );
+        let flagged = SpellContext {
+            loop_root_was_optional: true,
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&flagged).unwrap();
+        assert_eq!(wire.get(key), Some(&serde_json::json!(true)));
+        assert_eq!(
+            serde_json::from_value::<SpellContext>(wire).unwrap(),
+            flagged
+        );
+        let back: SpellContext = serde_json::from_value(default_wire).unwrap();
+        assert!(
+            !back.loop_root_was_optional,
+            "a payload without the key reads false"
         );
     }
 

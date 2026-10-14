@@ -1872,16 +1872,45 @@ fn drain_active_repeat_until(state: &mut GameState, events: &mut Vec<GameEvent>)
                 return;
             }
             // Thread the decremented cap into the re-entered loop so a bounded
-            // "once" repeat is not granted an extra iteration on resume.
-            let mut next = (*ability).clone();
-            next.repeat_until = Some(RepeatContinuation::WhileCondition {
-                condition: condition.clone(),
-                max_iterations: remaining,
-            });
+            // "once" repeat is not granted an extra iteration on resume; an
+            // accepted optional root is asked again (`next_pass_ability`).
+            let next = next_pass_ability(&ability, condition, remaining);
             let _ = resolve_ability_chain(state, &next, events, 1);
         }
         None => {}
     }
+}
+
+/// Does this ability, as the root of a pass, run its own up-front optional gate
+/// (a prompt, a stored answer, or no prompt player)? The gate authority decides.
+fn root_optional_gate_applies(state: &GameState, ability: &ResolvedAbility) -> bool {
+    upfront_optional_gate(state, ability, OptionalFeasibility::Probe).is_some()
+}
+
+/// The ability for the next pass of a `WhileCondition` loop, with the remaining
+/// cap threaded (the one owner of the cap threading for the driver, the drain
+/// and the decline arm).
+///
+/// CR 608.2c + CR 608.2d: when the root's optional decision was answered this
+/// pass (`loop_root_was_optional`), the next pass follows the whole instruction
+/// again, "you may" included, with no memory of the last pass's decision so an
+/// "if you do" rider reads this pass's decision.
+fn next_pass_ability(
+    ability: &ResolvedAbility,
+    condition: &AbilityCondition,
+    remaining: Option<u32>,
+) -> ResolvedAbility {
+    let mut next = ability.clone();
+    next.repeat_until = Some(RepeatContinuation::WhileCondition {
+        condition: Box::new(condition.clone()),
+        max_iterations: remaining,
+    });
+    if next.context.loop_root_was_optional {
+        next.optional = true;
+        next.context.loop_root_was_optional = false;
+        next.context.optional_effect_performed = false;
+    }
+    next
 }
 
 /// Park a repeat-until parent as the owner of a direct choice, or below the
@@ -4605,6 +4634,14 @@ pub(super) fn resolve_optional_effect_decision(
     match choice {
         AutoMayChoice::Accept => {
             ability.context.optional_effect_performed = true;
+            // CR 608.2c + CR 608.2d: a `WhileCondition` root's accepted "you may"
+            // is asked again on the next pass (`next_pass_ability`). Only that
+            // variant reads the flag; `ControllerChoice` re-prompts through
+            // `RepeatDecision` on its own.
+            ability.context.loop_root_was_optional = matches!(
+                ability.repeat_until,
+                Some(RepeatContinuation::WhileCondition { .. })
+            );
             state
                 .player_actions_this_way
                 .insert((ability.controller, PlayerActionKind::AcceptedOptionalEffect));
@@ -4630,6 +4667,11 @@ pub(super) fn resolve_optional_effect_decision(
             );
         }
         AutoMayChoice::Decline => {
+            // CR 608.2c: a declined root is not a special loop end; the loop
+            // predicate still decides. Captured before the decline branch runs.
+            let gate_asked = declined_while_root_was_gate_asked(state, &ability);
+            let waiting_before = state.waiting_for.clone();
+            let boundary = state.resolution_stack.capture_child_boundary();
             let decline_branch = optional_decline_branch(&ability);
             // CR 608.2c: Declining the optional return skips its action, but
             // an independent following instruction can still read its named
@@ -4683,9 +4725,66 @@ pub(super) fn resolve_optional_effect_decision(
                 strip_consumed_decline_performed_gate(&mut resolved);
                 resolve_ability_chain(state, &resolved, events, depth)?;
             }
+            if gate_asked {
+                continue_loop_after_declined_root(
+                    state,
+                    &ability,
+                    &waiting_before,
+                    boundary,
+                    events,
+                    depth,
+                )?;
+            }
         }
     }
     Ok(())
+}
+
+/// Was this `WhileCondition` root's decision the answer to its own up-front gate?
+fn declined_while_root_was_gate_asked(state: &GameState, ability: &ResolvedAbility) -> bool {
+    matches!(
+        ability.repeat_until,
+        Some(RepeatContinuation::WhileCondition { .. })
+    ) && {
+        let mut as_asked = ability.clone();
+        // The decision function lowered `optional` on entry; ask the gate as it was asked.
+        as_asked.optional = true;
+        root_optional_gate_applies(state, &as_asked)
+    }
+}
+
+/// CR 608.2c: after a `WhileCondition` root's own gate was declined, the
+/// instruction that follows it ("Then if an opponent controls more lands than you,
+/// repeat this process once") is still followed: the loop predicate and the cap
+/// decide, exactly as after a pass that was performed. A decline branch that
+/// paused parks the loop for the drain, as the driver parks an inner pause.
+fn continue_loop_after_declined_root(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    waiting_before: &WaitingFor,
+    boundary: ChildStackDepth,
+    events: &mut Vec<GameEvent>,
+    depth: u32,
+) -> Result<(), EffectError> {
+    let Some(RepeatContinuation::WhileCondition {
+        condition,
+        max_iterations,
+    }) = &ability.repeat_until
+    else {
+        return Ok(());
+    };
+    let mut declined = ability.clone();
+    declined.context.loop_root_was_optional = true;
+    if state.waiting_for != *waiting_before {
+        park_repeat_until_after_inner_pause(state, Box::new(declined), None, boundary);
+        return Ok(());
+    }
+    let mut remaining = *max_iterations;
+    if !should_repeat_while_condition(state, ability, condition, &mut remaining) {
+        return Ok(());
+    }
+    let next = next_pass_ability(&declined, condition, remaining);
+    resolve_ability_chain(state, &next, events, depth)
 }
 
 /// CR 608.2c + CR 608.2d: Select the exact continuation that survives an
@@ -14717,6 +14816,13 @@ pub fn resolve_ability_chain(
         // `depth == 0` prelude above ran exactly once — a repeated process is one
         // resolution (CR 608.2c), so per-resolution accumulators and the
         // resolution counter must not re-fire per iteration.
+        // Exception: a `WhileCondition` loop whose optional root was accepted this pass
+        // (`SpellContext::loop_root_was_optional`) re-enters this function for its next
+        // pass, so the root's 'you may' is asked again (CR 608.2c + CR 608.2d). That
+        // re-entry keeps `depth` and nests one call level per consecutive pass that
+        // neither pauses nor is handed to a prompt; a stored answer answers in line at
+        // `depth + 1`. It is bounded by the player's pauses, by the `depth > 20` guard
+        // and by the stack.
         debug_assert!(
             !(ability.repeat_for.is_some() && ability.repeat_until.is_some()),
             "repeat_for (count) and repeat_until (predicate) are mutually exclusive"
@@ -14828,9 +14934,17 @@ pub fn resolve_ability_chain(
                     let initial_waiting_for = state.waiting_for.clone();
                     let stack_depth_before_iteration =
                         state.resolution_stack.capture_child_boundary();
+                    // CR 608.2c + CR 608.2d: a pass that runs the root's own up-front
+                    // "you may" gate hands the loop's continuation to the optional-decision
+                    // machinery, however the gate is answered (a prompt resumes in the
+                    // engine handler; a stored answer runs the decision nested in line).
+                    let root_gate_decides = root_optional_gate_applies(state, ability);
                     with_iteration_return_result_occurrence(state, ability, |state| {
                         resolve_chain_body(state, ability, events, depth)
                     })?;
+                    if root_gate_decides {
+                        return Ok(());
+                    }
                     if state.waiting_for != initial_waiting_for {
                         // Inner pause: stash the loop ability with its remaining cap
                         // so the drain re-evaluates the condition after the choice.
@@ -14852,6 +14966,12 @@ pub fn resolve_ability_chain(
                     }
                     if !should_repeat_while_condition(state, ability, &condition, &mut remaining) {
                         return Ok(());
+                    }
+                    // CR 608.2c + CR 608.2d: an accepted optional root is asked again, so
+                    // the next pass re-enters through the ordinary entry gate.
+                    if ability.context.loop_root_was_optional {
+                        let next = next_pass_ability(ability, &condition, remaining);
+                        return resolve_ability_chain(state, &next, events, depth);
                     }
                 }
             }
@@ -33015,6 +33135,99 @@ mod tests {
             "Unimplemented tail must never run. Removing the `!Unimplemented` guard \
              would attempt speculative semantics."
         );
+    }
+
+    #[test]
+    fn loop_root_flag_stamps_only_while_condition_and_next_pass_restores_the_root() {
+        // CR 608.2c + CR 608.2d: an accepted optional `WhileCondition` root is
+        // asked again on the next pass; a `ControllerChoice` root is not stamped.
+        use crate::types::ability::AbilityCondition;
+        use crate::types::game_state::AutoMayChoice;
+        let mk = |effect: Effect| {
+            let mut a = ResolvedAbility::new(effect, vec![], ObjectId(100), PlayerId(0));
+            a.optional = true;
+            a
+        };
+        let gain = || Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+            player: crate::types::ability::TargetFilter::Controller,
+        };
+        let scry = || Effect::Scry {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: crate::types::ability::TargetFilter::Controller,
+        };
+
+        // ControllerChoice root: not stamped.
+        let mut state = GameState::new_two_player(42);
+        let mut a = mk(gain());
+        a.repeat_until = Some(RepeatContinuation::ControllerChoice);
+        let mut events = Vec::new();
+        resolve_optional_effect_decision(&mut state, a, AutoMayChoice::Accept, &mut events, 1)
+            .unwrap();
+        match &state.waiting_for {
+            WaitingFor::RepeatDecision { ability, .. } => {
+                assert!(
+                    ability.context.optional_effect_performed,
+                    "reach guard: the accept ran"
+                );
+                assert!(!ability.context.loop_root_was_optional);
+            }
+            other => panic!("expected RepeatDecision, got {other:?}"),
+        }
+
+        // WhileCondition root whose pass pauses: the parked loop carries the flag.
+        let mut state = GameState::new_two_player(42);
+        for n in 0..3 {
+            crate::game::zones::create_object(
+                &mut state,
+                crate::types::identifiers::CardId(900 + n),
+                PlayerId(0),
+                "Filler".to_string(),
+                Zone::Library,
+            );
+        }
+        let mut a = mk(scry());
+        let cond = AbilityCondition::IsYourTurn;
+        a.repeat_until = Some(RepeatContinuation::WhileCondition {
+            condition: Box::new(cond.clone()),
+            max_iterations: Some(1),
+        });
+        let mut events = Vec::new();
+        resolve_optional_effect_decision(&mut state, a, AutoMayChoice::Accept, &mut events, 1)
+            .unwrap();
+        let parked = state
+            .active_repeat_until()
+            .expect("the paused pass parked the loop")
+            .ability
+            .clone();
+        assert!(parked.context.loop_root_was_optional);
+        assert!(parked.context.optional_effect_performed);
+
+        // The next pass restores the root's "you may" and forgets the decision.
+        let next = next_pass_ability(&parked, &cond, Some(0));
+        assert!(next.optional);
+        assert!(!next.context.loop_root_was_optional);
+        assert!(!next.context.optional_effect_performed);
+        assert!(matches!(
+            next.repeat_until,
+            Some(RepeatContinuation::WhileCondition {
+                max_iterations: Some(0),
+                ..
+            })
+        ));
+
+        // An unflagged ability is cloned with only the cap threaded.
+        let mut plain = mk(gain());
+        plain.optional = false;
+        plain.context.optional_effect_performed = true;
+        plain.repeat_until = Some(RepeatContinuation::WhileCondition {
+            condition: Box::new(cond.clone()),
+            max_iterations: Some(1),
+        });
+        let n = next_pass_ability(&plain, &cond, Some(0));
+        assert!(!n.optional);
+        assert!(n.context.optional_effect_performed);
+        assert!(!n.context.loop_root_was_optional);
     }
 
     #[test]
