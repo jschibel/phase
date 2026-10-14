@@ -896,11 +896,13 @@ fn an_election_that_locks_no_mana_opens_no_window_in_either_mode() {
     }
 }
 
-/// An interaction candidate for a manual activation is offered for an ability
-/// that has a payment to make, and not for a mana ability, which is activated
-/// during a payment rather than paid for (CR 605.3a).
-#[test]
-fn a_manual_sibling_is_offered_for_an_equip_and_not_for_a_mana_ability() {
+/// The presentation surfaces of every choice P0's interaction view offers for
+/// exactly `action` (matched by its opaque action id): empty when it is not
+/// offered.
+fn offered_surfaces(
+    runner: &GameRunner,
+    action: &GameAction,
+) -> Vec<Vec<engine::types::interaction::InteractionPresentationSurface>> {
     use engine::game::interaction::{
         bind_interaction_authority, derive_viewer_interaction, interaction_action_id,
     };
@@ -908,68 +910,155 @@ fn a_manual_sibling_is_offered_for_an_equip_and_not_for_a_mana_ability() {
         InteractionOpportunityResponse, InteractionPresentationSurface, InteractionSessionId,
     };
 
-    let EquipBoard {
-        runner,
-        bonesplitter,
-        sol_ring,
-        ..
-    } = equip_board();
     let mut bound = runner.state().clone();
     bind_interaction_authority(&mut bound, InteractionSessionId("viewer".to_string()))
         .expect("the interaction authority binds");
     let filtered = engine::game::visibility::filter_state_for_viewer(&bound, P0);
     let view = derive_viewer_interaction(&bound, &filtered, P0);
-    let offers = |action: &GameAction| {
-        let wanted = interaction_action_id(action);
-        view.opportunities
-            .iter()
-            .flat_map(|opportunity| match &opportunity.response {
-                InteractionOpportunityResponse::ExactChoices { choices } => choices.iter(),
-                InteractionOpportunityResponse::Schema { candidates, .. } => candidates.iter(),
-            })
-            .flat_map(|choice| choice.surfaces.iter())
-            .any(|surface| {
+    let wanted = interaction_action_id(action);
+    view.opportunities
+        .iter()
+        .flat_map(|opportunity| match &opportunity.response {
+            InteractionOpportunityResponse::ExactChoices { choices } => choices.iter(),
+            InteractionOpportunityResponse::Schema { candidates, .. } => candidates.iter(),
+        })
+        .filter(|choice| {
+            choice.surfaces.iter().any(|surface| {
                 matches!(
                     surface,
                     InteractionPresentationSurface::Action { action_id: Some(id), .. }
                         if *id == wanted
                 )
             })
-    };
+        })
+        .map(|choice| choice.surfaces.clone())
+        .collect()
+}
+
+fn activation(
+    source_id: ObjectId,
+    ability_index: usize,
+    payment_mode: CastPaymentMode,
+) -> GameAction {
+    GameAction::ActivateAbility {
+        source_id,
+        ability_index,
+        payment_mode,
+    }
+}
+
+/// An interaction candidate for a manual activation is offered for an ability
+/// that has a payment to make, and not for a mana ability, which is activated
+/// during a payment rather than paid for (CR 605.3a). The pair is told apart
+/// by the payment mode in its presentation, as a manual cast is.
+#[test]
+fn a_manual_sibling_is_offered_for_an_equip_and_not_for_a_mana_ability() {
+    let EquipBoard {
+        runner,
+        bonesplitter,
+        sol_ring,
+        ..
+    } = equip_board();
     let equip_index = activated_ability_index(&runner, bonesplitter);
     let ring_index = runner.state().objects[&sol_ring]
         .abilities
         .iter()
         .position(is_mana_ability)
         .expect("Sol Ring's mana ability");
-    let activation = |source_id, ability_index, payment_mode| GameAction::ActivateAbility {
-        source_id,
-        ability_index,
-        payment_mode,
-    };
 
-    assert!(offers(&activation(
-        bonesplitter,
-        equip_index,
-        CastPaymentMode::Auto
-    )));
-    assert!(
-        offers(&activation(
-            bonesplitter,
-            equip_index,
-            CastPaymentMode::Manual
-        )),
-        "the equip has a manual sibling"
+    let auto = offered_surfaces(
+        &runner,
+        &activation(bonesplitter, equip_index, CastPaymentMode::Auto),
     );
-    assert!(offers(&activation(
-        sol_ring,
-        ring_index,
-        CastPaymentMode::Auto
-    )));
+    let manual = offered_surfaces(
+        &runner,
+        &activation(bonesplitter, equip_index, CastPaymentMode::Manual),
+    );
+    assert_eq!(auto.len(), 1, "the equip has an automatic candidate");
+    assert_eq!(manual.len(), 1, "the equip has a manual sibling");
+    assert_ne!(
+        auto[0], manual[0],
+        "the manual sibling is distinguishable from the automatic candidate"
+    );
+    assert!(!offered_surfaces(
+        &runner,
+        &activation(sol_ring, ring_index, CastPaymentMode::Auto)
+    )
+    .is_empty());
     assert!(
-        !offers(&activation(sol_ring, ring_index, CastPaymentMode::Manual)),
+        offered_surfaces(
+            &runner,
+            &activation(sol_ring, ring_index, CastPaymentMode::Manual)
+        )
+        .is_empty(),
         "a mana ability has no manual sibling"
     );
+}
+
+/// The same holds inside a spell's manual `ManaPayment` window, where the
+/// mana abilities that can pay it are the candidates: Krark-Clan Ironworks
+/// ("Sacrifice an artifact: Add {C}{C}.") is offered once, automatically, and
+/// has no manual twin (CR 605.3a).
+#[test]
+fn a_mana_ability_in_a_manual_payment_window_has_no_manual_sibling() {
+    let mut scenario = scenario_at_main();
+    let bears = add(&mut scenario, P0, "Grizzly Bears", Zone::Hand);
+    let ironworks = add(&mut scenario, P0, "Krark-Clan Ironworks", Zone::Battlefield);
+    let altar = add(&mut scenario, P0, "Ashnod's Altar", Zone::Battlefield);
+    add(&mut scenario, P0, "Grizzly Bears", Zone::Battlefield);
+    let mut runner = build(scenario);
+    let card_id = runner.state().objects[&bears].card_id;
+    let waiting_for = act(
+        &mut runner,
+        GameAction::CastSpell {
+            object_id: bears,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Manual,
+        },
+    );
+    assert!(is_mana_payment(&waiting_for), "{waiting_for:?}");
+
+    let ring_index = runner.state().objects[&ironworks]
+        .abilities
+        .iter()
+        .position(is_mana_ability)
+        .expect("Krark-Clan Ironworks' mana ability");
+    assert_eq!(
+        offered_surfaces(
+            &runner,
+            &activation(ironworks, ring_index, CastPaymentMode::Auto)
+        )
+        .len(),
+        1,
+        "reach guard: the window offers the ability once, automatically"
+    );
+    assert!(
+        offered_surfaces(
+            &runner,
+            &activation(ironworks, ring_index, CastPaymentMode::Manual)
+        )
+        .is_empty(),
+        "a mana ability has no manual sibling in the payment window either"
+    );
+    // The engine's own legal-action list (what an AI seat chooses from) agrees.
+    let (legal, _, _) = legal_actions_full(runner.state());
+    for source in [ironworks, altar] {
+        let index = runner.state().objects[&source]
+            .abilities
+            .iter()
+            .position(is_mana_ability)
+            .expect("a mana ability");
+        let offered = |mode| legal.contains(&activation(source, index, mode));
+        assert!(
+            offered(CastPaymentMode::Auto),
+            "reach guard: {source:?} is offered"
+        );
+        assert!(
+            !offered(CastPaymentMode::Manual),
+            "{source:?} has no manual twin"
+        );
+    }
 }
 
 /// CR 702.29a + CR 603.2 + CR 603.3: Lonely Sandbar's Cycling {U}, with Drake
