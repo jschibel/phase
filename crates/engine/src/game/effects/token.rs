@@ -4007,25 +4007,37 @@ fn heartwood_ability() -> AbilityDefinition {
 /// "[−1]: Surveil 1." (CR 701.25a) and "[−3]: Draw a card." (CR 121.1).
 /// Engine-defined from the rule text, not parsed from the catalog row's printed
 /// text, so the printed reminder parenthetical never becomes ability text.
+/// Each ability carries CR 606.3 timing via `loyalty_ability`.
 fn jace_token_abilities() -> Vec<AbilityDefinition> {
     vec![
-        AbilityDefinition::new(
-            AbilityKind::Activated,
+        loyalty_ability(
+            -1,
             Effect::Surveil {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Controller,
             },
-        )
-        .cost(AbilityCost::Loyalty { amount: -1 }),
-        AbilityDefinition::new(
-            AbilityKind::Activated,
+        ),
+        loyalty_ability(
+            -3,
             Effect::Draw {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Controller,
             },
-        )
-        .cost(AbilityCost::Loyalty { amount: -3 }),
+        ),
     ]
+}
+
+/// CR 606.2 + CR 606.3: an engine-defined loyalty ability — a loyalty cost
+/// plus the sorcery-speed restriction ("any time they have priority and the
+/// stack is empty during a main phase of their turn"). The loyalty gate
+/// (`planeswalker::can_activate_loyalty_ability`) enforces CR 606.3's
+/// once-per-permanent-per-turn cap itself and delegates timing to
+/// `activation_restrictions`, so static permissions can override it. This is
+/// the registry counterpart of the parser's `apply_loyalty_restrictions`.
+fn loyalty_ability(amount: i32, effect: Effect) -> AbilityDefinition {
+    AbilityDefinition::new(AbilityKind::Activated, effect)
+        .cost(AbilityCost::Loyalty { amount })
+        .sorcery_speed()
 }
 
 /// CR 111.10: Predefined token abilities keyed by subtype.
@@ -6325,6 +6337,45 @@ mod tests {
         // The registry arm is keyed to the Jace subtype, not to planeswalker
         // subtypes in general.
         assert!(predefined_token_abilities("Chandra").is_empty());
+    }
+
+    /// CR 606.3: every loyalty ability the predefined-token registry builds
+    /// carries the sorcery-speed timing restriction, for every subtype the
+    /// token catalog can reach.
+    #[test]
+    fn predefined_token_loyalty_abilities_are_sorcery_speed() {
+        let subtypes: std::collections::BTreeSet<&str> =
+            crate::game::token_presets::known_token_presets()
+                .iter()
+                .flat_map(|preset| preset.body.subtypes.iter().map(String::as_str))
+                .collect();
+        let loyalty_abilities: Vec<(&str, AbilityDefinition)> = subtypes
+            .iter()
+            .flat_map(|subtype| {
+                predefined_token_abilities(subtype)
+                    .into_iter()
+                    .map(move |ability| (*subtype, ability))
+            })
+            .filter(|(_, ability)| {
+                ability
+                    .cost
+                    .as_ref()
+                    .is_some_and(crate::types::ability::is_loyalty_ability_cost)
+            })
+            .collect();
+        // Reach-guard: the Jace pair is in the set, so the check below cannot
+        // pass on an empty collection.
+        assert!(
+            loyalty_abilities.len() >= 2,
+            "expected at least the Jace token's two loyalty abilities, got {}",
+            loyalty_abilities.len()
+        );
+        for (subtype, ability) in &loyalty_abilities {
+            assert!(
+                ability.is_sorcery_speed(),
+                "{subtype} token loyalty ability {ability:?} lacks CR 606.3 timing"
+            );
+        }
     }
 
     #[test]
