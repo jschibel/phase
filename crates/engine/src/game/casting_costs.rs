@@ -3788,8 +3788,10 @@ pub(crate) fn settle_sacrifice_for_cost_events(
         // current action buffer, and the ordinary claim below is
         // `OrdinaryCollectorsOnly`, so the CURRENT fragment's delayed scan is
         // left to that push (scanning it here too would double-fire a
-        // repeating delayed trigger). The context joins the deferred queue the
-        // push commits the collection into, so it is one batch (CR 603.3b).
+        // repeating delayed trigger; for the same reason a repeating batched
+        // delayed trigger sees the two fragments as separate batches, while
+        // ordinary triggers merge them). The context joins the deferred queue
+        // the push commits the collection into, so it is one batch (CR 603.3b).
         let carried_for_delayed = carried_cost_events.clone();
         let group: Vec<GameEvent> = carried_cost_events
             .into_iter()
@@ -6834,9 +6836,10 @@ pub(super) fn push_activated_ability_to_stack(
     // CR 601.2f + CR 602.2b: the activation's cost-modifier carrier, handed to
     // every root this function rebuilds.
     activation_cost_snapshot: Option<&crate::types::casting_costs::ActivationCostSnapshot>,
-    // CR 601.2h + CR 602.2b: whether a component of this activation's cost is
-    // already paid. Every root this function rebuilds for the unpaid suffix
-    // keeps that commitment, so the suffix's prompt still refuses a cancel.
+    // Engine policy (compare CR 601.2h, CR 733.1): whether a component of this
+    // activation's cost is already paid. Every root this function rebuilds for
+    // the unpaid suffix keeps that commitment, so the suffix's prompt still
+    // refuses a cancel.
     activation_cost_committed: bool,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
