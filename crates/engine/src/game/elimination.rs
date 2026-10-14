@@ -384,7 +384,12 @@ pub fn eliminate_players_simultaneously(
 
     if let Some(winner) = game_over_winner {
         if staged_optional_sacrifice_decline.is_some() {
-            finish_abandoned_source_bound_resolution_carrier(state);
+            // The game is over: no final part is owed to a finished game, so the
+            // whole family goes, carrier included.
+            crate::game::stack::abandon_active_resolution_carrier(
+                state,
+                crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
+            );
         }
         // Terminal: drop trigger scaffolding the client would otherwise show as
         // a stuck stack / ordering prompt.
@@ -1183,9 +1188,9 @@ fn do_eliminate(
     // cast-abandonment teardown can replace its prompt with priority.
     let leaving_is_latched_chooser = state.waiting_for.acting_player() == Some(player);
 
-    abandon_source_bound_resolution_prompt(state, player, events);
+    abandon_source_bound_resolution_prompt(state, player, leaving_set, events);
     retire_pending_zone_change_contexts_owned_by(state, player);
-    abandon_change_zone_family_for_controller(state, player);
+    abandon_change_zone_family_for_controller(state, player, leaving_set, events);
 
     crate::game::planechase::preserve_phenomenon_stack_abilities_for_handoff(state, planar_handoff);
 
@@ -1649,7 +1654,8 @@ fn retire_pending_zone_change_contexts_owned_by(state: &mut GameState, player: P
 fn abandon_source_bound_resolution_prompt(
     state: &mut GameState,
     player: PlayerId,
-    events: &mut [GameEvent],
+    leaving_set: &HashSet<PlayerId>,
+    events: &mut Vec<GameEvent>,
 ) {
     let selecting_resolution_sacrifice = matches!(
         &state.waiting_for,
@@ -1726,17 +1732,58 @@ fn abandon_source_bound_resolution_prompt(
         .expect("parked optional sacrifice payment must own its resume cursor");
     }
 
-    finish_abandoned_source_bound_resolution_carrier(state);
+    finish_abandoned_source_bound_resolution_carrier(state, leaving_set, events);
     state.waiting_for = WaitingFor::Priority {
         player: players::next_player(state, player),
     };
 }
 
-fn finish_abandoned_source_bound_resolution_carrier(state: &mut GameState) {
+/// CR 608.2n + CR 800.4a: abandon the resolution family a departing player's
+/// prompt owned. An instant or sorcery whose final part is still owed (CR
+/// 608.2c: its instructions paused) is an object on the stack that this family
+/// does not own: leaving the stack is the spell's own last step, not one of the
+/// abandoned instructions, so dropping the carrier must not strand it in the
+/// stack zone.
+///
+/// * When its owner or controller is among the players leaving, it leaves the
+///   game with them (CR 800.4a), through the player-left-game move, and the
+///   carrier is dropped with it; it is never reported resolved.
+/// * Otherwise its carrier and the marker it owes the final part under outlive
+///   the abandonment, with everything else of the family dropped; the
+///   final-part authority then puts the spell into its owner's graveyard
+///   (CR 608.2n) and retires the carrier, exactly once, at the next priority
+///   boundary.
+fn finish_abandoned_source_bound_resolution_carrier(
+    state: &mut GameState,
+    leaving_set: &HashSet<PlayerId>,
+    events: &mut Vec<GameEvent>,
+) {
+    let mut keep_for_final_part = None;
+    if let Some(spell) = crate::game::stack::spell_awaiting_final_part(state).cloned() {
+        let controller = crate::game::stack::stack_object_controller(state, &spell);
+        let owner = state.objects.get(&spell.id).map(|object| object.owner);
+        let leaver = [Some(controller), owner]
+            .into_iter()
+            .flatten()
+            .find(|candidate| leaving_set.contains(candidate));
+        match leaver {
+            Some(leaver) => move_object_for_player_left_game(state, spell.id, leaver, events),
+            None => {
+                keep_for_final_part = Some((
+                    state.resolving_stack_entry.take(),
+                    state.resolving_spell_final_part.take(),
+                ));
+            }
+        }
+    }
     crate::game::stack::abandon_active_resolution_carrier(
         state,
         crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
     );
+    if let Some((entry, owed)) = keep_for_final_part {
+        state.resolving_stack_entry = entry;
+        state.resolving_spell_final_part = owed;
+    }
 }
 
 /// CR 800.4a: A paused ChangeZone iteration is a single resolving family's
@@ -1744,7 +1791,12 @@ fn finish_abandoned_source_bound_resolution_carrier(state: &mut GameState) {
 /// the captured source context, so abandonment removes the owner and its tail
 /// together. `PendingBatchDeliveries` is intentionally not included: it is a
 /// shared per-object batch and retains the existing prune/resume rules.
-fn abandon_change_zone_family_for_controller(state: &mut GameState, player: PlayerId) {
+fn abandon_change_zone_family_for_controller(
+    state: &mut GameState,
+    player: PlayerId,
+    leaving_set: &HashSet<PlayerId>,
+    events: &mut Vec<GameEvent>,
+) {
     let Some(pending) = state
         .active_change_zone_frame()
         .and_then(|frame| frame.pending.as_ref())
@@ -1758,10 +1810,7 @@ fn abandon_change_zone_family_for_controller(state: &mut GameState, player: Play
     let _ = state
         .take_active_change_zone_frame()
         .expect("elimination cannot consume a buried ChangeZone frame");
-    crate::game::stack::abandon_active_resolution_carrier(
-        state,
-        crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
-    );
+    finish_abandoned_source_bound_resolution_carrier(state, leaving_set, events);
     state.waiting_for = WaitingFor::Priority {
         player: players::next_player(state, player),
     };
