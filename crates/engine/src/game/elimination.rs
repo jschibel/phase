@@ -1734,14 +1734,16 @@ fn abandon_source_bound_resolution_prompt(
 /// abandoned instructions, so dropping the carrier must not strand it in the
 /// stack zone.
 ///
-/// * When its owner or controller is among the players leaving, it leaves the
-///   game with them (CR 800.4a), through the player-left-game move, and the
-///   carrier is dropped with it; it is never reported resolved.
+/// * When its owner is among the players leaving, it leaves the game with them
+///   (CR 800.4a), through the player-left-game move, and the carrier is
+///   dropped with it; it is never reported resolved.
 /// * Otherwise its carrier and the marker it owes the final part under outlive
-///   the abandonment, with everything else of the family dropped; the
-///   final-part authority then puts the spell into its owner's graveyard
-///   (CR 608.2n) and retires the carrier, exactly once, at the next priority
-///   boundary.
+///   the abandonment, with everything else of the family dropped. The final-part
+///   authority then puts the spell into its owner's graveyard (CR 608.2n) and
+///   retires the carrier, exactly once, at the next priority boundary, unless
+///   the departure sweep takes it first: a leaving controller is settled there,
+///   after the leaver's control effects have ended, so a stolen spell reverts
+///   to its owner and finishes, and one the leaver still controls is exiled.
 fn finish_abandoned_source_bound_resolution_carrier(
     state: &mut GameState,
     leaving_set: &HashSet<PlayerId>,
@@ -1749,13 +1751,19 @@ fn finish_abandoned_source_bound_resolution_carrier(
 ) {
     let mut keep_for_final_part = None;
     if let Some(spell) = crate::game::stack::spell_awaiting_final_part(state).cloned() {
-        let controller = crate::game::stack::stack_object_controller(state, &spell);
-        let owner = state.objects.get(&spell.id).map(|object| object.owner);
-        let leaver = [Some(controller), owner]
-            .into_iter()
-            .flatten()
-            .find(|candidate| leaving_set.contains(candidate));
-        match leaver {
+        // Only the owner is decided here. A leaving controller is not: this
+        // runs before the leaver's control effects end, so a spell stolen
+        // with a control effect still reads the thief as its controller, yet
+        // CR 800.4a ends that control first and the spell reverts to its
+        // surviving owner. The departure sweep that follows owns the
+        // "controller leaves" case: it exiles what the leaver still controls
+        // once those effects have ended, and retires the carrier.
+        let owner = state
+            .objects
+            .get(&spell.id)
+            .map(|object| object.owner)
+            .filter(|owner| leaving_set.contains(owner));
+        match owner {
             Some(leaver) => move_object_for_player_left_game(state, spell.id, leaver, events),
             None => {
                 keep_for_final_part = Some((
