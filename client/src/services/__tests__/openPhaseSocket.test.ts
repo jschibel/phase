@@ -286,7 +286,7 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
-  it("rejects Full v140 before it can read the exert event's origin", async () => {
+  it("rejects Full v140 before it can read a cast-cost exile link", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
     ws.deliverMessage(helloFrame({ protocol_version: 140 }));
@@ -295,6 +295,26 @@ describe("openPhaseSocket", () => {
       kind: "protocol_mismatch",
     });
     expect(ws.close).toHaveBeenCalled();
+  });
+
+  it("rejects Full v141 before it can read the exert event's origin", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: 141 }));
+
+    await expect(promise).rejects.toMatchObject({
+      kind: "protocol_mismatch",
+    });
+    expect(ws.close).toHaveBeenCalled();
+  });
+
+  it("accepts the literal Full v142 exert-origin protocol", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: 142 }));
+
+    await expect(promise).resolves.toBeDefined();
+    expect(ws.close).not.toHaveBeenCalled();
   });
 
   it("rejects Full v139 before it can read the attack event's attacked players", async () => {
@@ -306,15 +326,6 @@ describe("openPhaseSocket", () => {
       kind: "protocol_mismatch",
     });
     expect(ws.close).toHaveBeenCalled();
-  });
-
-  it("accepts the literal Full v141 exert-origin protocol", async () => {
-    const promise = openPhaseSocket("ws://test");
-    const ws = MockWebSocket.instances[0];
-    ws.deliverMessage(helloFrame({ protocol_version: 141 }));
-
-    await expect(promise).resolves.toBeDefined();
-    expect(ws.close).not.toHaveBeenCalled();
   });
 
   it.each([134, 135, 136, 137, 138])("rejects Full v%s before it can read the crew relation", async (version) => {

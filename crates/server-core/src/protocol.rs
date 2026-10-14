@@ -3346,12 +3346,16 @@ mod tests {
         }
     }
 
-    /// v141: CR 701.43 `GameEvent::CreatureExerted` gains `origin` and an
+    /// v142: CR 701.43 `GameEvent::CreatureExerted` gains `origin` and an
     /// optional `player`, carried in a stack trigger's `trigger_event` and in
-    /// `pending_attack_trigger_events` inside `GameState`; a v140 peer drops
+    /// `pending_attack_trigger_events` inside `GameState`; a v141 peer drops
     /// both silently and would let an activated-ability exert satisfy an
     /// attack-linked "when you do" trigger, so it must be refused before it
-    /// receives v141 state.
+    /// receives v142 state.
+    ///
+    /// v141: `ExileLinkKind` gains `CastCost` (CR 607.2q cast-cost exile links),
+    /// carried in `GameState::exile_links`; a v140 peer cannot parse the tag, so
+    /// it must be refused before it receives v141 state.
     ///
     /// v140: `AttackSubject` gains `EventAttackers` (the players a trigger's
     /// attack event's attackers attacked), carried in a resolving or pending
@@ -3551,8 +3555,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_141_for_exert_origin() {
-        assert_eq!(PROTOCOL_VERSION, 141);
+    fn protocol_version_is_142_for_exert_origin() {
+        assert_eq!(PROTOCOL_VERSION, 142);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3563,7 +3567,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_141_for_exert_origin` stays
+    /// `protocol_version_is_142_for_exert_origin` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

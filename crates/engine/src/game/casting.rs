@@ -21566,6 +21566,7 @@ pub(super) fn can_feasibly_pay_mana_cost(
     can_feasibly_pay_mana_cost_with_probe(state, player, source_id, cost, None)
 }
 
+#[cfg(test)]
 pub(crate) fn has_manual_mana_ability_for_spell_payment(
     state: &GameState,
     player: PlayerId,
@@ -21581,21 +21582,42 @@ pub(crate) fn has_manual_mana_ability_for_spell_payment(
     )
 }
 
-/// Returns whether a cast that cannot be fully auto-paid has an engine-proven
-/// route into the normal mana-payment interaction.
+/// CR 601.2g-h + CR 605.3a: Whether the caster can pay a residual mana cost by
+/// activating mana abilities the Auto payer can't (choice-bearing or non-tap
+/// ones, or the exact filter-land route).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManualPaymentRoute {
+    /// The castability planner finds such a payment: the exact filter-land
+    /// witness, or a choice-bearing mana ability with activatable mana that
+    /// covers the residual cost.
+    Feasible,
+    /// It finds none.
+    Infeasible,
+}
+
+/// CR 601.2g + CR 605.3a: The manual mana route for an Auto-mode spell payment
+/// the Auto payer can't complete on its own. When a route exists the caster
+/// activates those mana abilities at the mana-payment step (CR 117.1d).
 ///
-/// CR 117.1d + CR 601.2g: In addition to the legacy manual non-tap ability
-/// path, a producer can fund a distinct costed-tap mana ability before the
-/// spell's remaining payment. The latter is admitted only when the bounded
-/// reducer witness proves the final cost is payable.
-pub(crate) fn has_manual_mana_payment_path_for_spell(
+/// The single authority, read by two consumers: the castability gate
+/// ([`can_feasibly_pay_mana_cost_without_x_with_probe`]: auto-tap or
+/// `Feasible`), and the reducer (`casting_costs::pay_and_push_adventure`),
+/// which carries an Auto cast the Auto payer can't finish into
+/// `WaitingFor::ManaPayment` exactly when the route is `Feasible`.
+pub(crate) fn spell_payment_manual_route(
     state: &GameState,
     player: PlayerId,
     source_id: ObjectId,
     cost: &ManaCost,
-) -> bool {
-    has_manual_mana_ability_for_spell_payment(state, player, source_id)
-        || has_exact_filter_land_payment_witness(state, player, source_id, cost, None)
+) -> ManualPaymentRoute {
+    // CR 601.2f + CR 107.1b: as in the feasibility gate, X = 0 is the cheapest
+    // concrete probe of a cost whose X is not yet announced.
+    if super::casting_costs::cost_has_x(cost) {
+        let mut concrete = cost.clone();
+        concrete.concretize_x(0);
+        return manual_mana_payment_route(state, player, Some(source_id), &concrete, None);
+    }
+    manual_mana_payment_route(state, player, Some(source_id), cost, None)
 }
 
 /// CR 601.2g-h: Choose the payment mode for an already-prepared spell cost.
@@ -22028,43 +22050,73 @@ fn can_feasibly_pay_mana_cost_without_x_with_probe(
         return true;
     };
 
-    // Reduce the cost by the current floating mana pool. `reduce_cost_by_pool`
-    // is the dry-run twin of the real payment path — it respects spell
-    // restrictions and any-color permissions exactly as the real pay does.
-    let Some(player_data) = state.players.iter().find(|p| p.id == player) else {
-        return false;
-    };
-
     let spell_meta = source_id.and_then(|sid| build_spell_meta(state, player, sid));
     let spell_ctx = spell_meta.as_ref().map(PaymentContext::Spell);
+    match spell_cost_residual_after_pool(state, player, source_id, cost, spell_ctx.as_ref()) {
+        None => return false,
+        Some(crate::types::mana::ManaCost::Cost { .. }) => {}
+        Some(
+            crate::types::mana::ManaCost::NoCost
+            | crate::types::mana::ManaCost::SelfManaCost
+            | crate::types::mana::ManaCost::SelfManaValue
+            | crate::types::mana::ManaCost::SelfManaCostReduced { .. },
+        ) => return true,
+    }
+
+    manual_mana_payment_route(state, player, source_id, cost, probe) == ManualPaymentRoute::Feasible
+}
+
+/// CR 601.2h: The unpaid part of `cost` once the caster's floating mana is
+/// applied, or `None` when `player` is not in the game.
+///
+/// `reduce_cost_by_pool` is the dry-run twin of the real payment path — it
+/// respects spell restrictions and any-color permissions exactly as the real
+/// pay does.
+fn spell_cost_residual_after_pool(
+    state: &GameState,
+    player: PlayerId,
+    source_id: Option<ObjectId>,
+    cost: &ManaCost,
+    spell_ctx: Option<&PaymentContext<'_>>,
+) -> Option<ManaCost> {
+    let player_data = state.players.iter().find(|p| p.id == player)?;
     let mana_spend_permission = source_id.and_then(|sid| {
-        player_mana_spend_permission_for_payment(state, player, Some(sid), spell_ctx.as_ref())
+        player_mana_spend_permission_for_payment(state, player, Some(sid), spell_ctx)
     });
-    let residual = mana_payment::reduce_cost_by_pool(
+    Some(mana_payment::reduce_cost_by_pool(
         &player_data.mana_pool,
         cost,
-        spell_ctx.as_ref(),
+        spell_ctx,
         mana_spend_permission,
         None,
-    );
+    ))
+}
 
-    let (residual_shards, residual_generic) = match &residual {
-        crate::types::mana::ManaCost::NoCost
-        | crate::types::mana::ManaCost::SelfManaCost
-        | crate::types::mana::ManaCost::SelfManaValue
-        | crate::types::mana::ManaCost::SelfManaCostReduced { .. } => return true,
-        crate::types::mana::ManaCost::Cost { shards, generic } => (shards, *generic),
-    };
-
+/// CR 117.1d + CR 601.2g + CR 605.3a: The manual leg of the castability
+/// feasibility gate: whether `cost` can be paid once the caster activates mana
+/// abilities the Auto payer can't (a choice-bearing or non-tap mana ability,
+/// or the exact producer -> filter-land route). It never asks whether the Auto
+/// payer alone would finish; [`can_feasibly_pay_mana_cost_without_x_with_probe`]
+/// tries that first.
+fn manual_mana_payment_route(
+    state: &GameState,
+    player: PlayerId,
+    source_id: Option<ObjectId>,
+    cost: &ManaCost,
+    probe: Option<&PriorityCastProbe>,
+) -> ManualPaymentRoute {
     // CR 117.1d + CR 601.2g + CR 605.3a + CR 605.3b: Before the residual approximation
     // rejects the cast for lacking a manually activated non-tap source, prove
     // the narrow producer -> filter-land route by executing both abilities on
     // a clone through their normal reducer actions and exact choice prompts.
     if let Some(sid) = source_id {
         if has_exact_filter_land_payment_witness(state, player, sid, cost, probe) {
-            return true;
+            return ManualPaymentRoute::Feasible;
         }
     }
+
+    let spell_meta = source_id.and_then(|sid| build_spell_meta(state, player, sid));
+    let spell_ctx = spell_meta.as_ref().map(PaymentContext::Spell);
 
     // CR 601.2g: Once the exact auto-tap payment probe has failed, only a
     // mana ability that requires a manual choice can make the cast reachable.
@@ -22076,8 +22128,23 @@ fn can_feasibly_pay_mana_cost_without_x_with_probe(
         source_id,
         spell_ctx.as_ref(),
     ) {
-        return false;
+        return ManualPaymentRoute::Infeasible;
     }
+
+    let Some(residual) =
+        spell_cost_residual_after_pool(state, player, source_id, cost, spell_ctx.as_ref())
+    else {
+        return ManualPaymentRoute::Infeasible;
+    };
+    let (residual_shards, residual_generic) = match &residual {
+        crate::types::mana::ManaCost::NoCost
+        | crate::types::mana::ManaCost::SelfManaCost
+        | crate::types::mana::ManaCost::SelfManaValue
+        | crate::types::mana::ManaCost::SelfManaCostReduced { .. } => {
+            return ManualPaymentRoute::Feasible
+        }
+        crate::types::mana::ManaCost::Cost { shards, generic } => (shards, *generic),
+    };
 
     // CR 117.1d + CR 601.2g: Residual shard feasibility under non-tap mana
     // sources (issue #583: Vivi Ornitier {0} combination mana; extends #1234).
@@ -22090,10 +22157,10 @@ fn can_feasibly_pay_mana_cost_without_x_with_probe(
             residual_shards,
         );
     if !residual_shards.is_empty() && !shards_covered {
-        return false;
+        return ManualPaymentRoute::Infeasible;
     }
     if residual_generic == 0 {
-        return true;
+        return ManualPaymentRoute::Feasible;
     }
 
     // CR 117.1d + CR 605.3a: Sum the per-permanent feasible mana capacity
@@ -22125,7 +22192,11 @@ fn can_feasibly_pay_mana_cost_without_x_with_probe(
         .sum::<u32>()
         .saturating_sub(shard_charge);
 
-    capacity >= residual_generic
+    if capacity >= residual_generic {
+        ManualPaymentRoute::Feasible
+    } else {
+        ManualPaymentRoute::Infeasible
+    }
 }
 
 /// Returns true if the player can pay this activated-ability mana cost after
@@ -24176,8 +24247,29 @@ pub(super) fn find_targeted_remove_counter_cost(
     }
 }
 
+/// CR 601.2a + CR 601.2g: Whether `object_id` is a spell being cast right now.
+/// Announcing a spell moves it to the stack, but its object keeps its origin
+/// zone (and its place in that zone's card list) until the cast finalizes
+/// (CR 601.2i, `casting_costs`' finalizer), so effects that granted castability keep
+/// applying. Such a card is no longer in its hand or graveyard: it can't be
+/// chosen to pay a cost from that zone, whether its own or a mana ability's
+/// activated while paying for it. Identified by its spell announcement (its
+/// incarnation as a spell) and the stack entry that announcement pushed.
+///
+/// The single authority every hand/graveyard cost-fodder enumeration consults.
+pub(crate) fn is_spell_being_cast(state: &GameState, object_id: ObjectId) -> bool {
+    state
+        .objects
+        .get(&object_id)
+        .is_some_and(|obj| obj.zone != Zone::Stack && obj.spell_announcement.is_some())
+        && state.stack.iter().any(|entry| {
+            entry.id == object_id && matches!(entry.kind, StackEntryKind::Spell { .. })
+        })
+}
+
 /// Shared eligibility helper for hand-card cost payments — returns every card
-/// in `player`'s hand matching `filter` (if any), excluding the cast source.
+/// in `player`'s hand matching `filter` (if any), excluding the cast source
+/// and any spell being cast ([`is_spell_being_cast`]).
 /// Used by both discard-as-cost (CR 601.2b) and exile-from-hand-as-cost
 /// (Force of Will family). The destination zone (graveyard vs exile) is the
 /// caller's concern; the eligibility set is identical.
@@ -24202,6 +24294,7 @@ fn find_eligible_hand_cost_targets(
                 .copied()
                 .filter(|&id| {
                     id != source
+                        && !is_spell_being_cast(state, id)
                         && filter_ref.is_none_or(|f| {
                             super::filter::matches_target_filter(state, id, f, &ctx)
                         })
@@ -24242,6 +24335,7 @@ pub(crate) fn find_eligible_discard_targets_for_ability(
                 .copied()
                 .filter(|&id| {
                     id != source
+                        && !is_spell_being_cast(state, id)
                         && filter.is_none_or(|filter| {
                             super::filter::matches_target_filter(state, id, filter, &ctx)
                         })
@@ -28083,6 +28177,8 @@ pub fn handle_cancel_cast(
         if let Some(obj) = state.objects.get_mut(&pending.object_id) {
             obj.spell_announcement = None;
         }
+        // CR 733.1 + CR 400.7: the undone cast's cost links end with its announcement.
+        super::exile_links::end_cast_cost_links(state, pending.object_id);
         // CR 601.2i: Remove the placeholder stack entry pushed at announcement.
         // No other player can interject between announce and cancel, so the
         // entry is still the topmost object for this cast.
