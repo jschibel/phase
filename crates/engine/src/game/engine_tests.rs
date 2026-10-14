@@ -4979,6 +4979,17 @@ fn thriving_grove_enters_tapped_with_color_choice() {
             card_id,
         })
         .unwrap();
+    // CR 614.12a: the colour is chosen before the land enters.
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::NamedChoice { .. })
+            && !runner.state().battlefield.contains(&grove),
+        "the as-enters colour choice is made before Thriving Grove enters"
+    );
+    runner
+        .act(GameAction::ChooseOption {
+            choice: "Red".to_string(),
+        })
+        .unwrap();
 
     assert!(
         runner.state().battlefield.contains(&grove),
@@ -5103,8 +5114,8 @@ fn thriving_grove_play_land_stays_tapped_after_color_choice() {
         } if source.prompt.identity.reference.object_id == grove
     ));
     assert!(
-        state.objects.get(&grove).unwrap().tapped,
-        "Thriving Grove must enter tapped before the as-enters color choice resolves"
+        state.objects.get(&grove).unwrap().zone == Zone::Hand,
+        "CR 614.12a: the as-enters color choice is made before Thriving Grove enters"
     );
 
     apply_as_current(

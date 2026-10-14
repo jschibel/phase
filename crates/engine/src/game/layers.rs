@@ -3532,9 +3532,9 @@ fn finish_layer_evaluation(
             .retire_absent_grants(&live_instances);
     }
 
-    // CR 603.6a + CR 611.2e: Layer evaluation just finalized post-layer
+    // Layer evaluation just finalized post-layer
     // trigger sets on every battlefield permanent (granted triggers from
-    // sliver lords, Changeling, Bramble Sovereign, suppress-triggers statics).
+    // sliver lords, Changeling).
     // Rebuild the TriggerIndex so the next event scan reads the post-layer
     // trigger set — CR 603.2 requires the post-layer view. Destructive
     // rebuild replaces both `by_key` and `unclassified` from scratch.
@@ -4364,6 +4364,7 @@ fn filter_prop_reads_life(prop: &FilterProp) -> bool {
         | FilterProp::Untapped
         | FilterProp::IsSaddled
         | FilterProp::SaddledSource
+        | FilterProp::CrewedThisTurn { .. }
         | FilterProp::ConvokedSource
         | FilterProp::ProtectorMatches { .. }
         | FilterProp::HasHasteOrControlledSinceTurnBegan
@@ -5441,7 +5442,9 @@ fn population_probe_blinded_by_entrant_characteristic_change(
 /// [`population_probe_blinded_by_entrant_characteristic_change`]. A variant that
 /// writes several kinds returns their union; a variant whose effect cannot be
 /// bounded returns [`CharacteristicKinds::ALL`].
-fn modification_characteristic_writes(m: &ContinuousModification) -> CharacteristicKinds {
+pub(crate) fn modification_characteristic_writes(
+    m: &ContinuousModification,
+) -> CharacteristicKinds {
     modification_characteristic_writes_at(m, GRANTED_STATIC_WRITE_DEPTH)
 }
 
@@ -5460,16 +5463,27 @@ fn modification_characteristic_writes_at(
     };
     match m {
         // ---- CR 613.1d (layer 4): typeline. ----
-        ContinuousModification::AddType { .. }
-        | ContinuousModification::RemoveType { .. }
-        | ContinuousModification::SetCardTypes { .. }
-        | ContinuousModification::AddSubtype { .. }
-        | ContinuousModification::RemoveSubtype { .. }
-        | ContinuousModification::RemoveAllSubtypes { .. }
-        | ContinuousModification::AddAllCreatureTypes
+        // CR 305.6: a land has the intrinsic mana ability of each basic land type
+        // it has, so a type write that can change whether an object is a land or
+        // which basic land types it has also writes its abilities.
+        ContinuousModification::AddType { core_type }
+        | ContinuousModification::RemoveType { core_type } => {
+            land_type_line_writes(*core_type == CoreType::Land)
+        }
+        ContinuousModification::AddSubtype { subtype }
+        | ContinuousModification::RemoveSubtype { subtype } => {
+            land_type_line_writes(subtype.parse::<BasicLandType>().is_ok())
+        }
+        ContinuousModification::RemoveAllSubtypes { set } => {
+            land_type_line_writes(*set == SubtypeSet::Land)
+        }
+        ContinuousModification::AddChosenSubtype { kind } => {
+            land_type_line_writes(*kind == ChosenSubtypeKind::BasicLandType)
+        }
+        ContinuousModification::SetCardTypes { .. }
         | ContinuousModification::AddAllBasicLandTypes
-        | ContinuousModification::AddAllLandTypes
-        | ContinuousModification::AddChosenSubtype { .. }
+        | ContinuousModification::AddAllLandTypes => land_type_line_writes(true),
+        ContinuousModification::AddAllCreatureTypes
         | ContinuousModification::AddSupertype { .. }
         | ContinuousModification::RemoveSupertype { .. } => CharacteristicKinds::CARD_TYPES,
         // CR 305.7: setting a basic land type replaces the land's subtypes AND
@@ -5577,6 +5591,16 @@ fn modification_characteristic_writes_at(
         // CR 306.5b: loyalty is read from the copiable values, not written as a
         // layer effect; the apply site asserts unreachable.
         | ContinuousModification::SetStartingLoyalty { .. } => CharacteristicKinds::EMPTY,
+    }
+}
+
+/// CR 613.1d + CR 305.6: a typeline write; one that can change a land's basic
+/// land types also writes the intrinsic mana abilities they give it.
+fn land_type_line_writes(can_change_basic_land_types: bool) -> CharacteristicKinds {
+    if can_change_basic_land_types {
+        CharacteristicKinds::CARD_TYPES.union(CharacteristicKinds::ABILITIES)
+    } else {
+        CharacteristicKinds::CARD_TYPES
     }
 }
 
@@ -6276,7 +6300,7 @@ fn copy_sublayer_effect_id(
 /// EXISTING global continuous-effect set (restricted to the entered objects via
 /// `apply_continuous_effect_to`), runs the per-object counter / keyword-counter /
 /// P-T-counter / loyalty fixups and the combat-assignment-rule application, then
-/// rebuilds the TriggerIndex (CR 603.6a + CR 611.2e — granted-trigger
+/// rebuilds the TriggerIndex (CR 613.1f — granted-trigger
 /// visibility). It does NOT clear attribution globally or touch the rest of the
 /// battlefield: pre-existing objects keep their already-derived characteristics.
 ///
@@ -6535,7 +6559,7 @@ fn apply_layers_incremental(
     // CR 613.11: Combat-assignment rule effects, restricted to recipient objects.
     apply_combat_assignment_rule_effects_filtered(state, Some(&recipient_ids));
 
-    // CR 603.6a + CR 611.2e: Rebuild the TriggerIndex so the next event scan
+    // Rebuild the TriggerIndex so the next event scan
     // sees the entered objects' (and any granted) trigger sets.
     crate::types::game_state::TriggerIndex::rebuild_from_battlefield(state);
 
@@ -7015,7 +7039,7 @@ fn active_continuous_effects_from_static_definitions(
 
         let retained_condition = def.condition.clone();
 
-        let affected_filter = def.affected.clone().unwrap_or(TargetFilter::Any);
+        let affected_filter = static_affected_filter(def).into_owned();
         for (mod_index, modification) in def.modifications.iter().enumerate() {
             // CR 701.15b: Goaded is a designation, not an ability granted
             // to the affected permanent. Combat reads this functioning source.
@@ -8573,7 +8597,7 @@ fn active_combat_assignment_rule_effects_from_static_definitions(
 
         let retained_condition = def.condition.clone();
 
-        let affected_filter = def.affected.clone().unwrap_or(TargetFilter::Any);
+        let affected_filter = static_affected_filter(def).into_owned();
         effects.extend(
             def.modifications
                 .iter()
@@ -10966,56 +10990,6 @@ fn apply_continuous_effect_filtered(
                 obj.keywords.clear();
                 abilities_suppressed.insert(id);
             }
-            ContinuousModification::AddType { core_type } => {
-                if !obj.card_types.core_types.contains(core_type) {
-                    obj.card_types.core_types.push(*core_type);
-                }
-            }
-            ContinuousModification::RemoveType { core_type } => {
-                obj.card_types.core_types.retain(|t| t != core_type);
-            }
-            ContinuousModification::SetColor { colors } => {
-                obj.color = colors.clone();
-            }
-            ContinuousModification::AddColor { color } => {
-                if !obj.color.contains(color) {
-                    obj.color.push(*color);
-                }
-            }
-            ContinuousModification::AddSubtype { ref subtype } => {
-                if !obj.card_types.subtypes.iter().any(|s| s == subtype) {
-                    obj.card_types.subtypes.push(subtype.clone());
-                }
-            }
-            ContinuousModification::RemoveSubtype { ref subtype } => {
-                obj.card_types.subtypes.retain(|s| s != subtype);
-            }
-            // CR 205.1a + CR 613.1d: Replace the entire core card-type set.
-            ContinuousModification::SetCardTypes { ref core_types } => {
-                obj.card_types.core_types = core_types.clone();
-                obj.card_types.subtypes.retain(|subtype| {
-                    subtype_matches_core_types(subtype, core_types, &all_creature_types)
-                });
-            }
-            // CR 205.1a + CR 613.1d: Remove every subtype belonging to the
-            // named subtype set. Membership for the `Creature` set is resolved
-            // against the runtime-populated `state.all_creature_types` — the
-            // same source `AddAllCreatureTypes` uses below.
-            ContinuousModification::RemoveAllSubtypes { set } => {
-                remove_subtype_set(&mut obj.card_types.subtypes, *set, &all_creature_types);
-            }
-            // CR 205.4 + CR 707.9d: "in addition to its other types" — append
-            // the supertype if absent. Idempotent.
-            ContinuousModification::AddSupertype { supertype } => {
-                if !obj.card_types.supertypes.contains(supertype) {
-                    obj.card_types.supertypes.push(*supertype);
-                }
-            }
-            // CR 205.4 + CR 707.9b: "isn't legendary" / "isn't basic" copy
-            // exception. Strip the supertype from the layered view.
-            ContinuousModification::RemoveSupertype { supertype } => {
-                obj.card_types.supertypes.retain(|s| s != supertype);
-            }
             // CR 122.1 + CR 614.1c: One-shot counter placement is consumed at
             // copy resolution by token_copy::resolve / become_copy::resolve.
             // Reaching this arm means a wiring bug.
@@ -11048,57 +11022,32 @@ fn apply_continuous_effect_filtered(
                      not via apply_continuous_effect"
                 );
             }
-            ContinuousModification::AddAllCreatureTypes => {
-                for subtype in &state.all_creature_types {
-                    if !obj.card_types.subtypes.iter().any(|s| s == subtype) {
-                        obj.card_types.subtypes.push(subtype.clone());
-                    }
-                }
-            }
-            // CR 305.6 + CR 305.7: Add all five basic land types (additive).
-            ContinuousModification::AddAllBasicLandTypes => {
-                for land_type in BasicLandType::all() {
-                    let subtype = land_type.as_subtype_str().to_string();
-                    if !obj.card_types.subtypes.iter().any(|s| s == &subtype) {
-                        obj.card_types.subtypes.push(subtype);
-                    }
-                }
-            }
-            // CR 205.3i: every land type is one of the 17 land subtypes.
-            // CR 305.7: a land that gains land types in addition to its own
-            // keeps its types and gains the new land types and their mana
-            // abilities. The basic types among the 17 grant their mana ability
-            // automatically via `apply_intrinsic_basic_land_mana_abilities`.
-            ContinuousModification::AddAllLandTypes => {
-                for subtype in crate::types::card_type::LAND_SUBTYPES {
-                    if !obj.card_types.subtypes.iter().any(|s| s == subtype) {
-                        obj.card_types.subtypes.push((*subtype).to_string());
-                    }
-                }
-            }
-            ContinuousModification::AddChosenSubtype { .. } => {
-                if let Some(ref subtype) = chosen_subtype {
-                    if !obj.card_types.subtypes.iter().any(|s| s == subtype) {
-                        obj.card_types.subtypes.push(subtype.clone());
-                    }
-                }
-            }
-            // CR 105.3 + CR 613.1e: Apply the source's chosen color. `Set`
-            // replaces prior colors; `Add` retains them (Painter's Servant
-            // "in addition to their other colors").
-            ContinuousModification::AddChosenColor { mode } => {
-                if let Some(color) = chosen_color {
-                    match mode {
-                        crate::types::ability::ColorChangeMode::Set => {
-                            obj.color = vec![color];
-                        }
-                        crate::types::ability::ColorChangeMode::Add => {
-                            if !obj.color.contains(&color) {
-                                obj.color.push(color);
-                            }
-                        }
-                    }
-                }
+            // CR 613.1d + CR 613.1e: the type- and colour-changing modifications
+            // share one per-object applier with the CR 614.12 entry projection
+            // (`filter::EntryProjection`), so the two can't drift.
+            modification @ (ContinuousModification::AddType { .. }
+            | ContinuousModification::RemoveType { .. }
+            | ContinuousModification::SetColor { .. }
+            | ContinuousModification::AddColor { .. }
+            | ContinuousModification::AddSubtype { .. }
+            | ContinuousModification::RemoveSubtype { .. }
+            | ContinuousModification::SetCardTypes { .. }
+            | ContinuousModification::RemoveAllSubtypes { .. }
+            | ContinuousModification::AddSupertype { .. }
+            | ContinuousModification::RemoveSupertype { .. }
+            | ContinuousModification::AddAllCreatureTypes
+            | ContinuousModification::AddAllBasicLandTypes
+            | ContinuousModification::AddAllLandTypes
+            | ContinuousModification::AddChosenSubtype { .. }
+            | ContinuousModification::AddChosenColor { .. }) => {
+                let applied = apply_type_or_color_modification(
+                    obj,
+                    modification,
+                    chosen_subtype.as_deref(),
+                    chosen_color,
+                    &all_creature_types,
+                );
+                debug_assert_eq!(applied, TypeColorModification::Applied);
             }
             ContinuousModification::SetDynamicPower { .. } => {
                 if let Some(val) = dynamic_pt {
@@ -11414,6 +11363,193 @@ fn apply_continuous_effect_filtered(
     None
 }
 
+/// CR 613.1: the set of objects a continuous static affects. An absent
+/// `affected` filter is every object. The single reading shared by the layer
+/// pass and the CR 614.12 entry projection (`filter::EntryProjection`).
+pub(crate) fn static_affected_filter(def: &StaticDefinition) -> std::borrow::Cow<'_, TargetFilter> {
+    def.affected.as_ref().map_or(
+        std::borrow::Cow::Owned(TargetFilter::Any),
+        std::borrow::Cow::Borrowed,
+    )
+}
+
+/// What [`apply_type_or_color_modification`] did with one modification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypeColorModification {
+    /// A layer-4 / layer-5 modification, applied to the object.
+    Applied,
+    /// A layer-4 modification this per-object applier cannot perform: setting a
+    /// land subtype also removes the land's rules-text abilities (CR 305.7), a
+    /// layer-wide side effect only the layer pass owns.
+    Unsupported,
+    /// Not a type- or colour-changing modification.
+    OtherLayer,
+}
+
+/// CR 613.1d (layer 4, type-changing) + CR 613.1e (layer 5, colour-changing):
+/// apply one modification to one object. The single per-object authority for
+/// these modifications, shared by the layer pass and the CR 614.12 entry
+/// projection (`filter::EntryProjection`). `chosen_subtype` / `chosen_color`
+/// are the modification source's chosen values (CR 607.2d).
+pub(crate) fn apply_type_or_color_modification(
+    obj: &mut crate::game::game_object::GameObject,
+    modification: &ContinuousModification,
+    chosen_subtype: Option<&str>,
+    chosen_color: Option<crate::types::mana::ManaColor>,
+    all_creature_types: &[String],
+) -> TypeColorModification {
+    match modification {
+        ContinuousModification::AddType { core_type } => {
+            if !obj.card_types.core_types.contains(core_type) {
+                obj.card_types.core_types.push(*core_type);
+            }
+        }
+        ContinuousModification::RemoveType { core_type } => {
+            obj.card_types.core_types.retain(|t| t != core_type);
+        }
+        ContinuousModification::SetColor { colors } => {
+            obj.color = colors.clone();
+        }
+        ContinuousModification::AddColor { color } => {
+            if !obj.color.contains(color) {
+                obj.color.push(*color);
+            }
+        }
+        ContinuousModification::AddSubtype { subtype } => {
+            if !obj.card_types.subtypes.iter().any(|s| s == subtype) {
+                obj.card_types.subtypes.push(subtype.clone());
+            }
+        }
+        ContinuousModification::RemoveSubtype { subtype } => {
+            obj.card_types.subtypes.retain(|s| s != subtype);
+        }
+        // CR 205.1a + CR 613.1d: Replace the entire core card-type set.
+        ContinuousModification::SetCardTypes { core_types } => {
+            obj.card_types.core_types = core_types.clone();
+            obj.card_types.subtypes.retain(|subtype| {
+                subtype_matches_core_types(subtype, core_types, all_creature_types)
+            });
+        }
+        // CR 205.1a + CR 613.1d: Remove every subtype belonging to the
+        // named subtype set. Membership for the `Creature` set is resolved
+        // against the runtime-populated `state.all_creature_types` — the
+        // same source `AddAllCreatureTypes` uses below.
+        ContinuousModification::RemoveAllSubtypes { set } => {
+            remove_subtype_set(&mut obj.card_types.subtypes, *set, all_creature_types);
+        }
+        // CR 205.4 + CR 707.9d: "in addition to its other types" — append
+        // the supertype if absent. Idempotent.
+        ContinuousModification::AddSupertype { supertype } => {
+            if !obj.card_types.supertypes.contains(supertype) {
+                obj.card_types.supertypes.push(*supertype);
+            }
+        }
+        // CR 205.4 + CR 707.9b: "isn't legendary" / "isn't basic" copy
+        // exception. Strip the supertype from the layered view.
+        ContinuousModification::RemoveSupertype { supertype } => {
+            obj.card_types.supertypes.retain(|s| s != supertype);
+        }
+        ContinuousModification::AddAllCreatureTypes => {
+            for subtype in all_creature_types {
+                if !obj.card_types.subtypes.iter().any(|s| s == subtype) {
+                    obj.card_types.subtypes.push(subtype.clone());
+                }
+            }
+        }
+        // CR 305.6 + CR 305.7: Add all five basic land types (additive).
+        ContinuousModification::AddAllBasicLandTypes => {
+            for land_type in BasicLandType::all() {
+                let subtype = land_type.as_subtype_str().to_string();
+                if !obj.card_types.subtypes.iter().any(|s| s == &subtype) {
+                    obj.card_types.subtypes.push(subtype);
+                }
+            }
+        }
+        // CR 205.3i: every land type is one of the 17 land subtypes.
+        // CR 305.7: a land that gains land types in addition to its own
+        // keeps its types and gains the new land types and their mana
+        // abilities. The basic types among the 17 grant their mana ability
+        // automatically via `apply_intrinsic_basic_land_mana_abilities`.
+        ContinuousModification::AddAllLandTypes => {
+            for subtype in crate::types::card_type::LAND_SUBTYPES {
+                if !obj.card_types.subtypes.iter().any(|s| s == subtype) {
+                    obj.card_types.subtypes.push((*subtype).to_string());
+                }
+            }
+        }
+        ContinuousModification::AddChosenSubtype { .. } => {
+            if let Some(subtype) = chosen_subtype {
+                if !obj.card_types.subtypes.iter().any(|s| s == subtype) {
+                    obj.card_types.subtypes.push(subtype.to_string());
+                }
+            }
+        }
+        // CR 105.3 + CR 613.1e: Apply the source's chosen color. `Set`
+        // replaces prior colors; `Add` retains them (Painter's Servant
+        // "in addition to their other colors").
+        ContinuousModification::AddChosenColor { mode } => {
+            if let Some(color) = chosen_color {
+                match mode {
+                    crate::types::ability::ColorChangeMode::Set => {
+                        obj.color = vec![color];
+                    }
+                    crate::types::ability::ColorChangeMode::Add => {
+                        if !obj.color.contains(&color) {
+                            obj.color.push(color);
+                        }
+                    }
+                }
+            }
+        }
+        ContinuousModification::SetBasicLandType { .. }
+        | ContinuousModification::SetChosenBasicLandType => {
+            return TypeColorModification::Unsupported;
+        }
+        ContinuousModification::CopyValues { .. }
+        | ContinuousModification::CopyChosen
+        | ContinuousModification::SetName { .. }
+        | ContinuousModification::SetTextName { .. }
+        | ContinuousModification::SubstituteTextWord { .. }
+        | ContinuousModification::AddPower { .. }
+        | ContinuousModification::AddToughness { .. }
+        | ContinuousModification::SetPower { .. }
+        | ContinuousModification::SetToughness { .. }
+        | ContinuousModification::AddKeyword { .. }
+        | ContinuousModification::RemoveKeyword { .. }
+        | ContinuousModification::GrantAbility { .. }
+        | ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
+        | ContinuousModification::GrantAllTriggeredAbilitiesOf { .. }
+        | ContinuousModification::GrantTrigger { .. }
+        | ContinuousModification::GrantReplacement { .. }
+        | ContinuousModification::RemoveAllAbilities
+        | ContinuousModification::SetDynamicPower { .. }
+        | ContinuousModification::SetDynamicToughness { .. }
+        | ContinuousModification::SetPowerDynamic { .. }
+        | ContinuousModification::SetToughnessDynamic { .. }
+        | ContinuousModification::AddDynamicPower { .. }
+        | ContinuousModification::AddDynamicToughness { .. }
+        | ContinuousModification::AddDynamicKeyword { .. }
+        | ContinuousModification::AddKeywordWithDerivedCost { .. }
+        | ContinuousModification::RemoveChosenKeyword
+        | ContinuousModification::AddChosenKeyword
+        | ContinuousModification::AddStaticMode { .. }
+        | ContinuousModification::GrantStaticAbility { .. }
+        | ContinuousModification::SwitchPowerToughness
+        | ContinuousModification::AssignDamageFromToughness
+        | ContinuousModification::AssignDamageAsThoughUnblocked
+        | ContinuousModification::AssignNoCombatDamage
+        | ContinuousModification::ChangeController
+        | ContinuousModification::SetChosenName
+        | ContinuousModification::RetainPrintedTriggerFromSource { .. }
+        | ContinuousModification::RetainPrintedAbilityFromSource { .. }
+        | ContinuousModification::RetainAllOtherAbilitiesFromSource
+        | ContinuousModification::AddCounterOnEnter { .. }
+        | ContinuousModification::SetStartingLoyalty { .. }
+        | ContinuousModification::RemoveManaCost => return TypeColorModification::OtherLayer,
+    }
+    TypeColorModification::Applied
+}
+
 // CR 305.7: Setting a land subtype replaces old land subtypes and removes the
 // land's rules-text abilities; layer 6 reapplies abilities from other effects.
 fn set_land_subtype_replacing(obj: &mut crate::game::game_object::GameObject, subtype: String) {
@@ -11439,22 +11575,29 @@ fn set_land_subtype_replacing(obj: &mut crate::game::game_object::GameObject, su
 /// intrinsic basic-land mana abilities before layer 6 ability effects apply.
 fn apply_intrinsic_basic_land_mana_abilities(state: &mut GameState, battlefield_ids: &[ObjectId]) {
     for &id in battlefield_ids {
-        let Some(obj) = state.objects.get_mut(&id) else {
-            continue;
-        };
-        if !obj.card_types.core_types.contains(&CoreType::Land) {
-            continue;
+        if let Some(obj) = state.objects.get_mut(&id) {
+            derive_intrinsic_basic_land_mana_abilities(obj);
         }
+    }
+}
 
-        let land_types: Vec<BasicLandType> = obj
-            .card_types
-            .subtypes
-            .iter()
-            .filter_map(|subtype| subtype.parse().ok())
-            .collect();
-        for land_type in land_types {
-            add_basic_land_mana_ability(obj, land_type);
-        }
+/// CR 305.6: give a land the intrinsic mana ability of each basic land type it
+/// has. The single authority shared by the layer pass and the CR 614.12 entry
+/// projection.
+pub(crate) fn derive_intrinsic_basic_land_mana_abilities(
+    obj: &mut crate::game::game_object::GameObject,
+) {
+    if !obj.card_types.core_types.contains(&CoreType::Land) {
+        return;
+    }
+    let land_types: Vec<BasicLandType> = obj
+        .card_types
+        .subtypes
+        .iter()
+        .filter_map(|subtype| subtype.parse().ok())
+        .collect();
+    for land_type in land_types {
+        add_basic_land_mana_ability(obj, land_type);
     }
 }
 

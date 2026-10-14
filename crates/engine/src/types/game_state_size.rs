@@ -59,8 +59,16 @@
 //! `GameState` now measures 14,208 B on x86_64-unknown-linux-gnu, under the
 //! 14,336 ceiling.
 //!
-//! Base `GameState` on x86_64-pc-windows-msvc measures 14,336 B at
-//! `nightly-2026-04-19`, exactly at the ceiling. The attacked-player referent
+//! `GameState` re-measured on x86_64-pc-windows-msvc at 14,352 B when the
+//! CR 614.12a pre-entry as-enters choice landed: two small boxed fields ? the
+//! entry event's `enter_with_choices` (`Option<Box<EntryChoices>>`, which widens
+//! every inline `ProposedEvent` by one pointer) and
+//! `PendingReplacement::delivery_boundary` (`Option<Box<ProposedEvent>>`). Both
+//! are already boxed, so nothing large went inline; the ceiling moved to
+//! 14,352.next_multiple_of(256) + 256 = 14,848.
+//!
+//! Base `GameState` on x86_64-pc-windows-msvc measured 14,336 B at
+//! `nightly-2026-04-19`, exactly at the ceiling of that time. The attacked-player referent
 //! work adds `attack_target: Option<AttackTarget>` to `ZoneChangeCombatStatus`
 //! (7 -> 24 B, align 1 -> 8), so `TriggerSourceContext` grows by 16 B and so does
 //! `WaitingFor::OpponentGuess`, its largest holder, which set the inline size of
@@ -69,7 +77,7 @@
 //! pending) is boxed. On x86_64-pc-windows-msvc `GameState` then measures
 //! 14,208 B, `WaitingFor` 1,632 B and `TriggerSourceContext` 1,496 B, with
 //! `WaitingFor::NamedChoice` (1,631 B) the largest `WaitingFor` variant. The
-//! ceiling is unchanged. Boxing OpponentGuess.owner leaves NamedChoice and
+//! boxing keeps `GameState` under the ceiling above. Boxing OpponentGuess.owner leaves NamedChoice and
 //! ChooseOneOfBranch more than 200 B apart, so `WaitingFor` carries an intentional
 //! `#[allow(clippy::large_enum_variant)]`; the GameState ceiling above is the bound.
 //!
@@ -82,7 +90,7 @@
 const _: () = {
     use core::mem::size_of;
     assert!(
-        size_of::<crate::types::game_state::GameState>() <= 14_336,
+        size_of::<crate::types::game_state::GameState>() <= 14_848,
         "GameState grew past its stack budget. It is moved by value through the \
          phase-server action + AI path, so an overrun is an uncatchable \
          guard-page abort, not a panic. Re-run the -Zprint-type-sizes command in \

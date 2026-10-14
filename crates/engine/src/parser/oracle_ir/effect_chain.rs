@@ -1261,6 +1261,13 @@ impl ClauseIrBuilder {
         self.repeated_process_end = Some(ClauseId(self.next_clause_id));
     }
 
+    /// CR 608.2c: whether any "repeat this process" directive has been recognized
+    /// in this chain — the chain then executes some of its instructions more
+    /// than once, wherever the directive stood relative to a given clause.
+    pub(crate) fn repeats_a_process(&self) -> bool {
+        self.repeated_process_end.is_some()
+    }
+
     /// CR 611.2a: arm (or disarm) the leading-duration stamp for the chunk about to
     /// be processed. Called once at the top of every chunk-loop iteration with
     /// `chunk.leading_duration`, so a chunk that carries none clears a previous

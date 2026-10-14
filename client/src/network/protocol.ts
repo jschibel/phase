@@ -106,9 +106,27 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
- *  114 — game_setup and state_update carry GameState whose ability definitions may hold
+ *  124 — game_setup and state_update carry GameState whose ability definitions may hold
  *       TargetFilter AttackedPlayerOrPlaneswalker. Bumped in lockstep with full-game
- *       protocol 132.
+ *       protocol 142.
+ *  123 — game_setup and state_update carry GameState whose exile_links may hold
+ *       ExileLinkKind CastCost (CR 607.2q). Bumped in lockstep with full-game
+ *       protocol 141.
+ *  122 — game_setup and state_update carry GameState whose ability player scopes
+ *       may hold AttackSubject EventAttackers. Bumped in lockstep with full-game
+ *       protocol 140.
+ *  121 — game_setup and state_update carry GameState with the per-turn crew
+ *       relation (crew_history_this_turn) and FilterProp::CrewedThisTurn
+ *       (CR 702.122c). Bumped in lockstep with full-game protocol 139.
+ *  116 — game_setup and state_update carry GameState whose AbilityActivated trigger
+ *       events may name the activation's stack_entry. Bumped in lockstep with
+ *       full-game protocol 134.
+ *  115 — game_setup and state_update carry GameState whose NamedChoice source
+ *       binding may be PendingEntry (CR 614.12a pre-entry as-enters choices).
+ *       Bumped in lockstep with full-game protocol 133.
+ *  114 — GameObject.exile_from_stack_linked_source carries the stamping incarnation
+ *       (ObjectIncarnationRef) in game_setup and state_update; a v113 peer cannot decode
+ *       a set rider. Bumped with full-game protocol 132.
  *  113 — game_setup and state_update carry GameState whose ability player scopes
  *       may hold PlayerFilter AnyOf / TargetPlayer. Bumped in lockstep with
  *       full-game protocol 131.
@@ -656,7 +674,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 114 as const;
+export const WIRE_PROTOCOL_VERSION = 124 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {
