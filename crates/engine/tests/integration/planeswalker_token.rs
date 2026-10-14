@@ -23,6 +23,7 @@ use engine::types::card::PrintedLoyalty;
 use engine::types::card_type::CoreType;
 use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
+use engine::types::game_state::CastPaymentMode;
 use engine::types::game_state::{ActionResult, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaColor;
@@ -317,6 +318,7 @@ fn assert_activation_refused(runner: &mut GameRunner, source: ObjectId, ability_
     let result = runner.act(GameAction::ActivateAbility {
         source_id: source,
         ability_index,
+        payment_mode: CastPaymentMode::Auto,
     });
     assert!(
         matches!(result, Err(EngineError::ActionNotAllowed(_))),
@@ -362,6 +364,7 @@ fn jace_token_loyalty_abilities_need_own_main_phase() {
         .act(GameAction::ActivateAbility {
             source_id: jace,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("activating [−1] in the postcombat main phase must succeed");
     assert_eq!(runner.state().objects[&jace].loyalty, Some(2));
@@ -428,6 +431,7 @@ fn jace_token_loyalty_abilities_need_an_empty_stack() {
         .act(GameAction::ActivateAbility {
             source_id: first,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("activating the first token's [−1] must succeed");
     assert_eq!(runner.state().stack.len(), 1);
