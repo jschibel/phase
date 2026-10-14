@@ -1000,7 +1000,7 @@ fn abandon_pending_zone_change_member_for_player_left(
         if state
             .pending_replacement
             .as_ref()
-            .is_some_and(|pending| pending.proposed == expected_event)
+            .is_some_and(|pending| pending.parks_delivery(&expected_event))
         {
             state.pending_replacement = None;
             state.replacement_may_cost_paused = false;
@@ -1672,6 +1672,17 @@ fn abandon_source_bound_resolution_prompt(
     let abandon = selecting_resolution_sacrifice
         || parked_resolution_sacrifice
         || match &state.waiting_for {
+            // CR 614.12a: a pre-entry as-enters choice answers the parked
+            // battlefield entry, not a resolution prompt; it is torn down with
+            // `pending_replacement`, like the CR 616.1 replacement prompts.
+            WaitingFor::NamedChoice {
+                source: Some(source),
+                ..
+            } if source.binding
+                == crate::types::game_state::NamedChoiceSourceBinding::PendingEntry =>
+            {
+                false
+            }
             WaitingFor::NamedChoice {
                 free_entry: None,
                 player: chooser,
@@ -2059,6 +2070,7 @@ mod tests {
             lifelink_bonus: 0,
             may_cost_paid: false,
             may_cost_remaining: None,
+            delivery_boundary: None,
         }
     }
 
@@ -3567,6 +3579,7 @@ mod tests {
             lifelink_bonus: 0,
             may_cost_paid: false,
             may_cost_remaining: None,
+            delivery_boundary: None,
         });
         // Latched chooser identity — the fix's key. C = P2.
         state.waiting_for = WaitingFor::ReplacementChoice {
@@ -3710,6 +3723,7 @@ mod tests {
             lifelink_bonus: 0,
             may_cost_paid: false,
             may_cost_remaining: None,
+            delivery_boundary: None,
         });
         state.waiting_for = WaitingFor::ReplacementChoice {
             player: PlayerId(0),
@@ -3765,6 +3779,7 @@ mod tests {
             lifelink_bonus: 0,
             may_cost_paid: false,
             may_cost_remaining: None,
+            delivery_boundary: None,
         });
         state.waiting_for = WaitingFor::ReplacementChoice {
             player: PlayerId(0),
@@ -3812,6 +3827,7 @@ mod tests {
             lifelink_bonus: 0,
             may_cost_paid: false,
             may_cost_remaining: None,
+            delivery_boundary: None,
         });
         state.waiting_for = WaitingFor::ReplacementChoice {
             player: PlayerId(0),
@@ -3889,6 +3905,7 @@ mod tests {
             lifelink_bonus: 0,
             may_cost_paid: false,
             may_cost_remaining: None,
+            delivery_boundary: None,
         });
         state.waiting_for = WaitingFor::ReplacementChoice {
             player: PlayerId(0),

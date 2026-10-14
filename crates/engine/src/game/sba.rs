@@ -4606,6 +4606,7 @@ mod tests {
             lifelink_bonus: 0,
             may_cost_paid: false,
             may_cost_remaining: None,
+            delivery_boundary: None,
         });
 
         // A concurrent player-loss SBA (P2 at 0 life) — the reason reconcile runs
@@ -4782,6 +4783,7 @@ mod tests {
             lifelink_bonus: 0,
             may_cost_paid: false,
             may_cost_remaining: None,
+            delivery_boundary: None,
         });
 
         let mut events = Vec::new();

@@ -1656,6 +1656,8 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // CR 702.122a: the resolved-crew marker (the AI crew-repeat guard's
     // payoff-in-force authority) is per-turn state; reset it with the cadence set.
     state.crew_resolved_this_turn.clear();
+    // CR 702.122c: "crewed ... this turn" — the per-turn crew-payment relation.
+    state.crew_history_this_turn.clear();
     // Belt-and-suspenders: these transient replacement-continuation seeds are
     // normally nulled by the full-drain clear (effects/mod.rs) on the next
     // action, but EventContextAmount reads

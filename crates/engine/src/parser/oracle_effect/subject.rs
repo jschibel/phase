@@ -19,7 +19,7 @@ use crate::types::ability::{
     AbilityDefinition, AbilityKind, ChosenSubtypeKind, ColorChangeMode, ContinuousModification,
     ControllerRef, CopyRecipient, Duration, EachDamageRecipient, Effect, EffectScope, FilterProp,
     MultiTargetSpec, ObjectScope, PlayerFilter, PlayerRelation, PlayerScope, PtValue, QuantityExpr,
-    QuantityRef, StaticCondition, StaticDefinition, TargetFilter, TypedFilter,
+    StaticCondition, StaticDefinition, TargetFilter, TypedFilter,
 };
 use crate::types::game_state::DayNight;
 use crate::types::keywords::Keyword;
@@ -46,7 +46,7 @@ use super::super::oracle_static::{
 };
 use super::super::oracle_target::{
     parse_target, parse_target_with_ctx, parse_target_with_syntax, parse_type_phrase_folding,
-    TargetSyntax,
+    parse_type_phrase_folding_with_ctx, TargetSyntax,
 };
 use super::super::oracle_util::{
     merge_or_filters, parse_number, TextPair, SELF_REF_PARSE_ONLY_PHRASES, SELF_REF_TYPE_PHRASES,
@@ -115,7 +115,7 @@ pub(super) fn try_parse_subject_predicate_ast(
     text: &str,
     ctx: &mut ParseContext,
 ) -> Option<ClauseAst> {
-    if try_parse_targeted_controller_gain_life(text).is_some() {
+    if try_parse_targeted_controller_gain_life(text, ctx).is_some() {
         return None;
     }
 
@@ -724,7 +724,8 @@ fn additive_type_subject_application(
     subject: &str,
     ctx: &mut ParseContext,
 ) -> Option<SubjectApplication> {
-    let (parsed_subject, rest) = parse_target(subject);
+    let (parsed_subject, rest) =
+        parse_target_with_ctx(subject, &mut ctx.clone_player_antecedents());
     if rest.trim().is_empty()
         && matches!(
             parsed_subject,
@@ -1750,7 +1751,10 @@ fn try_parse_target_and_same_name_pump_clause(
     // `SameNameAsParentTarget` gate is the load-bearing discriminator: a plain
     // "target creature and each creature you control get +1/+1" secondary lacks
     // it and returns `None`, leaving the generic path untouched.
-    let (secondary_filter, rest) = parse_target(secondary_tp.original.trim());
+    let (secondary_filter, rest) = parse_target_with_ctx(
+        secondary_tp.original.trim(),
+        &mut ctx.clone_player_antecedents(),
+    );
     if !rest.trim().is_empty() || !filter_carries_same_name_as_parent_target(&secondary_filter) {
         return None;
     }
@@ -2915,7 +2919,8 @@ fn parse_subject_application_for(
         }
         // Fallback: strip "of " and re-route through parse_target as "each <remainder>"
         let normalized = format!("each {remainder}");
-        let (filter, _) = parse_target(&normalized);
+        let (filter, _) =
+            ctx.with_player_antecedents(|scoped| parse_target_with_ctx(&normalized, scoped));
         return subject_filter_application(filter, false);
     }
     // CR 119.5: "each player's life total" / "all players' life
@@ -2940,7 +2945,8 @@ fn parse_subject_application_for(
     {
         let consumed = lower.len() - rest_lower.len();
         let phrase = &subject[consumed..];
-        let (filter, rest) = parse_type_phrase_folding(phrase);
+        let (filter, rest) = ctx
+            .with_player_antecedents(|scoped| parse_type_phrase_folding_with_ctx(phrase, scoped));
         let filter = merge_partial_type_phrase_filter(filter, rest.trim());
         return subject_filter_application(filter, false);
     }
@@ -2952,7 +2958,8 @@ fn parse_subject_application_for(
     .parse(lower.as_str())
     .is_ok()
     {
-        let (filter, _) = parse_target(subject);
+        let (filter, _) =
+            ctx.with_player_antecedents(|scoped| parse_target_with_ctx(subject, scoped));
         return Some(SubjectApplication {
             affected: filter,
             target: None,
@@ -3071,7 +3078,8 @@ fn parse_subject_application_for(
     // GainControl→GiveControl rewrite receives `recipient: Neighbor` rather than
     // a generic `Any`/`TriggeringPlayer`.
     {
-        let (neighbor_filter, rest) = parse_target(subject);
+        let (neighbor_filter, rest) =
+            parse_target_with_ctx(subject, &mut ctx.clone_player_antecedents());
         if rest.trim().is_empty() && matches!(neighbor_filter, TargetFilter::Neighbor { .. }) {
             return subject_filter_application(neighbor_filter, false);
         }
@@ -3681,7 +3689,8 @@ fn parse_subject_application_for(
     {
         let consumed = lower.len() - rest_subject.len();
         let original_rest = &subject[consumed..];
-        let (filter, rem) = parse_type_phrase_folding(original_rest);
+        let (filter, rem) =
+            parse_type_phrase_folding_with_ctx(original_rest, &mut ctx.clone_player_antecedents());
         if rem.trim().is_empty() && !matches!(filter, TargetFilter::Any) {
             return Some(SubjectApplication {
                 affected: TargetFilter::ParentTarget,
@@ -3702,7 +3711,8 @@ fn parse_subject_application_for(
         // the remainder as a type phrase. Covers all "that [type]" patterns generically.
         let consumed = lower.len() - rest_subject.len();
         let original_rest = &subject[consumed..];
-        let (filter, rem) = parse_type_phrase_folding(original_rest);
+        let (filter, rem) =
+            parse_type_phrase_folding_with_ctx(original_rest, &mut ctx.clone_player_antecedents());
         if rem.trim().is_empty() && !matches!(filter, TargetFilter::Any) {
             // CR 608.2k + CR 608.2c: Inside a trigger effect, "that [type]" is an
             // anaphoric back-reference to the triggering event's subject object (the
@@ -3748,7 +3758,8 @@ fn parse_subject_application_for(
         }
     }
 
-    let (filter, rest) = parse_type_phrase_folding(subject);
+    let (filter, rest) =
+        parse_type_phrase_folding_with_ctx(subject, &mut ctx.clone_player_antecedents());
     if rest.trim().is_empty() {
         return subject_filter_application(filter, false);
     }
@@ -5732,7 +5743,8 @@ fn build_become_clause(
         // `parse_target` lower-cases internally; pass it the lowercase tail so
         // its returned remainder is also lowercase (we'll feed that to
         // `parse_except_clause` whose tags are lowercase).
-        let (target, remainder) = parse_target(&after_copy_owned);
+        let (target, remainder) =
+            ctx.with_player_antecedents(|scoped| parse_target_with_ctx(&after_copy_owned, scoped));
         // CR 707.9: optional `, except <body> [and <body>]*`. The card name
         // for any SetName override comes from the parse context (set by
         // `parse_oracle_text`). When `ctx.card_name` is `None` or empty
@@ -5777,7 +5789,8 @@ fn build_become_clause(
     {
         let (after_copies_owned, mid_sentence_duration) = strip_pre_except_duration(after_copies);
         let duration = mid_sentence_duration.map(Some).unwrap_or(duration);
-        let (target, remainder) = parse_target(&after_copies_owned);
+        let (target, remainder) = ctx
+            .with_player_antecedents(|scoped| parse_target_with_ctx(&after_copies_owned, scoped));
         let card_name = ctx.card_name.as_deref().unwrap_or("");
         let additional_modifications =
             super::become_copy_except::parse_except_clause(remainder, card_name, ctx)
@@ -7402,7 +7415,10 @@ fn try_parse_copula_goaded_clause(
 /// threaded into the emitted `GainLife.player`. CR 108.3 distinguishes owner
 /// from controller (CR 109.4); they differ when the spell controller doesn't own
 /// the targeted permanent.
-pub(super) fn try_parse_targeted_controller_gain_life(text: &str) -> Option<ParsedEffectClause> {
+pub(super) fn try_parse_targeted_controller_gain_life(
+    text: &str,
+    ctx: &mut ParseContext,
+) -> Option<ParsedEffectClause> {
     let lower = text.to_lowercase();
     let (after_prefix, _) = opt(tag::<_, _, OracleError<'_>>("then "))
         .parse(lower.as_str())
@@ -7435,45 +7451,17 @@ pub(super) fn try_parse_targeted_controller_gain_life(text: &str) -> Option<Pars
     ))
     .parse(after_prefix)
     .ok()?;
-    if !nom_primitives::scan_contains(&lower, "gain")
-        || !nom_primitives::scan_contains(&lower, "life")
-    {
-        return None;
-    }
-    let amount = if nom_primitives::scan_contains(&lower, "equal to its power")
-        || nom_primitives::scan_contains(&lower, "its power")
-    {
-        QuantityExpr::Ref {
-            qty: QuantityRef::Power {
-                scope: crate::types::ability::ObjectScope::Target,
-            },
-        }
-    } else if nom_primitives::scan_contains(&lower, "equal to its toughness")
-        || nom_primitives::scan_contains(&lower, "its toughness")
-    {
-        QuantityExpr::Ref {
-            qty: QuantityRef::Toughness {
-                scope: crate::types::ability::ObjectScope::Target,
-            },
-        }
-    } else if nom_primitives::scan_contains(&lower, "equal to its mana value")
-        || nom_primitives::scan_contains(&lower, "its mana value")
-    {
-        QuantityExpr::Ref {
-            qty: QuantityRef::ObjectManaValue {
-                scope: crate::types::ability::ObjectScope::Target,
-            },
-        }
-    } else {
-        // Try to parse a fixed amount: "its controller gains 3 life"
-        let after = alt((tag::<_, _, OracleError<'_>>("gains "), tag("gain ")))
-            .parse(after_subject)
-            .map(|(rest, _)| rest)
-            .unwrap_or(after_subject);
-        QuantityExpr::Fixed {
-            value: parse_number(after).map(|(n, _)| n as i32).unwrap_or(1),
-        }
-    };
+    let (count_text, _) = alt((tag::<_, _, OracleError<'_>>("gains "), tag("gain ")))
+        .parse(after_subject)
+        .ok()?;
+    // CR 119.3: the life amount is the shared count position ("4 life", "life
+    // equal to its power", "that much life").
+    let mut amount = super::parse_verb_count_slot(&text[text.len() - count_text.len()..], ctx)
+        .filter(|slot| super::imperative::is_life_noun(slot.noun))?
+        .count;
+    // CR 608.2b: "its" is the parent target; reading it from the target keeps
+    // the illegal-target information rule on the count.
+    super::rebind_anaphoric_object_scope(&mut amount, ObjectScope::Target);
     Some(parsed_clause(Effect::GainLife {
         amount,
         player: player_filter,
@@ -8265,7 +8253,7 @@ mod tests {
     use crate::types::ability::AttackerBlockStatus;
     use crate::types::ability::{
         AbilityKind, BasicLandType, ChoiceType, ContinuousModification, ControllerRef, Effect,
-        TypeFilter,
+        QuantityRef, TypeFilter,
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::statics::BlockExceptionKind;
@@ -10228,6 +10216,7 @@ mod tests {
     fn targeted_controller_gains_life_equal_to_target_toughness() {
         let clause = try_parse_targeted_controller_gain_life(
             "Its controller gains life equal to its toughness.",
+            &mut ParseContext::default(),
         )
         .expect("targeted controller gain life clause");
 
@@ -10248,6 +10237,7 @@ mod tests {
     fn targeted_controller_gains_life_equal_to_target_mana_value() {
         let clause = try_parse_targeted_controller_gain_life(
             "Its controller gains life equal to its mana value.",
+            &mut ParseContext::default(),
         )
         .expect("targeted controller mana value gain life clause");
 
@@ -10268,6 +10258,7 @@ mod tests {
     fn targeted_controller_gain_life_accepts_then_prefix() {
         let clause = try_parse_targeted_controller_gain_life(
             "Then its controller gains life equal to its mana value.",
+            &mut ParseContext::default(),
         )
         .expect("chained targeted controller mana value gain life clause");
 
@@ -10286,8 +10277,11 @@ mod tests {
 
     #[test]
     fn targeted_controller_gains_fixed_life_still_parses() {
-        let clause = try_parse_targeted_controller_gain_life("Its controller gains 3 life.")
-            .expect("targeted controller fixed gain life clause");
+        let clause = try_parse_targeted_controller_gain_life(
+            "Its controller gains 3 life.",
+            &mut ParseContext::default(),
+        )
+        .expect("targeted controller fixed gain life clause");
 
         assert!(matches!(
             clause.effect,
@@ -10358,8 +10352,11 @@ mod tests {
         // Misfortune's Gain / Path of Peace: "Its owner gains 4 life." The
         // GainLife player slot must be ParentTargetOwner, not the default
         // Controller. Reverting the fix makes this ParentTargetController.
-        let clause = try_parse_targeted_controller_gain_life("Its owner gains 4 life.")
-            .expect("targeted owner fixed gain life clause");
+        let clause = try_parse_targeted_controller_gain_life(
+            "Its owner gains 4 life.",
+            &mut ParseContext::default(),
+        )
+        .expect("targeted owner fixed gain life clause");
 
         assert!(matches!(
             clause.effect,
@@ -10376,6 +10373,7 @@ mod tests {
         // combinator (parse_det_noun_owner) yields ParentTargetOwner.
         let clause = try_parse_targeted_controller_gain_life(
             "That creature's owner gains life equal to its power.",
+            &mut ParseContext::default(),
         )
         .expect("'that noun's owner' phrasing should route to ParentTargetOwner");
 
@@ -10395,8 +10393,11 @@ mod tests {
     #[test]
     fn targeted_controller_gains_fixed_life_still_routes_to_controller_after_owner_split() {
         // No-regression: the controller arm of the same alt is unaffected.
-        let clause = try_parse_targeted_controller_gain_life("Its controller gains 4 life.")
-            .expect("controller gain life still parses");
+        let clause = try_parse_targeted_controller_gain_life(
+            "Its controller gains 4 life.",
+            &mut ParseContext::default(),
+        )
+        .expect("controller gain life still parses");
         assert!(matches!(
             clause.effect,
             Effect::GainLife {
@@ -10411,6 +10412,7 @@ mod tests {
         // Solitude: "That creature's controller gains life equal to its power."
         let clause = try_parse_targeted_controller_gain_life(
             "That creature's controller gains life equal to its power.",
+            &mut ParseContext::default(),
         )
         .expect("'that noun's controller' phrasing should route to ParentTargetController");
 
@@ -10432,6 +10434,7 @@ mod tests {
         // "The permanent's controller gains life equal to its toughness."
         let clause = try_parse_targeted_controller_gain_life(
             "The permanent's controller gains life equal to its toughness.",
+            &mut ParseContext::default(),
         )
         .expect("'the noun's controller' phrasing should route to ParentTargetController");
 
@@ -10686,6 +10689,31 @@ mod tests {
             "should parse another creature controlled by target player, got {:?}",
             app.affected
         );
+    }
+
+    /// CR 608.2c: the "each <type phrase>" arm binds "that player" to the
+    /// caller's player antecedent; a literal "you" stays the controller
+    /// (CR 109.5).
+    #[test]
+    fn parse_subject_each_type_phrase_binds_that_player_to_relative_scope() {
+        for (text, expected) in [
+            (
+                "each creature that player controls",
+                ControllerRef::TargetPlayer,
+            ),
+            ("each creature you control", ControllerRef::You),
+        ] {
+            let mut ctx = ParseContext {
+                relative_player_scope: Some(ControllerRef::TargetPlayer),
+                ..ParseContext::default()
+            };
+            let app = parse_subject_application(text, &mut ctx).expect(text);
+            let TargetFilter::Typed(typed) = &app.affected else {
+                panic!("{text}: expected a typed filter, got {:?}", app.affected);
+            };
+            assert!(typed.type_filters.contains(&TypeFilter::Creature), "{text}");
+            assert_eq!(typed.controller, Some(expected), "{text}");
+        }
     }
 
     /// "another target A or B you control" excludes the source from

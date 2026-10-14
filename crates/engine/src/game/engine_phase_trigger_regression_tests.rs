@@ -3623,7 +3623,8 @@ fn glacierwood_siege_resolution_prompts_for_anchor_word_choice() {
     apply_as_current(&mut state, GameAction::PassPriority).unwrap();
     let resolve = apply_as_current(&mut state, GameAction::PassPriority).unwrap();
 
-    assert!(state.battlefield.contains(&siege_id));
+    // CR 614.12a: the anchor word is chosen before the Siege enters.
+    assert!(!state.battlefield.contains(&siege_id));
     match resolve.waiting_for {
         WaitingFor::NamedChoice {
             free_entry: None,
@@ -3636,7 +3637,7 @@ fn glacierwood_siege_resolution_prompts_for_anchor_word_choice() {
             assert_eq!(source.prompt.identity.reference.object_id, siege_id);
             assert_eq!(
                 source.binding,
-                crate::types::game_state::NamedChoiceSourceBinding::ExactObjectAndResolution
+                crate::types::game_state::NamedChoiceSourceBinding::PendingEntry
             );
             assert_eq!(options, &vec!["Temur".to_string(), "Sultai".to_string()]);
         }
@@ -3651,6 +3652,7 @@ fn glacierwood_siege_resolution_prompts_for_anchor_word_choice() {
     )
     .unwrap();
 
+    assert!(state.battlefield.contains(&siege_id));
     assert_eq!(state.objects[&siege_id].chosen_label(), Some("Temur"));
 }
 

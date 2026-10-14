@@ -5566,22 +5566,36 @@ describe("P2P wire-protocol version gate", () => {
   // check back into the transport would surface here as the refusing half
   // never emitting.
   //
+  it.each([115, 116, 117, 118, 119, 120, 121])("refuses independent earlier wire history v%s", async (version) => {
+    const refusing = makeGuest();
+    await refusing.adapter.initialize();
+    await refusing.conn.simulateData(setupFrameAt(version));
+
+    await expect(refusing.adapter.initializeGame()).rejects.toMatchObject({
+      code: "P2P_REJECTED",
+      message: expect.stringContaining("Wire protocol mismatch"),
+    });
+    expect(refusing.emitted).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "reconnectFailed" }),
+    );
+  });
+
   // Both halves stamp LITERALS. A frame built from WIRE_PROTOCOL_VERSION
   // cannot tell a bumped client from an unbumped one, which is why every
   // other handshake fixture in the suite is useless as an instrument for a
-  // bump. Reverting WIRE_PROTOCOL_VERSION itself (113 → 112) breaks both
-  // halves' premise: the v112 frame now equals the reverted constant and is
+  // bump. Reverting WIRE_PROTOCOL_VERSION itself (124 → 123) breaks both
+  // halves' premise: the v123 frame now equals the reverted constant and is
   // admitted instead of refused — this test would fail at that first
-  // assertion ("promise resolved … instead of rejecting") — and the v113
+  // assertion ("promise resolved … instead of rejecting") — and the v124
   // frame no longer equals it and would be refused instead of admitted,
   // though this single synchronous test body never reaches that second
   // assertion once the first has thrown. The admitting half is still the
-  // reach-guard — without it "refuses v112" is also satisfied by a client
+  // reach-guard — without it "refuses v123" is also satisfied by a client
   // that refuses everything.
-  it("refuses the previous wire protocol (v112) and admits its own (v113)", async () => {
+  it("refuses the previous wire protocol (v123) and admits its own (v124)", async () => {
     const refusing = makeGuest();
     await refusing.adapter.initialize();
-    await refusing.conn.simulateData(setupFrameAt(112));
+    await refusing.conn.simulateData(setupFrameAt(123));
 
     await expect(refusing.adapter.initializeGame()).rejects.toMatchObject({
       code: "P2P_REJECTED",
@@ -5593,7 +5607,7 @@ describe("P2P wire-protocol version gate", () => {
 
     const admitting = makeGuest();
     await admitting.adapter.initialize();
-    await admitting.conn.simulateData(setupFrameAt(113));
+    await admitting.conn.simulateData(setupFrameAt(124));
 
     await expect(admitting.adapter.initializeGame()).resolves.toBeDefined();
     expect(admitting.emitted).not.toHaveBeenCalledWith(

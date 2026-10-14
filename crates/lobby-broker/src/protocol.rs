@@ -60,7 +60,7 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
-/// 131 — The CR 608.2n final part of a spell's resolution is owed on the
+/// 142 — The CR 608.2n final part of a spell's resolution is owed on the
 ///      resolution carrier. `GameState::deferred_spell_delivery` (v110: the
 ///      destination recorded while a spell paused on its own free-cast window)
 ///      is removed, and `GameState` gains `resolving_spell_final_part`
@@ -68,13 +68,62 @@ pub struct TournamentRequestId(pub u64);
 ///      sorcery whose instructions paused for a choice (Faithless Looting's
 ///      discard, Doomsday's search, a free-cast window) stays on the stack, and
 ///      the marker says it still owes its on-resolution hooks, destination and
-///      move. A v130 peer drops the key and would move the spell before its
+///      move. A v141 peer drops the key and would move the spell before its
 ///      paused instructions finish, or leave it on the stack in no zone after a
-///      free-cast window, so full-game and P2P refuse the mismatch (wire 113).
-///      A v130 snapshot that carries `deferred_spell_delivery` is refused at
+///      free-cast window, so full-game and P2P refuse the mismatch (wire 124).
+///      A pre-v142 snapshot that carries `deferred_spell_delivery` is refused at
 ///      restore: it cannot say which hooks (rebound, paradigm, epic) already
 ///      ran, and replaying them would install a second delayed trigger. Lobby
 ///      messages are unchanged.
+///
+/// 141 — `ExileLinkKind` gains `CastCost` (`"CastCost"`, CR 607.2q: a card
+///      exiled to pay a cost of casting a permanent spell, linked to that spell
+///      and to the permanent it becomes), serialized in `GameState.exile_links`.
+///      A v140 peer cannot parse the tag. Full-game peers and P2P move in
+///      lockstep (wire 123); no lobby carrier names it.
+///
+/// 140 — `AttackSubject` gains `EventAttackers` (`"EventAttackers"`, the
+///      players a trigger's attack event's attackers were declared attacking,
+///      CR 508.6), serialized inside `GameState` wherever a resolving or pending
+///      ability carries a `player_scope` (Zurzoth, Chaos Rider). A v139 peer
+///      cannot parse the tag. Full-game peers and P2P move in lockstep (wire
+///      122); no lobby carrier names it.
+///
+/// 139 — CR 702.122c per-turn crew relation: `GameState` gains
+///      `crew_history_this_turn` (the Vehicle/crewer incarnation pairs) and
+///      `FilterProp` gains `CrewedThisTurn { relation }`, both serialized inside
+///      `GameState`; a v138 peer cannot parse the new filter tag. Full-game
+///      peers and P2P move in lockstep (wire 121); no lobby carrier names it.
+/// 134 — `GameEvent::AbilityActivated` gains `stack_entry` (`Option<ObjectId>`,
+///      omitted when absent) — the stack object a stack-using activation
+///      created (CR 602.2a), which an activation trigger's "copy that ability"
+///      names (CR 707.10). Events ride in `GameState` (`current_trigger_event`,
+///      each triggered ability's stored event), and an older peer drops the
+///      field silently, resolving those copies differently. Full-game peers and
+///      P2P move in lockstep (wire 116); no lobby carrier names it.
+///
+/// 133 — CR 614.12a pre-entry as-enters choices: `ProposedEvent::ZoneChange`
+///      gains `enter_with_choices` (the answers riding the entry event),
+///      `PendingReplacement` gains `delivery_boundary` (the event the paused
+///      delivery's owner parked on), and `NamedChoiceSourceBinding` gains
+///      `PendingEntry` (`WaitingFor::NamedChoice.source.binding`). All are
+///      serialized inside `GameState`; a v132 peer cannot parse the new binding
+///      tag. Full-game peers and P2P move in lockstep (wire 115); no lobby
+///      carrier names it.
+///
+/// 132 — `GameObject::exile_from_stack_linked_source` carries the stamping
+///      incarnation (`ObjectIncarnationRef`, CR 400.7). A v131 peer cannot
+///      decode a set rider; a legacy bare id decodes as `LEGACY_INCARNATION`
+///      and is attributed to no live object. Full-game peers and P2P move in
+///      lockstep (wire 114); no lobby carrier names it.
+///
+/// 131 — `PlayerFilter` gains `AnyOf { filters }`
+///      (`{"type":"AnyOf","filters":[…]}`, the union of player sets) and
+///      `TargetPlayer` (`{"type":"TargetPlayer"}`, the first declared player
+///      target), serialized inside `GameState` wherever a resolving or pending
+///      ability carries a `player_scope`. A v130 peer cannot parse either tag.
+///      Full-game peers and P2P move in lockstep (wire 113); no lobby carrier
+///      names it.
 ///
 /// 130 — `GameState::linked_exile_lki` holds one incarnation-bounded
 ///      `LinkedExileLki` per departure (CR 400.7). A v129 peer cannot decode a
@@ -1020,7 +1069,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 131;
+pub const PROTOCOL_VERSION: u32 = 142;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2277,12 +2326,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 131);
+        assert_eq!(PROTOCOL_VERSION, 142);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 130);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 141);
     }
 
     #[test]

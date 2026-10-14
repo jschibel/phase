@@ -210,13 +210,51 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
- * 131 — The CR 608.2n final part of a spell's resolution is owed on the
+ * 142 — The CR 608.2n final part of a spell's resolution is owed on the
  *      resolution carrier: `GameState::deferred_spell_delivery` (v110) is removed
  *      and `GameState::resolving_spell_final_part` (`{ spell,
  *      resolution_start_phase }`) marks an instant or sorcery whose paused
- *      instructions have not finished. A v130 peer drops the key and would move
+ *      instructions have not finished. A v141 peer drops the key and would move
  *      the spell too early (or leave it on the stack after a free-cast window).
- *      Wire 113 moves with it; no lobby frame names it.
+ *      Wire 124 moves with it; no lobby frame names it.
+ * 141 — ExileLinkKind gains CastCost (CR 607.2q: a card exiled to pay a cost
+ *      of casting a permanent spell, linked to the permanent it becomes),
+ *      carried in GameState.exile_links — see PROTOCOL_VERSION's own `/// 141`
+ *      entry in crates/lobby-broker/src/protocol.rs. A v140 peer cannot parse
+ *      the tag; the exact-match version check at connect refuses the pairing.
+ *      Wire 123 moves with it.
+ * 140 — AttackSubject gains EventAttackers (the players a trigger's attack
+ *      event's attackers attacked), carried in an ability's player_scope
+ *      inside GameState — see PROTOCOL_VERSION's own `/// 140` entry in
+ *      crates/lobby-broker/src/protocol.rs. A v139 peer cannot parse the tag;
+ *      the exact-match version check at connect refuses the pairing. Wire 122
+ *      moves with it.
+ * 139 — CR 702.122c per-turn crew relation: GameState gains
+ *      crew_history_this_turn and FilterProp gains CrewedThisTurn — see
+ *      PROTOCOL_VERSION's own `/// 139` entry in crates/lobby-broker/src/protocol.rs.
+ *      A v138 peer cannot parse the new filter tag. Wire 121 moves with it.
+ * 134 — GameEvent::AbilityActivated gains stack_entry, the stack object a
+ *      stack-using activation created, carried in GameState's trigger events —
+ *      see PROTOCOL_VERSION's own `/// 134` entry in
+ *      crates/lobby-broker/src/protocol.rs. A v133 peer drops it silently and
+ *      resolves an activation trigger's "copy that ability" differently; the
+ *      exact-match version check at connect refuses the pairing. Wire 116
+ *      moves with it.
+ * 133 — CR 614.12a pre-entry as-enters choices: NamedChoiceSourceBinding gains
+ *      PendingEntry (WaitingFor.NamedChoice.source.binding), and the parked
+ *      entry event / PendingReplacement carry the answers and the paused
+ *      delivery's boundary — see PROTOCOL_VERSION's own `/// 133` entry in
+ *      crates/lobby-broker/src/protocol.rs. A v132 peer cannot parse the new
+ *      binding tag. Wire 115 moves with it.
+ * 132 — `GameObject::exile_from_stack_linked_source` carries the stamping
+ *      incarnation (`ObjectIncarnationRef`, CR 400.7); a v131 peer cannot
+ *      decode a set rider. Wire 114 moves with it; no lobby frame names it.
+ * 131 — PlayerFilter gains AnyOf (the union of player sets) and TargetPlayer
+ *      (the first declared player target), carried in an ability's
+ *      player_scope inside GameState — see PROTOCOL_VERSION's own `/// 131`
+ *      entry in crates/lobby-broker/src/protocol.rs. A v130 peer cannot parse
+ *      either tag; the exact-match version check at connect refuses the
+ *      pairing. Wire 113 moves with it.
  * 130 — `GameState::linked_exile_lki` holds one incarnation-bounded
  *      `LinkedExileLki` per departure (CR 400.7); a v129 peer cannot decode a
  *      non-empty map. Wire 112 moves with it; no lobby frame names it.
@@ -829,7 +867,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 131;
+export const PROTOCOL_VERSION = 142;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
