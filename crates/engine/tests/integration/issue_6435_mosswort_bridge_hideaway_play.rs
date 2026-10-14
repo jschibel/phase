@@ -76,6 +76,7 @@ fn activate_mosswort_second_ability(
     let activate = runner.act(GameAction::ActivateAbility {
         source_id: mosswort,
         ability_index: 1,
+        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
     });
     if let Err(e) = &activate {
         panic!(
