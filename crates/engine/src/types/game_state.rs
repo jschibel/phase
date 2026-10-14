@@ -23695,6 +23695,9 @@ pub(crate) struct GameStateDecode;
 const LEGACY_EXPLOIT_EVENT_EVIDENCE_ERROR: &str =
     "CreatureExploited snapshot lacks authoritative victim record; restore a save that contains the exploit departure record";
 
+const LEGACY_DEFERRED_SPELL_DELIVERY_ERROR: &str =
+    "legacy deferred_spell_delivery snapshot cannot prove which on-resolution hooks already ran;      restore a save taken after the spell's free-cast window closed";
+
 const SERIALIZED_TRIGGER_DEFINITION_CORE_FIELDS: &[&str] = &[
     "execute",
     "valid_card",
@@ -23773,6 +23776,27 @@ fn migrate_legacy_exploited_trigger_roles(value: &mut serde_json::Value) {
         | serde_json::Value::Bool(_)
         | serde_json::Value::Number(_)
         | serde_json::Value::String(_) => {}
+    }
+}
+
+/// Rejects a snapshot that still carries the removed `deferred_spell_delivery` record.
+///
+/// CR 608.2n + CR 702.88a/c: before the final part of an instant or sorcery's
+/// resolution was owed on the resolution carrier (`resolving_spell_final_part`),
+/// a spell that paused on its own free-cast window had already armed its
+/// on-resolution hooks (rebound, paradigm, epic) and recorded only the chosen
+/// destination in `deferred_spell_delivery`. The carrier marker means the
+/// opposite: the hooks have NOT yet run. Completing an old snapshot through the
+/// final part would therefore re-arm them (a second rebound delayed trigger,
+/// CR 702.88c), and dropping the record would strand the spell in no zone. A
+/// record cannot say which hooks ran, so the snapshot is refused rather than
+/// guessed at. The key is the exact discriminator: it is never written by a
+/// current build, and `null` is not a record.
+fn reject_legacy_deferred_spell_delivery(value: &serde_json::Value) -> Result<(), String> {
+    let state = value.get("state").unwrap_or(value);
+    match state.get("deferred_spell_delivery") {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(_) => Err(LEGACY_DEFERRED_SPELL_DELIVERY_ERROR.to_string()),
     }
 }
 
@@ -24073,6 +24097,7 @@ impl GameStateDecode {
     ) -> Result<GameState, String> {
         reject_legacy_exploit_event_evidence(&value)?;
         reject_legacy_raw_prompt_authority(&value)?;
+        reject_legacy_deferred_spell_delivery(&value)?;
         if !matches!(mode, GameStateDecodeMode::DirectCurrentRaw) {
             migrate_legacy_delayed_trigger_provenance(&mut value)?;
             migrate_legacy_trigger_firing_carriers(
@@ -24130,6 +24155,7 @@ impl GameStateDecode {
         ));
         reject_legacy_exploit_event_evidence(value)?;
         reject_legacy_raw_prompt_authority(value)?;
+        reject_legacy_deferred_spell_delivery(value)?;
         if matches!(
             mode,
             GameStateDecodeMode::ResolutionWireV1 | GameStateDecodeMode::ResolutionWireV2
@@ -34320,6 +34346,35 @@ mod tests {
                 "declared v{version}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn reject_legacy_deferred_spell_delivery_refuses_only_a_present_record() {
+        // CR 608.2n + CR 702.88a/c: absent and `null` are not a record.
+        reject_legacy_deferred_spell_delivery(&serde_json::json!({ "turn_number": 3 }))
+            .expect("an absent key is a current-format state");
+        reject_legacy_deferred_spell_delivery(
+            &serde_json::json!({ "deferred_spell_delivery": null }),
+        )
+        .expect("null is not a record");
+
+        let record = serde_json::json!({ "object_id": 7, "destination": "Exile" });
+        let bare = serde_json::json!({ "deferred_spell_delivery": record });
+        let error = reject_legacy_deferred_spell_delivery(&bare)
+            .expect_err("a recorded destination cannot say which hooks already ran");
+        assert!(
+            error.contains(LEGACY_DEFERRED_SPELL_DELIVERY_ERROR),
+            "{error}"
+        );
+
+        // The trusted envelope nests the state under `state`.
+        let envelope = serde_json::json!({ "state": bare });
+        let error = reject_legacy_deferred_spell_delivery(&envelope)
+            .expect_err("the key under `state` is refused too");
+        assert!(
+            error.contains(LEGACY_DEFERRED_SPELL_DELIVERY_ERROR),
+            "{error}"
+        );
     }
 
     fn legacy_exploited_definition(marker: &str, actor_id: u64) -> serde_json::Value {

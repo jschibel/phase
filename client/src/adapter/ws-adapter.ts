@@ -210,6 +210,14 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 132 — The CR 608.2n final part of a spell's resolution is owed on the
+ *      resolution carrier: `GameState::deferred_spell_delivery` (v110) is removed
+ *      and `GameState::resolving_spell_final_part` (`{ spell,
+ *      resolution_start_phase }`) marks an instant or sorcery whose paused
+ *      instructions have not finished. A v131 peer drops the key and would move
+ *      the spell too early (or leave it on the stack after a free-cast window).
+ *      Wire 114 moves with it; no lobby frame names it.
+ *
  * 131 — TargetFilter gains AttackedPlayerOrPlaneswalker (the player or planeswalker an
  *      attacking creature is attacking, CR 506.3 + CR 115.10a), serialized in the
  *      ability definitions of GameState. A v130 peer cannot deserialize the tag; the
@@ -827,7 +835,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 131;
+export const PROTOCOL_VERSION = 132;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
