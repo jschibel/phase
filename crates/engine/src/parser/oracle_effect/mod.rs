@@ -38244,7 +38244,7 @@ enum RepeatProcessOutcome {
 /// stripped via the shared condition helpers and threaded into a
 /// `WhileCondition` predicate; the trailing "once"/"N times" sets its
 /// `max_iterations` cap. With no condition, "you may repeat …" maps to
-/// `ControllerChoice` and the bare / "if you do" forms are consumed only.
+/// `ControllerChoice`, the bare form is the structural `Bare` outcome (reached only through the gate of the comma-joined clause it trails), and the "if you do" forms are consumed only.
 fn try_parse_repeat_process_directive(
     text: &str,
     ctx: &mut ParseContext,
@@ -38285,8 +38285,8 @@ fn try_parse_repeat_process_directive(
     let body_lower = body.to_lowercase();
     let (parsed_directive, _) = nom_on_lower(body.as_str(), &body_lower, |i| {
         let (i, you_may) = opt(tag::<_, _, OracleError<'_>>("you may ")).parse(i)?;
-        // The bare/"if you do" forms have no condition and no "you may" — keep
-        // them recognized (consume-only) so they don't leak Unimplemented gaps.
+        // The bare/"if you do" forms have no condition and no "you may". The "if you do"
+        // form stays recognized consume-only so it doesn't leak Unimplemented gaps; the bare form is `Bare`.
         let (i, if_you_do) = opt(alt((
             tag::<_, _, OracleError<'_>>("if you do, "),
             tag("if you do "),

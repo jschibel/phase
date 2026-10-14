@@ -13649,7 +13649,7 @@ impl From<NinjutsuVariant> for CastVariantPaid {
     }
 }
 
-/// CR 702.49: Identifies which dedicated engine path handles a RuntimeHandled ability.
+/// CR 702.49 / CR 608.2c: Identifies how a RuntimeHandled node is handled: by a dedicated engine path (ninjutsu) or by the chain driver itself (the repeat directive).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeHandler {
     /// Handled by GameAction::ActivateNinjutsu path.
