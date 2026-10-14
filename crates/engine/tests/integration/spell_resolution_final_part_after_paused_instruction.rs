@@ -3055,3 +3055,94 @@ fn a_spell_whose_controller_owns_the_prompt_and_leaves_goes_with_them() {
     assert_eq!(stack_resolved_count(&events, mercy), 0);
     assert_settled(state);
 }
+
+/// Harsh Mercy cast by P0 and stolen with Commandeer by P1 in a three-player
+/// game, paused on P2's creature-type choice while P1 controls the spell.
+fn commandeered_harsh_mercy_paused_on_p2s_choice() -> (GameRunner, ObjectId) {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let mercy = scenario
+        .add_spell_to_hand_from_oracle(P0, "Harsh Mercy", false, HARSH_MERCY)
+        .with_mana_cost(ManaCost::generic(1))
+        .id();
+    let commandeer = scenario.add_real_card(P1, "Commandeer", Zone::Hand, db());
+    scenario.with_mana_pool(P0, mana(ManaType::White, 1));
+    scenario.with_mana_pool(P1, mana(ManaType::Blue, 7));
+    let mut runner = scenario.build();
+
+    runner.cast(mercy).commit();
+    runner
+        .act(GameAction::PassPriority)
+        .expect("P0 passes priority to P1");
+    runner.cast(commandeer).target_object(mercy).commit();
+    for _ in 0..16 {
+        match &runner.state().waiting_for {
+            WaitingFor::Priority { .. } => {
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("passing priority is accepted");
+            }
+            // "You may choose new targets for it." Harsh Mercy has none.
+            WaitingFor::OptionalEffectChoice { .. } => {
+                runner
+                    .act(GameAction::DecideOptionalEffect { accept: false })
+                    .expect("P1 keeps the spell's targets");
+            }
+            WaitingFor::NamedChoice {
+                player, options, ..
+            } if *player != PlayerId(2) => {
+                let choice = options.first().expect("a creature type is offered").clone();
+                runner
+                    .act(GameAction::ChooseOption { choice })
+                    .expect("the earlier player names a creature type");
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        matches!(
+            &runner.state().waiting_for,
+            WaitingFor::NamedChoice { player, source: Some(source), .. }
+                if *player == PlayerId(2) && source.prompt.controller == P1
+        ),
+        "reach guard: the stolen resolution paused on P2's creature-type choice, got {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(
+        runner.state().objects[&mercy].controller,
+        P1,
+        "reach guard: the thief controls the spell at the moment of concession"
+    );
+    assert_eq!(
+        runner
+            .state()
+            .owed_spell_final_part()
+            .map(|owed| owed.spell),
+        Some(mercy),
+        "reach guard: the paused sorcery owes its final part"
+    );
+    assert_eq!(runner.state().objects[&mercy].zone, Zone::Stack);
+    (runner, mercy)
+}
+
+/// CR 800.4a: the thief of a paused spell leaves while another player is
+/// answering. The control effect ends first and the spell reverts to its
+/// surviving owner, so it is not exiled with the thief: it finishes into its
+/// owner's graveyard, reported resolved once.
+#[test]
+fn a_commandeered_paused_spell_whose_thief_leaves_reverts_to_its_owner_and_finishes() {
+    let (mut runner, mercy) = commandeered_harsh_mercy_paused_on_p2s_choice();
+
+    let mut events = concede(&mut runner, P1);
+    events.extend(run_until_settled(&mut runner, |_| None));
+
+    let state = runner.state();
+    assert_eq!(
+        state.objects[&mercy].zone,
+        Zone::Graveyard,
+        "CR 800.4a: the reverted spell is not exiled; it finishes into its owner's graveyard"
+    );
+    assert_eq!(graveyard(state, P0), vec![mercy]);
+    assert_eq!(stack_resolved_count(&events, mercy), 1);
+    assert_settled(state);
+}
