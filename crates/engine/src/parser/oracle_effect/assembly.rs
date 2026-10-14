@@ -27,8 +27,9 @@ use crate::parser::oracle_nom::target::chain_text_mentions_chosen_object;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
     CastFromZoneDriver, CastingPermission, ChoiceType, ChosenGroupId, Comparator, ControllerRef,
-    DamageChannel, Effect, PlayerFilter, PlayerScope, QuantityExpr, QuantityRef, ReturnResultId,
-    SiblingCondition, StaticCondition, SubAbilityLink, TapStateChange, TargetFilter,
+    DamageChannel, Effect, EffectOutcomeSignal, PlayerFilter, PlayerScope, QuantityExpr,
+    QuantityRef, RepeatContinuation, ReturnResultId, SiblingCondition, StaticCondition,
+    SubAbilityLink, TapStateChange, TargetFilter,
 };
 use crate::types::game_state::TargetSelectionConstraint;
 use crate::types::zones::Zone;
@@ -4331,6 +4332,16 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     if let Some(ref continuation) = ir.repeat_until {
         result.repeat_until = Some(continuation.clone());
     }
+    // CR 608.2c: "If C, do A and repeat this process" — loop the chain while
+    // the repeat directive (a tail child of A's gated clause) is reached.
+    if bind_repeat_directives(&mut result) && result.repeat_until.is_none() {
+        result.repeat_until = Some(RepeatContinuation::WhileCondition {
+            condition: Box::new(AbilityCondition::EffectOutcome {
+                signal: EffectOutcomeSignal::RepeatDirectiveReached,
+            }),
+            max_iterations: None,
+        });
+    }
 
     // CR 607.2d: fill every committed-choice guess with the head Choose's domain.
     super::propagate_committed_choice_type_to_guesses(&mut result);
@@ -4343,6 +4354,47 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     super::propagate_guess_branch_condition_to_continuations(&mut result);
 
     result
+}
+
+/// CR 608.2c: validate the structural "repeat this process" directives of an
+/// assembled chain and report whether one survives (the root then loops on
+/// `EffectOutcomeSignal::RepeatDirectiveReached`).
+///
+/// A directive is meaningful only as the TAIL child of a GATED clause: the gate
+/// is what decides whether the process repeats, and a gated sub is skipped
+/// together with its continuation children. An ungated parent or a directive
+/// with successors cannot express that, so the directive is removed (fail
+/// closed) rather than left to loop until a zone runs dry. Validation lives at
+/// assembly because an outer "if" scope is applied after the nested body parse.
+pub(super) fn bind_repeat_directives(root: &mut AbilityDefinition) -> bool {
+    let mut survives = false;
+    let mut node = root;
+    loop {
+        let gated = node.condition.is_some();
+        let invalid = node.sub_ability.as_ref().is_some_and(|sub| {
+            sub.effect.is_repeat_directive() && (!gated || sub.sub_ability.is_some())
+        });
+        if invalid {
+            // Splice the invalid directive out, keeping its successors linked.
+            let tail = node
+                .sub_ability
+                .take()
+                .and_then(|mut sub| sub.sub_ability.take());
+            node.sub_ability = tail;
+            continue;
+        }
+        if node
+            .sub_ability
+            .as_ref()
+            .is_some_and(|sub| sub.effect.is_repeat_directive())
+        {
+            survives = true;
+        }
+        match node.sub_ability.as_deref_mut() {
+            Some(next) => node = next,
+            None => return survives,
+        }
+    }
 }
 
 // ===========================================================================

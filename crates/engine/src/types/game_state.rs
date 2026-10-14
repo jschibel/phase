@@ -22697,6 +22697,17 @@ declare_game_state! {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_coin_flip: Option<ResolutionCoinFlip>,
 
+    /// CR 608.2c: the "repeat this process" directive
+    /// (`RuntimeHandler::RepeatProcess`) was reached in the current pass of a
+    /// looped chain. Set when the directive node resolves and read by the
+    /// root's `EffectOutcomeSignal::RepeatDirectiveReached` loop predicate;
+    /// cleared at the head of every pass so a pass whose gate did not hold
+    /// (or that was declined) never reads a previous pass's request.
+    /// Resolution-scoped control flow, not game state proper: it is not part
+    /// of `PartialEq` and serializes only while set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repeat_process_requested: bool,
+
     /// CR 101.4 + CR 608.2c: Per-player `ChooseFromZone { EachPlayer }`
     /// iteration paused by the current player's interactive choice. Drained
     /// alongside the vote-ballot frame, before the ability-continuation frame
@@ -29215,6 +29226,7 @@ impl GameState {
             resolving_player_scope_linked_exile: None,
             merged_card_component_route: None,
             resolution_coin_flip: None,
+            repeat_process_requested: false,
             pending_player_scope_sacrifice_choice: None,
             pending_player_scope_unless_payment: None,
             pending_discard_batch: None,
@@ -32241,6 +32253,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         resolving_player_scope_linked_exile: _,
         merged_card_component_route: _,
         resolution_coin_flip: _,
+        repeat_process_requested: _,
         may_trigger_auto_choices: _,
         replacement_auto_choices: _,
         replacement_auto_choice_tail: _,

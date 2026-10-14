@@ -966,6 +966,16 @@ pub(super) fn strip_guess_outcome_conditional(text: &str) -> (Option<AbilityCond
 pub(super) fn strip_if_you_do_conditional(text: &str) -> (Option<AbilityCondition>, String) {
     let lower = text.to_lowercase();
 
+    // CR 701.17c + CR 608.2c: "If two cards that share a card type were milled
+    // this way, <effect>" (The Tale of Tamiyo) gates on the cards the preceding
+    // mill moved. Delegates to the existing nom stripper so the gate is
+    // recognized in the general clause cascade, not only in the repeat
+    // directive's own chunk.
+    let (milled, milled_rest) = strip_milled_shared_quality_conditional(text);
+    if milled.is_some() {
+        return (milled, milled_rest);
+    }
+
     // CR 603.12 + CR 608.2c: strip a leading reflexive-conditional connector
     // ("if you do, ", "when you do, ", "if that player doesn't, ", ...) and
     // return the corresponding AbilityCondition. Delegates to the shared
