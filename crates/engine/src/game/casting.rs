@@ -33104,6 +33104,7 @@ mod sacrifice_cost_context_identity_tests {
                 false,
                 None,
                 crate::types::game_state::CastPaymentMode::Auto,
+                false,
                 &mut vec![],
             )
             .unwrap();
