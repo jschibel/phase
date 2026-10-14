@@ -29,13 +29,12 @@ use crate::types::ability::{AttackSubject, CombatHistoryScope};
 use crate::types::events::{GameEvent, PlayerActionKind};
 use crate::types::format::ZoneScope;
 use crate::types::game_state::{
-    AutoMayChoice, CastOfferKind, ClauseMinimumSnapshot, DayNight, DiscardBatchCursor,
-    ExileLinkKind, GameState, LKISnapshot, ManaAbilityResume, MayTriggerAutoChoiceKey,
-    PendingContinuation, PendingCostMoveResume, PendingDiscardBatchCompletion,
-    PendingPlayerScopeLinkedExile, PendingPlayerScopeSacrificeChoice,
-    PendingPlayerScopeSacrificeCompletion, PendingPlayerScopeSacrificeFollowUp,
-    RepeatUntilStopWitness, ResolutionOptionalPaymentOption, ReturnResultOccurrenceId, WaitingFor,
-    ZoneChangeRecord, ZoneOpponentChooserPurpose,
+    AutoMayChoice, CastOfferKind, ClauseMinimumSnapshot, DayNight, DiscardBatchCursor, GameState,
+    LKISnapshot, ManaAbilityResume, MayTriggerAutoChoiceKey, PendingContinuation,
+    PendingCostMoveResume, PendingDiscardBatchCompletion, PendingPlayerScopeLinkedExile,
+    PendingPlayerScopeSacrificeChoice, PendingPlayerScopeSacrificeCompletion,
+    PendingPlayerScopeSacrificeFollowUp, RepeatUntilStopWitness, ResolutionOptionalPaymentOption,
+    ReturnResultOccurrenceId, WaitingFor, ZoneChangeRecord, ZoneOpponentChooserPurpose,
 };
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef, TrackedSetId};
 use crate::types::mana::ManaCost;
@@ -431,6 +430,11 @@ pub(crate) fn matches_player_scope(
                     PlayerFilter::AllExcept { exclude } => {
                         !matches_player_scope(state, p.id, exclude, controller, source_id)
                     }
+                    // CR 102.1 + CR 608.2c: predicate form of the union — a
+                    // player matches when any member names it.
+                    PlayerFilter::AnyOf { filters } => filters
+                        .iter()
+                        .any(|f| matches_player_scope(state, p.id, f, controller, source_id)),
                     // CR 102.2 / CR 102.3: "opponent" is a game-topology
                     // relation, not raw player-ID inequality. In team
                     // multiplayer a teammate is neither the controller nor an
@@ -584,6 +588,11 @@ pub(crate) fn matches_player_scope(
                     // (it has the ability in scope). Unreachable here — fail
                     // closed, mirroring the `ParentObjectTargetController` arm.
                     PlayerFilter::ChosenPlayer { .. } => false,
+                    // CR 115.1: the declared-target anchor needs the resolving
+                    // `ResolvedAbility` (for `ability.targets`), which this
+                    // generic scope predicate does not carry; the player_scope
+                    // driver routes it through `speed_effects::players_for_filter`.
+                    PlayerFilter::TargetPlayer => false,
                     // CR 108.3 + CR 109.4: the parent-object-target OWNER anchor
                     // likewise requires `ability.targets` to resolve via
                     // `ability_utils::parent_target_owner`. Resolved in
@@ -3522,13 +3531,93 @@ fn try_begin_deferred_else_branch_target_selection(
 /// Every OTHER chain condition — `EffectOutcome`, `QuantityCheck`, intervening
 /// `if` gates — is left intact and is still re-checked at resolution (CR 603.4).
 fn consume_reflexive_creation_gate(ability: &mut ResolvedAbility) {
-    AbilityCondition::take_when_you_do_marker(&mut ability.condition);
+    if AbilityCondition::take_when_you_do_marker(&mut ability.condition) {
+        settle_reflexive_zone_change_event(&mut ability.condition);
+    }
     if let Some(sub) = ability.sub_ability.as_deref_mut() {
         consume_reflexive_creation_gate(sub);
     }
     if let Some(alt) = ability.else_ability.as_deref_mut() {
         consume_reflexive_creation_gate(alt);
     }
+}
+
+/// CR 603.12 + CR 400.7 + CR 608.2b: the attachment pool of a reflexive
+/// "attach one of them" (`Attach { attachment: ParentTarget }`) created by a
+/// zone-change event. The pool is the event-scoped moved set — already bound by
+/// a `forward_result` hand-off, or read now from the creating resolution's
+/// ledger — and it is the ONLY carrier of that operand on the stack object: the
+/// forwarded copy the legacy hand-off wrote into `targets` would be judged as a
+/// declared host target when the reflexive resolves (CR 608.2b) and fizzle it,
+/// so it is dropped. A declared host is chosen as the reflexive is put on the
+/// stack (CR 603.3d). `None` when the reflexive is not such an attach or the
+/// event moved nothing matching.
+fn freeze_reflexive_attachment_pool(
+    state: &GameState,
+    reflexive: &ResolvedAbility,
+) -> Option<ResolvedAbility> {
+    if !matches!(
+        reflexive.effect,
+        Effect::Attach {
+            attachment: TargetFilter::ParentTarget,
+            ..
+        }
+    ) || reflexive
+        .condition
+        .as_ref()
+        .and_then(AbilityCondition::zone_changed_this_way_head)
+        .is_none()
+    {
+        return None;
+    }
+    let candidates = if reflexive.attach_attachment_candidates().is_empty() {
+        attach::attachment_candidates_from_zone_change(
+            state,
+            reflexive,
+            state.last_zone_changed_ids.as_slice(),
+        )
+    } else {
+        reflexive.attach_attachment_candidates().to_vec()
+    };
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut owned = reflexive.clone();
+    owned.bind_attach_attachment_candidates(candidates);
+    owned.set_unpinned_targets(Vec::new());
+    Some(owned)
+}
+
+/// CR 603.12: a reflexive triggered ability "trigger[s] based on whether the
+/// trigger event or events occurred earlier during the resolution of the spell
+/// or ability that created" it. For "When <a zone change> this way, …" that
+/// event is the root `ZoneChangedThisWay` member of the creation gate, read from
+/// the creating resolution's own zone-change ledger (`last_zone_changed_ids`).
+/// It was checked when the trigger was created, and it is not an intervening
+/// "if" (CR 603.4): the zone change already happened, and the ledger it reads
+/// belongs to the creating resolution, not to the reflexive ability's own
+/// resolution. Remove it from the stack object, collapsing the residual root
+/// like `take_when_you_do_marker` does. The parser never composes a
+/// zone-change intervening "if" with `WhenYouDo` (see
+/// `AbilityCondition::zone_changed_this_way_head`), so every root
+/// `ZoneChangedThisWay` member here is that trigger event. Only root members are
+/// settled; a `ZoneChangedThisWay` inside `Or`/`Not`/nested `And` is a different
+/// expression and stays.
+fn settle_reflexive_zone_change_event(condition: &mut Option<AbilityCondition>) {
+    let is_zone_change_event =
+        |member: &AbilityCondition| matches!(member, AbilityCondition::ZoneChangedThisWay { .. });
+    *condition = match condition.take() {
+        Some(AbilityCondition::And { mut conditions }) => {
+            conditions.retain(|member| !is_zone_change_event(member));
+            match conditions.len() {
+                0 => None,
+                1 => conditions.pop(),
+                _ => Some(AbilityCondition::And { conditions }),
+            }
+        }
+        Some(member) if is_zone_change_event(&member) => None,
+        other => other,
+    };
 }
 
 /// CR 603.12 + CR 603.3: Build one complete synthetic reflexive trigger from an
@@ -3681,6 +3770,24 @@ fn try_materialize_reflexive_trigger_inner(
         apply_parent_chain_context(&mut owned, parent, effect_context_object, state);
         reflexive_context_owned = owned;
         &reflexive_context_owned
+    } else {
+        reflexive
+    };
+
+    // CR 603.12 + CR 400.7 + CR 608.2c: "When you put one or more Equipment onto
+    // the battlefield this way, you may attach one of them …" — "them" is the
+    // set the zone change moved. The creating resolution's ledger names that
+    // set only until this reflexive leaves it, so freeze the incarnation-pinned
+    // attachment pool now, while the creation gate is still being evaluated.
+    let frozen_pool_owned;
+    let reflexive = if creates_reflexive_trigger {
+        match freeze_reflexive_attachment_pool(state, reflexive) {
+            Some(owned) => {
+                frozen_pool_owned = owned;
+                &frozen_pool_owned
+            }
+            None => reflexive,
+        }
     } else {
         reflexive
     };
@@ -7155,6 +7262,7 @@ fn scope_keeps_scoped_whole_hand_shuffle_local(scope: &PlayerFilter) -> bool {
         | PlayerFilter::ParentObjectTargetController
         | PlayerFilter::ParentObjectTargetOwner
         | PlayerFilter::GrantingObjectCaster
+        | PlayerFilter::TargetPlayer
         | PlayerFilter::ChosenPlayer { .. }
         // Turn/combat ledgers.
         | PlayerFilter::OpponentLostLife
@@ -7178,6 +7286,10 @@ fn scope_keeps_scoped_whole_hand_shuffle_local(scope: &PlayerFilter) -> bool {
         // Behaviour-identical while every arm above is `true`; recursing keeps it
         // from silently disagreeing with its anchor the moment one is not.
         PlayerFilter::AllExcept { exclude } => scope_keeps_scoped_whole_hand_shuffle_local(exclude),
+        // The union keeps the pair local only when every member does.
+        PlayerFilter::AnyOf { filters } => filters
+            .iter()
+            .all(scope_keeps_scoped_whole_hand_shuffle_local),
     }
 }
 
@@ -8311,6 +8423,82 @@ pub(crate) fn next_sub_needs_tracked_set(ability: &ResolvedAbility) -> bool {
     branch_references_tracked_set(ability.sub_ability.as_deref())
 }
 
+/// CR 608.2c + CR 608.2e: does the text that FOLLOWS `producer` consume the
+/// chain's tracked set?
+///
+/// Ordinarily that text is `producer`'s own `sub_ability` chain
+/// ([`next_sub_needs_tracked_set`]). A `player_scope` fan-out that pauses on a
+/// seat's choice parks the clause's remaining seats and its unscoped tail as
+/// the active ability continuation; the paused seat's answer then resolves the
+/// seat's producer with no consumer in its own chain. Its following text is
+/// that parked continuation, so it publishes into the clause's set as the
+/// continuation's generated legs do. A seat whose answer is itself the
+/// producing choice (an `EffectZoneChoice`) resumes no producer and does not
+/// reach this predicate; the fan-out driver's comment records that gap.
+///
+/// Two stops keep a parked continuation from being read as following text
+/// when it is not:
+///  * a CR 700.2 mode boundary inside `producer`'s own chain
+///    ([`crosses_modal_boundary`]): the continuation then follows a later mode;
+///  * a different source: another object's chain resolving during the pause
+///    (a replacement effect's, CR 614.1) is not this instruction's text.
+fn resolution_next_needs_tracked_set(state: &GameState, producer: &ResolvedAbility) -> bool {
+    next_sub_needs_tracked_set(producer)
+        || (std::iter::successors(producer.sub_ability.as_deref(), |node| {
+            node.sub_ability.as_deref()
+        })
+        .all(|node| !crosses_modal_boundary(node))
+            && state
+                .active_ability_continuation()
+                .is_some_and(|continuation| {
+                    continuation.chain.source_id == producer.source_id
+                        && chain_references_tracked_set(&continuation.chain)
+                }))
+}
+
+/// CR 608.2d + CR 115.10a: does `ability` choose, while it resolves, the
+/// object it puts counters on or whose counter kinds it reads, rather than
+/// carrying one declared with the ability?
+pub(crate) fn awaits_resolution_object_choice(ability: &ResolvedAbility) -> bool {
+    let needs_resolution_object_choice = match &ability.effect {
+        // CR 115.10a: "no recipient chosen yet" means "no OBJECT target", not
+        // "no targets at all". A `PutCounter` reached as a `ChooseOneOf` branch
+        // carries the `TargetRef::Player` that `choose_one_of::resolve_branch`
+        // injects for the branch chooser, which is not a recipient. This is a
+        // strict superset of the former `targets.is_empty()` test (an empty
+        // target list contains no `TargetRef::Object` either), so every
+        // pre-existing `PutCounter` caller is unaffected.
+        Effect::PutCounter { .. } => !ability
+            .targets
+            .iter()
+            .any(|target| matches!(target, TargetRef::Object(_))),
+        Effect::ChooseCounterKind { target, .. } => {
+            !matches!(target, TargetFilter::SpecificObject { .. })
+        }
+        _ => false,
+    };
+    ability.target_choice_timing == TargetChoiceTiming::Resolution
+        && needs_resolution_object_choice
+        && ability.distribution.is_none()
+}
+
+/// CR 608.2c + CR 608.2d: once its resolution-time object choice is answered,
+/// does the parked `head` publish its own result into the chain's tracked set?
+///
+/// A head that [`awaits_resolution_object_choice`] parks itself and resumes
+/// with the pick bound as its object. When its own chain reads the set, its
+/// postlude publishes the objects it affected through
+/// [`resolution_next_needs_tracked_set`], extending the chain's set as the
+/// single-candidate binding does. The answer must then publish nothing: a
+/// fresh set would drop what earlier instructions published, such as the
+/// earlier seats of a paused `player_scope` fan-out. This reads the
+/// frame-independent half of that predicate ([`next_sub_needs_tracked_set`]),
+/// because while the choice is pending the head's own parked frame is still
+/// the active continuation.
+pub(crate) fn resolution_choice_head_publishes_on_resume(head: &ResolvedAbility) -> bool {
+    awaits_resolution_object_choice(head) && next_sub_needs_tracked_set(head)
+}
+
 /// CR 700.2 + CR 608.2c: does ENTERING `node` cross into a different modal
 /// instruction?
 ///
@@ -8846,12 +9034,15 @@ fn player_filter_references_tracked_set(filter: &PlayerFilter) -> bool {
         | PlayerFilter::ParentObjectTargetController
         | PlayerFilter::ParentObjectTargetOwner
         | PlayerFilter::GrantingObjectCaster
+        | PlayerFilter::TargetPlayer
         | PlayerFilter::ChosenPlayer { .. }
         | PlayerFilter::ControlsCount { .. }
         | PlayerFilter::PlayerAttribute { .. } => false,
         // The negation wrapper inherits its inner filter's consumption: an
         // "all except <tracked-set possessor>" scope still needs the set.
         PlayerFilter::AllExcept { exclude } => player_filter_references_tracked_set(exclude),
+        // The union needs the set when any member does.
+        PlayerFilter::AnyOf { filters } => filters.iter().any(player_filter_references_tracked_set),
     }
 }
 
@@ -9601,6 +9792,25 @@ fn when_you_do_mandatory_parent_did_nothing(
         && !mandatory_parent_effect_performed(&parent.effect, parent_events)
 }
 
+/// CR 608.2c: Whether this node only grants a play or cast permission over cards
+/// an earlier instruction moved ("You may play that card this turn") and is
+/// directly followed by a "… this way" head that reads the earlier mover's
+/// zone-change ledger (Cait Sith, Fortune Teller; Hidetsugu, Devouring Chaos).
+/// Such a permission node moves nothing, so it leaves that ledger in place for
+/// the head. Scoped to the direct reader: other consumers after a permission
+/// node keep the established cleared ledger, because "cards exiled with this
+/// enchantment" readers (Court of Locthwain) would otherwise narrow to the
+/// current resolution's exile. Deliberately excludes `CastFromZone`, which can
+/// also cast during resolution.
+fn permission_node_keeps_ledger_for_this_way_head(ability: &ResolvedAbility) -> bool {
+    matches!(ability.effect, Effect::GrantCastingPermission { .. })
+        && ability
+            .sub_ability
+            .as_ref()
+            .and_then(|sub| sub.condition.as_ref())
+            .is_some_and(|condition| condition.zone_changed_this_way_head().is_some())
+}
+
 /// CR 603.12: Effect kinds whose reflexive "when you do" needs an actual move
 /// event even though their "if you do" (CR 118.12) treats a started-but-empty
 /// move as performed.
@@ -9652,6 +9862,71 @@ pub(crate) fn condition_has_reveal_until_matched_guard(condition: &AbilityCondit
     match condition {
         AbilityCondition::And { conditions } => conditions.iter().any(is_guard),
         condition => is_guard(condition),
+    }
+}
+
+#[cfg(test)]
+mod settle_reflexive_zone_change_event_tests {
+    use super::settle_reflexive_zone_change_event;
+    use crate::types::ability::{AbilityCondition, TargetFilter};
+
+    fn event() -> AbilityCondition {
+        AbilityCondition::ZoneChangedThisWay {
+            filter: TargetFilter::Any,
+            destination: None,
+        }
+    }
+
+    /// CR 603.12 + CR 603.4: only the root zone-change event is settled; an
+    /// ordinary guard and any nested expression ride onto the stack object.
+    #[test]
+    fn settles_only_the_root_zone_change_event() {
+        let mut alone = Some(event());
+        settle_reflexive_zone_change_event(&mut alone);
+        assert_eq!(alone, None);
+
+        let mut with_guard = Some(AbilityCondition::And {
+            conditions: vec![event(), AbilityCondition::IsYourTurn],
+        });
+        settle_reflexive_zone_change_event(&mut with_guard);
+        assert_eq!(with_guard, Some(AbilityCondition::IsYourTurn));
+
+        let nested = AbilityCondition::Or {
+            conditions: vec![event(), AbilityCondition::IsYourTurn],
+        };
+        let negated = AbilityCondition::Not {
+            condition: Box::new(event()),
+        };
+        for kept in [nested, negated] {
+            let mut condition = Some(kept.clone());
+            settle_reflexive_zone_change_event(&mut condition);
+            assert_eq!(condition, Some(kept));
+        }
+
+        let mut nested_and = Some(AbilityCondition::And {
+            conditions: vec![
+                AbilityCondition::IsYourTurn,
+                AbilityCondition::And {
+                    conditions: vec![event(), AbilityCondition::IsMonarch],
+                },
+            ],
+        });
+        let before = nested_and.clone();
+        settle_reflexive_zone_change_event(&mut nested_and);
+        assert_eq!(nested_and, before, "a nested And is a different expression");
+    }
+
+    /// The parser never composes a zone-change guard with `WhenYouDo`, so the
+    /// root member is the event by contract (see
+    /// `AbilityCondition::zone_changed_this_way_head`).
+    #[test]
+    fn the_reflexive_gate_names_its_event() {
+        let gate = AbilityCondition::when_you_do_with_guard(event());
+        assert_eq!(gate.zone_changed_this_way_head(), Some(&event()));
+        assert!(gate.has_root_zone_changed_this_way());
+        assert!(AbilityCondition::IsYourTurn
+            .zone_changed_this_way_head()
+            .is_none());
     }
 }
 
@@ -10286,7 +10561,7 @@ pub(crate) fn publish_tracked_set_for_resolution(
         (
             TrackedSetPublicationMode::Normal,
             TrackedSetPublicationInput::ResolvedEvents { ability, events },
-        ) if next_sub_needs_tracked_set(producer) => {
+        ) if resolution_next_needs_tracked_set(state, producer) => {
             let affected = affected_objects_with_causes(state, ability, &ability.effect, events);
             publish_tracked_set_with_causes(state, affected);
         }
@@ -12695,6 +12970,13 @@ fn hydratable_event_context_filter(filter: &TargetFilter) -> bool {
 /// Returns the filter only for event-context variants (TriggeringSpellController, etc.)
 /// that auto-resolve from `state.current_trigger_event` at resolution time.
 fn extract_event_context_filter(effect: &Effect) -> Option<&TargetFilter> {
+    // CR 608.2k + CR 707.10: a copy's `ParentTarget` names the copied stack
+    // object, which `copy_spell::copy_source_entry` resolves from the same
+    // trigger event; hydrating it would bind the event's object or the source's
+    // attached host (CR 301.5a / CR 303.4b) in its place.
+    if effect.parent_target_is_copy_referent() {
+        return None;
+    }
     // CR 110.2 + CR 603.7c: `GiveControl` carries both an object `target` and a
     // `recipient`. Kain ("that player gains control of Kain") binds the recipient
     // to `TriggeringPlayer` while the object is `SelfRef` — only the recipient
@@ -13438,11 +13720,9 @@ pub(super) fn linked_exile_batch_from_events(
                 .objects
                 .get(&id)
                 .is_some_and(|object| object.zone == Zone::Exile)
-            && state.exile_links.iter().any(|link| {
-                link.exiled_id == id
-                    && link.source_id == source_id
-                    && link.kind == ExileLinkKind::TrackedBySource
-            })
+            // CR 607.2a + CR 113.7a: this resolution's own tracked exile, as the
+            // acting incarnation made it.
+            && crate::game::exile_links::tracked_exile_of_acting_incarnation(state, source_id, id)
         {
             batch.push(ObjectIncarnationRef::from_object(&state.objects[&id]));
         }
@@ -14513,22 +14793,28 @@ pub(crate) fn finalize_discard_choice_completion(
     let PendingDiscardBatchCompletion::DiscardChoice { chosen } = completion else {
         return;
     };
-    let discarded_to_graveyard: Vec<ObjectId> = events
+    // CR 701.9a + CR 702.35a: a chosen card a replacement redirects on its way
+    // out of the hand (Rest in Peace, Leyline of the Void, madness → exile) is
+    // still discarded, so this completion — the single authority for what the
+    // discard moved, on both the synchronous and the replacement-paused path —
+    // publishes every chosen card's zone change, wherever it went. A public
+    // destination stays findable by the rest of the effect (CR 400.7j).
+    let discarded: Vec<ObjectId> = events
         .iter()
         .filter_map(|event| match event {
             GameEvent::ZoneChanged {
                 object_id,
-                to: Zone::Graveyard,
+                from: Some(Zone::Hand),
                 ..
-            } => Some(*object_id),
+            } if chosen.iter().any(|pick| pick.object_id == *object_id) => Some(*object_id),
             _ => None,
         })
         .collect();
-    if !discarded_to_graveyard.is_empty() {
-        state.last_zone_changed_ids = discarded_to_graveyard.clone();
+    if !discarded.is_empty() {
+        state.last_zone_changed_ids = discarded.clone();
         publish_tracked_set_with_causes(
             state,
-            discarded_to_graveyard
+            discarded
                 .into_iter()
                 .map(|id| (id, Some(ThisWayCause::Discarded)))
                 .collect(),
@@ -15341,6 +15627,25 @@ fn resolve_chain_body(
     events: &mut Vec<GameEvent>,
     depth: u32,
 ) -> Result<(), EffectError> {
+    // CR 115.10a + CR 301.5f + CR 303.4b: an untargeted "enchanted/equipped X"
+    // recipient is bound to the source's host as this instruction begins to
+    // resolve, before its conditions and effect read it. With no provable host
+    // the instruction itself does nothing (`host_effect_impossible`).
+    let host_binding = crate::game::targeting::bind_resolution_attachment_hosts(state, ability);
+    let host_effect_impossible = match &host_binding {
+        crate::game::targeting::ResolutionHostBinding::Absent => true,
+        crate::game::targeting::ResolutionHostBinding::NotApplicable
+        | crate::game::targeting::ResolutionHostBinding::Bound(_) => false,
+    };
+    let host_bound;
+    let ability = match host_binding {
+        crate::game::targeting::ResolutionHostBinding::Bound(bound) => {
+            host_bound = *bound;
+            &host_bound
+        }
+        crate::game::targeting::ResolutionHostBinding::NotApplicable
+        | crate::game::targeting::ResolutionHostBinding::Absent => ability,
+    };
     // CR 608.2c: Snapshot the `pending_continuation` *value* at chain-body
     // entry so the sub_ability guard further down can compare by IDENTITY, not
     // mere presence. An unrelated outer continuation (e.g. a `player_scope`
@@ -15711,7 +16016,9 @@ fn resolve_chain_body(
         let matching_players: Vec<PlayerId> = match scope {
             PlayerFilter::AllExcept { .. }
             | PlayerFilter::ParentObjectTargetController
-            | PlayerFilter::ParentObjectTargetOwner => {
+            | PlayerFilter::ParentObjectTargetOwner
+            | PlayerFilter::AnyOf { .. }
+            | PlayerFilter::TargetPlayer => {
                 // CR 608.2c + CR 109.4 + CR 608.2h: these anchors are all
                 // ability-target references — the `AllExcept` exclude anchor and the
                 // direct `ParentObjectTargetController` / `ParentObjectTargetOwner`
@@ -15722,7 +16029,9 @@ fn resolve_chain_body(
                 // last-known-information lookup over `ability.targets` is
                 // unavailable). Route through the ability-aware
                 // `speed_effects::players_for_filter`, then re-impose APNAP order by
-                // intersecting against the apnap sequence.
+                // intersecting against the apnap sequence. CR 115.1 + CR 101.4:
+                // `AnyOf` resolves every member ability-aware; `TargetPlayer` reads
+                // `ability.targets`.
                 let set =
                     crate::game::effects::speed_effects::players_for_filter(state, scope, ability);
                 apnap.into_iter().filter(|pid| set.contains(pid)).collect()
@@ -15881,6 +16190,28 @@ fn resolve_chain_body(
         // `EffectResolved` gap at that site). Repairing it means making the
         // per-clause table accumulate across continuation legs, which is
         // resume-machinery work well outside a draw-count change.
+        //
+        // When the tail is linearized after the generated legs, the clause's
+        // TRACKED SET is complete for seats whose producer publishes from its
+        // own resolution. The postlude below publishes the seats that completed,
+        // each generated leg's chain ends in the unscoped tail and so extends
+        // the chain set, and a paused seat's producer resumed under the parked
+        // continuation (a choose-one or optional answer, or a Resolution-timed
+        // recipient choice) extends it through
+        // `resolution_next_needs_tracked_set` (CR 608.2c "this way").
+        //
+        // A seat whose answer is itself the producing choice does not. An
+        // `EffectZoneChoice` answer (`publish_effect_zone_choice_tracked_set`)
+        // mints a fresh set for each paused seat, so a clause-wide detached
+        // tail read after it loses the earlier paused seats and every seat that
+        // completed before the last pause: it sees only the last paused seat's
+        // choice and the seats that complete after it. This is a known gap,
+        // filed separately.
+        //
+        // A tail that needs linked exile is not linearized: it rides the
+        // frame's `player_scope_linked_exile` sidecar, which that predicate
+        // does not read, so on that branch neither the legs nor the paused
+        // seat publish.
         let mut applied_domain_end = matching_players.len();
         // CR 608.2e: each clause's equalization minimum is fixed when that
         // clause begins; the snapshot is per `player_scope` link, captured
@@ -16732,27 +17063,7 @@ fn resolve_chain_body(
     // `resolve_defined_or_targets`'s existing `resolved_object_ids_for_filter`
     // fallback in `counters.rs`; routing them through an interactive prompt
     // here would be wrong (and untested against that resolver's semantics).
-    let needs_resolution_object_choice = match &ability.effect {
-        // CR 115.10a: "no recipient chosen yet" means "no OBJECT target", not
-        // "no targets at all". A `PutCounter` reached as a `ChooseOneOf` branch
-        // carries the `TargetRef::Player` that `choose_one_of::resolve_branch`
-        // injects for the branch chooser, which is not a recipient. This is a
-        // strict superset of the former `targets.is_empty()` test (an empty
-        // target list contains no `TargetRef::Object` either), so every
-        // pre-existing `PutCounter` caller is unaffected.
-        Effect::PutCounter { .. } => !ability
-            .targets
-            .iter()
-            .any(|target| matches!(target, TargetRef::Object(_))),
-        Effect::ChooseCounterKind { target, .. } => {
-            !matches!(target, TargetFilter::SpecificObject { .. })
-        }
-        _ => false,
-    };
-    if ability.target_choice_timing == TargetChoiceTiming::Resolution
-        && needs_resolution_object_choice
-        && ability.distribution.is_none()
-    {
+    if awaits_resolution_object_choice(ability) {
         if let Effect::PutCounter { target, .. } | Effect::ChooseCounterKind { target, .. } =
             &ability.effect
         {
@@ -16865,7 +17176,12 @@ fn resolve_chain_body(
         // If targets don't share the required quality, skip the effect.
         let shares_quality_failed = fails_shared_quality(state, effective);
 
-        if shares_quality_failed {
+        // CR 115.10a + CR 303.4b + CR 301.5f: an instruction naming its
+        // source's host when there is no provable host does nothing —
+        // skipped here like a failed group constraint,
+        // so no resolver can re-read the description as a scan or act on a new
+        // object under a departed host's storage id.
+        if shares_quality_failed || host_effect_impossible {
             // Group constraint not met — emit EffectResolved but skip execution.
             events.push(GameEvent::EffectResolved {
                 kind: crate::types::ability::EffectKind::from(&ability.effect),
@@ -17390,13 +17706,20 @@ fn resolve_chain_body(
 
     // CR 608.2c: Populate last_zone_changed_ids for ZoneChangedThisWay condition evaluation.
     // Scans ZoneChanged events emitted by this effect, mirroring the forward_result pattern.
-    state.last_zone_changed_ids = events[events_before..]
+    let zone_changed_ids: Vec<ObjectId> = events[events_before..]
         .iter()
         .filter_map(|e| match e {
             GameEvent::ZoneChanged { object_id, .. } => Some(*object_id),
             _ => None,
         })
         .collect();
+    // CR 608.2c: "… this way" names the earlier instruction that moved the
+    // cards. A play permission over those cards ("You may play that card this
+    // turn") directly followed by a "this way" head is not that instruction,
+    // so it leaves the moving instruction's ledger in place for the head.
+    if !permission_node_keeps_ledger_for_this_way_head(ability) {
+        state.last_zone_changed_ids = zone_changed_ids;
+    }
     let linked_batch =
         linked_exile_batch_from_events(state, ability.source_id, &events[events_before..]);
     if let Some(scope) = state.resolving_player_scope_linked_exile.as_mut() {
@@ -17529,7 +17852,7 @@ fn resolve_chain_body(
     //   - Counter-adding effects → `CounterAdded` (CR 122.1), so "those
     //     creatures" after a mass counter instruction means the permanents that
     //     actually received counters.
-    if next_sub_needs_tracked_set(ability) {
+    if resolution_next_needs_tracked_set(state, ability) {
         publish_tracked_set_for_resolution(
             state,
             ability,
@@ -20877,6 +21200,9 @@ fn scoped_player_matches_filter(
         PlayerFilter::AllExcept { exclude } => {
             !scoped_player_matches_filter(state, ability, candidate, exclude)
         }
+        PlayerFilter::AnyOf { filters } => filters
+            .iter()
+            .any(|f| scoped_player_matches_filter(state, ability, candidate, f)),
         PlayerFilter::OpponentLostLife => {
             crate::game::players::is_opponent(state, controller, candidate)
                 && state
@@ -20914,6 +21240,7 @@ fn scoped_player_matches_filter(
         | PlayerFilter::ChosenPlayer { .. }
         | PlayerFilter::ParentObjectTargetOwner
         | PlayerFilter::GrantingObjectCaster
+        | PlayerFilter::TargetPlayer
         | PlayerFilter::ControlsCount { .. }
         | PlayerFilter::TrackedSetPossessor { .. }
         | PlayerFilter::PlayerAttribute { .. } => false,
@@ -22768,6 +23095,36 @@ mod tests {
         assert!(ability_with_event_context_targets(&state, &ability)
             .targets
             .is_empty());
+    }
+
+    /// CR 608.2k + CR 707.10: a copy's `ParentTarget` ("copy that ability")
+    /// names the copied stack object, so resolution hydration must not bind it;
+    /// every other event-context copy filter and `ParentTarget` effect still
+    /// hydrates.
+    #[test]
+    fn extract_event_context_filter_skips_a_copy_referent_parent_target() {
+        let copy = |target| Effect::CopySpell {
+            target,
+            retarget: CopyRetargetPermission::MayChooseNewTargets,
+            copier: None,
+            additional_modifications: vec![],
+            starting_loyalty_from_casualty_sacrifice: false,
+        };
+        assert_eq!(
+            extract_event_context_filter(&copy(TargetFilter::ParentTarget)),
+            None
+        );
+        assert_eq!(
+            extract_event_context_filter(&copy(TargetFilter::TriggeringSource)),
+            Some(&TargetFilter::TriggeringSource)
+        );
+        assert_eq!(
+            extract_event_context_filter(&Effect::Destroy {
+                target: TargetFilter::ParentTarget,
+                cant_regenerate: false,
+            }),
+            Some(&TargetFilter::ParentTarget)
+        );
     }
     use crate::game::ability_utils::build_resolved_from_def;
     use crate::game::zones::create_object;
@@ -24756,6 +25113,138 @@ mod tests {
             ability_or_branch_references_tracked_set(&ability),
             "repeat_for: TrackedSetSize must mark the ability as referencing the tracked set"
         );
+    }
+
+    /// CR 608.2c + CR 608.2e: a producer at the end of a chain resumed under a
+    /// parked same-source continuation reads that continuation as its following
+    /// text; its own consumer, a mode boundary in its own chain, or a different
+    /// source decide otherwise.
+    #[test]
+    fn resolution_next_needs_tracked_set_reads_a_parked_same_source_continuation() {
+        let source = ObjectId(1);
+        let draw = |count: QuantityExpr, src: ObjectId| {
+            ResolvedAbility::new(
+                Effect::Draw {
+                    target: TargetFilter::Controller,
+                    count,
+                },
+                vec![],
+                src,
+                PlayerId(0),
+            )
+        };
+        let producer = |src| draw(QuantityExpr::Fixed { value: 1 }, src);
+        let non_consumer = |src| draw(QuantityExpr::Fixed { value: 2 }, src);
+        let consumer = |src| {
+            draw(
+                QuantityExpr::Ref {
+                    qty: QuantityRef::TrackedSetSize,
+                },
+                src,
+            )
+        };
+        let mut state = GameState::new_two_player(7);
+        // Nothing parked and no consumer of its own.
+        assert!(!resolution_next_needs_tracked_set(
+            &state,
+            &producer(source)
+        ));
+        // Its own consumer, nothing parked: the existing rule.
+        assert!(resolution_next_needs_tracked_set(
+            &state,
+            &producer(source).sub_ability(consumer(source))
+        ));
+        // A parked same-source continuation that consumes nothing.
+        append_to_pending_continuation(&mut state, Some(Box::new(non_consumer(source))));
+        assert!(!resolution_next_needs_tracked_set(
+            &state,
+            &producer(source)
+        ));
+        state
+            .take_active_ability_continuation()
+            .expect("the parked non-consumer is the active frame");
+        // A parked same-source consumer: the producer's chain end hands off.
+        append_to_pending_continuation(&mut state, Some(Box::new(consumer(source))));
+        assert!(resolution_next_needs_tracked_set(&state, &producer(source)));
+        // A non-consuming own chain still ends in the parked consumer.
+        assert!(resolution_next_needs_tracked_set(
+            &state,
+            &producer(source).sub_ability(non_consumer(source))
+        ));
+        // CR 700.2: a mode boundary inside the producer's own chain stops it.
+        let mut next_mode = non_consumer(source);
+        next_mode.modal_instruction_ordinal = Some(1);
+        assert!(!resolution_next_needs_tracked_set(
+            &state,
+            &producer(source).sub_ability(next_mode)
+        ));
+        // CR 614.1: another object's chain resolving during the pause.
+        assert!(!resolution_next_needs_tracked_set(
+            &state,
+            &producer(ObjectId(2))
+        ));
+    }
+
+    /// CR 608.2c + CR 608.2d: only a Resolution-timed recipient choice whose own
+    /// chain reads the set publishes on resume; a declared object, a head whose
+    /// chain reads nothing, or a head that is not a counter instruction leaves
+    /// the choice answer's publication in place.
+    #[test]
+    fn resolution_choice_head_publishes_on_resume_only_for_its_own_reader() {
+        let reader = || {
+            ResolvedAbility::new(
+                Effect::Draw {
+                    target: TargetFilter::Controller,
+                    count: QuantityExpr::Ref {
+                        qty: QuantityRef::TrackedSetSize,
+                    },
+                },
+                vec![],
+                ObjectId(1),
+                PlayerId(0),
+            )
+        };
+        let non_reader = || {
+            ResolvedAbility::new(
+                Effect::Draw {
+                    target: TargetFilter::Controller,
+                    count: QuantityExpr::Fixed { value: 1 },
+                },
+                vec![],
+                ObjectId(1),
+                PlayerId(0),
+            )
+        };
+        let head = |effect: Effect, timing: TargetChoiceTiming| {
+            let mut head = ResolvedAbility::new(effect, vec![], ObjectId(1), PlayerId(0));
+            head.target_choice_timing = timing;
+            head
+        };
+        let put_counter = || Effect::PutCounter {
+            counter_type: CounterType::Plus1Plus1,
+            count: QuantityExpr::Fixed { value: 2 },
+            target: TargetFilter::Typed(TypedFilter::creature()),
+        };
+        let resolution = TargetChoiceTiming::Resolution;
+
+        let recipient = head(put_counter(), resolution).sub_ability(reader());
+        assert!(awaits_resolution_object_choice(&recipient));
+        assert!(resolution_choice_head_publishes_on_resume(&recipient));
+        // Its own chain reads nothing.
+        assert!(!resolution_choice_head_publishes_on_resume(
+            &head(put_counter(), resolution).sub_ability(non_reader())
+        ));
+        // The object was declared with the ability, not chosen while resolving.
+        assert!(!resolution_choice_head_publishes_on_resume(
+            &head(put_counter(), TargetChoiceTiming::Stack).sub_ability(reader())
+        ));
+        let mut bound = head(put_counter(), resolution).sub_ability(reader());
+        bound.targets = vec![TargetRef::Object(ObjectId(5))];
+        assert!(!resolution_choice_head_publishes_on_resume(&bound));
+        // Not a counter instruction: the choice is the producer of the set.
+        assert!(!resolution_choice_head_publishes_on_resume(
+            &head(non_reader().effect, resolution).sub_ability(reader())
+        ));
     }
 
     /// CR 601.2c + CR 608.2c: a node that declares a single optional object target
@@ -35404,6 +35893,395 @@ mod tests {
         );
     }
 
+    /// CR 608.2c + CR 115.1 + CR 101.4: an `AnyOf[Controller, TargetPlayer]`
+    /// player scope fans the instruction out to each member seat — the
+    /// declared player target included — through the ability-aware resolver,
+    /// in APNAP order regardless of member order.
+    #[test]
+    fn player_scope_any_of_controller_and_declared_target_fans_out_to_each_seat() {
+        let resolve = |controller: PlayerId, targets: Vec<TargetRef>| {
+            let mut state = GameState::new_two_player(42);
+            for i in 0..2 {
+                create_object(
+                    &mut state,
+                    CardId(10 + i),
+                    PlayerId(0),
+                    format!("P0 Library {i}"),
+                    Zone::Library,
+                );
+                create_object(
+                    &mut state,
+                    CardId(20 + i),
+                    PlayerId(1),
+                    format!("P1 Library {i}"),
+                    Zone::Library,
+                );
+            }
+            let mut ability = ResolvedAbility::new(
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+                targets,
+                ObjectId(100),
+                controller,
+            );
+            ability.player_scope = Some(PlayerFilter::AnyOf {
+                filters: vec![PlayerFilter::Controller, PlayerFilter::TargetPlayer],
+            });
+            let mut events = Vec::new();
+            resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+            let drawn: Vec<PlayerId> = events
+                .iter()
+                .filter_map(|event| match event {
+                    GameEvent::CardDrawn { player_id, .. } => Some(*player_id),
+                    _ => None,
+                })
+                .collect();
+            (
+                state.players[0].hand.len(),
+                state.players[1].hand.len(),
+                drawn,
+            )
+        };
+
+        // (a) Controller P0, declared target P1: both seats draw.
+        let (p0, p1, _) = resolve(PlayerId(0), vec![TargetRef::Player(PlayerId(1))]);
+        assert_eq!(p0, 1, "reach guard: the controller member draws");
+        assert_eq!(p1, 1, "the declared player target draws too");
+
+        // (b) Controller P1 (non-active), declared target P0: member order is
+        // [P1, P0], but the draws follow APNAP from the active player P0.
+        let (p0, p1, drawn) = resolve(PlayerId(1), vec![TargetRef::Player(PlayerId(0))]);
+        assert_eq!((p0, p1), (1, 1));
+        assert_eq!(drawn, vec![PlayerId(0), PlayerId(1)]);
+
+        // (c) No declared player target: `TargetPlayer` names nobody.
+        let (p0, p1, _) = resolve(PlayerId(0), Vec::new());
+        assert_eq!((p0, p1), (1, 0));
+
+        // (d) The controller is the declared target: one seat, one iteration.
+        let (p0, p1, drawn) = resolve(PlayerId(0), vec![TargetRef::Player(PlayerId(0))]);
+        assert_eq!((p0, p1), (1, 0));
+        assert_eq!(drawn, vec![PlayerId(0)]);
+    }
+
+    /// CR 102.1 + CR 608.2c + CR 115.1: the generic predicate answers `AnyOf`
+    /// by any member, and `TargetPlayer` never (it needs the resolving
+    /// ability, which only the ability-aware resolver carries).
+    #[test]
+    fn matches_player_scope_any_of_is_any_member_and_target_player_is_ability_aware_only() {
+        let state = GameState::new_two_player(42);
+        let controller = PlayerId(0);
+        let matches = |player: PlayerId, scope: &PlayerFilter| {
+            matches_player_scope(&state, player, scope, controller, ObjectId(100))
+        };
+        let controller_only = PlayerFilter::AnyOf {
+            filters: vec![PlayerFilter::Controller],
+        };
+        assert!(matches(PlayerId(0), &controller_only), "reach guard");
+        assert!(!matches(PlayerId(1), &controller_only));
+
+        let controller_or_opponent = PlayerFilter::AnyOf {
+            filters: vec![PlayerFilter::Controller, PlayerFilter::Opponent],
+        };
+        assert!(matches(PlayerId(0), &controller_or_opponent));
+        assert!(matches(PlayerId(1), &controller_or_opponent));
+
+        assert!(!matches(PlayerId(0), &PlayerFilter::TargetPlayer));
+        assert!(!matches(PlayerId(1), &PlayerFilter::TargetPlayer));
+    }
+
+    /// CR 608.2b + CR 115.1: resolved from the stack, an `AnyOf[Controller,
+    /// TargetPlayer]` scope does not name a declared player target that became
+    /// illegal before resolution. A legal creature target keeps the ability
+    /// resolving, so the scoped node falls back to the stack carrier for its
+    /// player target, and that fallback must honour the carrier's legality stamp.
+    #[test]
+    fn player_scope_target_player_skips_a_player_target_illegal_at_resolution() {
+        let resolve = |target_player_has_hexproof: bool| {
+            let mut state = GameState::new_two_player(42);
+            for i in 0..2 {
+                create_object(
+                    &mut state,
+                    CardId(10 + i),
+                    PlayerId(0),
+                    format!("P0 Library {i}"),
+                    Zone::Library,
+                );
+                create_object(
+                    &mut state,
+                    CardId(20 + i),
+                    PlayerId(1),
+                    format!("P1 Library {i}"),
+                    Zone::Library,
+                );
+            }
+            let source = create_object(
+                &mut state,
+                CardId(1),
+                PlayerId(0),
+                "Ability Source".to_string(),
+                Zone::Battlefield,
+            );
+            let creature = create_object(
+                &mut state,
+                CardId(2),
+                PlayerId(0),
+                "Targeted Creature".to_string(),
+                Zone::Battlefield,
+            );
+            state
+                .objects
+                .get_mut(&creature)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+            if target_player_has_hexproof {
+                // "You have hexproof" on a permanent P1 controls: P1 is no longer
+                // a legal target of P0's ability.
+                let grantor = create_object(
+                    &mut state,
+                    CardId(3),
+                    PlayerId(1),
+                    "You Have Hexproof Source".to_string(),
+                    Zone::Battlefield,
+                );
+                state.objects.get_mut(&grantor).unwrap().static_definitions =
+                    vec![StaticDefinition::new(StaticMode::Hexproof).affected(
+                        TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::You)),
+                    )]
+                    .into();
+                crate::game::layers::flush_layers(&mut state);
+                assert!(
+                    crate::game::static_abilities::player_has_hexproof(&state, PlayerId(1)),
+                    "reach guard: the grant lands on P1"
+                );
+            }
+
+            let mut draw = ResolvedAbility::new(
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+                Vec::new(),
+                source,
+                PlayerId(0),
+            );
+            draw.player_scope = Some(PlayerFilter::AnyOf {
+                filters: vec![PlayerFilter::Controller, PlayerFilter::TargetPlayer],
+            });
+            // Declared slots: [Player(1), Object(creature)]. The damage node's
+            // player filter is rechecked as the ability resolves.
+            let root = ResolvedAbility::new(
+                Effect::DealDamage {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Player,
+                    damage_source: None,
+                    excess: None,
+                },
+                vec![TargetRef::Player(PlayerId(1))],
+                source,
+                PlayerId(0),
+            )
+            .sub_ability(
+                ResolvedAbility::new(
+                    Effect::TargetOnly {
+                        target: TargetFilter::Any,
+                    },
+                    vec![TargetRef::Object(creature)],
+                    source,
+                    PlayerId(0),
+                )
+                .sub_ability(draw),
+            );
+            state.stack.push_back(StackEntry {
+                id: ObjectId(500),
+                source_id: source,
+                controller: PlayerId(0),
+                kind: StackEntryKind::ActivatedAbility {
+                    source_id: source,
+                    ability: Box::new(root),
+                },
+            });
+
+            let mut events = Vec::new();
+            crate::game::stack::resolve_top(&mut state, &mut events);
+            (
+                state.players[0].hand.len(),
+                state.players[1].hand.len(),
+                state.players[1].life,
+            )
+        };
+
+        // Reach guard: with P1 a legal target, P1 is dealt damage, and both the
+        // controller and the declared player target draw.
+        assert_eq!(resolve(false), (1, 1, 19));
+        // P1 became an illegal target; the creature target keeps the ability
+        // resolving, and only the controller draws.
+        let (p0, p1, p1_life) = resolve(true);
+        assert_eq!(
+            p0, 1,
+            "reach guard: the ability resolved for the controller"
+        );
+        assert_eq!(
+            p1_life, 20,
+            "reach guard: P1 was pruned as an illegal target at resolution"
+        );
+        assert_eq!(
+            p1, 0,
+            "an illegal player target is not named by TargetPlayer"
+        );
+    }
+
+    /// CR 608.2b + CR 603.2: an enters trigger shaped like Assassin Gauntlet's
+    /// ("When this Equipment enters, attach it to up to one target creature you
+    /// control. Tap all creatures target opponent controls."), resolved from the
+    /// stack. When the opponent became an illegal target and the creature target
+    /// keeps the trigger resolving, "creatures target opponent controls" names
+    /// nobody: it does not fall back to the enters event's player, the trigger's
+    /// own controller.
+    #[test]
+    fn target_opponent_mass_tap_taps_nobody_when_the_opponent_target_is_illegal() {
+        let resolve = |opponent_has_hexproof: bool| {
+            let mut state = GameState::new_two_player(42);
+            let source = create_object(
+                &mut state,
+                CardId(1),
+                PlayerId(0),
+                "Entering Equipment".to_string(),
+                Zone::Battlefield,
+            );
+            let mut creature = |card: u64, controller: PlayerId| {
+                let id = create_object(
+                    &mut state,
+                    CardId(card),
+                    controller,
+                    format!("Creature {card}"),
+                    Zone::Battlefield,
+                );
+                state
+                    .objects
+                    .get_mut(&id)
+                    .unwrap()
+                    .card_types
+                    .core_types
+                    .push(CoreType::Creature);
+                id
+            };
+            let targeted = creature(2, PlayerId(0));
+            let yours = creature(3, PlayerId(0));
+            let theirs = creature(4, PlayerId(1));
+            if opponent_has_hexproof {
+                // "You have hexproof" on a permanent P1 controls: P1 is no longer
+                // a legal target of P0's trigger.
+                let grantor = create_object(
+                    &mut state,
+                    CardId(5),
+                    PlayerId(1),
+                    "You Have Hexproof Source".to_string(),
+                    Zone::Battlefield,
+                );
+                state.objects.get_mut(&grantor).unwrap().static_definitions =
+                    vec![StaticDefinition::new(StaticMode::Hexproof).affected(
+                        TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::You)),
+                    )]
+                    .into();
+                crate::game::layers::flush_layers(&mut state);
+                assert!(
+                    crate::game::static_abilities::player_has_hexproof(&state, PlayerId(1)),
+                    "reach guard: the grant lands on P1"
+                );
+            }
+
+            // Declared slots: [Object(targeted), Player(1)]. The opponent is the
+            // mass tap's companion player slot.
+            let root = ResolvedAbility::new(
+                Effect::PutCounter {
+                    counter_type: CounterType::Plus1Plus1,
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Typed(
+                        TypedFilter::creature().controller(ControllerRef::You),
+                    ),
+                },
+                vec![TargetRef::Object(targeted)],
+                source,
+                PlayerId(0),
+            )
+            .sub_ability(ResolvedAbility::new(
+                Effect::SetTapState {
+                    target: TargetFilter::Typed(
+                        TypedFilter::creature().controller(ControllerRef::TargetOpponent),
+                    ),
+                    scope: EffectScope::All,
+                    state: TapStateChange::Tap,
+                },
+                vec![TargetRef::Player(PlayerId(1))],
+                source,
+                PlayerId(0),
+            ));
+            state.stack.push_back(StackEntry {
+                id: ObjectId(500),
+                source_id: source,
+                controller: PlayerId(0),
+                kind: StackEntryKind::TriggeredAbility {
+                    source_id: source,
+                    ability: Box::new(root),
+                    condition: None,
+                    trigger_event: Some(GameEvent::ZoneChanged {
+                        object_id: source,
+                        from: Some(Zone::Hand),
+                        to: Zone::Battlefield,
+                        record: Box::new(ZoneChangeRecord::test_minimal(
+                            source,
+                            Some(Zone::Hand),
+                            Zone::Battlefield,
+                        )),
+                    }),
+                    description: None,
+                    source_name: String::new(),
+                    subject_match_count: None,
+                    die_result: None,
+                    provenance: None,
+                },
+            });
+
+            let mut events = Vec::new();
+            crate::game::stack::resolve_top(&mut state, &mut events);
+            let tapped = |id: ObjectId| state.objects[&id].tapped;
+            (
+                state.objects[&targeted]
+                    .counters
+                    .get(&CounterType::Plus1Plus1)
+                    .copied()
+                    .unwrap_or(0),
+                [tapped(targeted), tapped(yours)],
+                tapped(theirs),
+            )
+        };
+
+        // Reach guard: with P1 a legal target, P1's creature is tapped and the
+        // controller's are not.
+        assert_eq!(resolve(false), (1, [false, false], true));
+        // P1 became an illegal target; the creature target keeps the trigger
+        // resolving.
+        let (counters, yours, theirs) = resolve(true);
+        assert_eq!(
+            counters, 1,
+            "reach guard: the trigger resolved through its legal creature target"
+        );
+        assert_eq!(
+            yours,
+            [false, false],
+            "an illegal target opponent does not become the enters event's player"
+        );
+        assert!(
+            !theirs,
+            "an illegal target opponent's creatures are not tapped"
+        );
+    }
+
     #[test]
     fn player_scope_discard_then_dark_deal_draws_per_players_discard_count_minus_one() {
         let mut state = GameState::new_two_player(42);
@@ -37413,16 +38291,19 @@ mod tests {
                         exiled_id: exiled_a,
                         owner: PlayerId(0),
                         mana_value: 2,
+                        incarnation: state.objects[&exiled_a].incarnation,
                     },
                     LinkedExileSnapshot {
                         exiled_id: exiled_b,
                         owner: PlayerId(0),
                         mana_value: 3,
+                        incarnation: state.objects[&exiled_b].incarnation,
                     },
                     LinkedExileSnapshot {
                         exiled_id: exiled_c,
                         owner: PlayerId(1),
                         mana_value: 4,
+                        incarnation: state.objects[&exiled_c].incarnation,
                     },
                 ],
                 ..crate::types::game_state::ZoneChangeRecord::test_minimal(
@@ -42582,9 +43463,10 @@ mod tests {
     /// resolver (`resolve_ability_chain`) with the crewing creature as the chosen
     /// target.
     ///
-    /// The placement head is an explicit parser gap (no filter expresses "that
-    /// crewed it this turn"), so this resolves the parsed conditional-doubling
-    /// sentence on its own. `counters_after_placement` is the crewer's +1/+1
+    /// The placement head targets a crewer through `FilterProp::CrewedThisTurn`
+    /// (covered end to end in `tests/integration/balthier_and_fran_crew_history.rs`);
+    /// this resolves the parsed conditional-doubling sentence on its own.
+    /// `counters_after_placement` is the crewer's +1/+1
     /// count once the head's counter is on it. Returns the final +1/+1 total;
     /// `subtype` selects whether the conditional doubling fires.
     fn run_turtle_van_chain(subtype: &str, counters_after_placement: u32) -> u32 {
@@ -44085,6 +44967,10 @@ mod tests {
                 }),
                 caused_by: None,
             },
+            PlayerFilter::AnyOf {
+                filters: vec![PlayerFilter::Controller, PlayerFilter::Opponent],
+            },
+            PlayerFilter::TargetPlayer,
         ] {
             assert!(
                 is_player_scope_local_continuation(&scoped_move, &scoped_shuffle, &scope),

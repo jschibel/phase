@@ -165,13 +165,29 @@ fn source_object_for_context<'a>(
 /// Reads source-owned exile links from the same authority as all other
 /// triggered source facts. The live exile store is correct only when there is
 /// no exact trigger source context to preserve.
+///
+/// Both linked-pile readers — `QuantityRef::CardsExiledBySource` ("if a card is
+/// exiled with it") and the `CardTypeSetSource::ExiledBySource` population ("the
+/// power of the exiled card") — answer from this one filtered pile, so a
+/// condition and the X it guards cannot disagree.
 fn linked_exile_for_context(
     state: &GameState,
     ctx: &QuantityContext,
 ) -> Vec<crate::types::game_state::LinkedExileSnapshot> {
     ctx.trigger_source
         .as_ref()
-        .map(|source| source.linked_exile_snapshot.clone())
+        .map(|source| {
+            // CR 607.2a + CR 400.7: the linked pile is the cards still in the exile zone
+            // as the objects the trigger latched; a card that left exile after the
+            // trigger latched its pile (a CR 610.3 return, for one) is not "the exiled
+            // card", including when another effect exiled it again.
+            source
+                .linked_exile_snapshot
+                .iter()
+                .filter(|linked| linked.is_still_exiled(state))
+                .cloned()
+                .collect()
+        })
         .unwrap_or_else(|| crate::game::players::linked_exile_cards_for_source(state, ctx.source))
 }
 
@@ -1688,12 +1704,37 @@ pub fn resolve_quantity_with_spell(
     )
 }
 
+/// CR 608.2c: How a quantity reads the per-object recipient binding
+/// (`QuantityContext::recipient`). Declared in rank order: a composite quantity
+/// or filter reads at the strongest grade among its parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RecipientRead {
+    /// No recipient read recognized by this classifier; unenumerated readers
+    /// also reach this grade, so it is not proof that the binding is unused.
+    Unread,
+    /// Reads the recipient only as the identity that delimits a counted
+    /// population: "other" (`FilterProp::Another`) or "attached to it"
+    /// (`FilterProp::AttachedTo { to: Recipient }`), alone or under
+    /// `AnyOf` / `Not`. Which objects are counted depends on which object the
+    /// recipient is, never on its characteristics.
+    PopulationIdentity,
+    /// Reads the recipient object or its controller: an `ObjectScope::Recipient`
+    /// characteristic, a `PlayerScope::RecipientController` player quantity, or a
+    /// quality shared with it (`SharesQuality { reference: ParentTarget }`).
+    Characteristics,
+}
+
 /// True when the QuantityExpr needs a per-object recipient binding to resolve
 /// an anaphoric quantity such as "for each Aura attached to it" or "for each
 /// word in its name."
 pub(crate) fn quantity_expr_uses_recipient(expr: &QuantityExpr) -> bool {
+    quantity_expr_recipient_read(expr) != RecipientRead::Unread
+}
+
+/// How `expr` reads the recipient binding; see [`RecipientRead`].
+pub(crate) fn quantity_expr_recipient_read(expr: &QuantityExpr) -> RecipientRead {
     match expr {
-        QuantityExpr::Fixed { .. } => false,
+        QuantityExpr::Fixed { .. } => RecipientRead::Unread,
         QuantityExpr::Ref { qty } => match qty {
             QuantityRef::HandSize {
                 player: PlayerScope::RecipientController,
@@ -1723,7 +1764,7 @@ pub(crate) fn quantity_expr_uses_recipient(expr: &QuantityExpr) -> bool {
             }
             | QuantityRef::PartySize {
                 player: PlayerScope::RecipientController,
-            } => true,
+            } => RecipientRead::Characteristics,
             QuantityRef::ObjectCount { filter }
             | QuantityRef::ObjectCountDistinct { filter, .. }
             | QuantityRef::ObjectCountBySharedQuality { filter, .. }
@@ -1747,7 +1788,7 @@ pub(crate) fn quantity_expr_uses_recipient(expr: &QuantityExpr) -> bool {
             | QuantityRef::AttackedThisTurn {
                 filter: Some(filter),
                 ..
-            } => filter_uses_recipient(filter),
+            } => filter_recipient_read(filter),
             QuantityRef::ObjectColorCount {
                 scope: ObjectScope::Recipient,
             }
@@ -1787,7 +1828,7 @@ pub(crate) fn quantity_expr_uses_recipient(expr: &QuantityExpr) -> bool {
             | QuantityRef::CountersOn {
                 scope: ObjectScope::Recipient,
                 ..
-            } => true,
+            } => RecipientRead::Characteristics,
             QuantityRef::Power {
                 scope: ObjectScope::CostPaidObject,
             }
@@ -1799,20 +1840,22 @@ pub(crate) fn quantity_expr_uses_recipient(expr: &QuantityExpr) -> bool {
             }
             | QuantityRef::ObjectManaValue {
                 scope: ObjectScope::CostPaidObject,
-            } => false,
-            _ => false,
+            } => RecipientRead::Unread,
+            _ => RecipientRead::Unread,
         },
         QuantityExpr::DivideRounded { inner, .. }
         | QuantityExpr::Offset { inner, .. }
         | QuantityExpr::ClampMin { inner, .. }
-        | QuantityExpr::Multiply { inner, .. } => quantity_expr_uses_recipient(inner),
-        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => {
-            exprs.iter().any(quantity_expr_uses_recipient)
-        }
-        QuantityExpr::UpTo { max } => quantity_expr_uses_recipient(max),
-        QuantityExpr::Power { exponent, .. } => quantity_expr_uses_recipient(exponent),
+        | QuantityExpr::Multiply { inner, .. } => quantity_expr_recipient_read(inner),
+        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => exprs
+            .iter()
+            .map(quantity_expr_recipient_read)
+            .max()
+            .unwrap_or(RecipientRead::Unread),
+        QuantityExpr::UpTo { max } => quantity_expr_recipient_read(max),
+        QuantityExpr::Power { exponent, .. } => quantity_expr_recipient_read(exponent),
         QuantityExpr::Difference { left, right } => {
-            quantity_expr_uses_recipient(left) || quantity_expr_uses_recipient(right)
+            quantity_expr_recipient_read(left).max(quantity_expr_recipient_read(right))
         }
     }
 }
@@ -3204,30 +3247,51 @@ fn entered_object_contributes_devotion(
 }
 
 pub(crate) fn filter_uses_recipient(filter: &TargetFilter) -> bool {
+    filter_recipient_read(filter) != RecipientRead::Unread
+}
+
+/// How `filter` reads the recipient binding; see [`RecipientRead`].
+fn filter_recipient_read(filter: &TargetFilter) -> RecipientRead {
     match filter {
-        TargetFilter::Typed(tf) => tf.properties.iter().any(filter_prop_uses_recipient),
-        TargetFilter::Not { filter: inner } => filter_uses_recipient(inner),
-        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
-            filters.iter().any(filter_uses_recipient)
-        }
-        _ => false,
+        TargetFilter::Typed(tf) => tf
+            .properties
+            .iter()
+            .map(filter_prop_recipient_read)
+            .max()
+            .unwrap_or(RecipientRead::Unread),
+        TargetFilter::Not { filter: inner } => filter_recipient_read(inner),
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => filters
+            .iter()
+            .map(filter_recipient_read)
+            .max()
+            .unwrap_or(RecipientRead::Unread),
+        _ => RecipientRead::Unread,
     }
 }
 
-fn filter_prop_uses_recipient(prop: &FilterProp) -> bool {
+fn filter_prop_recipient_read(prop: &FilterProp) -> RecipientRead {
     match prop {
+        // CR 608.2c: "other" / "attached to it" name which object the counted
+        // population is relative to: an identity read.
         FilterProp::AttachedTo {
             to: AttachmentReferent::Recipient,
         }
-        | FilterProp::Another => true,
-        FilterProp::AnyOf { props } => props.iter().any(filter_prop_uses_recipient),
+        | FilterProp::Another => RecipientRead::PopulationIdentity,
+        FilterProp::AnyOf { props } => props
+            .iter()
+            .map(filter_prop_recipient_read)
+            .max()
+            .unwrap_or(RecipientRead::Unread),
         // CR 608.2c: Negation reads the inner prop's references — recurse (mirrors AnyOf).
-        FilterProp::Not { prop } => filter_prop_uses_recipient(prop),
+        FilterProp::Not { prop } => filter_prop_recipient_read(prop),
+        // A shared quality compares the referent's characteristics.
         FilterProp::SharesQuality {
             reference: Some(reference),
             ..
-        } => matches!(reference.as_ref(), TargetFilter::ParentTarget),
-        _ => false,
+        } if matches!(reference.as_ref(), TargetFilter::ParentTarget) => {
+            RecipientRead::Characteristics
+        }
+        _ => RecipientRead::Unread,
     }
 }
 
@@ -4607,8 +4671,18 @@ fn resolve_ref(
                     return v;
                 }
             }
+            // CR 601.2a: a spell being cast has moved to the stack, though its
+            // object's hand membership is deferred to finalization; it is not
+            // a card in hand (an unrestricted "Discard your hand" mana cost
+            // activated while paying for a spell discards only the rest of
+            // the hand).
             resolve_per_player_scalar(state, scope, controller, ctx, targets, ability, |p| {
-                usize_to_i32_saturating(p.hand.len())
+                usize_to_i32_saturating(
+                    p.hand
+                        .iter()
+                        .filter(|&&id| !super::casting::is_spell_being_cast(state, id))
+                        .count(),
+                )
             })
         }
         // CR 119 + CR 810.9a: a single player's life total reads the team's
@@ -5436,6 +5510,9 @@ fn resolve_ref(
             usize_to_i32_saturating(linked_exile_for_context(state, &ctx).len())
         }
         // CR 607.2a: The power of a specific card exiled by the source, indexed by order.
+        // Its only producer is The Mimeoplasm's entry replacement: the ordinal
+        // "this way" reading over the per-turn ledger. "The exiled card" readers
+        // use `PropertyAggregate(.., ExiledBySource)` instead.
         // ENGINE INVARIANT: The ordering is guaranteed by Vec::push in push_exiled_with_source_this_turn.
         QuantityRef::ExiledCardPower { index } => {
             let exiled_cards = cards_exiled_this_turn_for_context(state, &ctx);
@@ -9609,6 +9686,12 @@ pub(crate) fn resolve_player_count(
                                 state, p.id, exclude, controller, source_id,
                             )
                         }
+                        // CR 102.1 + CR 608.2c: the union of the members (count
+                        // context). Delegates to the single-authority predicate in
+                        // `matches_player_scope`, which answers any-member.
+                        PlayerFilter::AnyOf { .. } => crate::game::effects::matches_player_scope(
+                            state, p.id, filter, controller, source_id,
+                        ),
                         PlayerFilter::HighestSpeed => {
                             let highest_speed = state
                                 .players
@@ -9703,12 +9786,14 @@ pub(crate) fn resolve_player_count(
                             .last_vote_ballots
                             .iter()
                             .any(|(voter, idx)| *voter == p.id && *idx == *choice_index),
-                        // CR 109.4 + CR 108.3 + CR 601.2a + CR 608.2c: the parent-object-target
-                        // anchors, the granter caster and the resolution-scoped chosen-player
+                        // CR 109.4 + CR 108.3 + CR 601.2a + CR 608.2c + CR 115.1: the
+                        // parent-object-target anchors, the declared-player-target anchor,
+                        // the granter caster and the resolution-scoped chosen-player
                         // anchor have no single-player-count meaning here (these resolve
                         // to a single anchored player, not a counted set).
                         PlayerFilter::ParentObjectTargetController
                         | PlayerFilter::ParentObjectTargetOwner
+                        | PlayerFilter::TargetPlayer
                         | PlayerFilter::GrantingObjectCaster
                         | PlayerFilter::ChosenPlayer { .. } => false,
                         // CR 109.4 + CR 109.5: "each [player class] who controls
@@ -11971,6 +12056,108 @@ mod tests {
             !quantity_expr_uses_recipient(&source_fixed),
             "SharedCardTypes over ExiledBySource reads no recipient and must not force re-resolution"
         );
+    }
+
+    /// CR 608.2c: the graded recipient classifier separates identity reads
+    /// ("other", "attached to it") from characteristic/controller reads, a
+    /// composite or filter grades at its strongest part, and the legacy `bool`
+    /// classifier is exactly "grade != Unread" for every shape.
+    #[test]
+    fn recipient_read_grades_identity_below_characteristics() {
+        let count = |props: Vec<FilterProp>| QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(TypedFilter::creature().properties(props)),
+            },
+        };
+        let shares_name_with_parent = || FilterProp::SharesQuality {
+            quality: SharedQuality::Name,
+            reference: Some(Box::new(TargetFilter::ParentTarget)),
+            relation: Default::default(),
+        };
+        let power = |scope| QuantityExpr::Ref {
+            qty: QuantityRef::Power { scope },
+        };
+        let rows = vec![
+            // Identity reads.
+            (
+                count(vec![FilterProp::Another]),
+                RecipientRead::PopulationIdentity,
+            ),
+            (
+                count(vec![FilterProp::AttachedTo {
+                    to: crate::types::ability::AttachmentReferent::Recipient,
+                }]),
+                RecipientRead::PopulationIdentity,
+            ),
+            (
+                count(vec![FilterProp::AnyOf {
+                    props: vec![FilterProp::Another, FilterProp::Tapped],
+                }]),
+                RecipientRead::PopulationIdentity,
+            ),
+            (
+                count(vec![FilterProp::Not {
+                    prop: Box::new(FilterProp::Another),
+                }]),
+                RecipientRead::PopulationIdentity,
+            ),
+            (
+                QuantityExpr::Offset {
+                    inner: Box::new(count(vec![FilterProp::Another])),
+                    offset: 1,
+                },
+                RecipientRead::PopulationIdentity,
+            ),
+            // Characteristic / controller reads.
+            (
+                power(ObjectScope::Recipient),
+                RecipientRead::Characteristics,
+            ),
+            (
+                QuantityExpr::Ref {
+                    qty: QuantityRef::HandSize {
+                        player: PlayerScope::RecipientController,
+                    },
+                },
+                RecipientRead::Characteristics,
+            ),
+            (
+                count(vec![shares_name_with_parent()]),
+                RecipientRead::Characteristics,
+            ),
+            // A filter mixing an identity and a characteristic read.
+            (
+                count(vec![FilterProp::Another, shares_name_with_parent()]),
+                RecipientRead::Characteristics,
+            ),
+            // A composite mixing both.
+            (
+                QuantityExpr::Sum {
+                    exprs: vec![
+                        count(vec![FilterProp::Another]),
+                        power(ObjectScope::Recipient),
+                    ],
+                },
+                RecipientRead::Characteristics,
+            ),
+            // No recipient read.
+            (QuantityExpr::Fixed { value: 3 }, RecipientRead::Unread),
+            (count(vec![]), RecipientRead::Unread),
+            (power(ObjectScope::Source), RecipientRead::Unread),
+            (power(ObjectScope::CostPaidObject), RecipientRead::Unread),
+        ];
+        for (expr, expected) in rows {
+            assert_eq!(
+                quantity_expr_recipient_read(&expr),
+                expected,
+                "grade of {expr:?}"
+            );
+            assert_eq!(
+                quantity_expr_uses_recipient(&expr),
+                expected != RecipientRead::Unread,
+                "legacy verdict of {expr:?}"
+            );
+        }
     }
 
     /// CR 700.8 + CR 700.8b: party size — building-block test exercising
@@ -20007,16 +20194,19 @@ mod tests {
                         exiled_id: exiled_a,
                         owner: PlayerId(0),
                         mana_value: 2,
+                        incarnation: state.objects[&exiled_a].incarnation,
                     },
                     crate::types::game_state::LinkedExileSnapshot {
                         exiled_id: exiled_b,
                         owner: PlayerId(0),
                         mana_value: 3,
+                        incarnation: state.objects[&exiled_b].incarnation,
                     },
                     crate::types::game_state::LinkedExileSnapshot {
                         exiled_id: exiled_c,
                         owner: PlayerId(1),
                         mana_value: 4,
+                        incarnation: state.objects[&exiled_c].incarnation,
                     },
                 ],
                 ..ZoneChangeRecord::test_minimal(source, Some(Zone::Battlefield), Zone::Graveyard)

@@ -59,6 +59,14 @@
 //! `GameState` now measures 14,208 B on x86_64-unknown-linux-gnu, under the
 //! 14,336 ceiling.
 //!
+//! `GameState` re-measured on x86_64-pc-windows-msvc at 14,352 B when the
+//! CR 614.12a pre-entry as-enters choice landed: two small boxed fields ? the
+//! entry event's `enter_with_choices` (`Option<Box<EntryChoices>>`, which widens
+//! every inline `ProposedEvent` by one pointer) and
+//! `PendingReplacement::delivery_boundary` (`Option<Box<ProposedEvent>>`). Both
+//! are already boxed, so nothing large went inline; the ceiling moved to
+//! 14,352.next_multiple_of(256) + 256 = 14,848.
+//!
 //! When one of these fires, re-run the measurement above and change the number
 //! deliberately — do not widen a ceiling to make a build pass.
 //!
@@ -68,7 +76,7 @@
 const _: () = {
     use core::mem::size_of;
     assert!(
-        size_of::<crate::types::game_state::GameState>() <= 14_336,
+        size_of::<crate::types::game_state::GameState>() <= 14_848,
         "GameState grew past its stack budget. It is moved by value through the \
          phase-server action + AI path, so an overrun is an uncatchable \
          guard-page abort, not a panic. Re-run the -Zprint-type-sizes command in \

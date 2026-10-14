@@ -103,9 +103,9 @@
 use crate::types::ability::FilterProp;
 use crate::types::ability::{
     AbilityCondition, AbilityDefinition, AttachCardinality, AttachSelection, AttachmentReferent,
-    AttackedYouScope, CardTypeSetSource, ContinuousModification, ControllerRef, Duration, Effect,
-    GuessSubject, KeeperConstraint, ModalChoice, MultiTargetSpec, NameStickerSet, ObjectProperty,
-    ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef,
+    AttackSubject, AttackedYouScope, CardTypeSetSource, ContinuousModification, ControllerRef,
+    Duration, Effect, GuessSubject, KeeperConstraint, ModalChoice, MultiTargetSpec, NameStickerSet,
+    ObjectProperty, ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef,
     ReciprocalZoneChoiceRole, RepeatContinuation, ReplacementDefinition, ResolvedAbility,
     StaticCondition, StaticDefinition, TargetFilter, TriggerCondition, TriggerDefinition,
     TurnJournalKind, TypeFilter, TypedFilter, ZoneChoiceCandidateSource, ZoneRef,
@@ -2319,6 +2319,7 @@ fn legacy_player_filter(x: &PlayerFilter) -> bool {
             legacy_quantity_ref(attr) || legacy_quantity_expr(value)
         }
         PlayerFilter::AllExcept { exclude } => legacy_player_filter(exclude),
+        PlayerFilter::AnyOf { filters } => filters.iter().any(legacy_player_filter),
         // The damage-source narrowing is a nested object population.
         PlayerFilter::OpponentDealtDamage { source, .. } => {
             source.as_deref().is_some_and(legacy_target_filter)
@@ -2334,6 +2335,7 @@ fn legacy_player_filter(x: &PlayerFilter) -> bool {
         | PlayerFilter::ParentObjectTargetController
         | PlayerFilter::ParentObjectTargetOwner
         | PlayerFilter::GrantingObjectCaster
+        | PlayerFilter::TargetPlayer
         | PlayerFilter::Controller
         | PlayerFilter::Opponent
         | PlayerFilter::DefendingPlayer
@@ -2538,6 +2540,7 @@ fn legacy_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::Untapped
         | FilterProp::IsSaddled
         | FilterProp::SaddledSource
+        | FilterProp::CrewedThisTurn { .. }
         | FilterProp::ConvokedSource
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
@@ -2836,6 +2839,7 @@ fn member_bound_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::Untapped
         | FilterProp::IsSaddled
         | FilterProp::SaddledSource
+        | FilterProp::CrewedThisTurn { .. }
         | FilterProp::ConvokedSource
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
@@ -7346,6 +7350,13 @@ fn rw_player_filter(x: &PlayerFilter) -> RwProfile {
             p
         }
         PlayerFilter::AllExcept { exclude } => rw_player_filter(exclude),
+        PlayerFilter::AnyOf { filters } => {
+            let mut p = RwProfile::empty();
+            for f in filters {
+                p.merge(rw_player_filter(f));
+            }
+            p
+        }
         // CR 603.10a: the owners of the per-source exile set are a member-bound
         // look-back referent ⇒ refuse batch-T1.
         PlayerFilter::OwnersOfCardsExiledBySource => member_bound_read(),
@@ -7373,13 +7384,21 @@ fn rw_player_filter(x: &PlayerFilter) -> RwProfile {
         | PlayerFilter::Opponent
         | PlayerFilter::DefendingPlayer
         | PlayerFilter::HasLostTheGame
-        | PlayerFilter::OpponentAttacked { .. }
         | PlayerFilter::All
         | PlayerFilter::HighestSpeed
         | PlayerFilter::ZoneChangedThisWay
         | PlayerFilter::PerformedActionThisWay { .. }
         | PlayerFilter::VotedFor { .. }
+        // CR 115.1: a declared-target read, the same read as
+        // `ControllerRef::TargetPlayer` (no sibling-mutable state).
+        | PlayerFilter::TargetPlayer
         | PlayerFilter::ChosenPlayer { .. } => RwProfile::empty(),
+        // CR 603.2: the event attackers are read from the trigger event, like
+        // `OpponentOtherThanTriggering`.
+        PlayerFilter::OpponentAttacked { subject, .. } => match subject {
+            AttackSubject::You | AttackSubject::Source => RwProfile::empty(),
+            AttackSubject::EventAttackers => reads_event_live(),
+        },
     }
 }
 
@@ -7451,12 +7470,26 @@ fn rw_controller_ref(x: &ControllerRef) -> RwProfile {
 mod tests {
     use super::*;
     use crate::types::ability::{
-        AbilityKind, AggregateFunction, ChoiceType, Comparator, CountScope, LetterQuery,
-        PropertyAggregate, PtValue, ReciprocalZoneChoiceRole, TargetSelectionMode,
+        AbilityKind, AggregateFunction, ChoiceType, CombatHistoryScope, Comparator, CountScope,
+        LetterQuery, PropertyAggregate, PtValue, ReciprocalZoneChoiceRole, TargetSelectionMode,
         ZoneChoiceCandidateSource, ZoneChoiceChooser, ZoneOwner,
     };
 
     use crate::game::test_fixtures::mana_fixture_roles;
+
+    /// U-b. CR 603.2: `OpponentAttacked { EventAttackers }` reads the trigger event
+    /// live, like `OpponentOtherThanTriggering`; the controller's attacks read none.
+    #[test]
+    fn opponent_attacked_event_attackers_reads_the_event_live() {
+        let profile = |subject| {
+            rw_player_filter(&PlayerFilter::OpponentAttacked {
+                subject,
+                scope: CombatHistoryScope::ThisCombat,
+            })
+        };
+        assert_eq!(profile(AttackSubject::EventAttackers), reads_event_live());
+        assert_eq!(profile(AttackSubject::You), RwProfile::empty());
+    }
 
     #[test]
     fn property_aggregate_source_rw_profiles_are_exhaustive() {

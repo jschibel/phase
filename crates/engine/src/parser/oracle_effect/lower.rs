@@ -20,7 +20,7 @@ use super::super::oracle_nom::target::parse_declared_target_prefix;
 use super::super::oracle_quantity::{
     parse_cda_quantity, parse_cda_quantity_with_context, parse_event_context_quantity,
     parse_for_each_clause, parse_for_each_clause_expr, parse_for_each_clause_expr_with_context,
-    parse_player_attribute_attr_clause, parse_quantity_ref,
+    parse_for_each_short_of_clause_expr, parse_player_attribute_attr_clause, parse_quantity_ref,
 };
 use super::super::oracle_target::{
     parse_bare_was_dealt_damage_suffix, parse_target, parse_target_with_ctx,
@@ -33,14 +33,15 @@ use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::parser::oracle_ir::effect_chain::{ClauseIr, EffectChainIr};
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
-    AttackSubject, CastCostModifier, CastFromZoneDriver, CastPermissionConstraint,
-    CastingPermission, CombatHistoryScope, Comparator, ConjureSource, ContinuousModification,
-    ControllerRef, CountBinding, DamageChannel, DamageSource, DelayedTriggerCondition, Duration,
-    Effect, EffectScope, ExiledSpellRider, FilterProp, GameRestriction, LibraryPosition,
-    MultiTargetSpec, NameStickerSet, ObjectScope, PermissionGrantee, PlayerFilter,
-    PreventionAmount, PreventionScope, PtValue, QuantityExpr, QuantityRef, RestrictionPlayerScope,
-    RoundingMode, SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition,
-    SubAbilityLink, TargetChoiceTiming, TargetFilter, TypeFilter, TypedFilter,
+    AttackSubject, CardTypeSetSource, CastCostModifier, CastFromZoneDriver,
+    CastPermissionConstraint, CastingPermission, CombatHistoryScope, Comparator, ConjureSource,
+    ContinuousModification, ControllerRef, CountBinding, DamageChannel, DamageSource,
+    DelayedTriggerCondition, Duration, Effect, EffectScope, ExiledSpellRider, FilterProp,
+    GameRestriction, LibraryPosition, MultiTargetSpec, NameStickerSet, ObjectProperty, ObjectScope,
+    PermissionGrantee, PlayerFilter, PreventionAmount, PreventionScope, PropertyAggregate, PtValue,
+    QuantityExpr, QuantityRef, RestrictionPlayerScope, RoundingMode,
+    SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition, SubAbilityLink,
+    TargetChoiceTiming, TargetFilter, TypeFilter, TypedFilter,
 };
 use crate::types::counter::CounterType;
 use crate::types::game_state::{DistributionUnit, TargetSelectionConstraint};
@@ -1979,6 +1980,75 @@ pub(super) fn target_choice_timing_for_clause(clause_ir: &ClauseIr) -> TargetCho
     )
 }
 
+/// Whether an ability's printed clauses say "target" anywhere: a host reference
+/// written as "target enchanted creature" stays targeted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrintedTargetWord {
+    Present,
+    Absent,
+}
+
+impl PrintedTargetWord {
+    pub(crate) fn from_clauses(clauses: &[ClauseIr]) -> Self {
+        let present = clauses.iter().any(|clause| {
+            nom_primitives::scan_contains(
+                &clause
+                    .source
+                    .fragment()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+                "target ",
+            )
+        });
+        if present {
+            Self::Present
+        } else {
+            Self::Absent
+        }
+    }
+}
+
+/// CR 115.10a + CR 115.1b + CR 303.4b + CR 303.4m + CR 301.5f: "enchanted
+/// creature" / "equipped creature" in an Aura's or Equipment's own instruction
+/// names whatever the source is attached to. Unless the text says "target", the
+/// host is affected, not targeted: it claims no announcement slot, so it never
+/// "becomes the target" (ward, CR 702.21a) and shroud/hexproof can't stop the
+/// instruction. The runtime binds the host as the instruction resolves
+/// (`targeting::bind_resolution_attachment_hosts`).
+///
+/// Applied to the card's own fully composed ability (after every document
+/// relation), and only when the host instruction is the whole ability — one
+/// node, nothing before or after it (a later sentence that only modifies it,
+/// "That creature can't be regenerated.", folds into the same node). Without a
+/// provable host it then does nothing, exactly as the targeted form did when its
+/// only target was illegal (CR 608.2b). Instructions that precede or follow it
+/// read or depend on that host in ways the targeted form settled by fizzling
+/// the whole ability, so such chains keep their stack-time target (the
+/// followers of a host reference are follow-up work). Donor shapes ("becomes a
+/// copy of", "gains all activated abilities of" the host) also keep theirs.
+pub(crate) fn convert_terminal_attachment_host_reference(
+    def: &mut AbilityDefinition,
+    printed: PrintedTargetWord,
+) {
+    if def.sub_ability.is_some()
+        || def.else_ability.is_some()
+        || def.modal.is_some()
+        || !def.mode_abilities.is_empty()
+        || def.target_choice_timing != TargetChoiceTiming::Stack
+        || def.effect.attachment_host_slot() != crate::types::ability::AttachmentHostSlot::Operand
+    {
+        return;
+    }
+    if printed == PrintedTargetWord::Absent
+        && def
+            .effect
+            .target_filter()
+            .is_some_and(TargetFilter::contains_source_attachment_host)
+    {
+        def.target_choice_timing = TargetChoiceTiming::Resolution;
+    }
+}
+
 /// The clause's target-choice timing from its parsed effect and printed fragment; the
 /// compound splitter's continuation has no `ClauseIr` of its own.
 pub(super) fn target_choice_timing_for_parsed(
@@ -3019,10 +3089,11 @@ fn is_exile_resolving_return_rider(sub: &AbilityDefinition) -> bool {
 pub(super) fn rewire_result_anchored_subchain(def: &mut AbilityDefinition) {
     if let Some(sub) = def.sub_ability.as_mut() {
         let sub_is_attach_with_zone_changed_cond = matches!(*sub.effect, Effect::Attach { .. })
-            && matches!(
-                sub.condition,
-                Some(AbilityCondition::ZoneChangedThisWay { .. })
-            );
+            && sub
+                .condition
+                .as_ref()
+                .and_then(AbilityCondition::zone_changed_this_way_head)
+                .is_some();
         let parent_moves_to_battlefield = matches!(
             *def.effect,
             Effect::Dig {
@@ -5032,6 +5103,10 @@ pub(crate) fn strip_for_each_prefix_with_difference(
             let parsed_comparison = nom_quantity::parse_for_each_clause_ref_with_difference(clause)
                 .ok()
                 .and_then(|(rest, parsed)| rest.is_empty().then_some(parsed));
+            if let Some(short_of) = parse_for_each_short_of_clause_expr(clause) {
+                let offset = text.len() - remainder.len();
+                return (Some(short_of), None, text[offset..].to_string());
+            }
             let parsed_clause = parsed_comparison
                 .clone()
                 .map(|(qty, difference)| (qty, Some(difference)))
@@ -5081,6 +5156,7 @@ pub(crate) fn strip_for_each_prefix_with_difference(
 #[cfg(test)]
 mod difference_binding_tests {
     use super::strip_for_each_prefix_with_difference;
+    use crate::types::ability::{QuantityExpr, QuantityRef};
 
     #[test]
     fn comparison_parser_product_carries_difference_provenance() {
@@ -5101,6 +5177,40 @@ mod difference_binding_tests {
             let (_, difference, _) = strip_for_each_prefix_with_difference(text);
             assert!(difference.is_none(), "nested property must not bind: {text}");
         }
+    }
+
+    /// CR 107.1b + CR 608.2c: a leading "for each <noun> less than N …" counts
+    /// the shortfall below N (Truce), while the same clause without "less than"
+    /// keeps the plain "this way" count.
+    #[test]
+    fn leading_less_than_clause_counts_the_shortfall() {
+        let tracked = || QuantityExpr::Ref {
+            qty: QuantityRef::TrackedSetSize,
+        };
+        let (repeat_for, difference, rest) = strip_for_each_prefix_with_difference(
+            "For each card less than two a player draws this way, that player gains 2 life.",
+        );
+        assert_eq!(
+            repeat_for,
+            Some(QuantityExpr::ClampMin {
+                inner: Box::new(QuantityExpr::Offset {
+                    inner: Box::new(QuantityExpr::Multiply {
+                        factor: -1,
+                        inner: Box::new(tracked()),
+                    }),
+                    offset: 2,
+                }),
+                minimum: 0,
+            })
+        );
+        assert!(difference.is_none());
+        assert_eq!(rest, "that player gains 2 life.");
+
+        let (repeat_for, _, rest) = strip_for_each_prefix_with_difference(
+            "For each card a player draws this way, that player gains 2 life.",
+        );
+        assert_eq!(repeat_for, Some(tracked()));
+        assert_eq!(rest, "that player gains 2 life.");
     }
 }
 
@@ -6139,8 +6249,13 @@ pub(super) fn rebind_clause_recipients_with(
 /// ("for each opponent who doesn't" — "you" stays "you" inside an
 /// Opponent-scoped iteration).
 ///
-/// Same five-variant surface: `{ LoseLife, Draw, Discard, Mill, Token }`.
-/// `Sacrifice` is NOT covered (it carries its own target on the parent node).
+/// Six-variant surface: `{ LoseLife, Draw, Discard, Mill, Token,
+/// AddRestriction{ProhibitActivity} }`. `Sacrifice` is NOT covered (it carries
+/// its own target on the parent node).
+///
+/// Also applied per link by the coordinated player-set channel
+/// (`bind_coordinated_player_set`, "you and <player> each <body>"), where the
+/// body's implicit recipient is the seat performing the instruction.
 pub(super) fn rebind_subject_only_body_recipient(effect: &mut Effect) {
     fn rebind(filter: &mut TargetFilter) {
         if matches!(filter, TargetFilter::Controller) {
@@ -6575,6 +6690,7 @@ fn strip_performed_action_this_way_clause(
         | PlayerFilter::OpponentAttacked { .. }
         | PlayerFilter::OpponentAttackingEnchantedPlayer
         | PlayerFilter::AllExcept { .. }
+        | PlayerFilter::AnyOf { .. }
         | PlayerFilter::HighestSpeed
         | PlayerFilter::ZoneChangedThisWay
         | PlayerFilter::PerformedActionThisWay { .. }
@@ -6590,6 +6706,7 @@ fn strip_performed_action_this_way_clause(
         | PlayerFilter::ChosenPlayer { .. }
         | PlayerFilter::ParentObjectTargetOwner
         | PlayerFilter::GrantingObjectCaster
+        | PlayerFilter::TargetPlayer
         | PlayerFilter::TrackedSetPossessor { .. } => return None,
     };
     let (remainder, action) =
@@ -7664,17 +7781,40 @@ pub(super) fn extract_put_counter_multi_target(text: &str) -> Option<MultiTarget
             .parse(input)?;
         match strip_optional_target_prefix(after_on) {
             (rest, Some(spec)) => Ok((rest, spec)),
-            // CR 601.2c + CR 115.3: "each of <N|X> target …" announces exactly N different
-            // targets for the one instance of "target"; X comes from the cost (CR 107.3a).
-            (_, None) if each_of.is_some() => {
-                let (rest, count) = terminated(
-                    parse_multi_target_count_expr,
-                    (multispace1, peek(tag("target"))),
+            // CR 115.1a + CR 601.2c:
+            // "[each of ]one or two target …" / "[each of ]one, two, or three
+            // target …" announce a bounded target set (Predictive
+            // Preparations). The stem recognition is `parse_bounded_target_cardinality`,
+            // the single authority shared with the damage grammar; the "target …"
+            // span stays unconsumed for the downstream target parse. min is 1, so
+            // CR 115.6 (zero-target legality) does not apply.
+            (_, None) => {
+                if let Ok((after_ws, (spec, _, _))) = (
+                    parse_bounded_target_cardinality,
+                    multispace1,
+                    peek(alt((
+                        tag("target "),
+                        tag("other target "),
+                        tag("another target "),
+                    ))),
                 )
-                .parse(after_on)?;
-                Ok((rest, MultiTargetSpec::exact(count)))
+                    .parse(after_on)
+                {
+                    return Ok((after_ws, spec));
+                }
+                // CR 601.2c + CR 115.3: "each of <N|X> target …" announces exactly N different
+                // targets for the one instance of "target"; X comes from the cost (CR 107.3a).
+                if each_of.is_some() {
+                    let (rest, count) = terminated(
+                        parse_multi_target_count_expr,
+                        (multispace1, peek(tag("target"))),
+                    )
+                    .parse(after_on)?;
+                    Ok((rest, MultiTargetSpec::exact(count)))
+                } else {
+                    Err(oracle_err(input))
+                }
             }
-            (_, None) => Err(oracle_err(input)),
         }
     }) {
         return Some(spec);
@@ -7944,7 +8084,7 @@ enum EachOfTargetNoun {
 /// Composes the trailing noun off `BOUNDED_TARGET_CARDINALITIES` exactly as
 /// that constant's doc comment prescribes, so a future cardinality is added in
 /// one place.
-fn parse_bounded_target_cardinality(input: &str) -> OracleResult<'_, MultiTargetSpec> {
+pub(crate) fn parse_bounded_target_cardinality(input: &str) -> OracleResult<'_, MultiTargetSpec> {
     for &(stem, min, max) in BOUNDED_TARGET_CARDINALITIES {
         if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(stem).parse(input) {
             return Ok((rest, MultiTargetSpec::fixed(min, max)));
@@ -9686,7 +9826,9 @@ pub(super) fn try_parse_damage_with_remainder<'a>(
                         ecr_rem,
                     ));
                 } else {
-                    let (target, remainder) = parse_target(target_phrase);
+                    let (target, remainder) = ctx.with_player_antecedents(|scoped| {
+                        parse_target_with_ctx(target_phrase, scoped)
+                    });
                     let (target, remainder) = refine_damage_target_remainder(target, remainder);
                     if !remainder.trim().is_empty() {
                         ctx.push_diagnostic(OracleDiagnostic::IgnoredRemainder {
@@ -10780,7 +10922,35 @@ fn parse_amount_of_mana_paid_this_way(input: &str) -> OracleResult<'_, ()> {
     Ok((input, ()))
 }
 
+/// Whether a where-X / equal-to quantity phrase may read a non-determiner
+/// "<name>'s power/toughness" as the card's own printed name
+/// (`parse_where_x_printed_name_possessive_stat`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrintedNamePossessive {
+    /// The where-X binder: "where X is Halana and Alena's power" names the source.
+    Source,
+    /// The count entry's equal-to chain: a foreign possessive ("your
+    /// Ring-bearer's power") is a miss, never the source's own stat.
+    Declined,
+}
+
 pub(crate) fn parse_where_x_quantity_expression(where_x_expression: &str) -> Option<QuantityExpr> {
+    parse_where_x_quantity_with(where_x_expression, PrintedNamePossessive::Source)
+}
+
+/// Every arm of [`parse_where_x_quantity_expression`] except the printed-name
+/// possessive arm. The count entry's equal-to chain
+/// (`oracle_util::parse_equal_to_count`) reads its quantity through this core so
+/// "mills cards equal to your Ring-bearer's power" stays a miss instead of
+/// becoming the source's power.
+pub(crate) fn parse_where_x_quantity_core(where_x_expression: &str) -> Option<QuantityExpr> {
+    parse_where_x_quantity_with(where_x_expression, PrintedNamePossessive::Declined)
+}
+
+fn parse_where_x_quantity_with(
+    where_x_expression: &str,
+    possessive: PrintedNamePossessive,
+) -> Option<QuantityExpr> {
     let expression = where_x_expression.trim().trim_end_matches('.');
     let expression_lower = expression.to_ascii_lowercase();
     // CR 702.51c + CR 603.3: Knight-Errant of Eos reads the number of
@@ -10855,7 +11025,7 @@ pub(crate) fn parse_where_x_quantity_expression(where_x_expression: &str) -> Opt
         .parse(expression_lower.as_str())
     {
         let consumed = expression_lower.len() - rest_lower.len();
-        if let Some(inner) = parse_where_x_quantity_expression(&expression[consumed..]) {
+        if let Some(inner) = parse_where_x_quantity_with(&expression[consumed..], possessive) {
             let inner = if sign < 0 {
                 QuantityExpr::Multiply {
                     factor: -1,
@@ -10965,8 +11135,10 @@ pub(crate) fn parse_where_x_quantity_expression(where_x_expression: &str) -> Opt
     // ability source (Halana and Alena, Partners). Must precede
     // `parse_event_context_quantity`, which only recognizes anaphoric/participle
     // possessives.
-    if let Some(expr) = parse_where_x_printed_name_possessive_stat(expression_lower.as_str()) {
-        return Some(expr);
+    if possessive == PrintedNamePossessive::Source {
+        if let Some(expr) = parse_where_x_printed_name_possessive_stat(expression_lower.as_str()) {
+            return Some(expr);
+        }
     }
     // CR 706.2 + CR 706.4: "where X is the result" of a die roll / coin flip
     // binds X to the rolled value via the shared `EventContextAmount` channel
@@ -10979,18 +11151,26 @@ pub(crate) fn parse_where_x_quantity_expression(where_x_expression: &str) -> Opt
     crate::parser::oracle_quantity::parse_event_context_quantity(where_x_expression)
 }
 
-/// CR 107.3c + CR 608.2h: "where X is the power of the exiled card" DEFINES X as
-/// the power of the card exiled by this ability's source — Bishop of Binding
-/// ("Whenever this creature attacks, target Vampire gets +X/+X until end of
-/// turn, where X is the power of the exiled card") and Redemptor Dreadnought.
-/// CR 608.2h: the exiled card is read via last known information, which is what
-/// `QuantityRef::ExiledCardPower` resolves against (game/quantity.rs).
+/// CR 607.2a + CR 607.3 + CR 608.2h: "where X is the power of the exiled card"
+/// is the power of the card(s) in exile linked to this object; with several
+/// linked cards X is their sum. Bishop of Binding ("Whenever this creature
+/// attacks, target Vampire gets +X/+X until end of turn, where X is the power of
+/// the exiled card") and Redemptor Dreadnought print it.
 ///
-/// `index: 0` is the first (and, for this class, only) card the source exiled.
+/// The `CardTypeSetSource::ExiledBySource` population reads the linked-exile
+/// authority (`linked_exile_for_context` in game/quantity.rs), the same pile
+/// "if a card is exiled with it" (`QuantityRef::CardsExiledBySource`) counts.
 fn parse_where_x_exiled_card_power(expression_lower: &str) -> Option<QuantityExpr> {
     all_consuming(value(
         QuantityExpr::Ref {
-            qty: QuantityRef::ExiledCardPower { index: 0 },
+            qty: QuantityRef::PropertyAggregate(
+                PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::Power,
+                    CardTypeSetSource::ExiledBySource,
+                )
+                .expect("statically valid property aggregate"),
+            ),
         },
         tag::<_, _, OracleError<'_>>("the power of the exiled card"),
     ))
@@ -11169,7 +11349,7 @@ fn parse_where_x_scry_look_count(where_x_expression: &str) -> Option<QuantityExp
 /// to bind. A node with no X reference is returned unchanged as `Some`, so an
 /// unrepresentable where-X clause on an ability that never uses X cannot poison
 /// that ability.
-pub(super) fn apply_where_x_quantity_expression(
+pub(crate) fn apply_where_x_quantity_expression(
     value: QuantityExpr,
     where_x_expression: Option<&str>,
 ) -> Option<QuantityExpr> {

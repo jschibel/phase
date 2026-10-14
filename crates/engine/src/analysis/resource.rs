@@ -4945,6 +4945,7 @@ history_members! {
         CreaturesBlockedThisTurn => creatures_blocked_this_turn: false,
         CrewActivatedThisTurn => crew_activated_this_turn: false,
         CrewResolvedThisTurn => crew_resolved_this_turn: false,
+        CrewHistoryThisTurn => crew_history_this_turn: false,
         ExileCastPermissionsUsed => exile_cast_permissions_used: false,
         ExilePlayPermissionsUsed => exile_play_permissions_used: false,
         GraveyardCastPermissionsUsed => graveyard_cast_permissions_used: false,

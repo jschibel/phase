@@ -8,7 +8,7 @@ use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until, take_while1};
 use nom::character::complete::satisfy;
-use nom::combinator::{all_consuming, eof, map, map_res, opt, peek, value, verify};
+use nom::combinator::{all_consuming, eof, map, map_opt, map_res, opt, peek, value, verify};
 use nom::multi::{many0, separated_list1};
 use nom::sequence::{pair, preceded, terminated};
 use nom::Parser;
@@ -18,9 +18,13 @@ use super::duration::parse_cast_snapshot_suffix;
 use super::error::{oracle_err, OracleResult};
 use super::primitives::{
     parse_article, parse_color, parse_core_type, parse_counter_type_typed, parse_keyword_name,
-    parse_number,
+    parse_number, scan_preceded,
 };
-use super::target::parse_type_filter_word;
+use super::target::{
+    parse_controller_phrase, parse_type_filter_word, ControllerForm, ControllerSubject,
+    ControllerTense, PlayerAnaphor,
+};
+use crate::parser::oracle_ir::context::{bind_controller_phrase, PlayerAntecedents};
 use crate::parser::oracle_target::{
     parse_counter_suffix, parse_shared_quality, parse_shared_quality_clause,
     parse_target_with_syntax, parse_type_phrase_folding, TargetSyntax,
@@ -590,18 +594,11 @@ fn parse_cards_in_possessive_zone(input: &str) -> OracleResult<'_, QuantityRef> 
 /// controller. `"you"` remains `ControllerRef::You`.
 fn parse_possessive_objects_they_control(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, _) = tag("the ").parse(input)?;
-    let (rest, (type_phrase, controller)) = alt((
-        map(
-            terminated(take_until(" they control"), tag(" they control")),
-            |type_phrase| (type_phrase, ControllerRef::ScopedPlayer),
-        ),
-        map(
-            terminated(take_until(" you control"), tag(" you control")),
-            |type_phrase| (type_phrase, ControllerRef::You),
-        ),
-    ))
-    .parse(rest)?;
-    let (mut filter, type_rest) = parse_type_phrase_folding(type_phrase);
+    let antecedents = PlayerAntecedents::for_each_iteration_unscoped();
+    let (type_phrase, controller, rest) =
+        scan_preceded(rest, |i| controller_you_or_they(i, &antecedents))
+            .ok_or_else(|| oracle_err(input))?;
+    let (mut filter, type_rest) = parse_type_phrase_folding(type_phrase.trim_end());
     if !type_rest.trim().is_empty() || !quantity_filter_has_meaningful_content(&filter) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -659,17 +656,70 @@ fn quantity_filter_has_meaningful_content(filter: &TargetFilter) -> bool {
     }
 }
 
+/// A quantity count's controller suffix: the present-tense direct projection
+/// of `parse_controller_phrase` that a count can resolve.
 fn parse_quantity_controller_suffix(input: &str) -> OracleResult<'_, ControllerRef> {
-    alt((
-        value(ControllerRef::You, tag(" you control")),
-        value(
-            ControllerRef::SourceChosenPlayer,
-            tag(" the chosen player controls"),
-        ),
+    preceded(
+        tag(" "),
+        map_opt(parse_controller_phrase, |phrase| {
+            match (phrase.subject, phrase.tense) {
+                (ControllerSubject::Direct(controller), ControllerTense::Present) => {
+                    admits_quantity_controller(&controller, phrase.form).then_some(controller)
+                }
+                (ControllerSubject::Direct(_), ControllerTense::Past)
+                | (ControllerSubject::Anaphoric(_), _) => None,
+            }
+        }),
+    )
+    .parse(input)
+}
+
+/// The direct controllers, by clause form, a quantity count's controller
+/// suffix admits.
+fn admits_quantity_controller(controller: &ControllerRef, form: ControllerForm) -> bool {
+    match controller {
+        ControllerRef::You | ControllerRef::SourceChosenPlayer => true,
         // CR 109.4: "your opponents control" — aggregate across each opponent's
         // permanents (Angry Mob, Chameleon Spirit, Entropic Specter class).
-        value(ControllerRef::Opponent, tag(" your opponents control")),
-    ))
+        // "an opponent controls" and "you don't control" are not admitted.
+        ControllerRef::Opponent => match form {
+            ControllerForm::Plural => true,
+            ControllerForm::Singular | ControllerForm::Negated | ControllerForm::Passive => false,
+        },
+        ControllerRef::ScopedPlayer
+        | ControllerRef::TargetPlayer
+        | ControllerRef::TargetOpponent
+        | ControllerRef::ParentTargetController
+        | ControllerRef::EventTargetController
+        | ControllerRef::ParentTargetOwner
+        | ControllerRef::DefendingPlayer
+        | ControllerRef::ChosenPlayer { .. }
+        | ControllerRef::TriggeringPlayer
+        | ControllerRef::EnchantedPlayer
+        | ControllerRef::ActivePlayer
+        | ControllerRef::SpecificPlayer { .. }
+        | ControllerRef::DeclaredPlayer { .. } => false,
+    }
+}
+
+/// "you control" or an anaphoric "they control", the controller arm of the
+/// `for each` / possessive count carriers. "they" binds through the caller's
+/// antecedents.
+fn controller_you_or_they<'a>(
+    input: &'a str,
+    antecedents: &PlayerAntecedents,
+) -> OracleResult<'a, ControllerRef> {
+    map_opt(parse_controller_phrase, |phrase| {
+        match (&phrase.subject, phrase.tense) {
+            (ControllerSubject::Direct(ControllerRef::You), ControllerTense::Present) => {
+                Some(ControllerRef::You)
+            }
+            (ControllerSubject::Anaphoric(PlayerAnaphor::They), ControllerTense::Present) => {
+                bind_controller_phrase(&phrase, antecedents)
+            }
+            (ControllerSubject::Direct(_), _) | (ControllerSubject::Anaphoric(_), _) => None,
+        }
+    })
     .parse(input)
 }
 
@@ -1186,7 +1236,12 @@ pub fn parse_quantity_ref(input: &str) -> OracleResult<'_, QuantityRef> {
         // Bare suffix form — reachable when a parent combinator has already
         // consumed "there are N " (see `parse_there_are_conditions`). Anaphoric
         // "they control" binds to a target player here (not a for-each scope).
-        |i| parse_basic_land_types_among_lands_controlled_by_ref(i, ControllerRef::TargetPlayer),
+        |i| {
+            parse_basic_land_types_among_lands_controlled_by_ref(
+                i,
+                &PlayerAntecedents::basic_land_type_count(),
+            )
+        },
         parse_devotion_ref,
         parse_chroma_devotion_ref,
         parse_graveyard_chroma_ref,
@@ -3981,6 +4036,19 @@ fn parse_damage_dealt_this_turn_ref(input: &str) -> OracleResult<'_, QuantityRef
     .parse(input)
 }
 
+/// CR 119.3 + CR 608.2c: "life they|that player <verb> [this turn]" — the
+/// third-person anaphor names the clause's target player ("Target opponent
+/// loses life equal to the amount of life they lost this turn", Astarion), so
+/// the callers map it to `PlayerScope::Target`, which a per-player loop rebinds
+/// to `ScopedPlayer`.
+fn parse_third_person_life_change<'a>(input: &'a str, verb: &str) -> OracleResult<'a, ()> {
+    let (input, _) = tag("life ").parse(input)?;
+    let (input, _) = alt((tag("they "), tag("that player "))).parse(input)?;
+    let (input, _) = tag(verb).parse(input)?;
+    let (input, _) = nom::combinator::opt(tag(" this turn")).parse(input)?;
+    Ok((input, ()))
+}
+
 /// Parse life-lost references: "the life you've lost this turn", "life you've lost", etc.
 /// Includes duration-stripped forms (without "this turn") for post-duration-stripping contexts.
 /// Accepts an optional "(the) amount of " prefix so phrases like
@@ -3991,6 +4059,14 @@ fn parse_life_lost_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     // downstream variant automatically supports it.
     let (input, _) =
         nom::combinator::opt(alt((tag("the amount of "), tag("amount of ")))).parse(input)?;
+    if let Ok((rest, ())) = parse_third_person_life_change(input, "lost") {
+        return Ok((
+            rest,
+            QuantityRef::LifeLostThisTurn {
+                player: PlayerScope::Target,
+            },
+        ));
+    }
     alt((
         value(
             QuantityRef::LifeLostThisTurn {
@@ -4143,6 +4219,14 @@ fn parse_life_gained_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     // CR 119.3: Optional "the amount of " / "amount of " prefix; see parse_life_lost_ref.
     let (input, _) =
         nom::combinator::opt(alt((tag("the amount of "), tag("amount of ")))).parse(input)?;
+    if let Ok((rest, ())) = parse_third_person_life_change(input, "gained") {
+        return Ok((
+            rest,
+            QuantityRef::LifeGainedThisTurn {
+                player: PlayerScope::Target,
+            },
+        ));
+    }
     alt((
         value(
             QuantityRef::LifeGainedThisTurn {
@@ -4795,20 +4879,16 @@ fn parse_target_life_ref(input: &str) -> OracleResult<'_, QuantityRef> {
 /// the "there are N ..." condition form (see `parse_there_are_conditions` in
 /// `oracle_nom/condition.rs`) share a single tag authority. The singular form
 /// appears after "for each"; the plural form appears after "the number of".
-fn parse_basic_land_types_among_lands_controlled_by_ref(
-    input: &str,
-    they_controller: ControllerRef,
-) -> OracleResult<'_, QuantityRef> {
+fn parse_basic_land_types_among_lands_controlled_by_ref<'a>(
+    input: &'a str,
+    antecedents: &PlayerAntecedents,
+) -> OracleResult<'a, QuantityRef> {
     let (rest, _) = tag("basic land type").parse(input)?;
     let (rest, _) = opt(tag("s")).parse(rest)?;
     let (rest, _) = tag(" among lands ").parse(rest)?;
-    let (rest, controller) = alt((
-        value(ControllerRef::You, tag("you control")),
-        // The caller supplies the anaphoric "they control" binding: the iterating
-        // player inside a `for each` clause, or a target player in "the number of …".
-        value(they_controller, tag("they control")),
-    ))
-    .parse(rest)?;
+    // The caller supplies the anaphoric "they control" binding: the iterating
+    // player inside a `for each` clause, or a target player in "the number of …".
+    let (rest, controller) = controller_you_or_they(rest, antecedents)?;
     Ok((rest, QuantityRef::BasicLandTypeCount { controller }))
 }
 
@@ -4818,7 +4898,12 @@ fn parse_basic_land_type_count(input: &str) -> OracleResult<'_, QuantityRef> {
         tag("the number of "),
         // In a quantity reference, anaphoric "they control" binds to a target
         // player rather than a `for each` scoped player.
-        |i| parse_basic_land_types_among_lands_controlled_by_ref(i, ControllerRef::TargetPlayer),
+        |i| {
+            parse_basic_land_types_among_lands_controlled_by_ref(
+                i,
+                &PlayerAntecedents::basic_land_type_count(),
+            )
+        },
     )
     .parse(input)
 }
@@ -4899,9 +4984,18 @@ fn parse_wedge_clan_colors(input: &str) -> OracleResult<'_, Vec<ManaColor>> {
 /// (Outrage Shaman, Primalcrux). The graveyard-scope and single-object Chroma
 /// forms are a different population and intentionally not matched here.
 fn parse_chroma_devotion_ref(input: &str) -> OracleResult<'_, QuantityRef> {
-    let (rest, _) = tag("the number of ").parse(input)?;
-    let (rest, color) = super::primitives::parse_color(rest)?;
-    let (rest, _) = tag(" mana symbols in the mana costs of permanents you control").parse(rest)?;
+    preceded(tag("the number of "), parse_chroma_permanents_symbols).parse(input)
+}
+
+/// CR 700.5: "<color> mana symbol[s] in the mana costs of permanents you control"
+/// counts the mana symbols devotion counts, so it is `QuantityRef::Devotion` with a
+/// fixed color. Shared tail of the "the number of …" Chroma ref and the
+/// "for each …" Chroma rider (Springjack Shepherd).
+fn parse_chroma_permanents_symbols(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (rest, color) = parse_color(input)?;
+    let (rest, _) = tag(" mana symbol").parse(rest)?;
+    let (rest, _) = opt(tag("s")).parse(rest)?;
+    let (rest, _) = tag(" in the mana costs of permanents you control").parse(rest)?;
     Ok((
         rest,
         QuantityRef::Devotion {
@@ -5032,7 +5126,10 @@ pub fn parse_kicker_count_where_x_expression(input: &str) -> OracleResult<'_, Qu
 
 /// Parse the inner content after "for each ".
 pub fn parse_for_each_clause_ref(input: &str) -> OracleResult<'_, QuantityRef> {
-    parse_for_each_clause_ref_with_they_controller(input, ControllerRef::ScopedPlayer)
+    parse_for_each_clause_ref_with_they_controller(
+        input,
+        &PlayerAntecedents::for_each_iteration_unscoped(),
+    )
 }
 
 /// Parse "for each differently named <type>" patterns.
@@ -5121,10 +5218,10 @@ pub(crate) fn parse_for_each_clause_ref_with_context<'a>(
     input: &'a str,
     ctx: &ParseContext,
 ) -> OracleResult<'a, QuantityRef> {
-    let they_controller = ctx
-        .third_person_player_controller_ref()
-        .unwrap_or(ControllerRef::ScopedPlayer);
-    parse_for_each_clause_ref_with_they_controller(input, they_controller)
+    parse_for_each_clause_ref_with_they_controller(
+        input,
+        &PlayerAntecedents::for_each_iteration(ctx),
+    )
 }
 
 /// CR 608.2c: Read the Runes — "for each card[s] drawn this way". The "this way"
@@ -5220,10 +5317,10 @@ fn parse_for_each_unspent_mana(input: &str) -> OracleResult<'_, QuantityRef> {
     Ok((rest, QuantityRef::UnspentMana { color }))
 }
 
-fn parse_for_each_clause_ref_with_they_controller(
-    input: &str,
-    they_controller: ControllerRef,
-) -> OracleResult<'_, QuantityRef> {
+fn parse_for_each_clause_ref_with_they_controller<'a>(
+    input: &'a str,
+    antecedents: &PlayerAntecedents,
+) -> OracleResult<'a, QuantityRef> {
     alt((
         // CR 123.6d + CR 123.6e: first, so no earlier arm can stop `alt` with a
         // stranded remainder; its "unique vowel"/"<letter>'s" + sticker-set
@@ -5247,7 +5344,15 @@ fn parse_for_each_clause_ref_with_they_controller(
             parse_object_colors_for_each,
             parse_object_name_word_count_for_each,
             parse_object_typeline_component_count_for_each,
-            parse_mana_symbols_in_object_mana_cost_for_each,
+            // CR 700.5: the Chroma permanents tail ("… in the mana costs of
+            // permanents you control") is devotion; it shares the "<color> mana
+            // symbol[s] in " prefix with the per-object arm and goes first as the
+            // more specific tail. Nested to keep the outer `alt` within nom's
+            // tuple arity (21 items).
+            alt((
+                parse_chroma_permanents_symbols,
+                parse_mana_symbols_in_object_mana_cost_for_each,
+            )),
             // CR 205.2a: "for each card type among <population>" and "card type
             // they share with <population>" share the population grammar; nested
             // to keep the outer `alt` within nom's tuple arity (21 items).
@@ -5290,7 +5395,7 @@ fn parse_for_each_clause_ref_with_they_controller(
         )),
     ))
     .or(alt((
-        |input| parse_for_each_combat_creature_controlled(input, they_controller.clone()),
+        |input| parse_for_each_combat_creature_controlled(input, antecedents),
         parse_for_each_combat_creature_other_than_source,
         parse_for_each_attacking_controller_type,
         parse_for_each_blocking_source_type,
@@ -5320,7 +5425,7 @@ fn parse_for_each_clause_ref_with_they_controller(
         // must precede the generic `<type> you control` arm so the leading
         // "basic land type" is not mis-consumed as a creature/permanent type.
         // Anaphoric "they control" binds to the iterating/scoped player here.
-        |i| parse_basic_land_types_among_lands_controlled_by_ref(i, they_controller.clone()),
+        |i| parse_basic_land_types_among_lands_controlled_by_ref(i, antecedents),
         // CR 122.1 + CR 109.4: "[other] <type> you control with a <kind> counter on
         // it" — a controller-scoped count gated on a counter predicate. Must
         // precede `parse_for_each_controlled_type`, whose bare " you control"
@@ -5984,10 +6089,10 @@ fn parse_number_of_object_colors_tail(input: &str) -> OracleResult<'_, QuantityR
 
 /// Parse controller-relative combat-class counts:
 /// "for each attacking/blocking creature they/you control".
-fn parse_for_each_combat_creature_controlled(
-    input: &str,
-    they_controller: ControllerRef,
-) -> OracleResult<'_, QuantityRef> {
+fn parse_for_each_combat_creature_controlled<'a>(
+    input: &'a str,
+    antecedents: &PlayerAntecedents,
+) -> OracleResult<'a, QuantityRef> {
     let (rest, attachment_property) = opt(alt((
         value(FilterProp::EquippedBy, tag("equipped ")),
         value(FilterProp::EnchantedBy, tag("enchanted ")),
@@ -5999,11 +6104,8 @@ fn parse_for_each_combat_creature_controlled(
     ))
     .parse(rest)?;
     let (rest, tf) = parse_type_filter_word(rest)?;
-    let (rest, controller) = alt((
-        value(they_controller, tag(" they control")),
-        value(ControllerRef::You, tag(" you control")),
-    ))
-    .parse(rest)?;
+    let (rest, controller) =
+        preceded(tag(" "), |i| controller_you_or_they(i, antecedents)).parse(rest)?;
     let mut properties = Vec::new();
     if let Some(prop) = attachment_property {
         properties.push(prop);
@@ -11314,9 +11416,9 @@ mod tests {
         // The article-only forms are the exact Wound Reflection / Archfiend /
         // Warlock / Blitzwing phrasings. The "amount of life they lost" gloss
         // (Astarion Feed) is consumed by `parse_life_lost_ref`'s leading
-        // `opt("the amount of ")` strip and routed through the imperative-level
-        // `parse_target_relative_life_change_this_turn` recognizer instead, which
-        // also yields `Target` — so it is asserted at that layer, not here.
+        // `opt("the amount of ")` strip and read by
+        // `parse_third_person_life_change`, which also yields `Target`
+        // (`parse_quantity_ref_third_person_life_change_amount_of_gloss`).
         for phrase in [
             "the life they lost this turn",
             "the life that player lost this turn",
@@ -11350,6 +11452,74 @@ mod tests {
                 },
                 "{phrase:?} must stay Controller-scoped, got {q:?}"
             );
+            assert_eq!(rest, "", "{phrase:?} left remainder {rest:?}");
+        }
+    }
+
+    /// CR 119.3 + CR 608.2c: the "(the) amount of life they|that player
+    /// lost|gained [this turn]" forms (Astarion's Feed / Friends glosses) map the
+    /// third-person anaphor to the clause's target player; the first-person
+    /// "you" form stays `Controller`.
+    #[test]
+    fn parse_quantity_ref_third_person_life_change_amount_of_gloss() {
+        for (phrase, expected) in [
+            (
+                "the amount of life they lost this turn",
+                QuantityRef::LifeLostThisTurn {
+                    player: PlayerScope::Target,
+                },
+            ),
+            (
+                "the amount of life that player lost this turn",
+                QuantityRef::LifeLostThisTurn {
+                    player: PlayerScope::Target,
+                },
+            ),
+            (
+                "the amount of life they lost",
+                QuantityRef::LifeLostThisTurn {
+                    player: PlayerScope::Target,
+                },
+            ),
+            (
+                "the amount of life that player lost",
+                QuantityRef::LifeLostThisTurn {
+                    player: PlayerScope::Target,
+                },
+            ),
+            (
+                "the amount of life they gained this turn",
+                QuantityRef::LifeGainedThisTurn {
+                    player: PlayerScope::Target,
+                },
+            ),
+            (
+                "the amount of life that player gained this turn",
+                QuantityRef::LifeGainedThisTurn {
+                    player: PlayerScope::Target,
+                },
+            ),
+            (
+                "the amount of life they gained",
+                QuantityRef::LifeGainedThisTurn {
+                    player: PlayerScope::Target,
+                },
+            ),
+            (
+                "the amount of life that player gained",
+                QuantityRef::LifeGainedThisTurn {
+                    player: PlayerScope::Target,
+                },
+            ),
+            (
+                "the amount of life you lost this turn",
+                QuantityRef::LifeLostThisTurn {
+                    player: PlayerScope::Controller,
+                },
+            ),
+        ] {
+            let (rest, q) = parse_quantity_ref(phrase).unwrap();
+            assert_eq!(q, expected, "{phrase:?}");
             assert_eq!(rest, "", "{phrase:?} left remainder {rest:?}");
         }
     }
@@ -12579,6 +12749,49 @@ mod tests {
         );
     }
 
+    /// CR 700.5: the "for each" form of the Chroma permanents count (Springjack
+    /// Shepherd) is the same devotion quantity, singular or plural; the arm is
+    /// exact about the population, so other Chroma scopes stay off `Devotion`.
+    #[test]
+    fn test_parse_chroma_for_each_devotion() {
+        let (rest, q) = parse_for_each_clause_ref(
+            "white mana symbol in the mana costs of permanents you control",
+        )
+        .unwrap();
+        assert_eq!(
+            q,
+            QuantityRef::Devotion {
+                colors: DevotionColors::Fixed(vec![ManaColor::White])
+            }
+        );
+        assert_eq!(rest, "");
+
+        let (rest, q) = parse_for_each_clause_ref(
+            "green mana symbols in the mana costs of permanents you control",
+        )
+        .unwrap();
+        assert_eq!(
+            q,
+            QuantityRef::Devotion {
+                colors: DevotionColors::Fixed(vec![ManaColor::Green])
+            }
+        );
+        assert_eq!(rest, "");
+
+        for other_population in [
+            "green mana symbol in the mana costs of permanents your opponents control",
+            "blue mana symbol in the mana costs of the revealed cards",
+        ] {
+            assert!(
+                !matches!(
+                    parse_for_each_clause_ref(other_population),
+                    Ok((_, QuantityRef::Devotion { .. }))
+                ),
+                "{other_population:?} must not parse as devotion"
+            );
+        }
+    }
+
     #[test]
     fn test_parse_devotion_chosen_color() {
         let (rest, q) = parse_quantity_ref("your devotion to that color").unwrap();
@@ -12777,6 +12990,53 @@ mod tests {
             }
         );
         assert_eq!(rest, "");
+    }
+
+    /// CR 608.2i: a past-tense "they controlled" is a look-back, not the
+    /// present-tense carrier arm, so it is not half-consumed as "they control".
+    #[test]
+    fn for_each_combat_creature_carrier_stops_at_word_boundary() {
+        let antecedents = PlayerAntecedents::for_each_iteration_unscoped();
+        // Positive guard: the carrier is reached and consumes the phrase.
+        let (rest, _) = parse_for_each_combat_creature_controlled(
+            "attacking creature they control",
+            &antecedents,
+        )
+        .expect("present-tense carrier should parse");
+        assert_eq!(rest, "");
+        assert!(parse_for_each_combat_creature_controlled(
+            "attacking creature they controlled",
+            &antecedents
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parse_quantity_controller_suffix_admits_its_base_set() {
+        for (text, expected) in [
+            (" you control", ControllerRef::You),
+            (" your opponents control", ControllerRef::Opponent),
+            (
+                " the chosen player controls",
+                ControllerRef::SourceChosenPlayer,
+            ),
+        ] {
+            let (rest, c) = parse_quantity_controller_suffix(text)
+                .unwrap_or_else(|e| panic!("{text:?} should parse: {e:?}"));
+            assert_eq!(c, expected, "{text:?}");
+            assert_eq!(rest, "", "{text:?}");
+        }
+        for rejected in [
+            " an opponent controls",
+            " you don't control",
+            // CR 608.2i: a look-back is not "you control" + "led".
+            " you controlled",
+        ] {
+            assert!(
+                parse_quantity_controller_suffix(rejected).is_err(),
+                "{rejected:?} is not a quantity controller suffix"
+            );
+        }
     }
 
     /// CR 305.6 + CR 601.2f: domain must be reachable through the `for each`

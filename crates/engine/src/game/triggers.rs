@@ -3787,7 +3787,7 @@ pub(super) fn resolve_tap_mana_triggers_inline(
     events: &mut Vec<GameEvent>,
     events_before: usize,
 ) {
-    // CR 603.2 + CR 611.2e: Resolve against the post-layer live trigger surface,
+    // CR 603.2: Resolve against the post-layer live trigger surface,
     // then restore the serde-skipped index if this is the first post-deserialize
     // consult. Layer evaluation remains the authority for granted definitions.
     super::layers::flush_layers(state);
@@ -4575,7 +4575,7 @@ fn collect_pending_triggers_with_collection(
     collection: LogicalZoneTriggerCollection<'_>,
     session: &mut TriggerCollectionSession,
 ) -> Vec<PendingTriggerContext> {
-    // CR 603.6a + CR 611.2e: Continuous effects (including statics that grant
+    // CR 611.3c + CR 603.6a: Continuous effects (including statics that grant
     // triggered abilities to a class — sliver-lord pattern) apply the moment
     // the affected permanent is on the battlefield. The newcomers must be
     // checked for ETB triggers including any granted by their own static
@@ -4659,7 +4659,7 @@ fn collect_pending_triggers_with_collection(
             (HashSet::new(), HashSet::new())
         };
 
-        // CR 603.2 + CR 603.6a + CR 611.2e: Consult the maintained TriggerIndex
+        // CR 603.2 + CR 603.6a: Consult the maintained TriggerIndex
         // for candidate battlefield objects. Replaces the legacy full
         // battlefield scan with an event-keyed bucket union. The
         // `evaluate_layers` rebuild at the top of `collect_pending_triggers`
@@ -8603,6 +8603,10 @@ pub(crate) fn seed_event_context_parent_targets(
         // PUBLIC zone, so a card diverted to hand or library seeds no parent target
         // rather than binding the trigger to an object no effect may find.
         GameEvent::Milled { object_id, to, .. } if to.is_public() => (Some(*object_id), None),
+        // CR 707.10 + CR 113.7a: a copy's "that ability" / "that spell" is the stack
+        // object the trigger condition named, never the permanent this source is
+        // attached to; `copy_spell::copy_source_entry` resolves it from the event.
+        _ if ability.effect.parent_target_is_copy_referent() => (None, None),
         _ => {
             // CR 301.5a + CR 303.4b + CR 608.2k: Aura/Equipment triggers referencing ParentTarget/AttachedTo
             // (e.g. Slow Motion's upkeep sacrifice trigger) bind to the source's attached host permanent
@@ -12795,6 +12799,7 @@ fn filter_prop_binding_diverges(prop: &FilterProp) -> bool {
         | FilterProp::SameName
         | FilterProp::AttachedTo { to: AttachmentReferent::Source }
         | FilterProp::SaddledSource
+        | FilterProp::CrewedThisTurn { .. }
         | FilterProp::ConvokedSource
         | FilterProp::BlockingSource
         | FilterProp::PowerGTSource
@@ -12914,10 +12919,12 @@ fn count_scope_binding_diverges(scope: &crate::types::ability::CountScope) -> bo
 fn player_filter_binding_diverges(player: &PlayerFilter) -> bool {
     match player {
         PlayerFilter::AllExcept { exclude } => player_filter_binding_diverges(exclude),
+        PlayerFilter::AnyOf { filters } => filters.iter().any(player_filter_binding_diverges),
         // CR 109.4 + CR 115.1 + CR 601.2a: the anchor lives on the resolving ability
         // (`targets` / `chosen_players` / `cast_occurrence`).
         PlayerFilter::ParentObjectTargetController
         | PlayerFilter::ParentObjectTargetOwner
+        | PlayerFilter::TargetPlayer
         | PlayerFilter::GrantingObjectCaster
         | PlayerFilter::ChosenPlayer { .. }
         // CR 608.2c: ledgers a RESOLUTION publishes — the zone-change and action
@@ -13053,6 +13060,9 @@ fn attack_subject_binding_diverges(subject: &crate::types::ability::AttackSubjec
         // CR 109.5 + CR 400.7: the controller and the source object, both
         // carried by the fire-time context.
         AttackSubject::You | AttackSubject::Source => false,
+        // CR 603.2: like `PlayerFilter::TriggeringPlayer`, read from
+        // `state.current_trigger_event` directly.
+        AttackSubject::EventAttackers => true,
     }
 }
 
@@ -15567,19 +15577,22 @@ fn evaluate_trigger_condition_with_source(
             | PlayerFilter::OpponentAttackingEnchantedPlayer
             | PlayerFilter::All
             // CR 608.2c: a set-valued "all players except an anchor" population
-            // has no single-player "whose turn" semantic. Fail-closed.
+            // has no single-player "whose turn" semantic. Fail-closed. A union
+            // of player sets is likewise set-valued.
             | PlayerFilter::AllExcept { .. }
+            | PlayerFilter::AnyOf { .. }
             | PlayerFilter::HighestSpeed
             | PlayerFilter::ZoneChangedThisWay
             | PlayerFilter::PerformedActionThisWay { .. }
             | PlayerFilter::VotedFor { .. }
             | PlayerFilter::OwnersOfCardsExiledBySource
             | PlayerFilter::ParentObjectTargetController
-            // CR 108.3 + CR 601.2a + CR 608.2c: parent-target-owner, granter-caster
-            // and resolution-scoped chosen-player anchors are effect-resolution
-            // references, not turn-binding predicates — no "whose turn" semantic.
-            // Fail-closed.
+            // CR 108.3 + CR 601.2a + CR 608.2c + CR 115.1: parent-target-owner,
+            // granter-caster, resolution-scoped chosen-player and declared-player-
+            // target anchors are effect-resolution references, not turn-binding
+            // predicates — no "whose turn" semantic. Fail-closed.
             | PlayerFilter::ParentObjectTargetOwner
+            | PlayerFilter::TargetPlayer
             | PlayerFilter::GrantingObjectCaster
             | PlayerFilter::ChosenPlayer { .. }
             // CR 102.1: a controls-a-permanent population predicate is
@@ -18963,6 +18976,61 @@ pub mod tests {
         assert_eq!(untouched.targets, vec![TargetRef::Object(source)]);
     }
 
+    /// CR 707.10 + CR 113.7a: the attached-host fallback binds an Aura/Equipment
+    /// trigger's host anaphor ("sacrifice that creature"), but a copy's "that
+    /// ability" names the activated stack object, never the equipped creature.
+    #[test]
+    fn seed_event_context_parent_targets_attached_host_fallback_skips_a_copy_referent() {
+        let mut state = GameState::new_two_player(1);
+        let host = make_creature(&mut state, PlayerId(0), "Host", 1, 1);
+        let source_card = CardId(state.next_object_id);
+        let source = create_object(
+            &mut state,
+            source_card,
+            PlayerId(0),
+            "Bracers".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&source).unwrap().attached_to =
+            Some(crate::game::game_object::AttachTarget::Object(host));
+        let event = GameEvent::AbilityActivated {
+            player_id: PlayerId(0),
+            source_id: host,
+            kind: ActivatedAbilityKind::Normal,
+            departed_source_lki: None,
+            trigger_state: ActivationTriggerState::Pending,
+            stack_entry: None,
+        };
+        let seed = |effect: Effect| {
+            let mut ability = ResolvedAbility::new(effect, vec![], source, PlayerId(0));
+            seed_event_context_parent_targets(
+                &state,
+                &mut ability,
+                Some(&event),
+                EventContextSeedTiming::StackPush,
+            );
+            ability
+        };
+
+        // Control: a non-copy host anaphor still binds and pins the host, so the
+        // fallback is reached by this fixture.
+        let host_anaphor = seed(Effect::TargetOnly {
+            target: TargetFilter::ParentTarget,
+        });
+        assert_eq!(host_anaphor.targets, vec![TargetRef::Object(host)]);
+        assert!(!host_anaphor.target_incarnations.is_empty());
+
+        let copy = seed(Effect::CopySpell {
+            target: TargetFilter::ParentTarget,
+            retarget: CopyRetargetPermission::MayChooseNewTargets,
+            copier: None,
+            additional_modifications: vec![],
+            starting_loyalty_from_casualty_sacrifice: false,
+        });
+        assert!(copy.targets.is_empty());
+        assert!(copy.target_incarnations.is_empty());
+    }
+
     #[test]
     fn seed_event_context_parent_targets_overwrites_source_only_fallback() {
         use crate::types::ability::PerpetualModification;
@@ -20518,6 +20586,7 @@ pub mod tests {
             kind: crate::types::events::ActivatedAbilityKind::Normal,
             departed_source_lki: None,
             trigger_state: crate::types::events::ActivationTriggerState::Pending,
+            stack_entry: None,
         };
         assert!(check_trigger_condition(
             &state,
@@ -20532,6 +20601,7 @@ pub mod tests {
             kind: crate::types::events::ActivatedAbilityKind::Mana,
             departed_source_lki: None,
             trigger_state: crate::types::events::ActivationTriggerState::Pending,
+            stack_entry: None,
         };
         assert!(!check_trigger_condition(
             &state,
@@ -25023,6 +25093,7 @@ pub mod tests {
                 controller,
                 land,
                 ActivatedAbilityKind::Mana,
+                None,
                 Zone::Battlefield,
                 &mut events,
             );
@@ -26288,6 +26359,10 @@ pub mod tests {
                  carried by the fire-time context"
             );
         }
+        assert!(
+            attack_subject_binding_diverges(&crate::types::ability::AttackSubject::EventAttackers),
+            "CR 603.2: read from state.current_trigger_event directly, like PlayerFilter::TriggeringPlayer"
+        );
         // The two composite arms those axes feed, end to end.
         assert!(
             filter_prop_binding_diverges(&FilterProp::ManaValueParity {
@@ -39926,7 +40001,7 @@ pub mod tests {
     }
 
     // === L9-23: Sliver-lord self-static keyword/trigger grant ===
-    // CR 603.6a + CR 611.2e: Static abilities that grant abilities/keywords to
+    // CR 611.3c + CR 603.6a: Static abilities that grant abilities/keywords to
     // a class of permanents apply the moment a newcomer enters the battlefield.
     // ETB-trigger gathering MUST see the granted-trigger on the entering object
     // itself (Harmonic Sliver) and the granted keyword on the entering source
@@ -40157,7 +40232,7 @@ pub mod tests {
 
     #[test]
     fn venom_sliver_self_grants_deathtouch_via_layer_flush_in_process_triggers() {
-        // CR 611.2e: Venom Sliver pattern — a printed static "Sliver creatures
+        // CR 613.1f: Venom Sliver pattern — a printed static "Sliver creatures
         // you control have deathtouch" must apply to the source itself once
         // layers are evaluated. Pins that calling `process_triggers` (which
         // happens immediately after a zone change in the post-action pipeline)

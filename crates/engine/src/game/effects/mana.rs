@@ -1,3 +1,4 @@
+use crate::game::mana_sources::mana_type_to_color;
 use crate::game::quantity::{resolve_quantity, resolve_quantity_with_targets};
 use crate::game::{mana_payment, mana_sources};
 #[cfg(test)]
@@ -6,6 +7,7 @@ use crate::types::ability::{
     ChoiceValue, Effect, EffectError, EffectKind, LinkedExileScope, ManaProduction,
     ManaSpendRestriction, ManaTargetRole, ManaTargetSlot, ObjectScope, ResolvedAbility, TargetRef,
 };
+use crate::types::ability::{DevotionColors, QuantityRef};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
     GameState, ManaChoice, ManaChoiceContext, ManaChoicePrompt, MayTriggerOrigin, WaitingFor,
@@ -252,7 +254,13 @@ pub fn resolve(
                 // Resolve the count from the production descriptor, then produce
                 // that many units of the override color — mirrors the behavior of
                 // `resolve_single_color_override` in `mana_abilities.rs`.
-                let count = resolve_mana_types_with_ability(produced, &*state, count_ability).len();
+                let count = match mana_type_to_color(color) {
+                    Some(chosen) => {
+                        let bound = bind_any_one_color_choice(produced, chosen);
+                        resolve_mana_types_with_ability(&bound, &*state, count_ability).len()
+                    }
+                    None => resolve_mana_types_with_ability(produced, &*state, count_ability).len(),
+                };
                 vec![color; count]
             }
             Some(crate::types::game_state::ProductionOverride::Combination(types)) => types,
@@ -497,7 +505,13 @@ fn chosen_mana_types_for_prompt(
                     "Chosen color is not among the legal options".to_string(),
                 ));
             }
-            let count = resolve_mana_types_for_ability(produced, state, ability).len();
+            let count = match mana_type_to_color(color) {
+                Some(chosen) => {
+                    let bound = bind_any_one_color_choice(produced, chosen);
+                    resolve_mana_types_for_ability(&bound, state, ability).len()
+                }
+                None => resolve_mana_types_for_ability(produced, state, ability).len(),
+            };
             Ok(vec![color; count])
         }
         (ManaChoicePrompt::Combination { options }, ManaChoice::Combination(combo)) => {
@@ -718,16 +732,18 @@ fn resolve_mana_types_impl(
         }
         // CR 106.5: If an ability would produce one or more mana of an undefined type,
         // it produces no mana instead.
-        ManaProduction::AnyOneColor {
-            count,
-            color_options,
-            ..
-        } => {
-            let amount = resolve_count(count, state, ability, controller, source_id);
-            let Some(mana_type) = color_options.first().map(mana_color_to_type) else {
+        ManaProduction::AnyOneColor { color_options, .. } => {
+            let Some(&color) = color_options.first() else {
                 return Vec::new();
             };
-            vec![mana_type; amount]
+            // CR 608.2d + CR 700.5: The count reads this production's selected
+            // color, including when the default path makes that choice.
+            let bound = bind_any_one_color_choice(produced, color);
+            let ManaProduction::AnyOneColor { count, .. } = &*bound else {
+                unreachable!("binding preserves the production variant");
+            };
+            let amount = resolve_count(count, state, ability, controller, source_id);
+            vec![mana_color_to_type(&color); amount]
         }
         ManaProduction::AnyCombination {
             count,
@@ -1101,6 +1117,109 @@ pub(crate) fn chosen_color_for_mana(
                     _ => None,
                 })
         })
+}
+
+/// CR 700.5 + CR 608.2d: Whether an any-one-color production's amount reads
+/// the color chosen for it ("equal to your devotion to that color": Nykthos,
+/// Nyx Lotus, the plane Nyx). Within `AnyOneColor` the only choice such a
+/// count can name is the production's own, since the parser emits it only for
+/// "Choose a color. Add ... of that color".
+pub(crate) fn any_one_color_count_reads_choice(produced: &ManaProduction) -> bool {
+    let ManaProduction::AnyOneColor { count, .. } = produced else {
+        return false;
+    };
+    count.any_ref(&mut |qty| {
+        matches!(
+            qty,
+            QuantityRef::Devotion {
+                colors: DevotionColors::ChosenColor
+            }
+        )
+    })
+}
+
+/// CR 106.1 + CR 605.3b + CR 608.2d: `produced` with its amount bound to
+/// `color`, the color chosen for this production as it resolves. A count that
+/// reads "that color" reads `color` itself, never a color stored on the source
+/// or left over from another choice; nothing in the game state is written.
+/// Other productions are returned unchanged.
+pub(crate) fn bind_any_one_color_choice(
+    produced: &ManaProduction,
+    color: ManaColor,
+) -> std::borrow::Cow<'_, ManaProduction> {
+    if !any_one_color_count_reads_choice(produced) {
+        return std::borrow::Cow::Borrowed(produced);
+    }
+    let mut bound = produced.clone();
+    if let ManaProduction::AnyOneColor { count, .. } = &mut bound {
+        count.each_ref_mut(&mut |qty| {
+            if let QuantityRef::Devotion { colors } = qty {
+                if *colors == DevotionColors::ChosenColor {
+                    *colors = DevotionColors::Fixed(vec![color]);
+                }
+            }
+        });
+    }
+    std::borrow::Cow::Owned(bound)
+}
+
+/// CR 106.1 + CR 608.2d: The amount an any-one-color production adds for each
+/// color it could be activated for, when that amount depends on the color
+/// (see [`any_one_color_count_reads_choice`]); empty otherwise. Colors that
+/// would add no mana are omitted, and the rest are best first (ties keep the
+/// printed order), so a planner taking one row for generic mana takes the
+/// color that adds the most.
+pub(crate) fn any_one_color_outputs(
+    state: &GameState,
+    produced: &ManaProduction,
+    ability: &ResolvedAbility,
+) -> Vec<(ManaType, usize)> {
+    let ManaProduction::AnyOneColor { color_options, .. } = produced else {
+        return Vec::new();
+    };
+    if !any_one_color_count_reads_choice(produced) {
+        return Vec::new();
+    }
+    let mut outputs: Vec<(ManaType, usize)> = color_options
+        .iter()
+        .map(|color| {
+            (
+                mana_color_to_type(color),
+                any_one_color_amount(produced, state, ability, *color),
+            )
+        })
+        .filter(|(_, amount)| *amount > 0)
+        .collect();
+    outputs.sort_by_key(|(_, amount)| std::cmp::Reverse(*amount));
+    outputs
+}
+
+/// CR 106.1 + CR 608.2d: The amount an any-one-color production adds when
+/// `color` is chosen for it, as a scalar: the count is bound to `color`
+/// ([`bind_any_one_color_choice`]) and resolved directly, with no mana units
+/// built. The scalar authority for planning; resolution builds its units from
+/// the same bound count.
+fn any_one_color_amount(
+    produced: &ManaProduction,
+    state: &GameState,
+    ability: &ResolvedAbility,
+    color: ManaColor,
+) -> usize {
+    let bound = bind_any_one_color_choice(produced, color);
+    match &*bound {
+        ManaProduction::AnyOneColor {
+            count,
+            color_options,
+            ..
+        } if !color_options.is_empty() => resolve_count(
+            count,
+            state,
+            Some(ability),
+            ability.controller,
+            ability.source_id,
+        ),
+        _ => 0,
+    }
 }
 
 /// CR 106.1b: The first mana type noted by a past `Effect::NoteManaSpent`

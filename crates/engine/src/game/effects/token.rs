@@ -3,7 +3,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::game::game_object::{AttachTarget, BackFaceData, DisplaySource, GameObject};
-use crate::game::quantity::resolve_quantity_with_targets;
+use crate::game::quantity::{
+    quantity_expr_recipient_read, resolve_quantity_with_targets,
+    resolve_quantity_with_targets_and_recipient, RecipientRead,
+};
 use crate::game::replacement::{self, ReplacementResult};
 use crate::game::zones;
 use crate::types::ability::{
@@ -573,13 +576,7 @@ pub fn resolve(
 
     // CR 122.6a: Resolve ETB counter quantities before proposing — the event
     // carries fully-resolved counts, not quantity expressions.
-    let resolved_etb_counters: Vec<(CounterType, u32)> = etb_counters
-        .iter()
-        .map(|(ct, qty)| {
-            let n = resolve_quantity_with_targets(state, qty, ability).max(0) as u32;
-            (ct.clone(), n)
-        })
-        .collect();
+    let resolved_etb_counters = resolve_token_entry_counters(state, &etb_counters, ability);
 
     let spec = build_token_spec(
         &script_name,
@@ -652,6 +649,54 @@ pub fn resolve(
     });
 
     Ok(())
+}
+
+/// CR 122.6 + CR 614.1c + CR 608.2h: Resolve a created token's "enters with N
+/// <type> counters" amounts. The token is the object given those counters as it
+/// enters (CR 122.6), so an amount that counts a population relative to "it" —
+/// "the number of OTHER creatures you control", "… attached to it" — reads the
+/// token as that referent (CR 608.2c), not the creating ability's source. The
+/// amounts are determined once, before any token of the batch exists
+/// (CR 608.2h, CR 614.12): the token is bound by the id `zones::create_object`
+/// would allocate next. Ids are allocated monotonically from
+/// `next_object_id`, so no existing object holds it, "other" excludes nothing
+/// already on the battlefield and nothing is attached to it — what an object
+/// not yet on the battlefield answers. It names a referent, not the token's
+/// eventual id.
+///
+/// Only identity reads (`RecipientRead::PopulationIdentity`) are bound. An
+/// amount that reads the recipient's characteristics or controller ("its
+/// power", `SharesQuality`) would read an id with no object behind it, while
+/// CR 614.12 asks for the permanent as it would exist on the battlefield; such
+/// amounts (as far as the classifier enumerates them), and amounts that read no
+/// recipient, resolve exactly as before. A recipient read the classifier does
+/// not enumerate (its `_` tail, e.g. `Intensity { scope: Recipient }`) is graded
+/// `Unread` and can ride along inside a composite with an identity read; no
+/// parsed card produces that shape today.
+///
+/// The single authority for both `resolve` and its read-only mirror
+/// `resolve_token_spec`, so the live resolution, the bulk-run gate and the
+/// CR 614.1a substitute spec cannot disagree.
+fn resolve_token_entry_counters(
+    state: &GameState,
+    enter_with_counters: &[(CounterType, QuantityExpr)],
+    ability: &ResolvedAbility,
+) -> Vec<(CounterType, u32)> {
+    let entering_token = ObjectId(state.next_object_id);
+    enter_with_counters
+        .iter()
+        .map(|(counter_type, qty)| {
+            let n = match quantity_expr_recipient_read(qty) {
+                RecipientRead::PopulationIdentity => {
+                    resolve_quantity_with_targets_and_recipient(state, qty, ability, entering_token)
+                }
+                RecipientRead::Unread | RecipientRead::Characteristics => {
+                    resolve_quantity_with_targets(state, qty, ability)
+                }
+            };
+            (counter_type.clone(), n.max(0) as u32)
+        })
+        .collect()
 }
 
 /// CR 609.3 "do as much as possible": resolve without creating a token.
@@ -3054,13 +3099,7 @@ pub(crate) fn resolve_token_spec(
         )
     });
 
-    let resolved_etb_counters: Vec<(CounterType, u32)> = enter_with_counters
-        .iter()
-        .map(|(ct, qty)| {
-            let n = resolve_quantity_with_targets(state, qty, ability).max(0) as u32;
-            (ct.clone(), n)
-        })
-        .collect();
+    let resolved_etb_counters = resolve_token_entry_counters(state, enter_with_counters, ability);
 
     let spec = build_token_spec(
         name,
@@ -3968,25 +4007,37 @@ fn heartwood_ability() -> AbilityDefinition {
 /// "[−1]: Surveil 1." (CR 701.25a) and "[−3]: Draw a card." (CR 121.1).
 /// Engine-defined from the rule text, not parsed from the catalog row's printed
 /// text, so the printed reminder parenthetical never becomes ability text.
+/// Each ability carries CR 606.3 timing via `loyalty_ability`.
 fn jace_token_abilities() -> Vec<AbilityDefinition> {
     vec![
-        AbilityDefinition::new(
-            AbilityKind::Activated,
+        loyalty_ability(
+            -1,
             Effect::Surveil {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Controller,
             },
-        )
-        .cost(AbilityCost::Loyalty { amount: -1 }),
-        AbilityDefinition::new(
-            AbilityKind::Activated,
+        ),
+        loyalty_ability(
+            -3,
             Effect::Draw {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Controller,
             },
-        )
-        .cost(AbilityCost::Loyalty { amount: -3 }),
+        ),
     ]
+}
+
+/// CR 606.2 + CR 606.3: an engine-defined loyalty ability — a loyalty cost
+/// plus the sorcery-speed restriction ("any time they have priority and the
+/// stack is empty during a main phase of their turn"). The loyalty gate
+/// (`planeswalker::can_activate_loyalty_ability`) enforces CR 606.3's
+/// once-per-permanent-per-turn cap itself and delegates timing to
+/// `activation_restrictions`, so static permissions can override it. This is
+/// the registry counterpart of the parser's `apply_loyalty_restrictions`.
+fn loyalty_ability(amount: i32, effect: Effect) -> AbilityDefinition {
+    AbilityDefinition::new(AbilityKind::Activated, effect)
+        .cost(AbilityCost::Loyalty { amount })
+        .sorcery_speed()
 }
 
 /// CR 111.10: Predefined token abilities keyed by subtype.
@@ -6286,6 +6337,45 @@ mod tests {
         // The registry arm is keyed to the Jace subtype, not to planeswalker
         // subtypes in general.
         assert!(predefined_token_abilities("Chandra").is_empty());
+    }
+
+    /// CR 606.3: every loyalty ability the predefined-token registry builds
+    /// carries the sorcery-speed timing restriction, for every subtype the
+    /// token catalog can reach.
+    #[test]
+    fn predefined_token_loyalty_abilities_are_sorcery_speed() {
+        let subtypes: std::collections::BTreeSet<&str> =
+            crate::game::token_presets::known_token_presets()
+                .iter()
+                .flat_map(|preset| preset.body.subtypes.iter().map(String::as_str))
+                .collect();
+        let loyalty_abilities: Vec<(&str, AbilityDefinition)> = subtypes
+            .iter()
+            .flat_map(|subtype| {
+                predefined_token_abilities(subtype)
+                    .into_iter()
+                    .map(move |ability| (*subtype, ability))
+            })
+            .filter(|(_, ability)| {
+                ability
+                    .cost
+                    .as_ref()
+                    .is_some_and(crate::types::ability::is_loyalty_ability_cost)
+            })
+            .collect();
+        // Reach-guard: the Jace pair is in the set, so the check below cannot
+        // pass on an empty collection.
+        assert!(
+            loyalty_abilities.len() >= 2,
+            "expected at least the Jace token's two loyalty abilities, got {}",
+            loyalty_abilities.len()
+        );
+        for (subtype, ability) in &loyalty_abilities {
+            assert!(
+                ability.is_sorcery_speed(),
+                "{subtype} token loyalty ability {ability:?} lacks CR 606.3 timing"
+            );
+        }
     }
 
     #[test]
@@ -9841,6 +9931,214 @@ mod tests {
             0,
             "counter must NOT land on Ka-Zar"
         );
+    }
+
+    // ── #9657: a token's entry-counter quantity reads "it" as the token ──
+
+    /// A creature on the battlefield with power = toughness = `pt`.
+    fn entry_counter_creature(
+        state: &mut GameState,
+        owner: PlayerId,
+        name: &str,
+        pt: i32,
+    ) -> ObjectId {
+        let id = create_object(state, CardId(0), owner, name.to_string(), Zone::Battlefield);
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.power = Some(pt);
+        obj.toughness = Some(pt);
+        obj.base_power = Some(pt);
+        obj.base_toughness = Some(pt);
+        id
+    }
+
+    /// Source `S` (P0, 3/3), friend `F` (P0, 2/2) and an opponent creature
+    /// `O` (P1, 2/2) on the battlefield; the ability creates two 0/0 Ooze
+    /// tokens from `S` whose +1/+1 entry-counter amount is `rider`.
+    fn entry_counter_fixture(rider: QuantityExpr) -> (GameState, ResolvedAbility, ObjectId) {
+        let mut state = GameState::new_two_player(42);
+        let source = entry_counter_creature(&mut state, PlayerId(0), "Source", 3);
+        entry_counter_creature(&mut state, PlayerId(0), "Friend", 2);
+        entry_counter_creature(&mut state, PlayerId(1), "Opponent Creature", 2);
+        let ability = ResolvedAbility::new(
+            Effect::Token {
+                name: "Ooze".to_string(),
+                power: PtValue::Fixed(0),
+                toughness: PtValue::Fixed(0),
+                types: vec!["Creature".to_string(), "Ooze".to_string()],
+                colors: vec![],
+                keywords: vec![],
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 2 },
+                owner: TargetFilter::Controller,
+                attach_to: None,
+                enters_attacking: false,
+                supertypes: vec![],
+                static_abilities: vec![],
+                enter_with_counters: vec![(CounterType::Plus1Plus1, rider)],
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        (state, ability, source)
+    }
+
+    /// Resolve the live `Effect::Token` path; the +1/+1 counters on each token.
+    fn live_entry_counters(state: &mut GameState, ability: &ResolvedAbility) -> Vec<u32> {
+        let mut events = Vec::new();
+        resolve(state, ability, &mut events).unwrap();
+        assert_eq!(
+            state.last_created_token_ids.len(),
+            2,
+            "reach guard: both tokens of the batch were created"
+        );
+        state
+            .last_created_token_ids
+            .iter()
+            .map(|id| {
+                state.objects[id]
+                    .counters
+                    .get(&CounterType::Plus1Plus1)
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .collect()
+    }
+
+    /// The read-only mirror's resolved entry counters.
+    fn mirror_entry_counters(
+        state: &GameState,
+        ability: &ResolvedAbility,
+    ) -> Vec<(CounterType, u32)> {
+        resolve_token_spec(state, ability)
+            .expect("Effect::Token resolves to a spec")
+            .0
+            .enter_with_counters
+    }
+
+    /// "the number of other creatures you control".
+    fn other_creatures_you_control() -> QuantityExpr {
+        QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(
+                    TypedFilter::creature()
+                        .controller(ControllerRef::You)
+                        .properties(vec![FilterProp::Another]),
+                ),
+            },
+        }
+    }
+
+    /// CR 122.6 + CR 608.2c + CR 608.2h: "The token enters with X counters,
+    /// where X is the number of OTHER creatures you control" — "other" is
+    /// relative to the entering token, which is not yet on the battlefield, so
+    /// the source and the friend both count (2); the opponent's creature does
+    /// not (CR 109.5), and the batch's tokens do not count each other. BASE
+    /// read "other" relative to the source: 1.
+    #[test]
+    fn token_entry_counters_read_other_relative_to_the_entering_token() {
+        let (mut state, ability, _) = entry_counter_fixture(other_creatures_you_control());
+        assert_eq!(live_entry_counters(&mut state, &ability), vec![2, 2]);
+
+        let (state, ability, _) = entry_counter_fixture(other_creatures_you_control());
+        assert_eq!(
+            mirror_entry_counters(&state, &ability),
+            vec![(CounterType::Plus1Plus1, 2)]
+        );
+
+        // Sibling: a rider that reads no recipient resolves as before.
+        let creatures_you_control = QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
+            },
+        };
+        let (mut state, ability, _) = entry_counter_fixture(creatures_you_control.clone());
+        assert_eq!(live_entry_counters(&mut state, &ability), vec![2, 2]);
+        let (state, ability, _) = entry_counter_fixture(creatures_you_control);
+        assert_eq!(
+            mirror_entry_counters(&state, &ability),
+            vec![(CounterType::Plus1Plus1, 2)]
+        );
+    }
+
+    /// Scope boundary, not a rules claim: an entry-counter amount that reads
+    /// the recipient's characteristics ("its power") is not bound to the
+    /// not-yet-existing token — an id with no object behind it would read 0 —
+    /// so it resolves exactly as before (here the source's power, 3). No
+    /// printed token rider has this shape.
+    #[test]
+    fn token_entry_counters_keep_characteristic_reads_on_the_base_resolver() {
+        // Positive control: the binding arm is live on this fixture.
+        let (mut state, ability, _) = entry_counter_fixture(other_creatures_you_control());
+        assert_eq!(live_entry_counters(&mut state, &ability), vec![2, 2]);
+
+        let its_power = QuantityExpr::Ref {
+            qty: QuantityRef::Power {
+                scope: crate::types::ability::ObjectScope::Recipient,
+            },
+        };
+        let (state, ability, _) = entry_counter_fixture(its_power.clone());
+        assert_eq!(
+            resolve_quantity_with_targets(&state, &its_power, &ability),
+            3,
+            "reference: the unbound resolver reads the source's power"
+        );
+        assert_eq!(
+            mirror_entry_counters(&state, &ability),
+            vec![(CounterType::Plus1Plus1, 3)]
+        );
+        let (mut state, ability, _) = entry_counter_fixture(its_power);
+        assert_eq!(live_entry_counters(&mut state, &ability), vec![3, 3]);
+    }
+
+    /// CR 301.5 + CR 111.1: "… attached to it" in a token's entry-counter
+    /// amount reads the entering token, to which nothing can be attached yet —
+    /// not the source, which carries an Equipment-like attachment here.
+    #[test]
+    fn token_entry_counters_attached_to_it_reads_the_entering_token() {
+        let attached_to_it = QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(TypedFilter::permanent().properties(vec![
+                    FilterProp::AttachedTo {
+                        to: crate::types::ability::AttachmentReferent::Recipient,
+                    },
+                ])),
+            },
+        };
+        let with_gear = |rider: QuantityExpr| {
+            let (mut state, ability, source) = entry_counter_fixture(rider);
+            let gear = create_object(
+                &mut state,
+                CardId(0),
+                PlayerId(0),
+                "Gear".to_string(),
+                Zone::Battlefield,
+            );
+            let gear_obj = state.objects.get_mut(&gear).unwrap();
+            gear_obj.card_types.core_types.push(CoreType::Artifact);
+            gear_obj.attached_to = Some(AttachTarget::Object(source));
+            state
+                .objects
+                .get_mut(&source)
+                .unwrap()
+                .attachments
+                .push(gear);
+            (state, ability)
+        };
+
+        let (state, ability) = with_gear(attached_to_it.clone());
+        assert_eq!(
+            resolve_quantity_with_targets(&state, &attached_to_it, &ability),
+            1,
+            "reach guard: the attachment on the source is visible to the unbound resolver"
+        );
+        assert_eq!(
+            mirror_entry_counters(&state, &ability),
+            vec![(CounterType::Plus1Plus1, 0)]
+        );
+        let (mut state, ability) = with_gear(attached_to_it);
+        assert_eq!(live_entry_counters(&mut state, &ability), vec![0, 0]);
     }
 }
 

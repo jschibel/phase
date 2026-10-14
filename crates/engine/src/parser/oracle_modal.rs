@@ -1046,6 +1046,14 @@ fn reflexive_modal_connector(
             )));
         }
         (Some((guard, LeadingConditionRoute::General)), _) => {
+            // CR 603.12 + CR 603.4: a zone-change guard cannot be a reflexive's
+            // intervening "if" (see `AbilityCondition::zone_changed_this_way_head`).
+            if guard.has_root_zone_changed_this_way() {
+                return Err(Box::new(Effect::unimplemented(
+                    "modal_reflexive_condition",
+                    &header.raw,
+                )));
+            }
             return Ok(AbilityCondition::when_you_do_with_guard(guard));
         }
         (None, _) => {}

@@ -106,10 +106,34 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
- *  113 — game_setup and state_update carry ability trees that may hold the
+ *  125 — game_setup and state_update carry ability trees that may hold the
  *       RuntimeHandler::RepeatProcess node and the
- *       EffectOutcomeSignal::RepeatDirectiveReached loop predicate; a v112 peer
- *       cannot parse either. Bumped with full-game protocol 131.
+ *       EffectOutcomeSignal::RepeatDirectiveReached loop predicate; a v124 peer
+ *       cannot parse either. Bumped with full-game protocol 143.
+ *  124 — game_setup and state_update carry GameState whose linked-exile
+ *       snapshots carry the exiled card's incarnation (CR 400.7). Bumped in
+ *       lockstep with full-game protocol 142.
+ *  123 — game_setup and state_update carry GameState whose exile_links may hold
+ *       ExileLinkKind CastCost (CR 607.2q). Bumped in lockstep with full-game
+ *       protocol 141.
+ *  122 — game_setup and state_update carry GameState whose ability player scopes
+ *       may hold AttackSubject EventAttackers. Bumped in lockstep with full-game
+ *       protocol 140.
+ *  121 — game_setup and state_update carry GameState with the per-turn crew
+ *       relation (crew_history_this_turn) and FilterProp::CrewedThisTurn
+ *       (CR 702.122c). Bumped in lockstep with full-game protocol 139.
+ *  116 — game_setup and state_update carry GameState whose AbilityActivated trigger
+ *       events may name the activation's stack_entry. Bumped in lockstep with
+ *       full-game protocol 134.
+ *  115 — game_setup and state_update carry GameState whose NamedChoice source
+ *       binding may be PendingEntry (CR 614.12a pre-entry as-enters choices).
+ *       Bumped in lockstep with full-game protocol 133.
+ *  114 — GameObject.exile_from_stack_linked_source carries the stamping incarnation
+ *       (ObjectIncarnationRef) in game_setup and state_update; a v113 peer cannot decode
+ *       a set rider. Bumped with full-game protocol 132.
+ *  113 — game_setup and state_update carry GameState whose ability player scopes
+ *       may hold PlayerFilter AnyOf / TargetPlayer. Bumped in lockstep with
+ *       full-game protocol 131.
  *  112 — GameState.linked_exile_lki holds one incarnation-bounded LinkedExileLki per
  *       departure in game_setup and state_update; a v111 peer cannot decode a non-empty
  *       map. Bumped with full-game protocol 130.
@@ -654,7 +678,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 113 as const;
+export const WIRE_PROTOCOL_VERSION = 125 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

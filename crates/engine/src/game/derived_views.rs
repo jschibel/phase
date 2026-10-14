@@ -2,10 +2,10 @@
 //! Engine-authored presentation projections over `GameState`.
 //!
 //! These "derived views" are computed just-in-time at serialization
-//! boundaries (the WASM getter, the server-core broadcast) and sent to
-//! clients alongside the raw state. Display consumers (React components)
-//! consume the pre-grouped shape directly and never compute game logic
-//! themselves — per CLAUDE.md's "engine owns all logic" invariant.
+//! boundaries and sent to clients alongside the viewer-filtered state.
+//! Display consumers (React components) consume the pre-grouped shape
+//! directly and never compute game logic themselves — per CLAUDE.md's
+//! "engine owns all logic" invariant.
 //!
 //! Contrast with `crates/engine/src/game/derived.rs`, which contains
 //! engine-internal state derivation (summoning sickness, commander damage
@@ -13,6 +13,7 @@
 //! that composes those helpers into a client-ready shape.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::analysis::resource::ResourceAxis;
@@ -761,11 +762,11 @@ pub struct DerivedViews {
     pub auras_attached_to_player: BTreeMap<PlayerId, Vec<ObjectId>>,
 
     /// CR 702.188a + 604.1: web-slinging alt-cost the VIEWING player may pay for each
-    /// qualifying card in their OWN hand (incl. statically-granted web-slinging). Keyed by
-    /// hand ObjectId. Populated ONLY for the `viewer` passed to derive_views and ONLY from
-    /// that viewer's hand — never another player's — so it cannot leak which opponent/AI
-    /// cards qualify, even on the unfiltered get_game_state() path. Empty when no viewer,
-    /// no granting static, or no qualifying card.
+    /// qualifying card in their OWN hand. Keyed by hand ObjectId. Populated ONLY for
+    /// the `viewer` passed to derive_views and ONLY from that viewer's hand — never
+    /// another player's — so it cannot leak which opponent/AI cards qualify, even
+    /// when derive_views is handed an unfiltered state. Empty when no viewer, no
+    /// granting static, or no qualifying card.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub web_slinging_costs: HashMap<ObjectId, ManaCost>,
 
@@ -943,17 +944,14 @@ pub struct DerivedViews {
     pub counter_display: HashMap<ObjectId, ObjectCounterDisplay>,
 }
 
-/// Serialize-only wrapper: the WASM getter passes `&GameState` by reference
-/// to avoid an O(n) clone of `state.objects` and other owned collections
-/// (GameState is not rpds-backed at the top level). The wire shape is
+/// Serialize-only wrapper. The wire shape is
 /// `{ state: <GameState>, derived: <DerivedViews> }`.
 #[derive(Debug)]
 pub struct ClientGameStateRef<'a> {
-    pub state: &'a GameState,
-    pub derived: DerivedViews,
-    display_visible_object_ids: Option<BTreeSet<ObjectId>>,
-    viewer: Option<PlayerId>,
-    already_filtered: bool,
+    /// Owned when [`Self::wrap`] computed the projection, borrowed when a
+    /// [`Self::wrap_filtered`] caller supplied it.
+    state: Cow<'a, GameState>,
+    derived: DerivedViews,
 }
 
 impl Serialize for ClientGameStateRef<'_> {
@@ -967,13 +965,7 @@ impl Serialize for ClientGameStateRef<'_> {
             derived: &'a DerivedViews,
         }
 
-        let state = client_state_wire_value(
-            self.state,
-            self.display_visible_object_ids.as_ref(),
-            self.viewer,
-            self.already_filtered,
-        )
-        .map_err(serde::ser::Error::custom)?;
+        let state = client_state_wire_value(&self.state).map_err(serde::ser::Error::custom)?;
         ClientGameStateEnvelope {
             state: &state,
             derived: &self.derived,
@@ -986,25 +978,8 @@ impl Serialize for ClientGameStateRef<'_> {
 /// persistence schema of [`GameState`]. Delayed-trigger receipts and their
 /// allocators authorize replay/transition handling; clients receive neither
 /// those private capabilities nor the resolved journal that contains them.
-fn client_state_wire_value(
-    state: &GameState,
-    display_visible_object_ids: Option<&BTreeSet<ObjectId>>,
-    viewer: Option<PlayerId>,
-    already_filtered: bool,
-) -> serde_json::Result<serde_json::Value> {
-    // CR 601.2h + CR 608.2c: direct client snapshots must pass through the
-    // same identity/knowledge redaction as the filtered-viewer path. An
-    // unscoped wire has no authenticated actor, so it must keep the canonical
-    // base and never materialize a staged shadow; wrap_filtered has already
-    // performed the viewer projection.
-    let payment_projected = match (viewer, already_filtered) {
-        (Some(viewer), false) => crate::game::visibility::filter_state_for_viewer(state, viewer),
-        (Some(_), true) => state.clone(),
-        (None, false) => crate::game::visibility::filter_state_for_unseated_viewer(state),
-        (None, true) => state.clone(),
-    };
-    let projected_state =
-        crate::game::visibility::project_paid_cast_cleanup_authority(&payment_projected);
+fn client_state_wire_value(state: &GameState) -> serde_json::Result<serde_json::Value> {
+    let projected_state = crate::game::visibility::project_paid_cast_cleanup_authority(state);
     let mut value = serde_json::to_value(&projected_state)?;
     let Some(root) = value.as_object_mut() else {
         return Ok(value);
@@ -1017,30 +992,6 @@ fn client_state_wire_value(
     // mutable redaction lists or from private execution carriers.
     root.insert("wire_projection".to_string(), serde_json::Value::Bool(true));
 
-    if let Some(display_visible_object_ids) = display_visible_object_ids {
-        if let Some(objects) = root
-            .get_mut("objects")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            for object in objects.values_mut() {
-                if let Some(object) = object.as_object_mut() {
-                    object.remove("display_visible_to_viewer");
-                }
-            }
-            for object_id in display_visible_object_ids {
-                if let Some(object) = objects
-                    .get_mut(&object_id.0.to_string())
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    object.insert(
-                        "display_visible_to_viewer".to_string(),
-                        serde_json::Value::Bool(true),
-                    );
-                }
-            }
-        }
-    }
-
     root.remove("next_delayed_trigger_token");
     root.remove("next_delayed_trigger_instance");
     root.remove("next_resolution_cast_offer_id");
@@ -1049,9 +1000,8 @@ fn client_state_wire_value(
     root.remove("resolving_trigger_firing");
     root.remove("resolved_rules_journal");
     root.remove("stack_resolution_session");
-    // CR 605.4a + CR 117.3c: Defense in depth for direct `ClientGameStateRef`
-    // callers that did not first run `visibility::filter_state_for_viewer`.
-    // Both are trusted persistence authorities, never client schema.
+    // CR 605.4a + CR 117.3c: Defense in depth. Both are trusted persistence
+    // authorities, never client schema.
     root.remove("pending_triggered_mana_resume");
     root.remove("pending_trigger_construction_priority_recipient");
     // Same defense in depth for the original Cube multiset: undealt entries and
@@ -1097,25 +1047,15 @@ impl<'a> ClientGameStateRef<'a> {
     /// Viewer-filtered paths must use [`Self::wrap_filtered`] so redaction cannot
     /// erase an authoritative decision projection.
     pub fn wrap(state: &'a GameState, viewer: Option<PlayerId>) -> Self {
-        let filtered_state = match viewer {
+        // CR 601.2h + CR 608.2c: direct client snapshots must pass through the
+        // same identity/knowledge redaction as the filtered-viewer path. An
+        // unscoped wire has no authenticated actor, so it must keep the canonical
+        // base and never materialize a staged shadow.
+        let projection = match viewer {
             Some(viewer) => crate::game::visibility::filter_state_for_viewer(state, viewer),
             None => crate::game::visibility::filter_state_for_unseated_viewer(state),
         };
-        let display_visible_object_ids = Some(
-            filtered_state
-                .objects
-                .iter()
-                .filter_map(|(id, object)| object.display_visible_to_viewer.then_some(*id))
-                .collect(),
-        );
-        let derived = derive_filtered_views(state, &filtered_state, viewer);
-        Self {
-            state,
-            derived,
-            display_visible_object_ids,
-            viewer,
-            already_filtered: false,
-        }
+        Self::from_projection(state, Cow::Owned(projection), viewer)
     }
 
     /// Wrap a viewer-filtered state while deriving rules-authoritative fields
@@ -1126,13 +1066,24 @@ impl<'a> ClientGameStateRef<'a> {
         filtered_state: &'a GameState,
         viewer: Option<PlayerId>,
     ) -> Self {
+        Self::from_projection(authoritative_state, Cow::Borrowed(filtered_state), viewer)
+    }
+
+    fn from_projection(
+        authoritative_state: &GameState,
+        projection: Cow<'a, GameState>,
+        viewer: Option<PlayerId>,
+    ) -> Self {
+        let derived = derive_filtered_views(authoritative_state, &projection, viewer);
         Self {
-            state: filtered_state,
-            derived: derive_filtered_views(authoritative_state, filtered_state, viewer),
-            display_visible_object_ids: None,
-            viewer,
-            already_filtered: true,
+            state: projection,
+            derived,
         }
+    }
+
+    /// The state the envelope's `state` half is serialized from.
+    pub fn state(&self) -> &GameState {
+        &self.state
     }
 }
 
@@ -5904,6 +5855,16 @@ mod tests {
                     ))
                     .expect("viewer continuation wire serializes"),
                 ),
+                (
+                    // `wrap_filtered` takes any `&GameState`; this entry hands it the unprojected one.
+                    "unprojected wrap_filtered",
+                    serde_json::to_value(ClientGameStateRef::wrap_filtered(
+                        &stage_state,
+                        &stage_state,
+                        Some(owner),
+                    ))
+                    .expect("unprojected wrap_filtered wire serializes"),
+                ),
             ] {
                 let client_state = &projection["state"];
                 let object = client_state["objects"]
@@ -6210,8 +6171,8 @@ mod tests {
 
     /// CR 702.188a + CR 604.1: web-slinging costs are VIEWER-scoped. P0 controls
     /// the grantor; both P0 and P1 hold a qualifying spell. `derive_views` for P0
-    /// must surface ONLY P0's card (never P1's, even though the grant is symmetric
-    /// in the abstract) so the unfiltered path can't leak opponent hand contents.
+    /// must surface ONLY P0's card (never P1's) so `derive_views` over an
+    /// unfiltered state can't leak opponent hand contents.
     /// `derive_views(_, None)` must surface nothing.
     #[test]
     fn web_slinging_costs_are_viewer_scoped_and_leak_proof() {
@@ -7969,9 +7930,8 @@ mod tests {
         );
     }
 
-    /// CR 605.4a + CR 117.3c (plan Step 6, boundary 2): `client_state_wire_value`
-    /// is the defence-in-depth boundary for direct `ClientGameStateRef::wrap`
-    /// callers that never ran `visibility::filter_state_for_viewer`.
+    /// CR 605.4a + CR 117.3c: `client_state_wire_value` is a defence-in-depth
+    /// boundary.
     ///
     /// All four projections — direct `wrap` for the prompt owner and for an
     /// opponent, and `wrap_filtered` over both filtered states — must omit both
@@ -8100,12 +8060,8 @@ mod tests {
         );
     }
 
-    /// `ClientGameStateRef::wrap` serializes the state it is handed, filtered
-    /// or not, so a direct caller that never ran `filter_state_for_viewer` must
-    /// still not ship the original Cube multiset to a client.
-    ///
-    /// REVERT-PROBE: drop `root.remove("booster_pack_pool")` from
-    /// `client_state_wire_value` and both envelopes carry the key and sentinel.
+    /// A `ClientGameStateRef::wrap` envelope must not ship the original Cube
+    /// multiset to a client.
     #[test]
     fn client_wire_omits_the_original_cube_booster_pool() {
         const SENTINEL: &str = "Undealt cube wire sentinel";
@@ -8121,10 +8077,6 @@ mod tests {
             "test precondition: trusted persistence keeps the source under its snake-case key"
         );
 
-        // Both iterations guard `root.remove`: `wrap` serializes the state it
-        // was handed and uses its `filter_state_for_viewer` copy only for
-        // display ids. Server frames (`filter_state_for_player`) and
-        // `wrap_filtered` callers are redacted independently by visibility.rs.
         for viewer in [None, Some(PlayerId(1))] {
             let projection = serde_json::to_value(ClientGameStateRef::wrap(&state, viewer))
                 .expect("client envelope serializes");

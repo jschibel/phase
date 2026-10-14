@@ -224,20 +224,32 @@ pub(crate) fn parse_vote_block_ir(
             // the body per vote.
             let (rest, choice, head, multiplier) = parse_aggregate_tally_clause(walk, &choices)?;
             let idx = choices.iter().position(|c| c == &choice)?;
-            let mut parsed =
-                parse_effect_chain_with_context(head, kind, &mut ParseContext::default());
-            // CR 608.2c: bind the tally count into the parsed effect's count
-            // slot. A tally body whose effect exposes no bindable count slot
-            // (GAP 2 strict-failure) must NOT silently mis-parse with a wrong
-            // count — `?` falls through by returning None so dispatch can try
-            // another shape or emit a diagnostic, rather than producing an
-            // effect with the wrong (placeholder) count.
-            *parsed.effect.count_expr_mut()? = QuantityExpr::Ref {
+            let tally = QuantityExpr::Ref {
                 qty: QuantityRef::VoteCount {
                     choice_index: idx as u32,
                 },
             }
             .scaled_by(multiplier);
+            // CR 701.38a + CR 608.2c: the head lost its "equal to … votes"
+            // binder to the strip above, so stage the tally as the caller-bound
+            // count the head's count position reads ("You create a number of
+            // Treasure tokens").
+            let mut parsed = parse_effect_chain_with_context(
+                head,
+                kind,
+                &mut ParseContext {
+                    caller_bound_count: Some(tally.clone()),
+                    ..Default::default()
+                },
+            );
+            // CR 608.2c: bind the tally count into the parsed effect's count
+            // slot (the put-counter count position does not read the staged
+            // count). A tally body whose effect exposes no bindable count slot
+            // (GAP 2 strict-failure) must NOT silently mis-parse with a wrong
+            // count — `?` falls through by returning None so dispatch can try
+            // another shape or emit a diagnostic, rather than producing an
+            // effect with the wrong (placeholder) count.
+            *parsed.effect.count_expr_mut()? = tally;
             (rest, idx, parsed, false)
         };
         if slots[idx].is_some() {
@@ -1801,9 +1813,33 @@ mod tests {
         }
     }
 
+    /// The coordinated set `AnyOf[Controller, TargetPlayer]` behind a
+    /// `TargetOnly { opponent }` head — the declared player target.
+    fn assert_targeted_coordinated_body(parsed: &AbilityDefinition) -> &AbilityDefinition {
+        assert_eq!(
+            *parsed.effect,
+            Effect::TargetOnly {
+                target: TargetFilter::Typed(
+                    TypedFilter::default().controller(ControllerRef::Opponent)
+                ),
+            },
+            "the head declares the targeted opponent"
+        );
+        let body = parsed.sub_ability.as_deref().expect("the coordinated body");
+        assert_eq!(
+            body.player_scope,
+            Some(PlayerFilter::AnyOf {
+                filters: vec![PlayerFilter::Controller, PlayerFilter::TargetPlayer],
+            }),
+            "exactly the caster and the targeted opponent act"
+        );
+        assert!(body.sub_ability.is_none(), "one body link, not two halves");
+        body
+    }
+
     /// "you and target opponent each create a Treasure token" — the chosen
-    /// opponent must be surfaced as a real player target, not collapsed into a
-    /// single token effect with `owner: Any`.
+    /// opponent is a real player target (the `TargetOnly` head), and one token
+    /// effect is created per seat, owned by the seat (CR 111.2).
     #[test]
     fn parser_distributes_you_and_target_opponent_each_create_token() {
         let parsed = parse_effect_chain_with_context(
@@ -1811,29 +1847,16 @@ mod tests {
             AbilityKind::Spell,
             &mut ParseContext::default(),
         );
-        match *parsed.effect {
-            Effect::Token { ref owner, .. } => {
-                assert_eq!(*owner, TargetFilter::OriginalController);
-            }
-            other => panic!("expected Token for first half, got {:?}", other),
-        }
-        let sub = parsed
-            .sub_ability
-            .expect("expected second-half sub_ability");
-        match *sub.effect {
-            Effect::Token { ref owner, .. } => {
-                assert_eq!(
-                    *owner,
-                    TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent))
-                );
-            }
-            other => panic!("expected Token for second half, got {:?}", other),
+        let body = assert_targeted_coordinated_body(&parsed);
+        match &*body.effect {
+            Effect::Token { owner, .. } => assert_eq!(*owner, TargetFilter::ScopedPlayer),
+            other => panic!("expected the body to create a Token, got {other:?}"),
         }
     }
 
     /// Fall of the First Civilization chapter I: "you and target opponent each
-    /// draw two cards" — both halves distribute; the opponent half keeps a real
-    /// opponent-scoped target slot (not a context ref).
+    /// draw two cards" — the opponent keeps a real opponent-scoped target slot
+    /// (the `TargetOnly` head), and each seat draws two for itself.
     #[test]
     fn parser_distributes_you_and_target_opponent_each_draw_two() {
         let parsed = parse_effect_chain_with_context(
@@ -1841,36 +1864,14 @@ mod tests {
             AbilityKind::Spell,
             &mut ParseContext::default(),
         );
-        match *parsed.effect {
+        let body = assert_targeted_coordinated_body(&parsed);
+        assert_eq!(
+            *body.effect,
             Effect::Draw {
-                ref target, count, ..
-            } => {
-                assert_eq!(*target, TargetFilter::OriginalController);
-                assert_eq!(count, QuantityExpr::Fixed { value: 2 });
+                target: TargetFilter::ScopedPlayer,
+                count: QuantityExpr::Fixed { value: 2 },
             }
-            other => panic!(
-                "expected Draw {{ target: OriginalController, count: 2 }} for first half, got {:?}",
-                other
-            ),
-        }
-        let sub = parsed
-            .sub_ability
-            .expect("expected second-half sub_ability");
-        match *sub.effect {
-            Effect::Draw {
-                ref target, count, ..
-            } => {
-                assert_eq!(
-                    *target,
-                    TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent))
-                );
-                assert_eq!(count, QuantityExpr::Fixed { value: 2 });
-            }
-            other => panic!(
-                "expected Draw {{ target: Player, count: 2 }} for second half, got {:?}",
-                other
-            ),
-        }
+        );
     }
 
     /// Issue #3667 — the opponent half must surface a real player target slot.
