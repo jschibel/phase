@@ -5894,6 +5894,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: source,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("activate targetless reflexive mana ability");
@@ -8434,7 +8435,7 @@ mod tests {
             action,
             crate::types::actions::GameAction::ActivateAbility {
                 source_id,
-                ability_index: 0,
+                ability_index: 0, ..
             } if *source_id == source
         )));
 
@@ -8443,6 +8444,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: source,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("hand-zone self-exile mana ability should activate");
@@ -9040,6 +9042,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: treasure,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("token Treasure should activate into a color prompt");
@@ -9086,6 +9089,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: a,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("Treasure should activate into a color prompt");
@@ -9163,6 +9167,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: ids[0],
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("Treasure should activate into a color prompt");
@@ -10115,6 +10120,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: a,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("activate first Treasure");
@@ -10157,6 +10163,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: a,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("activate first Treasure");
@@ -10199,6 +10206,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: a,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("activate the 5-color Treasure");
@@ -13009,6 +13017,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: nykthos,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("Nykthos's {2}{T} ability should activate");
@@ -13105,6 +13114,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: forest,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("Forest's {T} ability should activate");
@@ -13244,6 +13254,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: opp_forest,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("opponent's Forest {T} ability should activate");
@@ -13268,6 +13279,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: my_forest,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("controller's Forest {T} ability should activate");
@@ -13560,6 +13572,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: land,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("storage mana ability should prompt for a counter count");
@@ -13655,6 +13668,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: land,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("storage mana ability should prompt for a counter count");
@@ -13764,6 +13778,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: land,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect(
@@ -13881,6 +13896,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: land,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("the first chosen-count leaf should prompt for its own count");
@@ -14037,6 +14053,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: land,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("the first leaf should prompt for its own count");
@@ -14150,6 +14167,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: land,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("the first Any leaf should prompt for its own count");
@@ -14396,6 +14414,7 @@ mod tests {
             crate::types::actions::GameAction::ActivateAbility {
                 source_id: land,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         );
         assert!(
