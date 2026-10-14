@@ -23696,7 +23696,7 @@ const LEGACY_EXPLOIT_EVENT_EVIDENCE_ERROR: &str =
     "CreatureExploited snapshot lacks authoritative victim record; restore a save that contains the exploit departure record";
 
 const LEGACY_DEFERRED_SPELL_DELIVERY_ERROR: &str =
-    "legacy deferred_spell_delivery snapshot cannot prove which on-resolution hooks already ran;      restore a save taken after the spell's free-cast window closed";
+    "legacy deferred_spell_delivery snapshot cannot prove which on-resolution hooks already ran; restore a save taken after the spell's free-cast window closed";
 
 const SERIALIZED_TRIGGER_DEFINITION_CORE_FIELDS: &[&str] = &[
     "execute",
