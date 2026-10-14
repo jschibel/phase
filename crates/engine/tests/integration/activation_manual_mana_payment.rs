@@ -995,6 +995,54 @@ fn a_manual_sibling_is_offered_for_an_equip_and_not_for_a_mana_ability() {
     );
 }
 
+/// CR 605.3a + CR 113.6b: Elvish Spirit Guide ("Exile this card from your hand:
+/// Add {G}.") is a mana ability that works from the hand, so it sits in the
+/// Priority candidate list itself rather than being appended after it. It is
+/// offered once, automatically, and gets no manual twin; Bonesplitter's equip
+/// beside it still does, so the gate is on the mana ability and not on the board.
+#[test]
+fn a_mana_ability_activated_from_the_hand_has_no_manual_sibling_at_priority() {
+    let mut scenario = scenario_at_main();
+    let guide = add(&mut scenario, P0, "Elvish Spirit Guide", Zone::Hand);
+    let bonesplitter = add(&mut scenario, P0, "Bonesplitter", Zone::Battlefield);
+    add(&mut scenario, P0, "Grizzly Bears", Zone::Battlefield);
+    add(&mut scenario, P0, "Mountain", Zone::Battlefield);
+    let runner = build(scenario);
+    let guide_index = runner.state().objects[&guide]
+        .abilities
+        .iter()
+        .position(is_mana_ability)
+        .expect("Elvish Spirit Guide's mana ability");
+    let equip_index = activated_ability_index(&runner, bonesplitter);
+
+    assert_eq!(
+        offered_surfaces(
+            &runner,
+            &activation(guide, guide_index, CastPaymentMode::Auto)
+        )
+        .len(),
+        1,
+        "reach guard: the hand-zone mana ability is offered once, automatically"
+    );
+    assert!(
+        offered_surfaces(
+            &runner,
+            &activation(guide, guide_index, CastPaymentMode::Manual)
+        )
+        .is_empty(),
+        "a hand-zone mana ability has no manual sibling"
+    );
+    assert_eq!(
+        offered_surfaces(
+            &runner,
+            &activation(bonesplitter, equip_index, CastPaymentMode::Manual)
+        )
+        .len(),
+        1,
+        "the equip beside it keeps its manual sibling"
+    );
+}
+
 /// The same holds inside a spell's manual `ManaPayment` window, where the
 /// mana abilities that can pay it are the candidates: Krark-Clan Ironworks
 /// ("Sacrifice an artifact: Add {C}{C}.") is offered once, automatically, and
@@ -1041,7 +1089,11 @@ fn a_mana_ability_in_a_manual_payment_window_has_no_manual_sibling() {
         .is_empty(),
         "a mana ability has no manual sibling in the payment window either"
     );
-    // The engine's own legal-action list (what an AI seat chooses from) agrees.
+    // The window is a DirectChoices window (interaction.rs `human_response_model`),
+    // whose list is the Auto mana actions and which clones no Manual sibling, so the
+    // viewer half above holds by the window model. This half only checks the AI
+    // list (`legal_actions_full`), which never builds Manual siblings at all; the
+    // sibling rule itself is pinned by the Priority rows.
     let (legal, _, _) = legal_actions_full(runner.state());
     for source in [ironworks, altar] {
         let index = runner.state().objects[&source]

@@ -26246,6 +26246,26 @@ fn activation_mana_leg_waits_for_player(pending: &PendingCast) -> bool {
     activation_pays_mana_manually(pending) || target_first_interactive_suffix
 }
 
+/// CR 605.3a + CR 605.3b: whether `action` activates a mana ability, wherever its
+/// source sits (battlefield, hand, graveyard). A mana ability is itself what pays
+/// a mana payment, resolves at once without the stack, and has no payment window
+/// of its own, so there is no manual way to pay for it.
+pub(crate) fn activates_mana_ability(state: &GameState, action: &GameAction) -> bool {
+    let GameAction::ActivateAbility {
+        source_id,
+        ability_index,
+        ..
+    } = action
+    else {
+        return false;
+    };
+    state
+        .objects
+        .get(source_id)
+        .and_then(|obj| obj.abilities.get(*ability_index))
+        .is_some_and(super::mana_abilities::is_mana_ability)
+}
+
 /// CR 602.2b + CR 601.2g: whether the player chose to activate the mana
 /// abilities that pay this activation themself.
 fn activation_pays_mana_manually(pending: &PendingCast) -> bool {

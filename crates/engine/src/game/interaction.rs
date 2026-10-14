@@ -6777,6 +6777,10 @@ fn actor_candidates(
     let manual_cast_candidates = candidates
         .iter()
         .filter_map(|candidate| {
+            // CR 605.3a: a mana ability has no payment of its own to make by hand.
+            if super::casting::activates_mana_ability(state, &candidate.action) {
+                return None;
+            }
             let mut manual = candidate.clone();
             let payment_mode = manual.action.payment_mode_mut()?;
             if *payment_mode == CastPaymentMode::Manual {
