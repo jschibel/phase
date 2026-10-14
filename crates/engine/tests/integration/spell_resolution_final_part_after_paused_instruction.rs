@@ -2801,3 +2801,148 @@ fn a_persisted_bare_spell_rest_owing_a_final_part_fails_closed() {
         "the marker is kept"
     );
 }
+
+/// The residue a markerless terminal-rest fixture carries beside its carrier.
+#[derive(Clone, Copy, Debug)]
+enum TerminalRest {
+    Devour,
+    OwnerlessSweep,
+}
+
+fn markerless_rest(rest: TerminalRest, core_type: CoreType, zone: Zone) -> (GameState, ObjectId) {
+    use engine::types::game_state::{
+        DrainStatus, PostReplacementDrain, PostReplacementDrainStack, ResidentDrainPolicy,
+    };
+    let mut state = GameState::new(FormatConfig::free_for_all(), 2, 0x57AC);
+    state.phase = Phase::PreCombatMain;
+    state.active_player = P0;
+    state.priority_player = P0;
+    state.waiting_for = WaitingFor::Priority { player: P0 };
+    let spell = create_object(&mut state, CardId(77), P0, "Rested Spell".to_string(), zone);
+    {
+        let object = state.objects.get_mut(&spell).expect("the object exists");
+        object.card_types.core_types.push(core_type);
+        object.base_card_types = object.card_types.clone();
+    }
+    state.resolving_stack_entry = Some(StackEntry {
+        id: spell,
+        source_id: spell,
+        controller: P0,
+        kind: StackEntryKind::Spell {
+            card_id: CardId(77),
+            ability: None,
+            casting_variant: CastingVariant::Normal,
+            actual_mana_spent: 0,
+        },
+    });
+    let mut drains = PostReplacementDrainStack::default();
+    if matches!(rest, TerminalRest::OwnerlessSweep) {
+        drains.install(
+            PostReplacementDrain {
+                status: DrainStatus::Dispatching,
+                source: None,
+                applied: Default::default(),
+                event_source: None,
+                event_target: None,
+                controller: None,
+            },
+            ResidentDrainPolicy::Replace,
+        );
+    }
+    state.resolution_stack.push_post_replacement(drains);
+    if matches!(rest, TerminalRest::Devour) {
+        state.push_devour_change_zone_snapshot([ObjectId(27)].into_iter().collect());
+    }
+    (state, spell)
+}
+
+/// CR 608.2n: the two terminal-rest recoveries that settle a resolving carrier
+/// beside residue other than a bare spell-resolution frame (a Devour-only
+/// snapshot under an empty replacement parent, and an ownerless `Dispatching`
+/// post-replacement drain) are guarded the way the bare-frame recovery is: a
+/// markerless instant or sorcery still in the stack zone has not made its move
+/// to the graveyard, and settling its carrier would strand it there.
+fn assert_restore_refuses(rest: TerminalRest, expected: PersistedRestoreError) {
+    for core_type in [CoreType::Sorcery, CoreType::Instant] {
+        let (state, spell) = markerless_rest(rest, core_type, Zone::Stack);
+        assert!(
+            matches!(state.waiting_for, WaitingFor::Priority { .. })
+                && state.owed_spell_final_part().is_none()
+                && state.stack.is_empty()
+                && !state.resolution_stack.is_empty()
+                && state.resolving_stack_entry.as_ref().map(|entry| entry.id) == Some(spell)
+                && state.objects[&spell].zone == Zone::Stack,
+            "reach guard: a markerless {core_type:?} carrier in the stack zone beside the {rest:?} rest"
+        );
+        assert_eq!(
+            PersistedGameState::Raw(Box::new(state))
+                .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+                .err(),
+            Some(expected.clone()),
+            "{core_type:?} in the stack zone beside the {rest:?} rest"
+        );
+    }
+}
+
+#[test]
+fn a_persisted_devour_rest_naming_a_stacked_instant_or_sorcery_fails_closed() {
+    assert_restore_refuses(
+        TerminalRest::Devour,
+        PersistedRestoreError::TerminalRestRecoveryExhausted,
+    );
+}
+
+#[test]
+fn a_stale_pass_does_not_recover_a_devour_rest_naming_a_stacked_instant_or_sorcery() {
+    for core_type in [CoreType::Sorcery, CoreType::Instant] {
+        let (mut state, spell) = markerless_rest(TerminalRest::Devour, core_type, Zone::Stack);
+        apply(&mut state, P0, GameAction::PassPriority)
+            .expect("the priority holder may submit a stale pass");
+        assert_eq!(
+            state.resolving_stack_entry.as_ref().map(|entry| entry.id),
+            Some(spell),
+            "{core_type:?}: the carrier is kept"
+        );
+        assert_eq!(
+            state.objects[&spell].zone,
+            Zone::Stack,
+            "{core_type:?}: the spell is not stranded by a settled carrier"
+        );
+    }
+}
+
+#[test]
+fn an_ownerless_sweep_rest_naming_a_stacked_instant_or_sorcery_fails_closed() {
+    assert_restore_refuses(
+        TerminalRest::OwnerlessSweep,
+        PersistedRestoreError::UnsettledPriorityResolution,
+    );
+}
+
+/// Discriminating controls for the refusals above, over both rests: a
+/// permanent spell in the stack zone and an instant or sorcery already in the
+/// graveyard are genuine terminal rests the restore settles. A refusal of every
+/// carrier, or of every object in the stack zone, would fail one of these.
+#[test]
+fn a_terminal_rest_naming_a_spell_that_has_left_the_stack_still_settles() {
+    for rest in [TerminalRest::Devour, TerminalRest::OwnerlessSweep] {
+        for (core_type, zone) in [
+            (CoreType::Creature, Zone::Stack),
+            (CoreType::Sorcery, Zone::Graveyard),
+        ] {
+            let (state, _spell) = markerless_rest(rest, core_type, zone);
+            let restored = PersistedGameState::Raw(Box::new(state))
+                .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+                .unwrap_or_else(|error| {
+                    panic!("{core_type:?} in {zone:?} beside {rest:?} must restore: {error:?}")
+                })
+                .finalize_after_rehydration(|_| Ok(()))
+                .expect("the settled state is publishable");
+            assert!(
+                restored.resolving_stack_entry.is_none() && restored.resolution_stack.is_empty(),
+                "{core_type:?} in {zone:?} beside {rest:?}: the carrier is settled"
+            );
+            assert_eq!(restored.waiting_for, WaitingFor::Priority { player: P0 });
+        }
+    }
+}
