@@ -2946,3 +2946,112 @@ fn a_terminal_rest_naming_a_spell_that_has_left_the_stack_still_settles() {
         }
     }
 }
+
+const HARSH_MERCY: &str =
+    "Each player chooses a creature type. Destroy all creatures that aren't of \
+    a type chosen this way. They can't be regenerated.";
+
+/// Harsh Mercy cast by P0 in a three-player game, paused on a creature-type
+/// choice owned by `owner`. Returns the runner and the spell.
+fn harsh_mercy_paused_on_a_choice_of(owner: PlayerId) -> (GameRunner, ObjectId) {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let mercy = scenario
+        .add_spell_to_hand_from_oracle(P0, "Harsh Mercy", false, HARSH_MERCY)
+        .with_mana_cost(ManaCost::generic(1))
+        .id();
+    scenario.with_mana_pool(P0, mana(ManaType::White, 1));
+    let mut runner = scenario.build();
+
+    runner.cast(mercy).commit();
+    // Each player chooses in turn order: P0 first, then P1, then P2.
+    for _ in 0..12 {
+        match &runner.state().waiting_for {
+            WaitingFor::Priority { .. } => {
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("passing priority is accepted");
+            }
+            WaitingFor::NamedChoice {
+                player, options, ..
+            } if *player != owner => {
+                let choice = options.first().expect("a creature type is offered").clone();
+                runner
+                    .act(GameAction::ChooseOption { choice })
+                    .expect("the earlier player names a creature type");
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        matches!(
+            &runner.state().waiting_for,
+            WaitingFor::NamedChoice { player, source: Some(source), .. }
+                if *player == owner && source.prompt.controller == P0
+        ),
+        "reach guard: the resolution paused on {owner:?}'s creature-type choice, got {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(
+        runner
+            .state()
+            .owed_spell_final_part()
+            .map(|owed| owed.spell),
+        Some(mercy),
+        "reach guard: the paused sorcery owes its final part"
+    );
+    assert_eq!(
+        runner.state().objects[&mercy].zone,
+        Zone::Stack,
+        "reach guard: the paused sorcery is still on the stack"
+    );
+    (runner, mercy)
+}
+
+/// CR 608.2n + CR 800.4a: the sorcery's controller is not the player who
+/// leaves. P1, who owns one of Harsh Mercy's creature-type choices, concedes;
+/// the choice is abandoned with its resolution, and the spell, which is
+/// P0's and stays in the game, is put into its owner's graveyard as its final
+/// part, exactly once, instead of being stranded in the stack zone.
+#[test]
+fn a_spell_whose_non_controller_prompt_owner_leaves_finishes_into_its_owners_graveyard() {
+    let (mut runner, mercy) = harsh_mercy_paused_on_a_choice_of(P1);
+
+    let mut events = concede(&mut runner, P1);
+    events.extend(run_until_settled(&mut runner, |_| None));
+
+    let state = runner.state();
+    assert_eq!(
+        state.objects[&mercy].zone,
+        Zone::Graveyard,
+        "CR 608.2n: the spell is put into its owner's graveyard"
+    );
+    assert_eq!(graveyard(state, P0), vec![mercy]);
+    assert_eq!(
+        stack_resolved_count(&events, mercy),
+        1,
+        "the resolution is reported exactly once"
+    );
+    assert_settled(state);
+}
+
+/// Control: the leaver is the sorcery's controller (and owner), the existing
+/// CR 800.4a path. The spell leaves the game with them and is never reported
+/// resolved; nothing is stranded.
+#[test]
+fn a_spell_whose_controller_owns_the_prompt_and_leaves_goes_with_them() {
+    let (mut runner, mercy) = harsh_mercy_paused_on_a_choice_of(P0);
+
+    let mut events = concede(&mut runner, P0);
+    events.extend(run_until_settled(&mut runner, |_| None));
+
+    let state = runner.state();
+    assert_eq!(
+        state.objects[&mercy].zone,
+        Zone::Exile,
+        "CR 800.4a: the departed player's spell leaves the game with them"
+    );
+    assert!(graveyard(state, P0).is_empty());
+    assert_eq!(stack_resolved_count(&events, mercy), 0);
+    assert_settled(state);
+}
