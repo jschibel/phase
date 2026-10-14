@@ -49,9 +49,9 @@ fn live_spell_announcement(state: &GameState) -> Option<ObjectId> {
 /// overwrites) splits that batch or loses them. A spell is deliberately not
 /// covered: its paid-cost events stay parked publicly and survive a cancel;
 /// routing them into a spell carrier would drop them on cancel, which needs the
-/// announcement-reversal machinery and is out of scope here. (An activation
-/// cannot be cancelled once a cost is paid, CR 601.2h, so its carrier is
-/// never dropped with paid-cost events in it.)
+/// announcement-reversal machinery and is out of scope here. (Engine policy,
+/// compare CR 733.1: an activation is not offered a cancel once a cost is paid,
+/// so its carrier is not dropped with paid-cost events in it.)
 ///
 /// `next_wait` is the prompt the paying step is about to return; the live
 /// announcement is read from the state and from that prompt, since a step that
