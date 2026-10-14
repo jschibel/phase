@@ -1084,6 +1084,7 @@ mod latched_redirect_controller;
 mod lathiel_end_step_counters_repro;
 mod leading_duration_distribution_7923;
 mod leeching_sliver;
+mod legacy_deferred_spell_delivery_restore;
 mod legend_rule_scope;
 mod leyline_taps_for_mana_repro;
 mod lictor_opponent_entered_this_turn;

@@ -210,6 +210,13 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 131 — The CR 608.2n final part of a spell's resolution is owed on the
+ *      resolution carrier: `GameState::deferred_spell_delivery` (v110) is removed
+ *      and `GameState::resolving_spell_final_part` (`{ spell,
+ *      resolution_start_phase }`) marks an instant or sorcery whose paused
+ *      instructions have not finished. A v130 peer drops the key and would move
+ *      the spell too early (or leave it on the stack after a free-cast window).
+ *      Wire 113 moves with it; no lobby frame names it.
  * 130 — `GameState::linked_exile_lki` holds one incarnation-bounded
  *      `LinkedExileLki` per departure (CR 400.7); a v129 peer cannot decode a
  *      non-empty map. Wire 112 moves with it; no lobby frame names it.
@@ -822,7 +829,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 130;
+export const PROTOCOL_VERSION = 131;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

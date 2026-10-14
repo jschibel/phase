@@ -106,6 +106,10 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  113 — GameState.deferred_spell_delivery is removed and GameState.resolving_spell_final_part
+ *       ({ spell, resolution_start_phase }) marks the CR 608.2n final part a paused instant or
+ *       sorcery still owes, in game_setup and state_update; a v112 peer drops the key and would
+ *       move the spell too early. Bumped with full-game protocol 131.
  *  112 — GameState.linked_exile_lki holds one incarnation-bounded LinkedExileLki per
  *       departure in game_setup and state_update; a v111 peer cannot decode a non-empty
  *       map. Bumped with full-game protocol 130.
@@ -650,7 +654,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 112 as const;
+export const WIRE_PROTOCOL_VERSION = 113 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {
