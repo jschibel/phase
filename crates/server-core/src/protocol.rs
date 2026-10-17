@@ -3346,6 +3346,9 @@ mod tests {
         }
     }
 
+    /// v147: a parked PutSticker head binds an untargeted recipient at
+    /// resolution. A v146 reducer would treat SelectCards as a partition.
+    ///
     /// v146: `SpellContext::loop_root_kind` carries the typed optional-root
     /// lifecycle. A v145 peer drops it and cannot safely resume the process,
     /// so it is refused before receiving v146 state.
@@ -3573,8 +3576,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_146_for_typed_loop_root_lifecycle() {
-        assert_eq!(PROTOCOL_VERSION, 146);
+    fn protocol_version_is_147_for_resolution_sticker_recipients() {
+        assert_eq!(PROTOCOL_VERSION, 147);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3585,7 +3588,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_146_for_typed_loop_root_lifecycle` stays
+    /// `protocol_version_is_147_for_resolution_sticker_recipients` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

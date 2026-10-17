@@ -45,6 +45,44 @@ fn assert_tracked_mana_value_source(def: &AbilityDefinition, expected: TrackedAn
     ));
 }
 
+#[test]
+fn put_sticker_timing_is_local_to_the_printed_instruction() {
+    for (name, text, card_type, expected_timing) in [
+        ("Finishing Move", "You get {TK}{TK}, then you may put a sticker on a nonland permanent you own. Target creature you control deals damage equal to its power to target creature you don't control.", "Sorcery", TargetChoiceTiming::Resolution),
+        ("Scampire", "When Scampire enters, you get {TK}, then you may put a sticker on a creature card in your graveyard.\n{3}{B}: Return target creature card with a sticker on it from your graveyard to the battlefield. That creature gains haste. Exile it at the beginning of the next end step. Activate only as a sorcery.", "Creature", TargetChoiceTiming::Resolution),
+        ("Prize Wall", "Defender\n{U}, {T}: You get {TK}.\n{4}{U}, {T}: You may put a sticker on a nonland permanent you own. Activate only as a sorcery.", "Creature", TargetChoiceTiming::Resolution),
+        ("_____ _____ Rocketship", "Flying\nWhen this Vehicle enters, you may put up to two name stickers on it.\nWhenever this Vehicle attacks, choose a letter. This Vehicle gets +1/+1 until end of turn for each name sticker on it that begins with the chosen letter.\nCrew 2", "Artifact", TargetChoiceTiming::Stack),
+        ("Targeted grammar control", "Put a sticker on target creature.", "Sorcery", TargetChoiceTiming::Stack),
+    ] {
+        let parsed = parse_oracle_text(text, name, &[], &[card_type.into()], &[]);
+        let mut found = 0;
+        for root in parsed.abilities.iter().chain(parsed.triggers.iter().filter_map(|trigger| trigger.execute.as_deref())) {
+            let mut node = Some(root);
+            while let Some(ability) = node {
+                if let Effect::PutSticker { target, .. } = ability.effect.as_ref() {
+                    found += 1;
+                    assert_eq!(ability.target_choice_timing, expected_timing, "{name}: {ability:?}");
+                    if expected_timing == TargetChoiceTiming::Resolution {
+                        assert!(!target.is_context_ref());
+                        assert!(ability.optional);
+                    }
+                    if name == "Finishing Move" {
+                        let source = ability.sub_ability.as_deref().expect("independent damage source");
+                        assert!(matches!(source.effect.as_ref(), Effect::TargetOnly { .. }));
+                        assert_eq!(source.target_choice_timing, TargetChoiceTiming::Stack);
+                        let damage = source.sub_ability.as_deref().expect("one-way damage clause");
+                        assert!(matches!(damage.effect.as_ref(), Effect::DealDamage { .. }));
+                        assert_eq!(damage.target_choice_timing, TargetChoiceTiming::Stack);
+                        assert!(damage.sub_ability.is_none());
+                    }
+                }
+                node = ability.sub_ability.as_deref();
+            }
+        }
+        assert_eq!(found, 1, "{name} must reach the actual sticker grammar");
+    }
+}
+
 fn assert_attachment_chain_has_no_unimplemented(def: &AbilityDefinition) {
     let mut current = Some(def);
     while let Some(ability) = current {

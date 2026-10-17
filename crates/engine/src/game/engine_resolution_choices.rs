@@ -5448,6 +5448,26 @@ pub(super) fn handle_resolution_choice(
                     state.waiting_for.clone(),
                 ));
             }
+            // CR 115.10a + CR 608.2d: this answer selects only a sticker
+            // recipient. It is neither a partition nor a completed placement.
+            let sticker_recipient = state
+                .active_ability_continuation()
+                .filter(|cont| {
+                    matches!(cont.chain.effect, Effect::PutSticker { .. })
+                        && effects::awaits_resolution_object_choice(&cont.chain)
+                })
+                .and_then(|_| chosen.first())
+                .and_then(|id| {
+                    state.objects.get(id).map(|object| {
+                        (
+                            *id,
+                            crate::types::identifiers::ObjectIncarnationRef::of(
+                                *id,
+                                object.incarnation,
+                            ),
+                        )
+                    })
+                });
             // CR 608.2c: When the parked continuation consumes the chain's
             // tracked set (a `GrantCastingPermission { target: TrackedSet }` /
             // any `TrackedSet`-referencing downstream effect — e.g. End-Blaze
@@ -5468,6 +5488,7 @@ pub(super) fn handle_resolution_choice(
                 state.active_ability_continuation().is_some_and(|cont| {
                     effects::chain_references_tracked_set(&cont.chain)
                         && !effects::resolution_choice_head_publishes_on_resume(&cont.chain)
+                        && sticker_recipient.is_none()
                 });
             if continuation_consumes_tracked_set {
                 effects::publish_fresh_tracked_set(state, chosen.clone());
@@ -5512,7 +5533,9 @@ pub(super) fn handle_resolution_choice(
                 .then(|| Box::new(ForwardedResultContext::from_object_ids(state, &unchosen)));
             if let Some(frame) = state.active_ability_continuation_frame_mut() {
                 let cont = &mut frame.pending;
-                if let Some(snapshot) = counter_kind_choice {
+                if let Some((id, pin)) = sticker_recipient {
+                    effects::stickers::bind_recipient(&mut cont.chain, id, pin);
+                } else if let Some(snapshot) = counter_kind_choice {
                     if let crate::types::ability::Effect::ChooseCounterKind { target, .. } =
                         &mut cont.chain.effect
                     {
@@ -5562,7 +5585,7 @@ pub(super) fn handle_resolution_choice(
                     cont.chain.effect,
                     crate::types::ability::Effect::PutCounter { .. }
                         | crate::types::ability::Effect::ChooseCounterKind { .. }
-                );
+                ) && sticker_recipient.is_none();
                 if is_partition {
                     if let Some(ref mut next_sub) = cont.chain.sub_ability {
                         // CR 707.12a: A `CastCopyOfCard` continuation casts the

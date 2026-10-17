@@ -80,6 +80,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // v142 adds `LinkedExileSnapshot.incarnation` (CR 400.7) to GameState's linked-exile snapshots.
 // v143 retypes GameState's modal no-repeat history keys to `ObjectIncarnationRef` (CR 400.7).
 // v146 replaces SpellContext.loop_root_was_optional with typed loop_root_kind.
+// v147 binds an untargeted sticker recipient to a parked PutSticker head.
 // v145 adds the RuntimeHandler::RepeatProcess and EffectOutcomeSignal::RepeatDirectiveReached
 // tags (the "repeat this process" directive) to ability trees.
 // v134 adds `GameEvent::AbilityActivated.stack_entry` (the activation's stack object).
@@ -169,7 +170,8 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +74: v145 adds the RuntimeHandler::RepeatProcess and
 //      EffectOutcomeSignal::RepeatDirectiveReached tags (the repeat directive).
 // +75: v146 carries the typed optional-repeat root lifecycle.
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 75;
+// +76: v147 changes SelectCards meaning for parked PutSticker recipients.
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 76;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
@@ -268,7 +270,8 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 // +72: wire 126 moves with full-game v144 for one-time boons.
 // +73: wire 127 moves with full-game v145 for the repeat-process directive tags.
 // +74: wire 128 moves with full-game v146 for the typed loop-root lifecycle.
-const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 74;
+// +75: wire 129 moves with full-game v147 for resolution sticker recipients.
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 75;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse

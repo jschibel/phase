@@ -8499,6 +8499,7 @@ pub(crate) fn awaits_resolution_object_choice(ability: &ResolvedAbility) -> bool
         Effect::ChooseCounterKind { target, .. } => {
             !matches!(target, TargetFilter::SpecificObject { .. })
         }
+        Effect::PutSticker { target, .. } => !target.is_context_ref(),
         _ => false,
     };
     ability.target_choice_timing == TargetChoiceTiming::Resolution
@@ -9422,6 +9423,17 @@ fn affected_objects_from_events(
 ) -> Vec<ObjectId> {
     let fallback_targets = ability.targets.as_slice();
     match effect {
+        // CR 123.3: choosing a recipient or opening a prompt places nothing.
+        Effect::PutSticker { .. } | Effect::ApplySticker { .. } => events
+            .iter()
+            .filter_map(|event| {
+                if let GameEvent::StickerPlaced { object_id, .. } = event {
+                    Some(*object_id)
+                } else {
+                    None
+                }
+            })
+            .collect(),
         // CR 508.1a + CR 608.2c + CR 603.7c + CR 611.2c + CR 615.11 (issue
         // #6682): A mass "attack this turn if able" coercion (Maddening Imp's
         // `{T}` `GenericEffect{MustAttack}`) or a Continuous-mode broadcast
@@ -9987,6 +9999,10 @@ fn compound_run_unperformed(ability: &ResolvedAbility) -> bool {
 
 fn mandatory_parent_effect_performed(effect: &Effect, events: &[GameEvent]) -> bool {
     match effect {
+        // CR 123.3: only an actual placement satisfies a placement rider.
+        Effect::PutSticker { .. } | Effect::ApplySticker { .. } => events
+            .iter()
+            .any(|event| matches!(event, GameEvent::StickerPlaced { .. })),
         Effect::Destroy { .. } | Effect::DestroyAll { .. } => events.iter().any(|event| {
             matches!(
                 event,
@@ -11676,6 +11692,7 @@ fn optionality_is_per_iteration(state: &GameState, ability: &ResolvedAbility) ->
 /// the prompt lets the effect resolve as its defined no-op instead.
 fn optional_effect_is_infeasible(state: &GameState, ability: &ResolvedAbility) -> bool {
     match &ability.effect {
+        Effect::PutSticker { .. } => stickers::optional_is_infeasible(state, ability),
         Effect::PutChosenCounter {
             target,
             target_condition,
@@ -15660,6 +15677,17 @@ fn resolve_chain_body(
     events: &mut Vec<GameEvent>,
     depth: u32,
 ) -> Result<(), EffectError> {
+    // CR 608.2c: a printed placement instruction establishes a fresh "that
+    // sticker", including when it is declined or cannot place anything.
+    if matches!(ability.effect, Effect::PutSticker { .. }) {
+        state.placed_sticker_this_resolution = None;
+        if resolution_next_needs_tracked_set(state, ability) {
+            // CR 608.2c: this instruction replaces an earlier placement's
+            // result, including a decline or impossible placement. Only actual
+            // StickerPlaced events may fill its fresh set on completion.
+            publish_fresh_tracked_set(state, Vec::new());
+        }
+    }
     // CR 115.10a + CR 301.5f + CR 303.4b: an untargeted "enchanted/equipped X"
     // recipient is bound to the source's host as this instruction begins to
     // resolve, before its conditions and effect read it. With no provable host
@@ -16672,6 +16700,7 @@ fn resolve_chain_body(
         &ability.effect,
         Effect::CastFromZone { .. }
             | Effect::ChangeZone { .. }
+            | Effect::PutSticker { .. }
             | Effect::MoveCounters { .. }
             | Effect::Transform {
                 target: TargetFilter::SelfRef,
@@ -17101,6 +17130,42 @@ fn resolve_chain_body(
     // fallback in `counters.rs`; routing them through an interactive prompt
     // here would be wrong (and untested against that resolver's semantics).
     if awaits_resolution_object_choice(ability) {
+        if matches!(ability.effect, Effect::PutSticker { .. }) {
+            let legal = stickers::recipient_ids(state, ability);
+            match legal.as_slice() {
+                [] => {}
+                [id] => {
+                    let mut bound = ability.clone();
+                    stickers::bind_recipient(
+                        &mut bound,
+                        *id,
+                        crate::types::identifiers::ObjectIncarnationRef::of(
+                            *id,
+                            state.objects[id].incarnation,
+                        ),
+                    );
+                    return resolve_ability_chain(state, &bound, events, depth);
+                }
+                _ => {
+                    // CR 608.2d: park this instruction with its independently
+                    // bound tail; the answer binds only the local recipient.
+                    state.park_ability_continuation(PendingContinuation::new(
+                        Box::new(ability.clone()),
+                        state,
+                    ));
+                    state.waiting_for = WaitingFor::ChooseFromZoneChoice {
+                        player: ability.controller,
+                        cards: legal,
+                        count: 1,
+                        up_to: false,
+                        constraint: None,
+                        source_id: ability.source_id,
+                        reciprocal_role: None,
+                    };
+                    return Ok(());
+                }
+            }
+        }
         if let Effect::PutCounter { target, .. } | Effect::ChooseCounterKind { target, .. } =
             &ability.effect
         {

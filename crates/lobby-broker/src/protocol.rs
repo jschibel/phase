@@ -60,6 +60,11 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
+/// 147 — Untargeted sticker recipients use a parked PutSticker head with
+///      SelectCards at resolution. Older reducers interpret that answer as a
+///      partition and can overwrite independently announced following targets.
+///      Full-game and P2P move together (wire 129).
+///
 /// 146 — `SpellContext` replaces `loop_root_was_optional: bool` with
 ///      `loop_root_kind: LoopRootKind::{Mandatory, Optional}`. Old peers drop
 ///      the instruction lifecycle and cannot safely resume repeated optional
@@ -1101,7 +1106,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 146;
+pub const PROTOCOL_VERSION: u32 = 147;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2358,12 +2363,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 146);
+        assert_eq!(PROTOCOL_VERSION, 147);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 145);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 146);
     }
 
     #[test]
