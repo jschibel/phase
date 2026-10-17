@@ -2533,6 +2533,7 @@
     "chooseTargetForCopy": "为复制品选择目标",
     "chooseTargetForCopySlot": "为复制品选择目标：第 {{current}} 个，共 {{total}} 个",
     "chooseTargetOf": "选择目标：第 {{current}} 个，共 {{total}} 个",
+    "chooseTokenHost": "选择一个衍生物的宿主",
     "collapseDescription": "收起",
     "confirmSacrifice": "牺牲（{{selected}}/{{count}}）",
     "confirmTap": "确认横置（{{selected}}/{{count}}）",

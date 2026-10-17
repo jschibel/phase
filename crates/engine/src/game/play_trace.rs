@@ -1196,7 +1196,11 @@ fn answer_optionality(prompt: &WaitingFor, answer: Answer) -> AnswerOptionality 
         | WaitingFor::AssignCombatDamage { .. }
         | WaitingFor::AssignBlockerDamage { .. }
         | WaitingFor::DistributeAmong { .. }
-        | WaitingFor::PhyrexianPayment { .. } => Mandatory,
+        | WaitingFor::PhyrexianPayment { .. }
+        // Digital-only Alchemy (no CR entry): the "one of them" token-host
+        // choice names no "may" — the controller picks one of the stamped
+        // entrants, or no prompt is raised at all.
+        | WaitingFor::ChooseTokenHost { .. } => Mandatory,
     }
 }
 

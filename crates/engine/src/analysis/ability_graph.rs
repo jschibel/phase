@@ -960,6 +960,8 @@ fn effect_projection(effect: &Effect) -> Projection {
         | Effect::BecomeSaddled { .. }
         | Effect::SetClassLevel { .. }
         | Effect::CreateDelayedTrigger { .. }
+        | Effect::CreateBoon { .. }
+        | Effect::NoteNumber { .. }
         | Effect::AddTargetReplacement { .. }
         | Effect::AddRestriction { .. }
         | Effect::ReduceNextSpellCost { .. }
@@ -1356,6 +1358,11 @@ fn collect_effects_in_effect<'a>(effect: &'a Effect, out: &mut Vec<&'a Effect>) 
             ..
         } => collect_effects(d, out),
         Effect::CreateDelayedTrigger { effect, .. } => collect_effects(effect, out),
+        Effect::CreateBoon { trigger, .. } => {
+            if let Some(execute) = trigger.execute.as_deref() {
+                collect_effects(execute, out)
+            }
+        }
         Effect::RollDie { results, .. } => {
             for branch in results {
                 collect_effects(&branch.effect, out);
@@ -2356,8 +2363,8 @@ pub(crate) fn candidate_cycles_from_nodes(nodes: Vec<AbilityNode>) -> Vec<Candid
 mod tests {
     use super::*;
     use crate::types::ability::{
-        default_target_filter_any, EffectScope, PlayerFilter, PtValue, QuantityRef, SacrificeCost,
-        TriggerDefinition, TypedFilter,
+        default_target_filter_any, ChooseOneOfKind, EffectScope, PlayerFilter, PtValue,
+        QuantityRef, SacrificeCost, TriggerDefinition, TypedFilter,
     };
     use crate::types::counter::CounterType;
 
@@ -2846,6 +2853,7 @@ mod tests {
         let mut top = activated(Effect::ChooseOneOf {
             chooser: PlayerFilter::Controller,
             branches: vec![branch],
+            kind: ChooseOneOfKind::Ordinary,
         });
         top.sub_ability = Some(Box::new(activated(put_counter(
             CounterType::Plus1Plus1,
