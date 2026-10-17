@@ -1855,6 +1855,23 @@ pub(crate) fn is_emblem_creation_head(current: &str) -> bool {
     is_emblem_head
 }
 
+/// Digital-only Alchemy (no CR entry): the one-time-boon twin of
+/// `is_emblem_creation_head` — every printed recipient head, longest first.
+/// A boon is a held trigger with no board presence (less even than an
+/// emblem), so a sentence following its granted-trigger quote can never be
+/// an anaphor referring back to it.
+pub(crate) fn is_boon_creation_head(current: &str) -> bool {
+    alt((
+        tag_no_case::<_, _, OracleError<'_>>("target opponent gets a one-time boon with \""),
+        tag_no_case("that player gets a one-time boon with \""),
+        tag_no_case("you get a one-time boon with \""),
+        tag_no_case("get a one-time boon with \""),
+        tag_no_case("gets a one-time boon with \""),
+    ))
+    .parse(current.trim_start())
+    .is_ok()
+}
+
 fn quote_closes_sentence_before_sequence(current: &str, remainder: &str) -> bool {
     let quoted_text_ends_sentence = current
         .chars()
@@ -1875,6 +1892,12 @@ fn quote_closes_sentence_before_sequence(current: &str, remainder: &str) -> bool
     // "… Search your library …" would otherwise be swallowed into the emblem's
     // static text (issue #5282).
     if is_emblem_creation_head(current) {
+        return true;
+    }
+    // Digital-only Alchemy (no CR entry): same always-split rule for a boon
+    // head — March Toward Perfection's "Draft a card from ~'s spellbook."
+    // would otherwise be swallowed into the granted trigger (issue #7495).
+    if is_boon_creation_head(current) {
         return true;
     }
 
@@ -4747,8 +4770,10 @@ fn recognize_counter_loses_abilities_rider(lower: &str) -> Option<CounterLosesAb
 /// continuation clause (Memory Lapse, Remand, Spell Crumple). Operates on
 /// lowercased text; tolerates a trailing period/whitespace. Returns the parsed
 /// [`SpellStackToGraveyardReplacement`], or `None` for an unsupported destination
-/// (Hinder's "your choice of the top or bottom", Transcendent Dragon's "exile
-/// it instead") so those cards are honestly gapped rather than misparsed.
+/// (Hinder's "your choice of the top or bottom") so those cards are honestly
+/// gapped rather than misparsed. "Exile it instead" also returns `None`: it
+/// lowers to the `ChangeZone { Exile, ParentTarget }` rider `counter::resolve`
+/// reads (Dissipate, Transcendent Dragon).
 ///
 /// Composed from independent axes rather than enumerated as full strings:
 ///   - spell anaphor ("that spell" / "that card" / "it").
@@ -7986,6 +8011,7 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
         | Effect::BecomeBlocked { .. }
         | Effect::SetClassLevel { .. }
         | Effect::CreateDelayedTrigger { .. }
+        | Effect::CreateBoon { .. }
         | Effect::AddTargetReplacement { .. }
         | Effect::AddRestriction { .. }
         | Effect::ReduceNextSpellCost { .. }
@@ -8075,6 +8101,7 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
         | Effect::Adapt { .. }
         | Effect::Learn
         | Effect::NoteManaSpent
+        | Effect::NoteNumber { .. }
         | Effect::Forage
         | Effect::CompletePlayerAction { .. }
         | Effect::Harness
@@ -8543,7 +8570,8 @@ pub(super) fn parse_followup_continuation_ast_with_search_destination(
         // Remand, Spell Crumple). The `scan_contains` pre-guard mirrors the
         // source-rider arms above; the real classification is the combinator
         // recognizer, which returns `None` for unsupported destinations
-        // (Hinder, Transcendent Dragon) so those cards stay honestly gapped.
+        // (Hinder) so those cards stay honestly gapped; "exile it instead"
+        // (Transcendent Dragon) also returns `None` and lowers to the exile rider.
         Effect::Counter { .. }
             if nom_primitives::scan_contains(&lower, "countered this way") => // allow-noncombinator
         {

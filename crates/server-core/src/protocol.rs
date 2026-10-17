@@ -3346,12 +3346,28 @@ mod tests {
         }
     }
 
-    /// v142: CR 701.43 `GameEvent::CreatureExerted` gains `origin` and an
+    /// v145: CR 701.43 `GameEvent::CreatureExerted` gains `origin` and an
     /// optional `player`, carried in a stack trigger's `trigger_event` and in
-    /// `pending_attack_trigger_events` inside `GameState`; a v141 peer drops
+    /// `pending_attack_trigger_events` inside `GameState`; a v144 peer drops
     /// both silently and would let an activated-ability exert satisfy an
     /// attack-linked "when you do" trigger, so it must be refused before it
-    /// receives v142 state.
+    /// receives v145 state.
+    ///
+    /// v144: one-time boons (#7495) add `Effect::CreateBoon`, `Effect::NoteNumber`,
+    /// the `HasBoon` conditions, and `WaitingFor::ChooseTokenHost` tags, and
+    /// retype the perpetual P/T edit's `power_delta`/`toughness_delta` to
+    /// required `QuantityExpr` `power`/`toughness`. A v143 peer cannot parse
+    /// the new shapes, so it must be refused before it receives v144 state.
+    ///
+    /// v143: `GameState::modal_modes_chosen_this_turn` / `_this_game` retype to
+    /// `(ObjectIncarnationRef, usize)` (CR 400.7 incarnation-keyed modal
+    /// history); a v142 peer cannot decode the object-shaped key, so it must be
+    /// refused before it receives v143 state.
+    ///
+    /// v142: `LinkedExileSnapshot` gains `incarnation` (CR 400.7), carried in
+    /// `GameState::linked_exile_lki` and the trigger and zone-change linked-exile
+    /// snapshots; a v141 peer re-encoding state drops it, so it must be refused
+    /// before it receives v142 state.
     ///
     /// v141: `ExileLinkKind` gains `CastCost` (CR 607.2q cast-cost exile links),
     /// carried in `GameState::exile_links`; a v140 peer cannot parse the tag, so
@@ -3555,8 +3571,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_142_for_exert_origin() {
-        assert_eq!(PROTOCOL_VERSION, 142);
+    fn protocol_version_is_145_for_exert_origin() {
+        assert_eq!(PROTOCOL_VERSION, 145);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3567,7 +3583,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_142_for_exert_origin` stays
+    /// `protocol_version_is_145_for_exert_origin` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

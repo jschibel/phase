@@ -863,6 +863,7 @@
     "chooseCreatureToEquip": "Escolha uma criatura para equipar",
     "chooseCreatureTokenToPopulate": "Escolha uma ficha de criatura para popular",
     "chooseReturnAsAuraTarget": "Escolha um permanente para encantar",
+    "chooseTokenHost": "Escolha um hospedeiro para a ficha",
     "tapUntappedCreatures_one": "Vire {{count}} criatura desvirada",
     "tapUntappedCreatures_other": "Vire {{count}} criaturas desviradas",
     "chooseTargetOf": "Escolha o alvo {{current}} de {{total}}",
@@ -2624,8 +2625,8 @@
     "close": "Fechar sobreposição da decisão da IA"
   },
   "status": {
-    "yourPriority": "Your priority",
-    "yourPriorityReason": "Your priority — {{reason}}",
+    "yourPriority": "Sua prioridade",
+    "yourPriorityReason": "Sua prioridade — {{reason}}",
     "waitingFor": "Waiting for <player>{{player}}</player>",
     "waitingForReason": "Waiting for <player>{{player}}</player> — {{reason}}",
     "reason": {

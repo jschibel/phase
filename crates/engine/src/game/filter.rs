@@ -2794,6 +2794,7 @@ fn quantity_ref_contains_filter_prop(
         | QuantityRef::TurnsTaken
         | QuantityRef::ChosenNumber
         | QuantityRef::PlayerChosenNumber { .. }
+        | QuantityRef::NotedNumber
         | QuantityRef::DescendedThisTurn
         | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. }
         | QuantityRef::SpellsCastLastTurn
@@ -2917,6 +2918,60 @@ pub(crate) fn bind_declaring_owner_authority(
             {
                 *prop = FilterProp::Owned {
                     controller: ControllerRef::SpecificPlayer { id: controller },
+                };
+            }
+        },
+        &mut complete,
+    );
+    if complete {
+        *filter = rewritten;
+    }
+    complete
+}
+
+/// Re-anchor holder-relative ("you") references in one boon-granted trigger
+/// MATCHER filter to the concrete holder.
+///
+/// Delayed-trigger matchers resolve "you" through the trigger source's
+/// controller — the boon's CREATOR. When the holder differs (Loch Larent,
+/// Valiant Batrider), an un-rewritten reference watches the wrong player's
+/// events. Binding unconditionally (even when holder == creator) additionally
+/// immunizes self-held boons against the creating object changing controller
+/// mid-flight; in the common case the bound filter matches exactly what the
+/// relative one would.
+///
+/// Reuses the shared [`rewrite_filter_props`] traversal (the same seam as
+/// [`bind_declaring_owner_authority`]), so nested descendants an ad-hoc
+/// recursion would miss — `TrackedSetFiltered` filters, `DistinctFrom` /
+/// `SharesQuality` / comparator references, `Typed` properties — re-anchor
+/// too. Rewritten leaves: bare `Controller` nodes, `Typed.controller == You`,
+/// and `Owned { You }` props. `Opponent` and the other relative
+/// `ControllerRef`s have no concrete singular form and are left untouched, as
+/// are event-determined (`Triggering*`) and source-identity
+/// (`SourceController`) leaves. Transactional like its sibling: an incomplete
+/// bounded walk leaves the input unchanged and reports `false`.
+pub(crate) fn reanchor_filter_to_holder(filter: &mut TargetFilter, holder: PlayerId) -> bool {
+    let mut rewritten = filter.clone();
+    let mut complete = true;
+    rewrite_filter_props(
+        &mut rewritten,
+        &mut |node| {
+            if matches!(node, TargetFilter::Controller) {
+                *node = TargetFilter::SpecificPlayer { id: holder };
+            }
+            if let TargetFilter::Typed(typed) = node {
+                if typed.controller == Some(ControllerRef::You) {
+                    typed.controller = Some(ControllerRef::SpecificPlayer { id: holder });
+                }
+            }
+        },
+        &mut |prop| {
+            if let FilterProp::Owned {
+                controller: ControllerRef::You,
+            } = prop
+            {
+                *prop = FilterProp::Owned {
+                    controller: ControllerRef::SpecificPlayer { id: holder },
                 };
             }
         },
@@ -3740,6 +3795,7 @@ fn rewrite_quantity_ref_filter_props(
         | QuantityRef::TurnsTaken
         | QuantityRef::ChosenNumber
         | QuantityRef::PlayerChosenNumber { .. }
+        | QuantityRef::NotedNumber
         | QuantityRef::DescendedThisTurn
         | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. }
         | QuantityRef::SpellsCastLastTurn
@@ -6244,6 +6300,8 @@ fn filter_inner_for_object(
         // CR 603.10a + CR 607.2a: "cards exiled with [this object]" on a
         // leaves-the-battlefield trigger resolves from the trigger event's
         // zone-change snapshot; other contexts fall back to live exile links.
+        // CR 400.7: an entry names the object it captured, so a card that left
+        // exile (and any later exile of it) does not match.
         TargetFilter::ExiledBySource => {
             let source_ctx = source_context_from_filter(
                 state,
@@ -6260,7 +6318,9 @@ fn filter_inner_for_object(
             } else {
                 crate::game::players::linked_exile_cards_for_source(state, source_id).to_vec()
             };
-            linked.iter().any(|entry| entry.exiled_id == object_id)
+            linked
+                .iter()
+                .any(|entry| entry.exiled_id == object_id && entry.is_still_exiled(state))
         }
         // CR 607.2a: References a specific card exiled by the source, indexed by order.
         // Used by The Mimeoplasm to distinguish "the first card exiled this way" from
@@ -14583,6 +14643,85 @@ mod tests {
         ));
     }
 
+    /// CR 607.2a + CR 400.7: a snapshot entry names the object it captured. The
+    /// card matches while it stays in exile; once it leaves exile it no longer
+    /// matches, and it still does not match after it is exiled again, because
+    /// the card in exile is a new object. Checked for the trigger-snapshot arm
+    /// and for the live-link arm.
+    #[test]
+    fn exiled_by_source_does_not_match_a_card_exiled_again() {
+        let fixture = || {
+            let mut state = GameState::new_two_player(42);
+            let source = create_object(
+                &mut state,
+                CardId(1),
+                PlayerId(0),
+                "Source".into(),
+                Zone::Battlefield,
+            );
+            let card = create_object(
+                &mut state,
+                CardId(2),
+                PlayerId(1),
+                "Exiled Card".into(),
+                Zone::Exile,
+            );
+            (state, source, card)
+        };
+        let move_card = |state: &mut GameState, card: ObjectId, zone: Zone| {
+            let mut events = Vec::new();
+            crate::game::zones::move_to_zone(state, card, zone, &mut events);
+        };
+
+        // Trigger-snapshot arm: the trigger latched the card while it was in exile.
+        let (mut state, source, card) = fixture();
+        let mut trigger_source = state.objects[&source]
+            .snapshot_for_zone_change(source, Some(Zone::Battlefield), Zone::Battlefield)
+            .trigger_source_context
+            .expect("a battlefield object has a trigger source context");
+        trigger_source.linked_exile_snapshot =
+            vec![crate::game::exile_links::exiled_card_snapshot(&state, card)
+                .expect("the card is in exile")];
+        let matches_snapshot = |state: &GameState| {
+            super::matches_target_filter(
+                state,
+                card,
+                &TargetFilter::ExiledBySource,
+                &FilterContext::from_trigger_source(&trigger_source),
+            )
+        };
+        assert!(
+            matches_snapshot(&state),
+            "positive: the latched card in exile matches"
+        );
+        move_card(&mut state, card, Zone::Graveyard);
+        assert!(!matches_snapshot(&state), "the card left exile");
+        move_card(&mut state, card, Zone::Exile);
+        assert!(
+            !matches_snapshot(&state),
+            "CR 400.7: the card exiled again is a new object"
+        );
+
+        // Live-link arm (no trigger source): the link is pruned when the card
+        // leaves exile.
+        let (mut state, source, card) = fixture();
+        state.exile_links.push(crate::types::game_state::ExileLink {
+            exiled_id: card,
+            source_id: source,
+            kind: crate::types::game_state::ExileLinkKind::TrackedBySource,
+        });
+        assert!(
+            matches_target_filter(&state, card, &TargetFilter::ExiledBySource, source),
+            "positive: the linked card in exile matches"
+        );
+        move_card(&mut state, card, Zone::Graveyard);
+        move_card(&mut state, card, Zone::Exile);
+        assert!(
+            !matches_target_filter(&state, card, &TargetFilter::ExiledBySource, source),
+            "CR 400.7: the card exiled again is a new object"
+        );
+    }
+
     #[test]
     fn shares_quality_creature_type_passes_with_shared_subtype() {
         let mut state = setup();
@@ -16461,6 +16600,72 @@ mod tests {
         let before = other.clone();
         assert!(bind_declaring_owner_authority(&mut other, PlayerId(0)));
         assert_eq!(other, before, "a complete unrelated owner stays untouched");
+    }
+
+    /// M10: boon holder re-anchoring reuses the shared traversal seam, so
+    /// nested descendants the old ad-hoc recursion missed —
+    /// `TrackedSetFiltered` filters, `DistinctFrom` references, `Typed`
+    /// properties, `Owned` props — bind the holder too, while
+    /// opponent-relative leaves (no singular form) stay untouched.
+    #[test]
+    fn boon_holder_reanchor_is_total_over_nested_filter_topology() {
+        use crate::types::identifiers::TrackedSetId;
+
+        let holder = PlayerId(1);
+        let bound = ControllerRef::SpecificPlayer { id: holder };
+
+        let mut bare = TargetFilter::Controller;
+        assert!(reanchor_filter_to_holder(&mut bare, holder));
+        assert_eq!(bare, TargetFilter::SpecificPlayer { id: holder });
+
+        // TrackedSetFiltered descendant the old recursion never entered.
+        let mut tracked = TargetFilter::TrackedSetFiltered {
+            id: TrackedSetId(0),
+            filter: Box::new(TargetFilter::Typed(
+                TypedFilter::creature().controller(ControllerRef::You),
+            )),
+            caused_by: None,
+        };
+        assert!(reanchor_filter_to_holder(&mut tracked, holder));
+        let TargetFilter::TrackedSetFiltered { filter, .. } = &tracked else {
+            unreachable!()
+        };
+        assert_eq!(
+            filter.as_ref(),
+            &TargetFilter::Typed(TypedFilter::creature().controller(bound.clone())),
+            "tracked-set descendants must re-anchor"
+        );
+
+        // DistinctFrom reference + Owned prop inside Typed.properties.
+        let mut propped = TargetFilter::Typed(TypedFilter::creature().properties(vec![
+            FilterProp::DistinctFrom {
+                reference: Box::new(TargetFilter::Controller),
+            },
+            FilterProp::Owned {
+                controller: ControllerRef::You,
+            },
+        ]));
+        assert!(reanchor_filter_to_holder(&mut propped, holder));
+        let TargetFilter::Typed(typed) = &propped else {
+            unreachable!()
+        };
+        assert_eq!(
+            typed.properties,
+            vec![
+                FilterProp::DistinctFrom {
+                    reference: Box::new(TargetFilter::SpecificPlayer { id: holder }),
+                },
+                FilterProp::Owned { controller: bound },
+            ],
+            "prop-nested You references must re-anchor"
+        );
+
+        // Opponent-relative leaves have no singular form: untouched.
+        let mut opponent =
+            TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::Opponent));
+        let before = opponent.clone();
+        assert!(reanchor_filter_to_holder(&mut opponent, holder));
+        assert_eq!(opponent, before);
     }
 
     /// The chosen-type relation rewrites a property wherever the typed filter

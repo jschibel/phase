@@ -18,12 +18,13 @@ use super::ability::{
     ChoiceValue, ChooseFromZoneConstraint, ChosenAttribute, CoinFlipResult, Comparator,
     ContinuousModification, ControlWindow, CopiableValues, CopyChooseScope, CopyScale,
     CopyTargetPurpose, CostPaidObjectSnapshot, CounterCostSelection, DelayedTriggerCondition,
-    DigRestOrder, DigRestSplitScope, Duration, EffectKind, FaceDownProfile, GameRestriction,
-    KeywordAction, KickerVariant, LibraryPosition, ModalChoice, PermanentEntryMode, PileSource,
-    QuantityExpr, ResolvedAbility, ReturnResultId, SearchDestinationSplit, SearchOrderingHint,
-    SearchSelectionConstraint, StackAbilityKind, StaticCondition, TapCreaturesSelectionMode,
-    TargetFilter, TargetRef, ThisWayCause, TriggerBaseSetInstanceRef, TriggerCondition,
-    TriggerDefinition, TriggerDefinitionOccurrenceRef, TriggerDefinitionRef, TriggerEntry,
+    DelayedTriggerKind, DigRestOrder, DigRestSplitScope, Duration, EffectKind, FaceDownProfile,
+    GameRestriction, KeywordAction, KickerVariant, LibraryPosition, ModalChoice,
+    PermanentEntryMode, PileSource, QuantityExpr, ResolvedAbility, ReturnResultId,
+    SearchDestinationSplit, SearchOrderingHint, SearchSelectionConstraint, StackAbilityKind,
+    StaticCondition, TapCreaturesSelectionMode, TargetFilter, TargetRef, ThisWayCause,
+    TriggerBaseSetInstanceRef, TriggerCondition, TriggerDefinition, TriggerDefinitionOccurrenceRef,
+    TriggerDefinitionRef, TriggerEntry,
 };
 use super::actions::{DebugCardCreationKind, GameAction, ResolveAllScope};
 use super::attribution::ObjectAttribution;
@@ -46,6 +47,7 @@ use super::mana::{
     ColoredManaCount, ManaColor, ManaCost, ManaPipId, ManaType, ManaUnit, StepEndManaAction,
 };
 use super::match_config::{MatchConfig, MatchForfeitResult, MatchPhase, MatchScore};
+use super::object_map::ObjectMap;
 use super::phase::{Phase, PhaseStop, TurnDirection, TurnSegment};
 use super::player::{Player, PlayerCounterKind, PlayerId};
 use super::proposed_event::{
@@ -356,18 +358,13 @@ mod legacy_trigger_definition_ref_map {
 /// have no such proof and are rejected at the state restore boundary.
 fn deserialize_objects_with_trigger_provenance<'de, D>(
     deserializer: D,
-) -> Result<im::HashMap<ObjectId, GameObject, rustc_hash::FxBuildHasher>, D::Error>
+) -> Result<ObjectMap, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let mut objects =
-        im::HashMap::<ObjectId, GameObject, rustc_hash::FxBuildHasher>::deserialize(deserializer)?;
-    for (_, object) in objects.iter_mut() {
-        object
-            .migrate_legacy_trigger_definitions()
-            .map_err(serde::de::Error::custom)?;
-    }
-    Ok(objects)
+    ObjectMap::deserialize_with_migration(deserializer, |object| {
+        object.migrate_legacy_trigger_definitions()
+    })
 }
 
 /// Tracks whether the game is in day or night state (CR 730).
@@ -1975,11 +1972,31 @@ pub struct AttachmentSnapshot {
 
 /// CR 603.10a + CR 607.2a: Snapshot of a single card linked as "exiled with"
 /// a source at the instant before that source leaves the battlefield.
+/// Readers that consult the live card gate on [`Self::is_still_exiled`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkedExileSnapshot {
     pub exiled_id: ObjectId,
     pub owner: PlayerId,
     pub mana_value: u32,
+    /// CR 400.7: the exiled card's incarnation when the snapshot was captured. A
+    /// card that leaves exile is a new object, even if it is exiled again, so a
+    /// reader that consults the live card matches it only at this incarnation.
+    /// Legacy saves that predate this field decode to `LEGACY_INCARNATION`, which
+    /// no live object has (fail-closed, mirroring `CostPaidObjectSnapshot`).
+    #[serde(default = "crate::types::ability::legacy_incarnation")]
+    pub incarnation: u64,
+}
+
+impl LinkedExileSnapshot {
+    /// CR 607.2a + CR 400.7: Whether this snapshot's card is still the same object
+    /// in exile. Readers that consult the live card gate on this; readers of the
+    /// frozen `owner`/`mana_value` read last known information (CR 608.2h) and do not.
+    pub fn is_still_exiled(&self, state: &GameState) -> bool {
+        state
+            .objects
+            .get(&self.exiled_id)
+            .is_some_and(|obj| obj.zone == Zone::Exile && obj.incarnation == self.incarnation)
+    }
 }
 
 /// CR 400.7 + CR 607.2a + CR 607.2b + CR 113.7a: The linked exiles a source had
@@ -4838,6 +4855,12 @@ pub struct PendingChooseOneOf {
     )]
     pub replacement_applied: HashSet<AppliedReplacementKey>,
     pub remaining_players: Vec<PlayerId>,
+    /// CR 608.2: prompt-time trigger-event context, carried across the
+    /// ChooseOneOfBranch pause so event-context-bound branches resolve as if
+    /// unpaused (Swiftspear loss, run boon-blockers-20261010). Mirrors
+    /// PendingContinuation.trigger_context; None = no live context = no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_context: Option<ResolvingTriggerContext>,
 }
 
 /// CR 101.4 + CR 608.2c: Per-player `ChooseFromZone { zone_owner: EachPlayer }`
@@ -7419,6 +7442,12 @@ pub struct DelayedTrigger {
     /// Whether this trigger fires once and is removed (most delayed triggers).
     /// CR 603.7b.
     pub one_shot: bool,
+    /// Which family this entry belongs to. Read by "if you have a boon"
+    /// (`TriggerCondition::HasBoon`) and by the boon-only embedded-condition
+    /// gate in delayed matching; skipped from JSON when `Ordinary` so every
+    /// pre-existing serialized delayed trigger round-trips byte-identical.
+    #[serde(default, skip_serializing_if = "DelayedTriggerKind::is_ordinary")]
+    pub kind: DelayedTriggerKind,
     /// Private command-backed installation identity. Legacy delayed triggers
     /// continue through the normal rules lifecycle without receipt or
     /// forced-transition authority.
@@ -7442,6 +7471,7 @@ impl DelayedTrigger {
             controller,
             source_id,
             one_shot,
+            kind: DelayedTriggerKind::Ordinary,
             provenance: DelayedInstallIdentity::LegacyDelayed,
         }
     }
@@ -15071,6 +15101,28 @@ pub enum WaitingFor {
         /// and generic Aura entry can preserve source metadata for completion.
         pending_effect: Box<ResolvedAbility>,
     },
+    /// Digital-only Alchemy (no CR entry): a batch-semantics boon's "one of
+    /// them" token host ("one or more creatures enter … attached to one of
+    /// them", Dunbarrow Revivalist). The fire path stamped every matching
+    /// entrant on the ability; 2+ are still legal, so the controller picks
+    /// the host. This is a CHOICE, not a target (no "target" word), so
+    /// hexproof / shroud / protection do NOT filter `legal_targets`. The
+    /// resume path re-enters token creation with the choice bound.
+    ///
+    /// Shaped like the `ReturnAsAuraTarget` cluster
+    /// (`player`/`source_id`/`legal_targets`/pending payload) for a future
+    /// `ObjectPick` unification (see that variant's note); a dedicated
+    /// variant today because the resume re-enters token creation rather
+    /// than attaching an existing entrant, which no cluster member does.
+    ChooseTokenHost {
+        player: PlayerId,
+        source_id: ObjectId,
+        /// The still-legal stamped entrants (incarnation-current battlefield
+        /// objects, in batch order) the controller chooses among.
+        legal_targets: Vec<TargetRef>,
+        /// The token-creation ability to resume once the host is chosen.
+        pending_ability: Box<ResolvedAbility>,
+    },
     EquipTarget {
         player: PlayerId,
         equipment_id: ObjectId,
@@ -15543,6 +15595,12 @@ pub enum WaitingFor {
         /// Players still to face the same choice in APNAP order (CR 701.55d).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         remaining_players: Vec<PlayerId>,
+        /// CR 608.2: prompt-time trigger-event context, carried across the
+        /// ChooseOneOfBranch pause so event-context-bound branches resolve as
+        /// if unpaused (Swiftspear loss, run boon-blockers-20261010). Mirrors
+        /// PendingContinuation.trigger_context; None = no live context = no-op.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger_context: Option<ResolvingTriggerContext>,
     },
     /// CR 701.50a: Player chooses card(s) to discard for connive.
     /// After discarding, nonland discards add +1/+1 counters to the conniving creature.
@@ -17753,6 +17811,7 @@ impl WaitingFor {
             WaitingFor::CopyTargetChoice { .. } => "CopyTargetChoice",
             WaitingFor::ExploreChoice { .. } => "ExploreChoice",
             WaitingFor::ReturnAsAuraTarget { .. } => "ReturnAsAuraTarget",
+            WaitingFor::ChooseTokenHost { .. } => "ChooseTokenHost",
             WaitingFor::EquipTarget { .. } => "EquipTarget",
             WaitingFor::CrewVehicle { .. } => "CrewVehicle",
             WaitingFor::StationTarget { .. } => "StationTarget",
@@ -17919,6 +17978,7 @@ impl WaitingFor {
             | WaitingFor::CopyTargetChoice { player, .. }
             | WaitingFor::ExploreChoice { player, .. }
             | WaitingFor::ReturnAsAuraTarget { player, .. }
+            | WaitingFor::ChooseTokenHost { player, .. }
             | WaitingFor::EquipTarget { player, .. }
             | WaitingFor::CrewVehicle { player, .. }
             | WaitingFor::StationTarget { player, .. }
@@ -18375,7 +18435,10 @@ impl WaitingFor {
             | WaitingFor::RemoveCountersChoice { .. }
             | WaitingFor::RetargetChoice { .. }
             | WaitingFor::CombatTaxPayment { .. }
-            | WaitingFor::PhyrexianPayment { .. } => false,
+            | WaitingFor::PhyrexianPayment { .. }
+            // Digital-only Alchemy (no CR entry): the token-host choice is a
+            // resolution-time prompt — the play was announced long before it.
+            | WaitingFor::ChooseTokenHost { .. } => false,
         }
     }
 
@@ -18470,6 +18533,7 @@ impl WaitingFor {
             | WaitingFor::CopyTargetChoice { .. }
             | WaitingFor::ExploreChoice { .. }
             | WaitingFor::ReturnAsAuraTarget { .. }
+            | WaitingFor::ChooseTokenHost { .. }
             | WaitingFor::EquipTarget { .. }
             | WaitingFor::CrewVehicle { .. }
             | WaitingFor::StationTarget { .. }
@@ -21052,11 +21116,13 @@ declare_game_state! {
     // the default SipHash RandomState: ObjectId is a thin integer key and this
     // map is looked up millions of times per large-board resolution — profiling
     // showed SipHash hashing + HAMT lookup was ~35% of resolution CPU.
+    // Each object sits behind an `Arc` inside `ObjectMap`, so a cloned state
+    // shares every object it does not write.
     #[serde(
         deserialize_with = "deserialize_objects_with_trigger_provenance",
-        serialize_with = "crate::types::deterministic_serde::im_hash_map"
+        serialize_with = "crate::types::object_map::serialize_sorted"
     )]
-    pub objects: im::HashMap<ObjectId, GameObject, rustc_hash::FxBuildHasher>,
+    pub objects: ObjectMap,
     pub next_object_id: u64,
     /// CR 603.7: persisted monotonic delayed-trigger installation allocator.
     #[serde(default)]
@@ -22693,18 +22759,26 @@ declare_game_state! {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_etb_counters: Vec<(ObjectId, CounterType, u32)>,
 
-    /// Modal modes chosen this turn per source: (ObjectId, mode_index).
-    /// CR 700.2: "choose one that hasn't been chosen this turn"
-    /// Note: ObjectId-keyed — zone changes create new ObjectId per CR 400.7, naturally resetting tracking.
+    /// Modal modes chosen this turn per source incarnation: (source, mode_index).
+    /// CR 700.2: "choose one that hasn't been chosen this turn".
+    /// CR 400.7: keyed by the exact object incarnation, not the reused storage
+    /// `ObjectId` — a permanent that leaves and returns is a new object whose
+    /// history starts empty, while a control change (no zone change) keeps it.
+    /// CR 603.10a: a look-back trigger from a departed source reads the departed
+    /// incarnation's history, so entries are never pruned at zone exit.
+    /// Cleared at turn start. Legacy saves keyed by bare `ObjectId` load as
+    /// `LEGACY_INCARNATION`, which matches no live object.
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
-    pub modal_modes_chosen_this_turn: HashSet<(ObjectId, usize)>,
-    /// Modal modes chosen this game per source: (ObjectId, mode_index).
-    /// CR 700.2: "choose one that hasn't been chosen" (game-scoped)
-    /// Note: ObjectId-keyed — zone changes create new ObjectId per CR 400.7, naturally resetting tracking.
+    pub modal_modes_chosen_this_turn: HashSet<(ObjectIncarnationRef, usize)>,
+    /// Modal modes chosen this game per source incarnation: (source, mode_index).
+    /// CR 700.2: "choose one that hasn't been chosen" (game-scoped).
+    /// CR 400.7 + CR 603.10a: keyed by exact incarnation exactly like
+    /// `modal_modes_chosen_this_turn`; never pruned (bounded by modes chosen).
+    /// Legacy saves keyed by bare `ObjectId` load as `LEGACY_INCARNATION`.
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
-    pub modal_modes_chosen_this_game: HashSet<(ObjectId, usize)>,
+    pub modal_modes_chosen_this_game: HashSet<(ObjectIncarnationRef, usize)>,
 
     /// Cards currently revealed to all players (e.g. during a RevealHand effect).
     /// `filter_state_for_player` skips hiding these cards.
@@ -22941,6 +23015,17 @@ declare_game_state! {
     /// prompt, whose answer resolves at depth 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placed_sticker_this_resolution: Option<crate::types::stickers::AppliedSticker>,
+
+    /// Digital-only Alchemy (no CR entry): `(noting player, value)` pairs
+    /// noted by THIS resolution's `NoteNumber` legs, keyed per player so
+    /// fan-out iterations cannot overwrite each other. A sibling `CreateBoon`
+    /// leg snapshots its noting player's entry into the granted ability;
+    /// absence means this resolution noted nothing for that player, so the
+    /// grant captures `None` and reads fall back to the live global.
+    /// Cleared at every top-level resolution — a stale note from an earlier
+    /// resolution is never visible here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub noted_numbers_this_resolution: Vec<(PlayerId, i32)>,
 
     /// CR 609.7a-b: The most recently chosen damage source and its source
     /// filter. Set by `DamageSourceChoice`, consumed by prevention/replacement
@@ -23474,8 +23559,9 @@ declare_game_state! {
     /// (CR 400.7), but an ability that sacrifices its own source as a cost and
     /// then refers to "cards exiled with this permanent" (Rod of Absorption)
     /// must still see those cards at resolution. `linked_exile_cards_for_source`
-    /// consults this as its final fallback, filtered to cards still in exile, so
-    /// stale entries (cards that later left exile) contribute nothing.
+    /// consults this as its final fallback, filtered to cards still in exile as
+    /// the object the entry captured (CR 400.7), so a card that left exile
+    /// contributes nothing, even if it was exiled again.
     /// One entry per battlefield departure (a source can leave more than once in
     /// a step), each bounded to that departure's incarnations, so a later
     /// incarnation of the same id never reads it (CR 400.7).
@@ -29181,7 +29267,7 @@ impl GameState {
             active_combat_phase_control: None,
             active_library_searches: ActiveLibrarySearches::default(),
             active_search_decision_controls: ActiveSearchDecisionControls::default(),
-            objects: im::HashMap::default(),
+            objects: ObjectMap::default(),
             next_object_id: 1,
             next_delayed_trigger_token: 1,
             next_delayed_trigger_instance: initial_delayed_trigger_instance_id(),
@@ -29417,6 +29503,7 @@ impl GameState {
             chosen_color_this_resolution: None,
             named_color_this_resolution: None,
             placed_sticker_this_resolution: None,
+            noted_numbers_this_resolution: Vec::new(),
             last_chosen_damage_source: None,
             all_creature_types: Vec::new(),
             all_card_names: Arc::from([]),
@@ -30538,6 +30625,10 @@ impl GameState {
         // reads (phase-2 quantity), so distinct live values must not share a
         // loop pre-filter fingerprint.
         self.placed_sticker_this_resolution.hash(&mut h);
+        // Digital-only Alchemy (no CR entry): a sibling grant snapshots this
+        // resolution's note, so distinct live values must not share a loop
+        // pre-filter fingerprint.
+        self.noted_numbers_this_resolution.hash(&mut h);
         self.stack.len().hash(&mut h);
         self.objects.len().hash(&mut h);
         // im::Vector<ObjectId>: Hash, ordered.
@@ -32031,10 +32122,7 @@ pub(crate) fn loop_states_equal(a: &GameState, b: &GameState) -> bool {
 /// [`object_content_eq`]'s own doc states and not on immutability — they are not
 /// immutable within a game; only the fields a mandatory action could change are
 /// compared.
-pub(crate) fn objects_content_eq(
-    a: &im::HashMap<ObjectId, GameObject, rustc_hash::FxBuildHasher>,
-    b: &im::HashMap<ObjectId, GameObject, rustc_hash::FxBuildHasher>,
-) -> bool {
+pub(crate) fn objects_content_eq(a: &ObjectMap, b: &ObjectMap) -> bool {
     a.len() == b.len()
         && a.iter()
             .all(|(id, x)| b.get(id).is_some_and(|y| object_content_eq(x, y)))
@@ -32436,6 +32524,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         chosen_color_this_resolution: _,
         named_color_this_resolution: _,
         placed_sticker_this_resolution: _,
+        noted_numbers_this_resolution: _,
         last_chosen_damage_source: _,
         all_creature_types: _,
         all_card_names: _,
@@ -32818,6 +32907,7 @@ impl PartialEq for GameState {
             && self.chosen_color_this_resolution == other.chosen_color_this_resolution
             && self.named_color_this_resolution == other.named_color_this_resolution
             && self.placed_sticker_this_resolution == other.placed_sticker_this_resolution
+            && self.noted_numbers_this_resolution == other.noted_numbers_this_resolution
             && self.last_revealed_ids == other.last_revealed_ids
             && self.private_look_ids == other.private_look_ids
             && self.private_look_player == other.private_look_player
@@ -35672,6 +35762,40 @@ mod tests {
 
         assert_eq!(restored.next_delayed_trigger_token, 2);
         assert_eq!(restored.next_delayed_trigger_instance, 2);
+    }
+
+    #[test]
+    fn delayed_trigger_kind_ordinary_omits_and_boon_round_trips() {
+        let (mut state, _) = delayed_install_fixture();
+        // Ordinary is the default and is omitted from JSON, so every
+        // pre-existing serialized delayed trigger round-trips byte-identical
+        // and a missing field decodes as Ordinary.
+        let serialized = serde_json::to_value(&state).expect("fixture serializes");
+        let entry = serialized["delayed_triggers"][0]
+            .as_object()
+            .expect("fixture has a live delayed trigger");
+        assert!(
+            !entry.contains_key("kind"),
+            "Ordinary must omit kind, got {entry:?}"
+        );
+        let restored: GameState = serde_json::from_value(serialized).expect("omitted kind decodes");
+        assert_eq!(
+            restored.delayed_triggers[0].kind,
+            crate::types::ability::DelayedTriggerKind::Ordinary
+        );
+
+        // A boon entry persists its kind explicitly and round-trips.
+        state.delayed_triggers[0].kind = crate::types::ability::DelayedTriggerKind::Boon;
+        let serialized = serde_json::to_value(&state).expect("boon serializes");
+        assert_eq!(
+            serialized["delayed_triggers"][0]["kind"],
+            serde_json::Value::String("Boon".to_string())
+        );
+        let restored: GameState = serde_json::from_value(serialized).expect("boon kind decodes");
+        assert_eq!(
+            restored.delayed_triggers[0].kind,
+            crate::types::ability::DelayedTriggerKind::Boon
+        );
     }
 
     fn erase_delayed_install_provenance(value: &mut serde_json::Value) {
@@ -39619,6 +39743,7 @@ mod tests {
             branches: Vec::new(),
             branch_descriptions: Vec::new(),
             parent_occurrences: aligned.clone(),
+            trigger_context: None,
             context: Default::default(),
             continuation: None,
             replacement_applied: HashSet::new(),
@@ -39629,6 +39754,7 @@ mod tests {
             source_id: ObjectId(7),
             branches: Vec::new(),
             parent_occurrences: aligned,
+            trigger_context: None,
             context: Default::default(),
             continuation: None,
             replacement_applied: HashSet::new(),
@@ -40469,6 +40595,7 @@ mod tests {
             controller: PlayerId(0),
             source_id: ObjectId(5),
             one_shot: true,
+            kind: DelayedTriggerKind::Ordinary,
             provenance: DelayedInstallIdentity::LegacyDelayed,
         });
         a.stack.push_back(StackEntry {
@@ -43862,6 +43989,7 @@ mod tests {
             continuation: None,
             replacement_applied: Default::default(),
             remaining_players: vec![],
+            trigger_context: None,
         }));
         variants.push(Box::new(WaitingFor::TriggerTargetSelection {
             player: PlayerId(0),

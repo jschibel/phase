@@ -76,9 +76,11 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // `FilterProp::CrewedThisTurn`).
 // v140 adds `AttackSubject::EventAttackers` (the attacked players of a trigger's attack
 // event) to ability player scopes in GameState.
-// v142 adds `GameEvent::CreatureExerted.origin` and `.player` (CR 701.43) to GameState's
-// trigger events.
 // v141 adds `ExileLinkKind::CastCost` (CR 607.2q cast-cost exile links) to GameState.
+// v142 adds `LinkedExileSnapshot.incarnation` (CR 400.7) to GameState's linked-exile snapshots.
+// v143 retypes GameState's modal no-repeat history keys to `ObjectIncarnationRef` (CR 400.7).
+// v145 adds `GameEvent::CreatureExerted.origin` and `.player` (CR 701.43) to GameState's
+// trigger events.
 // v134 adds `GameEvent::AbilityActivated.stack_entry` (the activation's stack object).
 // Keep the measured base so a future merge cannot collapse independent wire
 // changes onto one number.
@@ -157,10 +159,14 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +62: v133 adds the CR 614.12a pre-entry as-enters choice carriers.
 // +68: v139 adds the CR 702.122c per-turn crew relation.
 // +69: v140 adds `AttackSubject::EventAttackers` to ability player scopes in GameState.
-// +71: v142 adds `GameEvent::CreatureExerted.origin`/`.player` to GameState's trigger events.
 // +70: v141 adds `ExileLinkKind::CastCost` to `GameState.exile_links`.
+// +71: v142 adds `LinkedExileSnapshot.incarnation` to GameState's linked-exile snapshots.
+// +72: v143 retypes `GameState.modal_modes_chosen_this_{turn,game}` keys to `ObjectIncarnationRef`.
 // +63: v134 adds `GameEvent::AbilityActivated.stack_entry` (the activation's stack object).
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 71;
+// +73: v144 adds one-time boon tags (CreateBoon, NoteNumber, HasBoon,
+// ChooseTokenHost) and retypes the perpetual P/T edit to QuantityExpr.
+// +74: v145 adds `GameEvent::CreatureExerted.origin`/`.player` to GameState's trigger events.
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 74;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
@@ -252,10 +258,13 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 // +61: wire 115 moves with full-game v133 for the pre-entry as-enters choice.
 // +67: wire 121 moves with full-game v139 for the per-turn crew relation.
 // +68: wire 122 moves with full-game v140 for `AttackSubject::EventAttackers`.
-// +70: wire 124 moves with full-game v142 for `CreatureExerted.origin`/`.player`.
 // +69: wire 123 moves with full-game v141 for `ExileLinkKind::CastCost`.
+// +70: wire 124 moves with full-game v142 for `LinkedExileSnapshot.incarnation`.
+// +71: wire 125 moves with full-game v143 for incarnation-keyed modal history.
 // +62: wire 116 moves with full-game v134 for `AbilityActivated.stack_entry`.
-const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 70;
+// +72: wire 126 moves with full-game v144 for one-time boons.
+// +73: wire 127 moves with full-game v145 for `CreatureExerted.origin`/`.player`.
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 73;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse
