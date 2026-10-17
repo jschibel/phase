@@ -1,7 +1,5 @@
 use crate::game::combat::{AttackTarget, DamageAssignment, DamageTarget, TrampleKind};
-use crate::types::ability::{
-    CostPaidObjectSnapshot, TargetFilter, TargetRef, TriggerDefinitionRef,
-};
+use crate::types::ability::{CostPaidObjectSnapshot, TargetRef, TriggerDefinitionRef};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
     CombatDamageAssignmentMode, CombatTaxContext, CombatTaxPending, DamageSlot, GameState,
