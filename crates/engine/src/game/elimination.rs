@@ -390,6 +390,12 @@ pub fn eliminate_players_simultaneously(
                 state,
                 crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
             );
+            // CR 104.1: the abandonment keeps an owed spell's carrier; a
+            // finished game retires it too.
+            crate::game::stack::finish_resolving_stack_entry(
+                state,
+                crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
+            );
         }
         // Terminal: drop trigger scaffolding the client would otherwise show as
         // a stuck stack / ordering prompt.
@@ -1748,8 +1754,8 @@ fn abandon_source_bound_resolution_prompt(
 /// * When its owner is among the players leaving, it leaves the game with them
 ///   (CR 800.4a), through the player-left-game move, and the carrier is
 ///   dropped with it; it is never reported resolved.
-/// * Otherwise its carrier and the marker it owes the final part under outlive
-///   the abandonment, with everything else of the family dropped. The final-part
+/// * Otherwise the abandonment keeps its carrier and the marker it owes the
+///   final part under, with everything else of the family dropped. The final-part
 ///   authority then puts the spell into its owner's graveyard (CR 608.2n) and
 ///   retires the carrier, exactly once, at the next priority boundary, unless
 ///   the departure sweep takes it first: a leaving controller is settled there,
@@ -1760,7 +1766,6 @@ fn finish_abandoned_source_bound_resolution_carrier(
     leaving_set: &HashSet<PlayerId>,
     events: &mut Vec<GameEvent>,
 ) {
-    let mut keep_for_final_part = None;
     if let Some(spell) = crate::game::stack::spell_awaiting_final_part(state).cloned() {
         // Only the owner is decided here. A leaving controller is not: this
         // runs before the leaver's control effects end, so a spell stolen
@@ -1774,24 +1779,14 @@ fn finish_abandoned_source_bound_resolution_carrier(
             .get(&spell.id)
             .map(|object| object.owner)
             .filter(|owner| leaving_set.contains(owner));
-        match owner {
-            Some(leaver) => move_object_for_player_left_game(state, spell.id, leaver, events),
-            None => {
-                keep_for_final_part = Some((
-                    state.resolving_stack_entry.take(),
-                    state.resolving_spell_final_part.take(),
-                ));
-            }
+        if let Some(leaver) = owner {
+            move_object_for_player_left_game(state, spell.id, leaver, events);
         }
     }
     crate::game::stack::abandon_active_resolution_carrier(
         state,
         crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
     );
-    if let Some((entry, owed)) = keep_for_final_part {
-        state.resolving_stack_entry = entry;
-        state.resolving_spell_final_part = owed;
-    }
 }
 
 /// CR 800.4a: A paused ChangeZone iteration is a single resolving family's

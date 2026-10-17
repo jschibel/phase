@@ -152,6 +152,10 @@ fn record_illegal_target_slots(
 
 /// Abandon the currently resolving family as one lifecycle unit. Prompt owners
 /// call this only after settling any events already completed by their cursor.
+///
+/// CR 608.2n: an instant or sorcery still owing its final part is not part of
+/// the abandoned family; its carrier and marker survive so the final-part
+/// authority delivers it once.
 pub(super) fn abandon_active_resolution_carrier(
     state: &mut GameState,
     disposition: super::lifecycle::DelayedTerminalDisposition,
@@ -160,7 +164,17 @@ pub(super) fn abandon_active_resolution_carrier(
     let _ = state
         .clear_active_ability_continuation()
         .expect("resolution abandonment cannot clear a buried ability continuation");
+    let owed_spell = spell_awaiting_final_part(state).is_some().then(|| {
+        (
+            state.resolving_stack_entry.take(),
+            state.resolving_spell_final_part.take(),
+        )
+    });
     finish_resolving_stack_entry(state, disposition);
+    if let Some((entry, owed)) = owed_spell {
+        state.resolving_stack_entry = entry;
+        state.resolving_spell_final_part = owed;
+    }
     state.resolution_source_relatch = None;
     state.deferred_entry_events.clear();
     state.pending_token_battlefield_entry = None;
@@ -6696,6 +6710,68 @@ mod tests {
             state.resolving_spell_final_part.is_none(),
             "and the owed final part ends with its carrier"
         );
+    }
+
+    /// CR 608.2n: abandoning a resolution family keeps the carrier of an instant
+    /// or sorcery still owing its final part, which then delivers it, and drops
+    /// a carrier whose spell already left the stack.
+    #[test]
+    fn abandoning_a_resolution_keeps_only_a_spell_still_owing_its_final_part() {
+        for (zone, kept) in [(Zone::Stack, true), (Zone::Graveyard, false)] {
+            let mut state = setup();
+            let spell = create_object(
+                &mut state,
+                CardId(1),
+                PlayerId(0),
+                "Paused Sorcery".to_string(),
+                zone,
+            );
+            state.resolving_stack_entry = Some(pending_spell_entry(spell));
+            state.resolving_spell_final_part = Some(OwedSpellFinalPart {
+                spell,
+                resolution_start_phase: state.phase,
+            });
+            state.waiting_for = WaitingFor::Priority {
+                player: PlayerId(0),
+            };
+
+            abandon_active_resolution_carrier(
+                &mut state,
+                super::super::lifecycle::DelayedTerminalDisposition::Removed,
+            );
+            assert_eq!(
+                state.resolving_stack_entry.as_ref().map(|entry| entry.id),
+                kept.then_some(spell),
+                "{zone:?}"
+            );
+            assert_eq!(
+                state.resolving_spell_final_part.map(|owed| owed.spell),
+                kept.then_some(spell),
+                "{zone:?}"
+            );
+            if !kept {
+                continue;
+            }
+
+            let mut events = Vec::new();
+            assert!(super::super::engine::run_spell_final_part_if_due(
+                &mut state,
+                &mut events
+            ));
+            assert_eq!(state.objects[&spell].zone, Zone::Graveyard);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        GameEvent::StackResolved { object_id } if *object_id == spell
+                    ))
+                    .count(),
+                1
+            );
+            assert!(state.resolving_stack_entry.is_none());
+            assert!(state.resolving_spell_final_part.is_none());
+        }
     }
 
     /// CR 608.2c + CR 608.2n: "the instructions are done" and "the carrier may

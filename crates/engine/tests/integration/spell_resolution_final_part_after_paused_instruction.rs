@@ -2048,6 +2048,62 @@ fn a_state_based_death_in_the_final_parts_pass_joins_the_resolutions_batch() {
     assert_eq!(trigger_controllers(state), vec![P0, P0]);
 }
 
+/// CR 603.7b + CR 603.3b: the same pass with P0's Whippoorwill delayed
+/// trigger watching the bears. Its death trigger joins Syr Konrad's and the
+/// Quest's batch, so P0 orders all three, and it exiles the bears.
+#[test]
+fn a_delayed_death_trigger_joins_the_final_parts_batch() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let prophecy = fire_prophecy_in_hand(&mut scenario);
+    scenario.with_mana_pool(
+        P0,
+        [mana(ManaType::Green, 2), mana(ManaType::Red, 4)].concat(),
+    );
+    let bird = scenario.add_real_card(P0, "Whippoorwill", Zone::Battlefield, db());
+    let quest = scenario.add_real_card(P0, "Quest for Ancient Secrets", Zone::Battlefield, db());
+    let konrad = scenario.add_real_card(P0, "Syr Konrad, the Grim", Zone::Battlefield, db());
+    let bears = scenario.add_vanilla(P1, 2, 2);
+    let mut runner = scenario.build();
+
+    runner.activate(bird, 0).target_object(bears).resolve();
+    assert_eq!(
+        runner.state().delayed_triggers.len(),
+        1,
+        "reach guard: Whippoorwill's delayed trigger watches the bears"
+    );
+    cast_fire_prophecy_to_its_optional_put(&mut runner, prophecy, bears);
+    runner
+        .act(GameAction::DecideOptionalEffect { accept: false })
+        .expect("P0 declines the optional put");
+
+    let state = runner.state();
+    assert_eq!(state.objects[&bears].zone, Zone::Graveyard);
+    let WaitingFor::OrderTriggers { player, triggers } = &state.waiting_for else {
+        panic!("P0 orders the batch, got {:?}", state.waiting_for);
+    };
+    assert_eq!(*player, P0);
+    let mut sources: Vec<_> = triggers.iter().map(|summary| summary.source_id).collect();
+    sources.sort();
+    let mut expected = vec![quest, konrad, bird];
+    expected.sort();
+    assert_eq!(
+        sources, expected,
+        "CR 603.3b: Whippoorwill's delayed trigger is ordered with the batch, once"
+    );
+    assert!(trigger_controllers(state).is_empty());
+
+    runner
+        .act(GameAction::OrderTriggers {
+            order: (0..expected.len()).collect(),
+        })
+        .expect("P0 orders their triggers");
+    run_until_settled(&mut runner, accept_optional_effects);
+    let state = runner.state();
+    assert_eq!(state.objects[&bears].zone, Zone::Exile);
+    assert!(state.delayed_triggers.is_empty());
+}
+
 /// CR 117.5 + CR 603.3b + CR 101.4: the same pass with Divination below Fire
 /// Prophecy and P1's Footlight Fiend dying to it. Fiend's death trigger (P1)
 /// and the Quest's trigger on Fire Prophecy's move (P0) are one batch, put on

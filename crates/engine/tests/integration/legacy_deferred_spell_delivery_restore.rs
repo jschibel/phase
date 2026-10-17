@@ -1,4 +1,4 @@
-//! CR 608.2n + CR 702.88a/c: the final part of an instant or sorcery's resolution (its
+//! CR 608.2n + CR 702.88a: the final part of an instant or sorcery's resolution (its
 //! on-resolution hooks, its destination and the move off the stack) is owed on the resolution
 //! carrier (`GameState::resolving_spell_final_part`) while the spell's instructions are paused
 //! for a choice. This file pins two things around that marker:
@@ -9,7 +9,7 @@
 //!    (rebound's delayed trigger, paradigm, epic). The marker means the opposite: the hooks have
 //!    NOT yet run. No mapping from the record to the marker can say which hooks ran, so
 //!    completing such a snapshot installs a second rebound trigger and loses the chosen
-//!    destination (CR 702.88c), and dropping the record strands the spell in `Zone::Stack`
+//!    destination (CR 702.88a), and dropping the record strands the spell in `Zone::Stack`
 //!    outside `state.stack`. `GameStateDecode` therefore refuses a snapshot that carries the
 //!    key, on every route (persisted raw, trusted envelope, bare `GameState`, resolution wire
 //!    v2-v4).
@@ -360,7 +360,7 @@ fn assert_taigam_fixture_reaches_the_legacy_shape(value: &Value) {
     );
 }
 
-/// CR 608.2n + CR 702.88a/c: the old Taigam save cannot be completed without a second rebound
+/// CR 608.2n + CR 702.88a: the old Taigam save cannot be completed without a second rebound
 /// installation or a lost delivery, so it is refused on every route into the engine.
 #[test]
 fn a_legacy_taigam_free_cast_save_is_refused_at_every_decode_boundary() {

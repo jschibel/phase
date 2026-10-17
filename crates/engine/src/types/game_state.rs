@@ -12674,7 +12674,8 @@ pub(crate) fn validate_trigger_firing_coherence(state: &GameState) -> Result<(),
 
 /// CR 608.2n: an owed final part belongs to the instant or sorcery whose
 /// resolution carrier is installed. A restored marker that names no carrier, a
-/// non-spell carrier, or a different spell is rejected rather than published.
+/// non-spell carrier, a different spell, or a permanent spell (CR 608.3: its
+/// resolution is not the instant/sorcery path) is rejected rather than published.
 pub(crate) fn validate_owed_spell_final_part_coherence(state: &GameState) -> Result<(), String> {
     let Some(owed) = state.resolving_spell_final_part else {
         return Ok(());
@@ -12690,11 +12691,16 @@ pub(crate) fn validate_owed_spell_final_part_coherence(state: &GameState) -> Res
                 | StackEntryKind::KeywordAction { .. }
                 | StackEntryKind::CombatDamage { .. } => false,
             });
-    if names_installed_spell {
-        Ok(())
-    } else {
-        Err("an owed spell final part must name the installed spell carrier".to_string())
+    if !names_installed_spell {
+        return Err("an owed spell final part must name the installed spell carrier".to_string());
     }
+    if crate::game::stack::is_permanent_spell(state, owed.spell) {
+        return Err(
+            "an owed spell final part must name an instant or sorcery spell, not a permanent spell"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// The public scheduling classifier and private firing identity are redundant
@@ -23943,14 +23949,14 @@ fn migrate_legacy_exploited_trigger_roles(value: &mut serde_json::Value) {
 
 /// Rejects a snapshot that still carries the removed `deferred_spell_delivery` record.
 ///
-/// CR 608.2n + CR 702.88a/c: before the final part of an instant or sorcery's
+/// CR 608.2n + CR 702.88a: before the final part of an instant or sorcery's
 /// resolution was owed on the resolution carrier (`resolving_spell_final_part`),
 /// a spell that paused on its own free-cast window had already armed its
 /// on-resolution hooks (rebound, paradigm, epic) and recorded only the chosen
 /// destination in `deferred_spell_delivery`. The carrier marker means the
 /// opposite: the hooks have NOT yet run. Completing an old snapshot through the
 /// final part would therefore re-arm them (a second rebound delayed trigger,
-/// CR 702.88c), and dropping the record would strand the spell in no zone. A
+/// CR 702.88a), and dropping the record would strand the spell in no zone. A
 /// record cannot say which hooks ran, so the snapshot is refused rather than
 /// guessed at. The key is the exact discriminator: it is never written by a
 /// current build, and `null` is not a record.
@@ -38736,6 +38742,62 @@ mod tests {
             persisted.resolving_spell_final_part,
             coherent.resolving_spell_final_part
         );
+    }
+
+    /// CR 608.2n + CR 608.3: only an instant or sorcery owes the final part, so
+    /// a marker naming a permanent spell's carrier is rejected on both decodes.
+    #[test]
+    fn an_owed_final_part_naming_a_permanent_spell_is_rejected_on_decode() {
+        use crate::types::card_type::CoreType;
+        const PERMANENT: &str =
+            "an owed spell final part must name an instant or sorcery spell, not a permanent spell";
+        for core in [CoreType::Creature, CoreType::Instant, CoreType::Sorcery] {
+            let mut state = owed_final_part_state(None, ObjectId(0));
+            let spell = crate::game::zones::create_object(
+                &mut state,
+                CardId(4_301),
+                PlayerId(0),
+                "Owed Spell".to_string(),
+                crate::types::zones::Zone::Stack,
+            );
+            state
+                .objects
+                .get_mut(&spell)
+                .expect("the spell object exists")
+                .card_types
+                .core_types = vec![core];
+            state.resolving_stack_entry = Some(owed_final_part_spell_carrier(spell));
+            state.resolving_spell_final_part = Some(OwedSpellFinalPart {
+                spell,
+                resolution_start_phase: state.phase,
+            });
+            let raw = serde_json::to_value(&state).expect("the fixture serializes");
+            let transport = serde_json::from_value::<GameState>(raw);
+            let persisted = serde_json::from_value::<PersistedGameState>(
+                current_version_persisted_payload(&state),
+            );
+            if core == CoreType::Creature {
+                let transport = transport.expect_err("the transport decode rejects it");
+                assert!(transport.to_string().contains(PERMANENT), "{transport}");
+                let persisted = persisted.expect_err("the persisted decode rejects it");
+                assert!(persisted.to_string().contains(PERMANENT), "{persisted}");
+            } else {
+                assert_eq!(
+                    transport.expect("an instant or sorcery marker decodes"),
+                    state,
+                    "{core:?}: round-trips"
+                );
+                let PersistedGameState::Raw(restored) =
+                    persisted.expect("the persisted decode accepts it")
+                else {
+                    panic!("an unenveloped payload decodes as a raw snapshot");
+                };
+                assert_eq!(
+                    restored.resolving_spell_final_part, state.resolving_spell_final_part,
+                    "{core:?}"
+                );
+            }
+        }
     }
 
     /// CR 608.2n: the v1 normalization of a completed resolution clears the

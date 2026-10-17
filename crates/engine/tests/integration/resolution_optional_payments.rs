@@ -9,6 +9,7 @@ use engine::types::ability::{
     ResolvedAbility, SacrificeCost, SubAbilityLink, TargetFilter, TargetRef,
 };
 use engine::types::actions::{GameAction, ResolutionOptionalPaymentChoice};
+use engine::types::events::GameEvent;
 use engine::types::game_state::{
     AutoMayChoice, LoopDetectSample, MayTriggerAutoChoiceKey, MayTriggerOrigin, WaitingFor,
 };
@@ -16,6 +17,7 @@ use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
+use engine::types::proposed_event::ProposedEvent;
 use engine::types::replacements::ReplacementEvent;
 use engine::types::zones::Zone;
 
@@ -1331,7 +1333,7 @@ fn stale_replacement_prompt_abandons_real_carrier_and_settles_completed_prefix()
         .unwrap()
         .incarnation += 1;
     let stale_incarnation = runner.state().objects[&stale].incarnation;
-    apply(
+    let stale_answer = apply(
         runner.state_mut(),
         P0,
         GameAction::ChooseReplacement { index: 0 },
@@ -1348,13 +1350,69 @@ fn stale_replacement_prompt_abandons_real_carrier_and_settles_completed_prefix()
     assert_eq!(runner.state().players[P0.0 as usize].life, 20);
     assert!(runner.state().active_optional_effect_frame().is_none());
     assert!(runner.state().active_ability_continuation().is_none());
-    assert!(runner.state().resolving_stack_entry.is_none());
     assert!(runner.state().pending_cost_move_resume.is_none());
-    assert!(runner.state().pending_replacement.is_none());
-    assert!(!matches!(
-        runner.state().waiting_for,
-        WaitingFor::ReplacementChoice { .. }
+    // CR 608.2n + CR 616.1: the abandoned instructions leave the spell owing its
+    // final part, whose own move to the graveyard asks Graveyard Warden.
+    let WaitingFor::ReplacementChoice { candidates, .. } = &runner.state().waiting_for else {
+        panic!(
+            "the spell's own move must ask its replacement, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    let pending = runner
+        .state()
+        .pending_replacement
+        .as_ref()
+        .expect("the spell's own move is parked");
+    assert!(matches!(
+        pending.proposed,
+        ProposedEvent::ZoneChange {
+            object_id,
+            to: Zone::Graveyard,
+            ..
+        } if object_id == spell
     ));
+    assert_eq!(
+        pending
+            .candidates
+            .iter()
+            .map(|candidate| candidate.source)
+            .collect::<Vec<_>>(),
+        vec![warden]
+    );
+    let decline = candidates
+        .iter()
+        .position(|candidate| candidate.description == "Decline")
+        .unwrap();
+    let own_move = apply(
+        runner.state_mut(),
+        P0,
+        GameAction::ChooseReplacement { index: decline },
+    )
+    .unwrap();
+    assert_eq!(runner.state().objects[&spell].zone, Zone::Graveyard);
+    assert!(runner.state().players[P0.0 as usize]
+        .graveyard
+        .contains(&spell));
+    assert!(runner.state().resolving_stack_entry.is_none());
+    assert!(!runner
+        .state()
+        .objects
+        .values()
+        .any(|object| object.zone == Zone::Stack));
+    assert_eq!(
+        stale_answer
+            .events
+            .iter()
+            .chain(&own_move.events)
+            .filter(|event| matches!(
+                event,
+                GameEvent::StackResolved { object_id } if *object_id == spell
+            ))
+            .count(),
+        1,
+        "the spell resolves exactly once"
+    );
     runner.advance_until_stack_empty();
     assert_eq!(
         runner.state().players[observer.0 as usize].life,
@@ -2015,4 +2073,110 @@ fn the_resolution_net_finishes_an_owed_spell_above_the_spell_below_before_it_res
     );
     assert!(state.deferred_triggers.is_empty());
     assert_eq!(state.waiting_for, WaitingFor::Priority { player: P0 });
+}
+
+const WHIPPOORWILL: &str = "{G}{G}, {T}: Target creature can't be regenerated this turn. Damage that would be dealt to that creature this turn can't be prevented or dealt instead to another permanent or player. When the creature dies this turn, exile the creature.";
+
+/// CR 603.7b + CR 603.3b: in the pass that finishes the owed spell through the
+/// resolution net, a creature Whippoorwill watches dies to state-based actions.
+/// Its delayed trigger joins the final part's batch, ordered once with the two
+/// graveyard observers, and exiles the creature.
+#[test]
+fn the_resolution_nets_final_part_batch_collects_a_delayed_death_trigger() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let below = scenario
+        .add_spell_to_hand_from_oracle(P0, "Below Draw", false, "Draw a card.")
+        .id();
+    scenario.with_library_top(P0, &["Draw One", "Pad", "Pad Two"]);
+    let spell = scenario
+        .add_spell_to_hand(P0, "Optional Sacrifice", true)
+        .with_mana_cost(ManaCost::generic(0))
+        .with_ability_definition(optional_sacrifice_spell(TargetFilter::Opponent, 1))
+        .id();
+    let archivist = scenario
+        .add_enchantment_from_oracle(P0, "Graveyard Archivist", GRAVEYARD_ARCHIVIST)
+        .id();
+    let drainer = scenario
+        .add_enchantment_from_oracle(
+            P0,
+            "Graveyard Drainer",
+            "Whenever a card is put into your graveyard from anywhere, each opponent loses 1 life.",
+        )
+        .id();
+    let bird = scenario
+        .add_creature_from_oracle(P0, "Whippoorwill", 1, 1, WHIPPOORWILL)
+        .id();
+    let victim = scenario.add_creature(PlayerId(2), "Victim", 2, 2).id();
+    scenario.with_mana_pool(
+        P0,
+        (0..2)
+            .map(|_| ManaUnit::new(ManaType::Green, ObjectId(0), false, vec![]))
+            .collect(),
+    );
+    scenario.add_creature(P1, "Foreign Fodder", 1, 1);
+    let mut runner = scenario.build();
+    runner.activate(bird, 0).target_object(victim).resolve();
+    assert_eq!(
+        runner.state().delayed_triggers.len(),
+        1,
+        "reach guard: Whippoorwill's delayed trigger watches the victim"
+    );
+    runner.cast(below).commit();
+    start_optional_sacrifice_spell(&mut runner, spell);
+    apply(
+        runner.state_mut(),
+        P1,
+        GameAction::ChooseResolutionOptionalPaymentBranch {
+            choice: ResolutionOptionalPaymentChoice::Pay { index: 0 },
+        },
+    )
+    .unwrap();
+    eliminate_player(runner.state_mut(), P1, &mut Vec::new());
+    assert_eq!(
+        runner
+            .state()
+            .owed_spell_final_part()
+            .map(|owed| owed.spell),
+        Some(spell),
+        "reach guard: the instructions are done and the final part is owed"
+    );
+    assert_eq!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { player: P0 }
+    );
+
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&victim)
+        .unwrap()
+        .damage_marked = 2;
+    let others: Vec<PlayerId> = [P1, PlayerId(2)]
+        .into_iter()
+        .filter(|player| !runner.state().players[player.0 as usize].is_eliminated)
+        .collect();
+    runner.state_mut().priority_passes = others.iter().copied().collect();
+    runner.state_mut().priority_pass_count = others.len() as u8;
+    apply(runner.state_mut(), P0, GameAction::PassPriority).unwrap();
+
+    let state = runner.state();
+    assert_eq!(state.objects[&spell].zone, Zone::Graveyard);
+    let WaitingFor::OrderTriggers { player, triggers } = &state.waiting_for else {
+        panic!("P0 orders the batch, got {:?}", state.waiting_for);
+    };
+    assert_eq!(*player, P0);
+    let mut sources: Vec<_> = triggers.iter().map(|summary| summary.source_id).collect();
+    sources.sort();
+    let mut expected = vec![archivist, drainer, bird];
+    expected.sort();
+    assert_eq!(
+        sources, expected,
+        "CR 603.3b: Whippoorwill's delayed trigger is ordered with the batch, once"
+    );
+
+    runner.advance_until_stack_empty();
+    let state = runner.state();
+    assert_eq!(state.objects[&victim].zone, Zone::Exile);
+    assert!(state.delayed_triggers.is_empty());
 }
