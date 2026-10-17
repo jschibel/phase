@@ -217,7 +217,10 @@ export class NativeEngineVersionMismatchError extends Error {
  *      see PROTOCOL_VERSION's own `/// 145` entry in
  *      crates/lobby-broker/src/protocol.rs. A v144 peer drops both silently; the
  *      exact-match version check at connect refuses the pairing. Wire 127 moves
- *      with it.
+ *      with it. Required ExertChoice.permission and typed remaining entries bind
+ *      each optional cost; attack_permission receipts link only its own payoff.
+ *      Definitions carry attack_cost_condition / SourceExertedThisTurn; unbound
+ *      persisted prompts are refused.
  * 144 — One-time boons (#7495): new Effect.CreateBoon / Effect.NoteNumber tags,
  *       HasBoon conditions, and WaitingFor.ChooseTokenHost; the perpetual P/T
  *       edit retypes power_delta/toughness_delta to required QuantityExpr

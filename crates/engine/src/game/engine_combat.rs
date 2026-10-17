@@ -1,9 +1,11 @@
 use crate::game::combat::{AttackTarget, DamageAssignment, DamageTarget, TrampleKind};
-use crate::types::ability::{CostPaidObjectSnapshot, TargetRef};
+use crate::types::ability::{
+    CostPaidObjectSnapshot, TargetFilter, TargetRef, TriggerDefinition, TriggerDefinitionRef,
+};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
     CombatDamageAssignmentMode, CombatTaxContext, CombatTaxPending, DamageSlot, GameState,
-    WaitingFor,
+    PendingAttackExert, WaitingFor,
 };
 use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
@@ -77,7 +79,8 @@ fn continue_declare_attackers_after_commit(
         state.pending_attack_trigger_events = events[declaration_start..].to_vec();
         return Ok(WaitingFor::ExertChoice {
             player,
-            attacker: *first,
+            attacker: first.attacker,
+            permission: first.permission.clone(),
             remaining: rest.to_vec(),
         });
     }
@@ -91,25 +94,81 @@ fn continue_declare_attackers_after_commit(
     finish_declare_attackers(state, events, attacks.is_empty())
 }
 
-/// CR 701.43d: Attackers carrying an "exert as it attacks" ability (a
-/// `TriggerMode::Exerted` triggered ability) that have not yet been exerted this
-/// turn, in declaration order. These attackers are offered the optional exert
-/// cost per CR 508.1g.
-fn exert_candidates(state: &GameState, attacks: &[(ObjectId, AttackTarget)]) -> Vec<ObjectId> {
+/// CR 508.1g–j + CR 701.43b: Snapshot each eligible ability occurrence before
+/// paying any optional cost. An earlier exert does not prohibit another exert;
+/// only the permission's own pre-payment condition can do that.
+fn exert_candidates(
+    state: &GameState,
+    attacks: &[(ObjectId, AttackTarget)],
+) -> Vec<PendingAttackExert> {
     attacks
         .iter()
-        .map(|(attacker_id, _)| *attacker_id)
-        .filter(|attacker_id| {
-            !state.exerted_this_turn.contains(attacker_id)
-                && state.objects.get(attacker_id).is_some_and(|obj| {
-                    super::functioning_abilities::active_trigger_definitions(state, obj).any(
-                        |active| {
-                            active.definition.mode == crate::types::triggers::TriggerMode::Exerted
-                        },
-                    )
+        .flat_map(|(attacker, _)| {
+            state
+                .objects
+                .get(attacker)
+                .into_iter()
+                .flat_map(move |object| {
+                    super::functioning_abilities::active_trigger_definitions(state, object)
+                        .filter(move |active| {
+                            is_attack_exert_permission(active.definition)
+                                && active.definition.attack_cost_condition.as_ref().is_none_or(
+                                    |condition| {
+                                        super::layers::evaluate_condition(
+                                            state,
+                                            condition,
+                                            object.controller,
+                                            *attacker,
+                                        )
+                                    },
+                                )
+                        })
+                        .map(move |active| PendingAttackExert {
+                            attacker: *attacker,
+                            permission: active.definition_ref,
+                        })
                 })
         })
         .collect()
+}
+
+fn is_attack_exert_permission(definition: &TriggerDefinition) -> bool {
+    definition.mode == crate::types::triggers::TriggerMode::Exerted
+        && definition.valid_card == Some(TargetFilter::SelfRef)
+        && definition.valid_target.is_none()
+}
+
+/// CR 400.7 + CR 508.1g: A queued cost cannot be rebound to a replacement source
+/// or a different functioning occurrence. Its pre-payment gate is already latched.
+pub(super) fn validate_attack_exert_permission(
+    state: &GameState,
+    player: PlayerId,
+    attacker: ObjectId,
+    permission: &TriggerDefinitionRef,
+) -> Result<(), EngineError> {
+    let valid = state.objects.get(&attacker).is_some_and(|object| {
+        object.zone == Zone::Battlefield
+            && object.controller == player
+            && state.combat.as_ref().is_some_and(|combat| {
+                combat
+                    .attackers
+                    .iter()
+                    .any(|entry| entry.object_id == attacker)
+            })
+            && super::functioning_abilities::active_trigger_definitions(state, object).any(
+                |active| {
+                    active.definition_ref == *permission
+                        && is_attack_exert_permission(active.definition)
+                },
+            )
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(EngineError::InvalidAction(
+            "Attack exert permission is no longer current".into(),
+        ))
+    }
 }
 
 /// CR 702.154b + CR 702.154d: each Enlist instance represents an independent
@@ -207,6 +266,7 @@ fn enlist_eligible_targets(state: &GameState, attacker: ObjectId) -> Vec<ObjectI
 pub(super) fn apply_attack_exert(
     state: &mut GameState,
     attacker: ObjectId,
+    permission: TriggerDefinitionRef,
     events: &mut Vec<GameEvent>,
 ) {
     let Some(obj) = state.objects.get(&attacker) else {
@@ -221,6 +281,7 @@ pub(super) fn apply_attack_exert(
         attacker,
         controller,
         crate::types::events::ExertOrigin::AttackCost,
+        Some(permission),
         events,
     )
     .expect("declared attacker must remain a live exact object");

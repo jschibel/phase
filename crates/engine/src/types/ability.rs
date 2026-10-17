@@ -12728,6 +12728,8 @@ pub enum StaticCondition {
     /// yet" (Palladia-Mors, the Ruiner; Karakyk Guardian). The "hasn't" negation
     /// wraps this in `StaticCondition::Not`.
     SourceHasDealtDamage,
+    /// CR 701.43b: The source has been exerted during the current turn.
+    SourceExertedThisTurn,
     /// CR 601.2 + CR 611.3a: True when the source permanent was cast (its
     /// `cast_from_zone` is `Some`). `zone: None` = cast from any zone; `Some(z)`
     /// = cast specifically from zone `z`. Used for "as long as it was cast"
@@ -12951,6 +12953,7 @@ impl StaticCondition {
             | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
             | StaticCondition::SourceEnteredThisTurn
             | StaticCondition::SourceHasDealtDamage
+            | StaticCondition::SourceExertedThisTurn
             | StaticCondition::WasCast { .. }
             | StaticCondition::IsRingBearer
             | StaticCondition::RingLevelAtLeast { .. }
@@ -13062,6 +13065,7 @@ impl StaticCondition {
             | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
             | StaticCondition::SourceEnteredThisTurn
             | StaticCondition::SourceHasDealtDamage
+            | StaticCondition::SourceExertedThisTurn
             | StaticCondition::WasCast { .. }
             | StaticCondition::IsRingBearer
             | StaticCondition::RingLevelAtLeast { .. }
@@ -13296,6 +13300,7 @@ impl StaticCondition {
             | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
             | StaticCondition::SourceEnteredThisTurn
             | StaticCondition::SourceHasDealtDamage
+            | StaticCondition::SourceExertedThisTurn
             | StaticCondition::WasCast { .. }
             | StaticCondition::IsRingBearer
             | StaticCondition::RingLevelAtLeast { .. }
@@ -13415,6 +13420,7 @@ impl StaticCondition {
             | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
             | StaticCondition::SourceEnteredThisTurn
             | StaticCondition::SourceHasDealtDamage
+            | StaticCondition::SourceExertedThisTurn
             | StaticCondition::WasCast { .. }
             | StaticCondition::IsRingBearer
             | StaticCondition::RingLevelAtLeast { .. }
@@ -31823,6 +31829,10 @@ pub struct TriggerDefinition {
     pub constraint: Option<TriggerConstraint>,
     #[serde(default)]
     pub condition: Option<TriggerCondition>,
+    /// CR 508.1g: Pre-payment eligibility of the linked optional attack cost.
+    /// Unlike an intervening-if, this is not rechecked after payment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attack_cost_condition: Option<StaticCondition>,
     /// Optional filter for counter-related trigger modes (CR 714.2b).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub counter_filter: Option<CounterTriggerFilter>,
@@ -32521,6 +32531,7 @@ impl TriggerDefinition {
             description: None,
             constraint: None,
             condition: None,
+            attack_cost_condition: None,
             counter_filter: None,
             saga_chapter: None,
             unless_pay: None,
@@ -32622,6 +32633,11 @@ impl TriggerDefinition {
 
     pub fn condition(mut self, condition: TriggerCondition) -> Self {
         self.condition = Some(condition);
+        self
+    }
+
+    pub fn attack_cost_condition(mut self, condition: StaticCondition) -> Self {
+        self.attack_cost_condition = Some(condition);
         self
     }
 
@@ -40757,6 +40773,7 @@ mod tests {
             description: Some("When ~ dies, draw a card.".to_string()),
             constraint: None,
             condition: None,
+            attack_cost_condition: None,
             counter_filter: None,
             saga_chapter: None,
             unless_pay: None,
@@ -44574,6 +44591,7 @@ mod static_condition_traversal_tests {
             StaticCondition::RecipientAttackingOwnerTarget {
                 target: crate::types::triggers::AttackTargetFilter::Player,
             },
+            StaticCondition::SourceExertedThisTurn,
             StaticCondition::SourceIsTapped,
             StaticCondition::None,
         ] {

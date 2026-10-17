@@ -7,7 +7,7 @@ use crate::types::ability::AttachmentReferent;
 
 use super::ability::{
     AbilityTag, AttachmentKind, CostPaidObjectSnapshot, EffectKind, FilterProp, TargetFilter,
-    TargetRef, ThisWayCause, TypeFilter, TypedFilter,
+    TargetRef, ThisWayCause, TriggerDefinitionRef, TypeFilter, TypedFilter,
 };
 use super::card::PrintedCardRef;
 use super::card_type::{CardType, CoreType, Supertype};
@@ -1166,6 +1166,10 @@ pub enum GameEvent {
         /// fact, not a guess.
         #[serde(default)]
         origin: ExertOrigin,
+        /// CR 607.2h: Exact optional attack permission whose cost was paid.
+        /// Historical completed events retain their original unbound meaning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attack_permission: Option<TriggerDefinitionRef>,
     },
     /// CR 702.154c: A creature enlisted another creature as it attacked. Fires
     /// the linked `TriggerMode::Enlisted` "when you do" trigger and carries the

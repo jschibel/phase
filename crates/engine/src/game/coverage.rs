@@ -5147,6 +5147,7 @@ fn fmt_static_condition(cond: &StaticCondition) -> String {
         }
         SC::SourceEnteredThisTurn => "source entered this turn".into(),
         SC::SourceHasDealtDamage => "source has dealt damage".into(),
+        SC::SourceExertedThisTurn => "source has been exerted this turn".into(),
         SC::WasCast { zone } => match zone {
             Some(z) => format!("cast from {}", fmt_zone(z)),
             None => "was cast".into(),
@@ -9923,6 +9924,9 @@ fn extract_trigger_features(
     if trigger.condition.is_some() {
         emit_structural(features, StructuralFeature::TriggerCondition);
     }
+    if let Some(condition) = &trigger.attack_cost_condition {
+        extract_static_condition_features(condition, features);
+    }
 }
 
 fn extract_effect_static_carrier_features(
@@ -10643,6 +10647,7 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         }
         StaticCondition::SourceEnteredThisTurn => ("SourceEnteredThisTurn", Handled),
         StaticCondition::SourceHasDealtDamage => ("SourceHasDealtDamage", Handled),
+        StaticCondition::SourceExertedThisTurn => ("SourceExertedThisTurn", Handled),
         StaticCondition::WasCast { .. } => ("WasCast", Handled),
         StaticCondition::IsRingBearer => ("IsRingBearer", Handled),
         StaticCondition::RingLevelAtLeast { .. } => ("RingLevelAtLeast", Handled),

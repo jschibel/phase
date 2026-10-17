@@ -20,7 +20,9 @@
 
 use engine::game::combat::AttackTarget;
 use engine::game::scenario::{CastOutcome, GameRunner, GameScenario, P0, P1};
-use engine::types::ability::{AbilityCost, ContinuousModification, TargetFilter};
+use engine::types::ability::{
+    AbilityCost, ContinuousModification, TargetFilter, TriggerDefinitionRef,
+};
 use engine::types::actions::GameAction;
 use engine::types::events::{ExertOrigin, GameEvent};
 use engine::types::game_state::{
@@ -28,6 +30,7 @@ use engine::types::game_state::{
     PersistedRestoreFinalization, WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
+use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
@@ -42,7 +45,8 @@ const ARENA_OF_GLORY: &str = "This land enters tapped unless you control a Mount
 {R}, {T}, Exert this land: Add {R}{R}. If any of that mana is spent on a creature spell, \
 it gains haste until end of turn. (An exerted permanent won't untap during your next untap step.)";
 const FERVENT_PAINCASTER: &str = "{T}: This creature deals 1 damage to target player or \
-planeswalker.\n{T}, Exert this creature: It deals 1 damage to target creature.";
+planeswalker.\n{T}, Exert this creature: It deals 1 damage to target creature. \
+(An exerted creature won't untap during your next untap step.)";
 const RESOLUTE_SURVIVORS: &str = "You may exert this creature as it attacks. (It won't untap \
 during your next untap step.)\nWhenever you exert a creature, this creature deals 1 damage to \
 each opponent and you gain 1 life.";
@@ -586,13 +590,25 @@ fn autopay_plain_row_does_not_exert() {
     assert_eq!(outcome.life_delta(P1), 0);
 }
 
-const AGATHAS_SOUL_CAULDRON: &str = "Creatures you control with +1/+1 counters on them have all \
-activated abilities of all creature cards exiled with Agatha's Soul Cauldron.";
+const AGATHAS_SOUL_CAULDRON: &str = "You may spend mana as though it were mana of any color to activate abilities of creatures you control.\n\
+Creatures you control with +1/+1 counters on them have all activated abilities of all creature cards exiled with Agatha's Soul Cauldron.\n\
+{T}: Exile target card from a graveyard. When a creature card is exiled this way, put a +1/+1 counter on target creature you control.";
+const COMBAT_CELEBRANT: &str = "If this creature hasn't been exerted this turn, you may exert it as it attacks. When you do, untap all other creatures you control and after this phase, there is an additional combat phase. (An exerted creature won't untap during your next untap step.)";
 
 /// CR 701.43d + CR 607.2h: Bitterblade Warrior (a +1/+1 counter on it) holds
 /// Fervent Paincaster's `{T}, Exert` activation through Agatha's Soul Cauldron.
 /// Returns the runner, the Warrior and an opposing creature to aim it at.
 fn warrior_with_granted_exert_activation(with_survivors: bool) -> (GameRunner, ObjectId, ObjectId) {
+    let (runner, warrior, bear, _) =
+        granted_exert_scenario("Bitterblade Warrior", BITTERBLADE_WARRIOR, with_survivors);
+    (runner, warrior, bear)
+}
+
+fn granted_exert_scenario(
+    name: &str,
+    oracle: &str,
+    with_survivors: bool,
+) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let cauldron = scenario
@@ -601,14 +617,21 @@ fn warrior_with_granted_exert_activation(with_survivors: bool) -> (GameRunner, O
     let mut paincaster = scenario.add_creature_to_exile(P0, "Fervent Paincaster", 2, 2);
     paincaster.from_oracle_text(FERVENT_PAINCASTER);
     let paincaster_card = paincaster.id();
-    let mut warrior_builder =
-        scenario.add_creature_from_oracle(P0, "Bitterblade Warrior", 2, 2, BITTERBLADE_WARRIOR);
+    let mut warrior_builder = scenario.add_creature_from_oracle(P0, name, 2, 2, oracle);
     warrior_builder.with_plus_counters(1);
     let warrior = warrior_builder.id();
     if with_survivors {
         scenario.add_creature_from_oracle(P0, "Resolute Survivors", 3, 3, RESOLUTE_SURVIVORS);
     }
     let bear = scenario.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    let vitalize = scenario
+        .add_spell_to_hand_from_oracle(P0, "Vitalize", false, "Untap all creatures you control.")
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Green],
+            generic: 0,
+        })
+        .id();
+    scenario.add_basic_land(P0, ManaColor::Green);
     let mut runner = scenario.build();
     runner.state_mut().exile_links.push(ExileLink {
         exiled_id: paincaster_card,
@@ -618,7 +641,7 @@ fn warrior_with_granted_exert_activation(with_survivors: bool) -> (GameRunner, O
     runner.state_mut().layers_dirty.mark_full();
     engine::game::layers::evaluate_layers(runner.state_mut());
     untap(&mut runner, &[warrior]);
-    (runner, warrior, bear)
+    (runner, warrior, bear, vitalize)
 }
 
 /// Activate the granted `{T}, Exert` ability on the Warrior, aimed at `bear`.
@@ -755,6 +778,7 @@ fn legacy_exert_event_shape_restores_without_inventing_an_actor() {
             object_id: warrior,
             player: None,
             origin: ExertOrigin::AttackCost,
+            attack_permission: None,
         }]
     );
 }
@@ -768,6 +792,7 @@ fn current_exert_event_shape_restores_with_its_actor_and_origin() {
         object_id: warrior,
         player: Some(P0),
         origin: ExertOrigin::AbilityCost,
+        attack_permission: None,
     };
     let value = serde_json::to_value(&current).unwrap();
 
@@ -775,4 +800,450 @@ fn current_exert_event_shape_restores_with_its_actor_and_origin() {
         .expect("a current exert event must restore");
 
     assert_eq!(restored.pending_attack_trigger_events, vec![current]);
+}
+
+fn cast_vitalize_after_activation(runner: &mut GameRunner, source: ObjectId, vitalize: ObjectId) {
+    assert!(runner.state().objects[&source].tapped);
+    assert!(runner.state().exerted_this_turn.contains(&source));
+    runner.cast(vitalize).resolve();
+    assert_eq!(runner.state().objects[&vitalize].zone, Zone::Graveyard);
+    assert!(!runner.state().objects[&source].tapped);
+    // CR 701.43b: An ordinary untap does not erase exertion history.
+    assert!(runner.state().exerted_this_turn.contains(&source));
+    assert!(runner.state().stack.is_empty());
+}
+
+fn declare_exert_attacker(runner: &mut GameRunner, attacker: ObjectId) {
+    runner.advance_to_combat();
+    assert_eq!(runner.waiting_for_kind(), "DeclareAttackers");
+    runner
+        .declare_attackers(&[(attacker, AttackTarget::Player(P1))])
+        .expect("legal attack");
+    assert!(runner
+        .state()
+        .combat
+        .as_ref()
+        .unwrap()
+        .attackers
+        .iter()
+        .any(|entry| entry.object_id == attacker));
+}
+
+fn current_permission(runner: &GameRunner) -> TriggerDefinitionRef {
+    match &runner.state().waiting_for {
+        WaitingFor::ExertChoice { permission, .. } => permission.clone(),
+        waiting => panic!("expected attack exert permission, got {waiting:?}"),
+    }
+}
+
+fn attack_receipts(events: &[GameEvent]) -> Vec<TriggerDefinitionRef> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            GameEvent::CreatureExerted {
+                origin: ExertOrigin::AttackCost,
+                attack_permission: Some(permission),
+                ..
+            } => Some(permission.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// CR 701.43b + CR 508.1g: An unconditional permission remains available after
+/// an exert activation followed by a real untap spell in the same game.
+#[test]
+fn granted_exert_then_vitalize_preserves_unconditional_attack_permission() {
+    for exert in [false, true] {
+        let (mut runner, warrior, bear, vitalize) =
+            granted_exert_scenario("Bitterblade Warrior", BITTERBLADE_WARRIOR, false);
+        let power = runner.state().objects[&warrior].power.unwrap();
+        let ability_events = activate_granted_exert(&mut runner, warrior, bear);
+        assert_eq!(
+            first_exert_origin(&ability_events),
+            Some(ExertOrigin::AbilityCost)
+        );
+        assert!(attack_receipts(&ability_events).is_empty());
+        assert_eq!(runner.state().objects[&warrior].power, Some(power));
+        assert!(!runner.state().objects[&warrior].has_keyword(&Keyword::Deathtouch));
+        cast_vitalize_after_activation(&mut runner, warrior, vitalize);
+        declare_exert_attacker(&mut runner, warrior);
+        let permission = current_permission(&runner);
+        let events = runner
+            .act(GameAction::ChooseExert { exert })
+            .expect("answer permission")
+            .events;
+        runner.advance_until_stack_empty();
+        assert!(!matches!(
+            runner.state().waiting_for,
+            WaitingFor::ExertChoice { .. }
+        ));
+        assert!(runner.state().stack.is_empty());
+        if exert {
+            assert_eq!(attack_receipts(&events), vec![permission]);
+            assert_eq!(runner.state().objects[&warrior].power, Some(power + 1));
+            assert!(runner.state().objects[&warrior].has_keyword(&Keyword::Deathtouch));
+        } else {
+            assert!(exerted_events(&events).is_empty());
+            assert_eq!(runner.state().objects[&warrior].power, Some(power));
+            assert!(!runner.state().objects[&warrior].has_keyword(&Keyword::Deathtouch));
+        }
+    }
+}
+
+/// CR 603.4 + CR 701.43b: Celebrant's explicit gate is a permission restriction,
+/// not an intervening-if that would counter its own payoff after payment.
+#[test]
+fn celebrant_gate_restricts_payment_but_not_the_paid_trigger() {
+    for prior_exert in [false, true] {
+        let (mut runner, celebrant, bear, vitalize) =
+            granted_exert_scenario("Combat Celebrant", COMBAT_CELEBRANT, false);
+        if prior_exert {
+            activate_granted_exert(&mut runner, celebrant, bear);
+            cast_vitalize_after_activation(&mut runner, celebrant, vitalize);
+        }
+        declare_exert_attacker(&mut runner, celebrant);
+        if prior_exert {
+            assert!(!matches!(
+                runner.state().waiting_for,
+                WaitingFor::ExertChoice { .. }
+            ));
+            assert!(runner.state().extra_phases.is_empty());
+            assert_eq!(cant_untap_markers(&runner, celebrant), 1);
+        } else {
+            let permission = current_permission(&runner);
+            let events = runner
+                .act(GameAction::ChooseExert { exert: true })
+                .unwrap()
+                .events;
+            assert_eq!(attack_receipts(&events), vec![permission]);
+            runner.advance_until_stack_empty();
+            assert_eq!(runner.state().extra_phases.len(), 1);
+            assert!(runner.state().exerted_this_turn.contains(&celebrant));
+        }
+        assert!(runner.state().stack.is_empty());
+    }
+}
+
+/// CR 607.2h: A conditional and an unconditional permission on one recipient
+/// retain independent identities. The generic observer sees each actual exert.
+#[test]
+fn mixed_attack_permissions_pay_only_the_selected_linked_occurrence() {
+    let mixed = format!("{COMBAT_CELEBRANT}\n{BITTERBLADE_WARRIOR}");
+    for prior_exert in [false, true] {
+        let (mut runner, source, bear, vitalize) =
+            granted_exert_scenario("Mixed permissions", &mixed, true);
+        let power = runner.state().objects[&source].power.unwrap();
+        if prior_exert {
+            activate_granted_exert(&mut runner, source, bear);
+            runner.advance_until_stack_empty();
+            assert_eq!(life(&runner, P1), 19);
+            cast_vitalize_after_activation(&mut runner, source, vitalize);
+        }
+        declare_exert_attacker(&mut runner, source);
+        if !prior_exert {
+            let declined = current_permission(&runner);
+            let events = runner
+                .act(GameAction::ChooseExert { exert: false })
+                .unwrap()
+                .events;
+            assert!(exerted_events(&events).is_empty());
+            assert_ne!(current_permission(&runner), declined);
+        }
+        let permission = current_permission(&runner);
+        if let WaitingFor::ExertChoice { remaining, .. } = &runner.state().waiting_for {
+            assert!(
+                remaining.is_empty(),
+                "the restricted permission was never queued"
+            );
+        }
+        let events = runner
+            .act(GameAction::ChooseExert { exert: true })
+            .unwrap()
+            .events;
+        assert_eq!(attack_receipts(&events), vec![permission]);
+        runner.advance_until_stack_empty();
+        assert!(runner.state().stack.is_empty());
+        assert!(!matches!(
+            runner.state().waiting_for,
+            WaitingFor::ExertChoice { .. }
+        ));
+        assert_eq!(runner.state().objects[&source].power, Some(power + 1));
+        assert!(runner.state().objects[&source].has_keyword(&Keyword::Deathtouch));
+        assert!(
+            runner.state().extra_phases.is_empty(),
+            "an unselected linked payoff must not fire"
+        );
+        assert_eq!(life(&runner, P1), if prior_exert { 18 } else { 19 });
+        assert_eq!(life(&runner, P0), if prior_exert { 22 } else { 21 });
+    }
+}
+
+/// CR 508.1g–j + CR 607.2h: Both initially eligible costs remain eligible after
+/// the first payment, even when their definitions have identical bodies.
+#[test]
+fn duplicate_conditional_permissions_latch_before_payment_and_restore_exactly() {
+    let duplicate = format!("{COMBAT_CELEBRANT}\n{COMBAT_CELEBRANT}");
+    let (mut runner, source, _, _) =
+        granted_exert_scenario("Two Celebrant permissions", &duplicate, false);
+    declare_exert_attacker(&mut runner, source);
+    let first = current_permission(&runner);
+    let events = runner
+        .act(GameAction::ChooseExert { exert: true })
+        .unwrap()
+        .events;
+    assert_eq!(attack_receipts(&events), vec![first.clone()]);
+    let second = current_permission(&runner);
+    assert_ne!(
+        first, second,
+        "identical payloads still have different occurrence authority"
+    );
+    assert!(runner.state().exerted_this_turn.contains(&source));
+    let restored = restore_after(&runner, |_| {}).expect("current bound queue restores");
+    assert_eq!(
+        attack_receipts(&restored.pending_attack_trigger_events),
+        vec![first]
+    );
+    let mut runner = GameRunner::from_state(restored);
+    assert_eq!(current_permission(&runner), second);
+    let events = runner
+        .act(GameAction::ChooseExert { exert: true })
+        .unwrap()
+        .events;
+    assert_eq!(attack_receipts(&events), vec![second]);
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        runner.state().extra_phases.len(),
+        2,
+        "one linked payoff per payment, never broadcast"
+    );
+    assert!(runner.state().stack.is_empty());
+    assert!(!matches!(
+        runner.state().waiting_for,
+        WaitingFor::ExertChoice { .. }
+    ));
+}
+
+/// Restore-only hostile fixtures: ordinary gameplay gives no priority during
+/// optional attack-cost selection. A stale prompt cannot become a fresh grant.
+#[test]
+fn stale_attack_permission_never_rebinds_to_a_new_source_or_slot() {
+    for change_source in [false, true] {
+        let duplicate = format!("{BITTERBLADE_WARRIOR}\n{BITTERBLADE_WARRIOR}");
+        let (mut runner, source, _, _) =
+            granted_exert_scenario("Duplicate Warrior", &duplicate, false);
+        declare_exert_attacker(&mut runner, source);
+        let original = current_permission(&runner);
+        let restored = restore_after(&runner, |_| {}).expect("current prompt restores");
+        let mut runner = GameRunner::from_state(restored);
+        let object = runner.state_mut().objects.get_mut(&source).unwrap();
+        if change_source {
+            // CR 400.7: Same storage ID, different all-zone incarnation.
+            object.incarnation += 1;
+        } else {
+            // Removing the selected entry shifts the identical surviving payload
+            // into the same display slot; its occurrence remains distinct.
+            object
+                .trigger_definitions
+                .retain(|entry| entry.occurrence != original.occurrence);
+        }
+        assert!(runner.act(GameAction::ChooseExert { exert: true }).is_err());
+        assert!(runner.state().exerted_this_turn.is_empty());
+        assert_eq!(current_permission(&runner), original);
+    }
+}
+
+/// CR 508.1g: Neither an empty declaration nor a generic exert observer grants
+/// a vanilla attacker an optional cost it does not actually have.
+#[test]
+fn generic_observer_does_not_manufacture_an_attack_permission() {
+    for mode in 0..3 {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let observer_only = "Whenever you exert a creature, this creature deals 1 damage to each opponent and you gain 1 life.";
+        let source = scenario
+            .add_creature_from_oracle(P0, "Observer only", 3, 3, observer_only)
+            .id();
+        let vanilla = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+        let attacker = if mode == 0 { source } else { vanilla };
+        let mut runner = scenario.build();
+        runner.advance_to_combat();
+        let attacks = if mode == 2 {
+            vec![]
+        } else {
+            vec![(attacker, AttackTarget::Player(P1))]
+        };
+        let events = runner
+            .declare_attackers(&attacks)
+            .expect("legal declaration")
+            .events;
+        assert!(!matches!(
+            runner.state().waiting_for,
+            WaitingFor::ExertChoice { .. }
+        ));
+        assert!(exerted_events(&events).is_empty());
+        assert_eq!(life(&runner, P1), 20);
+        if mode != 2 {
+            assert!(runner
+                .state()
+                .combat
+                .as_ref()
+                .unwrap()
+                .attackers
+                .iter()
+                .any(|entry| entry.object_id == attacker));
+        }
+    }
+}
+
+#[test]
+fn legacy_unbound_exert_prompts_are_rejected_in_raw_and_trusted_saves() {
+    let duplicate = format!("{BITTERBLADE_WARRIOR}\n{BITTERBLADE_WARRIOR}");
+    for oracle in [BITTERBLADE_WARRIOR, duplicate.as_str()] {
+        let (mut runner, source, _, _) =
+            granted_exert_scenario("Permission restore", oracle, false);
+        declare_exert_attacker(&mut runner, source);
+        let current = restore_after(&runner, |_| {}).expect("positive bound prompt restore");
+        let mut restored = GameRunner::from_state(current);
+        restored
+            .act(GameAction::ChooseExert { exert: false })
+            .unwrap();
+        if matches!(restored.state().waiting_for, WaitingFor::ExertChoice { .. }) {
+            restored
+                .act(GameAction::ChooseExert { exert: false })
+                .unwrap();
+        }
+        assert!(!matches!(
+            restored.state().waiting_for,
+            WaitingFor::ExertChoice { .. }
+        ));
+        for trusted in [false, true] {
+            for corruption in 0..5 {
+                let mut json = if trusted {
+                    serde_json::to_value(PersistedGameState::capture(runner.state().clone()))
+                        .unwrap()
+                } else {
+                    serde_json::to_value(runner.state()).unwrap()
+                };
+                let state = if trusted {
+                    &mut json["state"]
+                } else {
+                    &mut json
+                };
+                let prompt = &mut state["waiting_for"]["data"];
+                match corruption {
+                    0 => {
+                        prompt.as_object_mut().unwrap().remove("permission");
+                    }
+                    1 => prompt["permission"] = serde_json::Value::Null,
+                    2 => prompt["remaining"] = serde_json::json!([source]),
+                    3 => prompt["remaining"] = serde_json::json!([{ "attacker": source }]),
+                    4 => {
+                        prompt["remaining"] =
+                            serde_json::json!([{ "attacker": source, "permission": null }])
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    serde_json::from_value::<WaitingFor>(state["waiting_for"].clone()).is_err()
+                );
+                let error = serde_json::from_value::<PersistedGameState>(json)
+                    .expect_err("unbound pending cost must not publish")
+                    .to_string();
+                assert!(
+                    error.contains("exact attack permission authority"),
+                    "{error}"
+                );
+            }
+        }
+    }
+}
+
+/// CR 607.2h: Paying one attacker's permission cannot pay the other attacker's
+/// identical-looking permission, even though both trigger on exert events.
+#[test]
+fn separate_attackers_keep_their_own_permission_receipts() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let first = scenario
+        .add_creature_from_oracle(P0, "Bitterblade Warrior", 2, 2, BITTERBLADE_WARRIOR)
+        .id();
+    let second = scenario
+        .add_creature_from_oracle(P0, "Bitterblade Warrior", 2, 2, BITTERBLADE_WARRIOR)
+        .id();
+    let mut runner = scenario.build();
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[
+            (first, AttackTarget::Player(P1)),
+            (second, AttackTarget::Player(P1)),
+        ])
+        .unwrap();
+    let first_permission = current_permission(&runner);
+    let restored = restore_after(&runner, |_| {}).expect("bound remaining queue survives restore");
+    let mut runner = GameRunner::from_state(restored);
+    assert_eq!(current_permission(&runner), first_permission);
+    let events = runner
+        .act(GameAction::ChooseExert { exert: true })
+        .unwrap()
+        .events;
+    assert_eq!(attack_receipts(&events), vec![first_permission]);
+    let second_permission = current_permission(&runner);
+    assert_ne!(second_permission.source.object_id, first);
+    assert_eq!(second_permission.source.object_id, second);
+    let events = runner
+        .act(GameAction::ChooseExert { exert: false })
+        .unwrap()
+        .events;
+    assert!(exerted_events(&events).is_empty());
+    runner.advance_until_stack_empty();
+    assert_eq!(runner.state().objects[&first].power, Some(3));
+    assert_eq!(runner.state().objects[&second].power, Some(2));
+    assert!(!runner.state().objects[&second].has_keyword(&Keyword::Deathtouch));
+    assert!(runner.state().stack.is_empty());
+    assert!(!matches!(
+        runner.state().waiting_for,
+        WaitingFor::ExertChoice { .. }
+    ));
+}
+
+/// Historical completed events retain their old linked-trigger meaning. An
+/// absent actor still cannot satisfy an observer's "you exert" player filter.
+#[test]
+fn historical_exert_events_preserve_linked_matching_without_inventing_an_actor() {
+    for actor_present in [false, true] {
+        let (mut runner, source, _, _) =
+            granted_exert_scenario("Bitterblade Warrior", BITTERBLADE_WARRIOR, true);
+        let power = runner.state().objects[&source].power.unwrap();
+        declare_exert_attacker(&mut runner, source);
+        let mut event =
+            serde_json::json!({"type": "CreatureExerted", "data": {"object_id": source}});
+        if actor_present {
+            event["data"]["player"] = serde_json::to_value(P0).unwrap();
+        }
+        let restored = restore_after(&runner, |json| push_pending_attack_event(json, event))
+            .expect("completed historical event restores");
+        let mut runner = GameRunner::from_state(restored);
+        let events = runner
+            .act(GameAction::ChooseExert { exert: false })
+            .unwrap()
+            .events;
+        assert!(
+            exerted_events(&events).is_empty(),
+            "no current payment was made"
+        );
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            runner.state().objects[&source].power,
+            Some(power + 1),
+            "historical receipt-less attack event still matches its linked trigger"
+        );
+        assert_eq!(life(&runner, P1), if actor_present { 19 } else { 20 });
+        assert_eq!(life(&runner, P0), if actor_present { 21 } else { 20 });
+        assert!(runner.state().stack.is_empty());
+        assert!(!matches!(
+            runner.state().waiting_for,
+            WaitingFor::ExertChoice { .. }
+        ));
+    }
 }

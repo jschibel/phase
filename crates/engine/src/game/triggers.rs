@@ -14573,6 +14573,24 @@ fn check_trigger_constraint_with_ref(
 ) -> bool {
     use crate::types::ability::TriggerConstraint;
 
+    // CR 607.2h: A linked payoff observes only its own optional-cost payment.
+    // Generic actor-filtered observers still see every exert, and completed
+    // historical events without a receipt retain their saved interpretation.
+    if trig_def.mode == TriggerMode::Exerted
+        && trig_def.valid_target.is_none()
+        && trig_def.valid_card == Some(TargetFilter::SelfRef)
+    {
+        if let Some(GameEvent::CreatureExerted {
+            attack_permission: Some(permission),
+            ..
+        }) = event
+        {
+            if definition_ref != Some(permission) {
+                return false;
+            }
+        }
+    }
+
     let constraint = match &trig_def.constraint {
         Some(c) => c,
         None => return true, // No constraint — always fires

@@ -68,7 +68,11 @@ pub struct TournamentRequestId(pub u64);
 ///      attack exert a "when you do" trigger is linked to, and it never saw
 ///      an exert as a cost at all. Full-game peers and P2P move in lockstep
 ///      (wire 127). A pre-145 save holding the event restores with no actor and
-///      the attack-cost origin (the only exert it recorded).
+///      the attack-cost origin (the only exert it recorded). Exact attack costs
+///      now carry `attack_permission` receipts and required `ExertChoice.permission`
+///      bindings, including each typed remaining queue entry. Definitions carry
+///      `attack_cost_condition` / `SourceExertedThisTurn`; unbound saved prompts
+///      are refused rather than rebound to current ability occurrences.
 ///
 /// 144 — One-time boons (#7495) add serialized `GameState` tags, and the
 ///      perpetual P/T edit is retyped. `Effect::CreateBoon` (with its granted

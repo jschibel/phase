@@ -1911,6 +1911,7 @@ pub(super) fn match_exerted(
         object_id,
         player,
         origin,
+        ..
     } = event
     else {
         return false;

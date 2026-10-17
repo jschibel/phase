@@ -722,6 +722,13 @@ mod tests {
             step_bound_phase(&WaitingFor::ExertChoice {
                 player: PlayerId(0),
                 attacker: ObjectId(1),
+                permission: crate::types::ability::TriggerDefinitionRef {
+                    source: crate::types::identifiers::ObjectIncarnationRef::of(ObjectId(1), 0),
+                    occurrence: crate::types::ability::TriggerDefinitionOccurrenceRef::Printed {
+                        base_set: crate::types::ability::TriggerBaseSetInstanceRef::INITIAL,
+                        printed_index: 0,
+                    },
+                },
                 remaining: Vec::new(),
             }),
             None,

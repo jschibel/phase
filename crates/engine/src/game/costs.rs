@@ -1835,6 +1835,7 @@ fn pay_ability_cost_inner(
                 source_id,
                 player,
                 crate::types::events::ExertOrigin::AbilityCost,
+                None,
                 events,
             )?;
         }

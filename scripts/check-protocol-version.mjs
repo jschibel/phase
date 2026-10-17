@@ -80,7 +80,9 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // v142 adds `LinkedExileSnapshot.incarnation` (CR 400.7) to GameState's linked-exile snapshots.
 // v143 retypes GameState's modal no-repeat history keys to `ObjectIncarnationRef` (CR 400.7).
 // v145 adds `GameEvent::CreatureExerted.origin` and `.player` (CR 701.43) to GameState's
-// trigger events.
+// trigger events, exact attack_permission receipts, required ExertChoice.permission
+// and typed remaining bindings, plus attack_cost_condition / SourceExertedThisTurn.
+// Unbound historical payment prompts are rejected; historical events still load.
 // v134 adds `GameEvent::AbilityActivated.stack_entry` (the activation's stack object).
 // Keep the measured base so a future merge cannot collapse independent wire
 // changes onto one number.
@@ -165,7 +167,7 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +63: v134 adds `GameEvent::AbilityActivated.stack_entry` (the activation's stack object).
 // +73: v144 adds one-time boon tags (CreateBoon, NoteNumber, HasBoon,
 // ChooseTokenHost) and retypes the perpetual P/T edit to QuantityExpr.
-// +74: v145 adds `GameEvent::CreatureExerted.origin`/`.player` to GameState's trigger events.
+// +74: v145 adds exert actor/origin/permission receipts, bound cost queues and payment conditions.
 const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 74;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this

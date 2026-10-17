@@ -23394,6 +23394,7 @@ fn exert_with_when_you_do_pump() {
         );
     assert_eq!(r.triggers.len(), 1);
     assert_eq!(r.triggers[0].mode, TriggerMode::Exerted);
+    assert!(r.triggers[0].attack_cost_condition.is_none());
     let exec = r.triggers[0].execute.as_ref().unwrap();
     // The "gets +1/+3 and gains lifelink" is a continuous modification (GenericEffect),
     // not a direct Pump — parse_effect_chain handles this composite pattern.
@@ -23416,12 +23417,15 @@ fn exert_standalone_line() {
             &["Creature"],
             &[],
         );
-    // Standalone exert line produces no output (trigger is separate)
+    // SHAPE: The printed permission is independent from the generic observer.
     assert!(r.abilities.is_empty());
-    assert_eq!(r.triggers.len(), 1);
+    assert_eq!(r.triggers.len(), 2);
     assert_eq!(r.triggers[0].mode, TriggerMode::Exerted);
-    assert_eq!(r.triggers[0].valid_target, Some(TargetFilter::Controller));
-    assert!(r.triggers[0].valid_card.is_some());
+    assert_eq!(r.triggers[0].valid_card, Some(TargetFilter::SelfRef));
+    assert!(r.triggers[0].valid_target.is_none());
+    assert!(r.triggers[0].execute.is_none());
+    assert_eq!(r.triggers[1].valid_target, Some(TargetFilter::Controller));
+    assert!(r.triggers[1].valid_card.is_some());
 }
 
 #[test]
@@ -23448,6 +23452,40 @@ fn exert_conditional() {
         );
     assert_eq!(r.triggers.len(), 1);
     assert_eq!(r.triggers[0].mode, TriggerMode::Exerted);
+    // SHAPE: CR 603.4 — this condition belongs to payment, not resolution.
+    assert!(r.triggers[0].condition.is_none());
+    assert_eq!(
+        r.triggers[0].attack_cost_condition,
+        Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::SourceExertedThisTurn),
+        })
+    );
+    assert!(r.triggers[0].execute.is_some());
+}
+
+#[test]
+fn exert_unknown_condition_and_trailing_rider_stay_unsupported() {
+    for text in [
+        "If this creature has danced this turn, you may exert it as it attacks. When you do, draw a card.",
+        "You may exert this creature as it attacks. Dance a jig.",
+    ] {
+        let parsed = parse(text, "Unknown exert rider", &[], &["Creature"], &[]);
+        assert!(parsed.triggers.is_empty());
+        assert!(parsed.abilities.iter().any(|ability| matches!(*ability.effect, Effect::Unimplemented { .. })));
+    }
+    let supported = parse(
+        "You may exert this creature as it attacks.",
+        "Permission",
+        &[],
+        &["Creature"],
+        &[],
+    );
+    assert_eq!(supported.triggers.len(), 1);
+    assert!(supported.abilities.is_empty());
+    assert_eq!(
+        supported.triggers[0].valid_card,
+        Some(TargetFilter::SelfRef)
+    );
 }
 
 // ── Leveler activated abilities (CR 711.2a + CR 711.2b) ──

@@ -1,6 +1,8 @@
 //! Exert bookkeeping shared by every way a permanent is exerted (CR 701.43a).
 
-use crate::types::ability::{ContinuousModification, Duration, PlayerScope, TargetFilter};
+use crate::types::ability::{
+    ContinuousModification, Duration, PlayerScope, TargetFilter, TriggerDefinitionRef,
+};
 use crate::types::events::{ExertOrigin, GameEvent};
 use crate::types::game_state::GameState;
 use crate::types::identifiers::ObjectId;
@@ -34,6 +36,7 @@ pub(crate) fn exert_permanent(
     object_id: ObjectId,
     actor: PlayerId,
     origin: ExertOrigin,
+    attack_permission: Option<TriggerDefinitionRef>,
     events: &mut Vec<GameEvent>,
 ) -> Result<Option<GameEvent>, EngineError> {
     let Some(obj) = state.objects.get(&object_id) else {
@@ -67,6 +70,7 @@ pub(crate) fn exert_permanent(
         object_id,
         player: Some(actor),
         origin,
+        attack_permission,
     };
     events.push(event.clone());
     Ok(Some(event))
