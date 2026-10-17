@@ -56,7 +56,7 @@ pub(crate) fn recipient_ids(state: &GameState, ability: &ResolvedAbility) -> Vec
             // recipient. ParentTargetSlot is resolved before any projection.
             let position = match target {
                 _ if described => None,
-                TargetFilter::ParentTargetSlot { index } => Some(*index as usize),
+                TargetFilter::ParentTargetSlot { index } => Some(*index),
                 _ => ability
                     .targets
                     .iter()
