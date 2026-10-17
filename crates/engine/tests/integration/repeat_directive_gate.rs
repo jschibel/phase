@@ -31,6 +31,7 @@ use engine::types::phase::Phase;
 use engine::types::resolution::ResolutionFrame;
 use engine::types::zones::Zone;
 
+use self::K::{Creature, Insect, Land, Other};
 use crate::support::shared_card_db;
 
 const GRIST: &str = "As long as Grist isn't on the battlefield, it's a 1/1 Insect creature in addition to its other types.\n+1: Create a 1/1 black and green Insect creature token, then mill a card. If an Insect card was milled this way, put a loyalty counter on Grist and repeat this process.\n\u{2212}2: You may sacrifice a creature. When you do, destroy target creature or planeswalker.\n\u{2212}5: Each opponent loses life equal to the number of creature cards in your graveyard.";
@@ -116,7 +117,6 @@ fn grist_plus_one(lib: &[K], rest_in_peace: bool) -> GristRun {
 // token it creates is not a milled card (so `[Other]` is one pass).
 #[test]
 fn grist_plus_one_repeats_while_insect_cards_are_milled() {
-    use K::*;
     // Loyalty includes the +1 cost: 3 + 1 + one counter per Insect card milled.
     let r = grist_plus_one(&[Insect, Insect, Other], false);
     assert_eq!(
@@ -147,7 +147,6 @@ fn grist_plus_one_repeats_while_insect_cards_are_milled() {
 // G2: CR 701.17c - Rest in Peace exiles the milled cards; they were still milled.
 #[test]
 fn grist_plus_one_counts_cards_exiled_instead_of_milled() {
-    use K::*;
     let r = grist_plus_one(&[Insect, Insect, Other], true);
     assert_eq!(
         (r.loyalty, r.tokens, r.graveyard, r.exile),
@@ -166,7 +165,6 @@ fn grist_plus_one_counts_cards_exiled_instead_of_milled() {
 // route: the stamped incarnation keeps the loyalty counter off the graveyard object).
 #[test]
 fn grist_plus_one_continues_after_grist_leaves_the_battlefield() {
-    use K::*;
     let lib = [Insect, Insect, Other];
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
@@ -212,7 +210,6 @@ fn grist_plus_one_continues_after_grist_leaves_the_battlefield() {
 // G5: needs phase 1 - a milled Grist is an Insect card (CR 113.6c).
 #[test]
 fn a_milled_grist_is_an_insect_card_for_the_repeat() {
-    use K::*;
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
     let grist = sc
@@ -298,7 +295,6 @@ fn body_run(text: &str, name: &str, types: &[&str], subs: &[&str], lib: &[K]) ->
 // process repeats; a nonland stops it and stays on top.
 #[test]
 fn countryside_crusher_repeats_while_the_revealed_card_is_a_land() {
-    use K::*;
     let crusher = |lib: &[K]| {
         body_run(
             CRUSHER,
@@ -336,7 +332,6 @@ fn countryside_crusher_repeats_while_the_revealed_card_is_a_land() {
 // sharing a card type (the base drew unconditionally).
 #[test]
 fn tale_of_tamiyo_repeats_while_the_milled_cards_share_a_type() {
-    use K::*;
     let tamiyo = |lib: &[K]| {
         body_run(
             TAMIYO,
@@ -507,7 +502,6 @@ fn colossus_run(
 // and the repeat is reached only when a land was put and the card drawn.
 #[test]
 fn cultivator_colossus_repeats_and_asks_each_pass() {
-    use K::*;
     // Two lands in hand: each pass also pauses on the zone choice (drain with a choice).
     let r = colossus_run(
         2,
@@ -559,7 +553,6 @@ fn cultivator_colossus_repeats_and_asks_each_pass() {
 // (a request left behind by an earlier resolution) cannot re-ask a declined pass.
 #[test]
 fn a_stale_repeat_request_does_not_survive_a_declined_pass() {
-    use K::*;
     let r = colossus_run(1, &[Land, Land, Creature], "D", Gate::Prompted, true);
     assert_eq!(
         r.trace, "O",
@@ -585,7 +578,6 @@ fn grist_plus_one_then_minus_five(
     second_grist: bool,
     strip_second_static: bool,
 ) -> (u32, usize, i32, u32, Zone) {
-    use K::*;
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
     let grist = sc
