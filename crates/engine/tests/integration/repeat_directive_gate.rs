@@ -732,12 +732,16 @@ fn colossus_prompt_key(runner: &GameRunner, source: ObjectId) -> MayTriggerAutoC
 }
 
 fn assert_repeat_idle(runner: &GameRunner) {
-    assert!(matches!(
-        runner.state().waiting_for,
-        WaitingFor::Priority { player: P0 }
-    ));
-    assert!(runner.state().stack.is_empty());
-    assert!(runner.state().resolution_stack.is_empty());
+    let state = runner.state();
+    assert!(
+        matches!(&state.waiting_for, WaitingFor::Priority { player: P0 })
+            && state.stack.is_empty()
+            && state.resolution_stack.is_empty(),
+        "waiting_for={:?}, spell_stack_len={}, resolution_stack_len={}",
+        state.waiting_for,
+        state.stack.len(),
+        state.resolution_stack.len()
+    );
 }
 
 #[test]
@@ -794,12 +798,18 @@ fn colossus_real_etb_remembered_accept_26_puts() {
 
 #[test]
 fn colossus_real_etb_prompted_inner_pause_and_decline() {
-    for (lands, answers, expected_puts) in [(2, "AD", 1), (1, "AAD", 2), (1, "D", 0), (0, "", 0)] {
+    for (lands, answers, expected_puts) in [(2, "AD", 1), (1, "AAD", 2), (1, "D", 0), (0, "D", 0)] {
         let (scenario, source, hand, library) =
             colossus_scenario(lands, &["Forest", "Forest", "Shock"]);
         let mut runner = scenario.build();
         engine::game::rehydrate_game_from_card_db(runner.state_mut(), shared_card_db().unwrap());
         cast_colossus_etb(&mut runner, source);
+        if lands == 0 {
+            assert!(
+                runner.state().players[0].hand.is_empty(),
+                "zero-hand/no-eligible-land reach guard"
+            );
+        }
         for answer in answers.chars() {
             colossus_prompt_key(&runner, source);
             runner
@@ -848,6 +858,9 @@ fn colossus_real_etb_prompted_inner_pause_and_decline() {
         assert_eq!(
             runner.state().players[0].library.len(),
             library.len() - expected_puts
+        );
+        eprintln!(
+            "Colossus completion case: lands={lands}, answers={answers}, expected_puts={expected_puts}"
         );
         assert_repeat_idle(&runner);
     }
