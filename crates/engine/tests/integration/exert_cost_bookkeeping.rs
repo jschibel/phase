@@ -486,7 +486,7 @@ fn survivors_exerting_itself_drains_once() {
         let observer = object.trigger_definition_ref(
             object
                 .trigger_definitions
-                .iter_all()
+                .iter_unchecked()
                 .find(|entry| {
                     entry.definition.mode == TriggerMode::Exerted
                         && entry.definition.valid_target == Some(TargetFilter::Controller)
@@ -619,14 +619,14 @@ fn triggered_only_grant_omits_standalone_exert_permission() {
         let mut runner = scenario.build();
         assert!(!runner.state().objects[&koh]
             .trigger_definitions
-            .iter_all()
+            .iter_unchecked()
             .any(|entry| entry.definition.mode == TriggerMode::Exerted));
         let provider_object = &runner.state().objects[&provider];
         assert_eq!(provider_object.trigger_definitions.len(), 2);
         let observer = provider_object.trigger_definition_ref(
             provider_object
                 .trigger_definitions
-                .iter_all()
+                .iter_unchecked()
                 .find(|entry| entry.definition.valid_target == Some(TargetFilter::Controller))
                 .unwrap(),
         );
@@ -647,7 +647,7 @@ fn triggered_only_grant_omits_standalone_exert_permission() {
         engine::game::layers::evaluate_layers(runner.state_mut());
         let copied: Vec<_> = runner.state().objects[&koh]
             .trigger_definitions
-            .iter_all()
+            .iter_unchecked()
             .filter(|entry| entry.definition.mode == TriggerMode::Exerted)
             .collect();
         assert_eq!(copied.len(), 1, "only the genuine observer is granted");
