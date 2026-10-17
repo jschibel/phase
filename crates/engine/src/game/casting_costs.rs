@@ -11631,8 +11631,8 @@ pub(super) fn pay_and_push_adventure(
     let auto_payment_needs_input = payment_mode == CastPaymentMode::Auto
         && cost.mana_value() > 0
         && !super::casting::can_pay_cost_after_auto_tap(state, player, object_id, cost)
-        && super::casting::can_feasibly_pay_mana_cost(state, player, Some(object_id), cost)
-        && super::casting::has_manual_mana_payment_path_for_spell(state, player, object_id, cost);
+        && super::casting::spell_payment_manual_route(state, player, object_id, cost)
+            == super::casting::ManualPaymentRoute::Feasible;
     if has_x || convoke_mode.is_some() || manual_payment || auto_payment_needs_input {
         let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
         pending.base_cost = base_cost.clone();
@@ -12165,6 +12165,7 @@ fn finalize_cast_with_phyrexian_choices_inner(
     let mut ability = ability;
     ability.context.cast_from_zone = Some(source_zone);
     ability.context.cast_controller = Some(player);
+    ability.context.cast_active_player = Some(state.active_player);
     ability.context.cast_phase = Some(state.phase);
     // CR 601.2c + CR 608.2c: latch the declared object targets so a nested
     // sub-ability — whose own `targets` may hold a resolution-chosen recipient
@@ -29303,7 +29304,7 @@ its replicate cost was paid.)\nDraw a card.";
                 let (mut state, source, targets, fodder, tapper, cost, mut resolved) =
                     defensive_x_target_fixture(target_count, mixed);
                 match route {
-                    Route::Assigned => resolved.targets.push(TargetRef::Object(targets[0])),
+                    Route::Assigned => resolved.push_chosen_target(TargetRef::Object(targets[0])),
                     Route::Random => {
                         resolved.target_selection_mode =
                             crate::types::ability::TargetSelectionMode::Random;
