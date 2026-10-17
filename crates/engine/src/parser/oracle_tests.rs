@@ -23395,6 +23395,8 @@ fn exert_with_when_you_do_pump() {
     assert_eq!(r.triggers.len(), 1);
     assert_eq!(r.triggers[0].mode, TriggerMode::Exerted);
     assert!(r.triggers[0].attack_cost_condition.is_none());
+    assert!(r.triggers[0].is_attack_exert_permission());
+    assert!(!r.triggers[0].is_standalone_attack_exert_permission());
     let exec = r.triggers[0].execute.as_ref().unwrap();
     // The "gets +1/+3 and gains lifelink" is a continuous modification (GenericEffect),
     // not a direct Pump — parse_effect_chain handles this composite pattern.
@@ -23410,22 +23412,22 @@ fn exert_with_when_you_do_pump() {
 
 #[test]
 fn exert_standalone_line() {
-    let r = parse(
-            "You may exert this creature as it attacks.\nWhenever you exert a creature, you may discard a card. If you do, draw a card.",
-            "Battlefield Scavenger",
-            &[],
-            &["Creature"],
-            &[],
-        );
-    // SHAPE: The printed permission is independent from the generic observer.
-    assert!(r.abilities.is_empty());
-    assert_eq!(r.triggers.len(), 2);
-    assert_eq!(r.triggers[0].mode, TriggerMode::Exerted);
-    assert_eq!(r.triggers[0].valid_card, Some(TargetFilter::SelfRef));
-    assert!(r.triggers[0].valid_target.is_none());
-    assert!(r.triggers[0].execute.is_none());
-    assert_eq!(r.triggers[1].valid_target, Some(TargetFilter::Controller));
-    assert!(r.triggers[1].valid_card.is_some());
+    for (name, oracle) in [
+        ("Battlefield Scavenger", "You may exert this creature as it attacks. (It won't untap during your next untap step.)\nWhenever you exert a creature, you may discard a card. If you do, draw a card."),
+        ("Resolute Survivors", "You may exert this creature as it attacks. (It won't untap during your next untap step.)\nWhenever you exert a creature, this creature deals 1 damage to each opponent and you gain 1 life."),
+    ] {
+        let r = parse(oracle, name, &[], &["Creature"], &[]);
+        // SHAPE, CR 701.43d: Two aggregate records carry one static permission
+        // and one independent triggered observer, not two triggered abilities.
+        assert!(r.abilities.is_empty());
+        assert_eq!(r.triggers.len(), 2);
+        assert!(r.triggers[0].is_attack_exert_permission());
+        assert!(r.triggers[0].is_standalone_attack_exert_permission());
+        assert!(!r.triggers[1].is_attack_exert_permission());
+        assert!(!r.triggers[1].is_standalone_attack_exert_permission());
+        assert_eq!(r.triggers[1].valid_target, Some(TargetFilter::Controller));
+        assert!(r.triggers[1].execute.is_some());
+    }
 }
 
 #[test]

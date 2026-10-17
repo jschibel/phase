@@ -21,7 +21,8 @@
 use engine::game::combat::AttackTarget;
 use engine::game::scenario::{CastOutcome, GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
-    AbilityCost, ContinuousModification, TargetFilter, TriggerDefinitionRef,
+    AbilityCost, ChosenAttribute, ContinuousModification, TargetFilter,
+    TriggerDefinitionOccurrenceRef, TriggerDefinitionRef,
 };
 use engine::types::actions::GameAction;
 use engine::types::events::{ExertOrigin, GameEvent};
@@ -29,12 +30,14 @@ use engine::types::game_state::{
     CastPaymentMode, ExileLink, ExileLinkKind, ManaChoice, PersistedGameState,
     PersistedRestoreFinalization, WaitingFor,
 };
-use engine::types::identifiers::ObjectId;
+use engine::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType};
-use engine::types::phase::Phase;
+use engine::types::phase::{Phase, PhaseGroup, TurnSegment};
 use engine::types::player::PlayerId;
+use engine::types::resolved_commands::{ResolvedObjectStatus, ResolvedRulesCommand};
 use engine::types::statics::StaticMode;
+use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 
 const OASIS_RITUALIST: &str = "{T}: Add one mana of any color.\n\
@@ -53,6 +56,12 @@ each opponent and you gain 1 life.";
 const BITTERBLADE_WARRIOR: &str = "You may exert this creature as it attacks. When you do, it \
 gets +1/+0 and gains deathtouch until end of turn. (An exerted creature won't untap during your \
 next untap step.)";
+const STANDALONE_EXERT_PERMISSION: &str =
+    "You may exert this creature as it attacks. (It won't untap during your next untap step.)";
+const GLORY_BOUND_INITIATE: &str = "You may exert this creature as it attacks. When you do, it gets +1/+3 and gains lifelink until end of turn. (An exerted creature won't untap during your next untap step.)";
+const KOH: &str = "When Koh enters, exile up to one other target creature.\nWhenever another nontoken creature dies, you may exile it.\nPay 1 life: Choose a creature card exiled with Koh.\nKoh has all activated and triggered abilities of the last chosen card.";
+const CLOUDSHIFT: &str = "Exile target creature you control, then return that card to the battlefield under your control.";
+const FERVOR: &str = "Creatures you control have haste. (They can attack and {T} as soon as they come under your control.)";
 
 fn life(runner: &GameRunner, player: PlayerId) -> i32 {
     runner
@@ -466,19 +475,253 @@ fn declining_the_exert_fires_no_observer() {
 /// Row 7: no double fire - Survivors exerting itself drains exactly once.
 #[test]
 fn survivors_exerting_itself_drains_once() {
-    let mut scenario = GameScenario::new();
-    scenario.at_phase(Phase::PreCombatMain);
-    let survivors = scenario
-        .add_creature_from_oracle(P0, "Resolute Survivors", 3, 3, RESOLUTE_SURVIVORS)
-        .id();
-    let mut runner = scenario.build();
+    for exert in [false, true] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let survivors = scenario
+            .add_creature_from_oracle(P0, "Resolute Survivors", 3, 3, RESOLUTE_SURVIVORS)
+            .id();
+        let mut runner = scenario.build();
+        let object = &runner.state().objects[&survivors];
+        let observer = object.trigger_definition_ref(
+            object
+                .trigger_definitions
+                .iter_all()
+                .find(|entry| {
+                    entry.definition.mode == TriggerMode::Exerted
+                        && entry.definition.valid_target == Some(TargetFilter::Controller)
+                })
+                .expect("the real observer exists separately from its permission"),
+        );
+        declare_exert_attacker(&mut runner, survivors);
+        let permission = current_permission(&runner);
+        let events = runner
+            .act(GameAction::ChooseExert { exert })
+            .unwrap()
+            .events;
+        // CR 701.43d + CR 603.1: The static permission creates no stack item
+        // and cannot manufacture an OrderTriggers prompt alongside the observer.
+        assert_exert_priority(&runner, usize::from(exert));
+        if exert {
+            assert_eq!(exerted_events(&events), vec![(survivors, P0)]);
+            assert_eq!(attack_receipts(&events), vec![permission]);
+            assert_eq!(runner.state().stack[0].source_id, survivors);
+            assert_eq!(
+                runner.state().stack[0]
+                    .ability()
+                    .unwrap()
+                    .trigger_definition_ref,
+                Some(observer)
+            );
+            assert!(runner.state().exerted_this_turn.contains(&survivors));
+        } else {
+            assert!(exerted_events(&events).is_empty());
+            assert!(!runner.state().exerted_this_turn.contains(&survivors));
+        }
+        assert_eq!(life(&runner, P0), 20);
+        assert_eq!(life(&runner, P1), 20);
+        runner.advance_until_stack_empty();
+        assert_exert_priority(&runner, 0);
+        assert_eq!(life(&runner, P1), if exert { 19 } else { 20 });
+        assert_eq!(life(&runner, P0), if exert { 21 } else { 20 });
+    }
+}
 
-    let events = attack_with_exert(&mut runner, P0, survivors, true);
+/// CR 701.43d + CR 603.1: The exact first Survivors paragraph is an isolated
+/// compositional static permission fixture, without a triggered effect.
+#[test]
+fn standalone_attack_permission_has_no_triggered_stack_entry() {
+    for exert in [false, true] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let attacker = scenario
+            .add_creature_from_oracle(
+                P0,
+                "Survivors permission component",
+                3,
+                3,
+                STANDALONE_EXERT_PERMISSION,
+            )
+            .id();
+        let mut runner = scenario.build();
+        declare_exert_attacker(&mut runner, attacker);
+        let permission = current_permission(&runner);
+        let events = runner
+            .act(GameAction::ChooseExert { exert })
+            .unwrap()
+            .events;
+        assert_exert_priority(&runner, 0);
+        assert_eq!(cant_untap_markers(&runner, attacker), usize::from(exert));
+        assert_eq!(runner.state().exerted_this_turn.contains(&attacker), exert);
+        if exert {
+            assert_eq!(exerted_events(&events), vec![(attacker, P0)]);
+            assert_eq!(attack_receipts(&events), vec![permission]);
+        } else {
+            assert!(exerted_events(&events).is_empty());
+        }
+    }
+}
 
-    assert!(runner.state().exerted_this_turn.contains(&survivors));
-    assert_eq!(exerted_events(&events), vec![(survivors, P0)]);
-    assert_eq!(life(&runner, P1), 19, "one trigger, not two");
-    assert_eq!(life(&runner, P0), 21);
+/// CR 701.43d + CR 607.2h: A real linked effect remains a triggered ability.
+#[test]
+fn linked_attack_permission_still_publishes_its_selected_trigger() {
+    for exert in [false, true] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let initiate = scenario
+            .add_creature_from_oracle(P0, "Glory-Bound Initiate", 3, 1, GLORY_BOUND_INITIATE)
+            .id();
+        let mut runner = scenario.build();
+        declare_exert_attacker(&mut runner, initiate);
+        let permission = current_permission(&runner);
+        let events = runner
+            .act(GameAction::ChooseExert { exert })
+            .unwrap()
+            .events;
+        assert_exert_priority(&runner, usize::from(exert));
+        if exert {
+            assert_eq!(attack_receipts(&events), vec![permission.clone()]);
+            assert_eq!(
+                runner.state().stack[0]
+                    .ability()
+                    .unwrap()
+                    .trigger_definition_ref,
+                Some(permission)
+            );
+        } else {
+            assert!(exerted_events(&events).is_empty());
+        }
+        runner.advance_until_stack_empty();
+        assert_exert_priority(&runner, 0);
+        let object = &runner.state().objects[&initiate];
+        assert_eq!(object.power, Some(if exert { 4 } else { 3 }));
+        assert_eq!(object.toughness, Some(if exert { 4 } else { 1 }));
+        assert_eq!(object.has_keyword(&Keyword::Lifelink), exert);
+    }
+}
+
+/// CR 701.43d + CR 603.1: Koh copies Survivors' observer, but its triggered-only
+/// grant cannot give Koh the standalone static attack permission.
+#[test]
+fn triggered_only_grant_omits_standalone_exert_permission() {
+    for exert_warrior in [false, true] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let koh = scenario
+            .add_creature_from_oracle(P0, "Koh, the Face Stealer", 6, 6, KOH)
+            .id();
+        let mut provider_builder = scenario.add_creature_to_exile(P0, "Resolute Survivors", 3, 3);
+        provider_builder.from_oracle_text(RESOLUTE_SURVIVORS);
+        let provider = provider_builder.id();
+        let warrior = scenario
+            .add_creature_from_oracle(P0, "Bitterblade Warrior", 2, 2, BITTERBLADE_WARRIOR)
+            .id();
+        let mut runner = scenario.build();
+        assert!(!runner.state().objects[&koh]
+            .trigger_definitions
+            .iter_all()
+            .any(|entry| entry.definition.mode == TriggerMode::Exerted));
+        let provider_object = &runner.state().objects[&provider];
+        assert_eq!(provider_object.trigger_definitions.len(), 2);
+        let observer = provider_object.trigger_definition_ref(
+            provider_object
+                .trigger_definitions
+                .iter_all()
+                .find(|entry| entry.definition.valid_target == Some(TargetFilter::Controller))
+                .unwrap(),
+        );
+        let pin = ObjectIncarnationRef::from_object(provider_object);
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&koh)
+            .unwrap()
+            .chosen_attributes
+            .push(ChosenAttribute::Card(pin));
+        runner.state_mut().exile_links.push(ExileLink {
+            exiled_id: provider,
+            source_id: koh,
+            kind: ExileLinkKind::TrackedBySource,
+        });
+        runner.state_mut().layers_dirty.mark_full();
+        engine::game::layers::evaluate_layers(runner.state_mut());
+        let copied: Vec<_> = runner.state().objects[&koh]
+            .trigger_definitions
+            .iter_all()
+            .filter(|entry| entry.definition.mode == TriggerMode::Exerted)
+            .collect();
+        assert_eq!(copied.len(), 1, "only the genuine observer is granted");
+        assert!(!copied[0].definition.is_attack_exert_permission());
+        match &copied[0].occurrence {
+            TriggerDefinitionOccurrenceRef::ExpandedGrant { provider, .. } => {
+                assert_eq!(provider.as_ref(), &observer)
+            }
+            occurrence => panic!("expected the original provider identity, got {occurrence:?}"),
+        }
+        let copied_ref = runner.state().objects[&koh].trigger_definition_ref(copied[0]);
+        runner.advance_to_combat();
+        assert_eq!(runner.waiting_for_kind(), "DeclareAttackers");
+        let mut attacks = vec![(koh, AttackTarget::Player(P1))];
+        if exert_warrior {
+            attacks.push((warrior, AttackTarget::Player(P1)));
+        }
+        runner
+            .declare_attackers(&attacks)
+            .expect("Koh attacks legally");
+        assert!(runner
+            .state()
+            .combat
+            .as_ref()
+            .unwrap()
+            .attackers
+            .iter()
+            .any(|entry| entry.object_id == koh));
+        if exert_warrior {
+            let permission = current_permission(&runner);
+            assert_eq!(permission.source.object_id, warrior);
+            let events = runner
+                .act(GameAction::ChooseExert { exert: true })
+                .unwrap()
+                .events;
+            assert_eq!(attack_receipts(&events), vec![permission]);
+            match &runner.state().waiting_for {
+                WaitingFor::OrderTriggers { player, triggers } => {
+                    assert_eq!(*player, P0);
+                    assert_eq!(
+                        triggers.len(),
+                        2,
+                        "one Warrior payoff and one copied observer"
+                    );
+                }
+                waiting => panic!("expected ordering of the two genuine triggers, got {waiting:?}"),
+            }
+            runner
+                .act(GameAction::OrderTriggers { order: vec![1, 0] })
+                .unwrap();
+            assert_exert_priority(&runner, 2);
+            assert_eq!(
+                runner
+                    .state()
+                    .stack
+                    .iter()
+                    .filter(
+                        |entry| entry.ability().unwrap().trigger_definition_ref.as_ref()
+                            == Some(&copied_ref)
+                    )
+                    .count(),
+                1
+            );
+            runner.advance_until_stack_empty();
+            assert_eq!(life(&runner, P0), 21);
+            assert_eq!(life(&runner, P1), 19);
+            assert_eq!(runner.state().objects[&warrior].power, Some(3));
+        } else {
+            assert_exert_priority(&runner, 0);
+            assert_eq!(life(&runner, P0), 20);
+            assert_eq!(life(&runner, P1), 20);
+        }
+        assert_exert_priority(&runner, 0);
+    }
 }
 
 /// Row 8, CR 701.43b: an already-exerted permanent can be exerted again; the
@@ -609,6 +852,15 @@ fn granted_exert_scenario(
     oracle: &str,
     with_survivors: bool,
 ) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    granted_exert_scenario_with(name, oracle, with_survivors, |_| {})
+}
+
+fn granted_exert_scenario_with(
+    name: &str,
+    oracle: &str,
+    with_survivors: bool,
+    configure: impl FnOnce(&mut GameScenario),
+) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let cauldron = scenario
@@ -632,6 +884,7 @@ fn granted_exert_scenario(
         })
         .id();
     scenario.add_basic_land(P0, ManaColor::Green);
+    configure(&mut scenario);
     let mut runner = scenario.build();
     runner.state_mut().exile_links.push(ExileLink {
         exiled_id: paincaster_card,
@@ -831,9 +1084,31 @@ fn declare_exert_attacker(runner: &mut GameRunner, attacker: ObjectId) {
 
 fn current_permission(runner: &GameRunner) -> TriggerDefinitionRef {
     match &runner.state().waiting_for {
-        WaitingFor::ExertChoice { permission, .. } => permission.clone(),
+        WaitingFor::ExertChoice {
+            player,
+            attacker,
+            permission,
+            ..
+        } => {
+            assert_eq!(*attacker, permission.source.object_id);
+            assert_eq!(*player, runner.state().objects[attacker].controller);
+            permission.clone()
+        }
         waiting => panic!("expected attack exert permission, got {waiting:?}"),
     }
+}
+
+fn assert_exert_priority(runner: &GameRunner, stack_len: usize) {
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { .. }
+    ));
+    assert_eq!(runner.state().stack.len(), stack_len);
+    assert!(runner.state().pending_trigger.is_none());
+    assert!(runner.state().pending_trigger_entry.is_none());
+    assert!(runner.state().pending_trigger_order.is_none());
+    assert!(runner.state().deferred_triggers.is_empty());
+    assert!(runner.state().pending_attack_trigger_events.is_empty());
 }
 
 fn attack_receipts(events: &[GameEvent]) -> Vec<TriggerDefinitionRef> {
@@ -873,12 +1148,14 @@ fn granted_exert_then_vitalize_preserves_unconditional_attack_permission() {
             .act(GameAction::ChooseExert { exert })
             .expect("answer permission")
             .events;
+        assert_exert_priority(&runner, usize::from(exert));
         runner.advance_until_stack_empty();
         assert!(!matches!(
             runner.state().waiting_for,
             WaitingFor::ExertChoice { .. }
         ));
         assert!(runner.state().stack.is_empty());
+        assert_exert_priority(&runner, 0);
         if exert {
             assert_eq!(attack_receipts(&events), vec![permission]);
             assert_eq!(runner.state().objects[&warrior].power, Some(power + 1));
@@ -889,6 +1166,270 @@ fn granted_exert_then_vitalize_preserves_unconditional_attack_permission() {
             assert!(!runner.state().objects[&warrior].has_keyword(&Keyword::Deathtouch));
         }
     }
+}
+
+/// CR 400.7 + CR 702.10b: A real blink ends the old exerted object's history;
+/// Fervor permits the returned Celebrant to attack during the same turn.
+#[test]
+fn granted_exert_then_cloudshift_allows_fresh_celebrant_attack() {
+    let mut added = None;
+    let (mut runner, celebrant, bear, _) =
+        granted_exert_scenario_with("Combat Celebrant", COMBAT_CELEBRANT, false, |scenario| {
+            scenario.add_enchantment_from_oracle(P0, "Fervor", FERVOR);
+            let cloudshift = scenario
+                .add_spell_to_hand_from_oracle(P0, "Cloudshift", true, CLOUDSHIFT)
+                .with_mana_cost(ManaCost::Cost {
+                    shards: vec![ManaCostShard::White],
+                    generic: 0,
+                })
+                .id();
+            scenario.add_basic_land(P0, ManaColor::White);
+            let other = scenario
+                .add_creature_from_oracle(P0, "Oasis Ritualist", 2, 4, OASIS_RITUALIST)
+                .id();
+            added = Some((cloudshift, other));
+        });
+    let (cloudshift, other) = added.unwrap();
+    let mut other_events = Vec::new();
+    let other_index = composite_index(&runner, other);
+    activate_ritualist(&mut runner, other, other_index, &mut other_events);
+    assert_eq!(exerted_events(&other_events), vec![(other, P0)]);
+    let ability_events = activate_granted_exert(&mut runner, celebrant, bear);
+    assert_eq!(
+        first_exert_origin(&ability_events),
+        Some(ExertOrigin::AbilityCost)
+    );
+    let old = ObjectIncarnationRef::from_object(&runner.state().objects[&celebrant]);
+    assert!(!runner.state().objects[&celebrant].counters.is_empty());
+    assert_exert_priority(&runner, 0);
+    let outcome = runner.cast(cloudshift).target_object(celebrant).resolve();
+    let moves: Vec<_> = outcome
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            GameEvent::ZoneChanged {
+                object_id,
+                from,
+                to,
+                ..
+            } if *object_id == celebrant => Some((*from, *to)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        moves,
+        vec![
+            (Some(Zone::Battlefield), Zone::Exile),
+            (Some(Zone::Exile), Zone::Battlefield)
+        ]
+    );
+    outcome.assert_zone(&[cloudshift], Zone::Graveyard);
+    assert!(matches!(
+        outcome.final_waiting_for(),
+        WaitingFor::Priority { .. }
+    ));
+    let returned = &runner.state().objects[&celebrant];
+    let fresh = ObjectIncarnationRef::from_object(returned);
+    assert_eq!(fresh.object_id, old.object_id);
+    assert_ne!(fresh, old);
+    assert_eq!(returned.zone, Zone::Battlefield);
+    assert!(returned.counters.is_empty());
+    assert!(!returned
+        .abilities
+        .iter()
+        .any(|ability| matches!(ability.cost, Some(AbilityCost::Composite { .. }))));
+    assert!(returned.has_keyword(&Keyword::Haste));
+    assert!(!runner.state().exerted_this_turn.contains(&celebrant));
+    assert!(runner.state().exerted_this_turn.contains(&other));
+    assert_exert_priority(&runner, 0);
+    declare_exert_attacker(&mut runner, celebrant);
+    let permission = current_permission(&runner);
+    assert_eq!(permission.source, fresh);
+    let events = runner
+        .act(GameAction::ChooseExert { exert: true })
+        .unwrap()
+        .events;
+    assert_eq!(attack_receipts(&events), vec![permission.clone()]);
+    assert_exert_priority(&runner, 1);
+    assert_eq!(
+        runner.state().stack[0]
+            .ability()
+            .unwrap()
+            .trigger_definition_ref,
+        Some(permission)
+    );
+    runner.advance_until_stack_empty();
+    assert_exert_priority(&runner, 0);
+    assert_eq!(runner.state().extra_phases.len(), 1);
+    assert_eq!(
+        runner.state().extra_phases[0].segment,
+        TurnSegment::Phase(PhaseGroup::Combat)
+    );
+    assert!(runner.state().exerted_this_turn.contains(&celebrant));
+    assert!(runner.state().exerted_this_turn.contains(&other));
+}
+
+/// CR 400.7: Replay of actual recorded transitions ends the same object's
+/// exert history as live delivery, without adding replay journal authority.
+#[test]
+fn exert_history_zone_change_live_replay_agree() {
+    let (mut runner, celebrant, bear, _) =
+        granted_exert_scenario("Combat Celebrant", COMBAT_CELEBRANT, false);
+    activate_granted_exert(&mut runner, celebrant, bear);
+    // A second real permanent is independently exerted through the existing
+    // status authority, so clearing the entire set fails the preservation guard.
+    engine::game::object_state::resolve_and_apply_object_edit(
+        runner.state_mut(),
+        bear,
+        ResolvedObjectStatus::Exerted,
+        true,
+    )
+    .unwrap();
+    let old_status = runner
+        .state()
+        .resolved_rules_journal
+        .entries()
+        .iter()
+        .filter_map(|entry| entry.command.as_ref())
+        .find_map(|command| match command {
+            ResolvedRulesCommand::ObjectStatus(command)
+                if command.object.object_id == celebrant
+                    && command.status == ResolvedObjectStatus::Exerted =>
+            {
+                Some(command.clone())
+            }
+            _ => None,
+        })
+        .expect("activation recorded its exert status authority");
+    let before_noop = ObjectIncarnationRef::from_object(&runner.state().objects[&celebrant]);
+    let journal_before_noop = runner.state().resolved_rules_journal.clone();
+    engine::game::zones::move_to_zone(
+        runner.state_mut(),
+        celebrant,
+        Zone::Battlefield,
+        &mut Vec::new(),
+    );
+    assert_eq!(
+        ObjectIncarnationRef::from_object(&runner.state().objects[&celebrant]),
+        before_noop
+    );
+    assert!(runner.state().exerted_this_turn.contains(&celebrant));
+    assert_eq!(runner.state().resolved_rules_journal, journal_before_noop);
+    let mut replayed = runner.state().clone();
+    let replay_journal = replayed.resolved_rules_journal.clone();
+    for destination in [Zone::Exile, Zone::Battlefield] {
+        engine::game::zones::move_to_zone(
+            runner.state_mut(),
+            celebrant,
+            destination,
+            &mut Vec::new(),
+        );
+        let command = runner
+            .state()
+            .resolved_rules_journal
+            .entries()
+            .iter()
+            .rev()
+            .filter_map(|entry| entry.command.as_ref())
+            .find_map(|command| match command {
+                ResolvedRulesCommand::ZoneChange(command)
+                    if command.object.object_id == celebrant =>
+                {
+                    Some(command.as_ref().clone())
+                }
+                _ => None,
+            })
+            .expect("the live move records its actual zone command");
+        if destination == Zone::Exile {
+            for stale_occurrence in [false, true] {
+                let mut rejected = command.clone();
+                if stale_occurrence {
+                    rejected.object.incarnation += 1;
+                } else {
+                    rejected.from = Zone::Graveyard;
+                }
+                assert!(
+                    engine::game::zones::apply_resolved_zone_change(&mut replayed, &rejected)
+                        .is_err()
+                );
+                assert!(replayed.exerted_this_turn.contains(&celebrant));
+                assert_eq!(
+                    ObjectIncarnationRef::from_object(&replayed.objects[&celebrant]),
+                    before_noop
+                );
+                assert_eq!(replayed.resolved_rules_journal, replay_journal);
+            }
+        }
+        engine::game::zones::apply_resolved_zone_change(&mut replayed, &command)
+            .expect("valid recorded transition replays");
+        let live = &runner.state().objects[&celebrant];
+        let replay = &replayed.objects[&celebrant];
+        assert_eq!(live.zone, destination);
+        assert_eq!(replay.zone, destination);
+        assert_eq!(
+            ObjectIncarnationRef::from_object(live),
+            ObjectIncarnationRef::from_object(replay)
+        );
+        assert_eq!(live.timestamp, replay.timestamp);
+        assert_eq!(replay.incarnation, command.resulting_incarnation);
+        if let Some(timestamp) = command.entry_timestamp {
+            assert_eq!(replay.timestamp, timestamp);
+        }
+        assert!(!runner.state().exerted_this_turn.contains(&celebrant));
+        assert!(!replayed.exerted_this_turn.contains(&celebrant));
+        assert!(runner.state().exerted_this_turn.contains(&bear));
+        assert!(replayed.exerted_this_turn.contains(&bear));
+        assert_eq!(replayed.resolved_rules_journal, replay_journal);
+    }
+    assert!(engine::game::object_state::apply_resolved_object_edit(
+        runner.state_mut(),
+        &old_status
+    )
+    .is_err());
+    assert!(
+        engine::game::object_state::apply_resolved_object_edit(&mut replayed, &old_status).is_err()
+    );
+    assert!(!runner.state().exerted_this_turn.contains(&celebrant));
+    assert!(!replayed.exerted_this_turn.contains(&celebrant));
+}
+
+/// CR 400.7: A live Command departure bypasses the ordinary resolved-zone
+/// applier, so it independently exercises the live cleanup authority.
+#[test]
+fn exert_history_clears_on_live_commander_departure() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    // This compositional fixture marks the real exert-cost creature as a
+    // commander in place, isolating Command's special live-container branch.
+    let paincaster = scenario
+        .add_creature_from_oracle(P0, "Fervent Paincaster", 2, 2, FERVENT_PAINCASTER)
+        .commander()
+        .id();
+    let bear = scenario.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    let mut runner = scenario.build();
+    let index = composite_index(&runner, paincaster);
+    let events = runner
+        .activate(paincaster, index)
+        .target_object(bear)
+        .resolve()
+        .events()
+        .to_vec();
+    assert_eq!(runner.state().objects[&bear].damage_marked, 1);
+    assert_eq!(exerted_events(&events), vec![(paincaster, P0)]);
+    assert!(runner.state().exerted_this_turn.contains(&paincaster));
+    assert_exert_priority(&runner, 0);
+    let old = ObjectIncarnationRef::from_object(&runner.state().objects[&paincaster]);
+    engine::game::zones::move_to_zone(
+        runner.state_mut(),
+        paincaster,
+        Zone::Command,
+        &mut Vec::new(),
+    );
+    let departed = &runner.state().objects[&paincaster];
+    assert_eq!(departed.zone, Zone::Command);
+    assert!(departed.is_commander);
+    assert_ne!(ObjectIncarnationRef::from_object(departed), old);
+    assert!(!runner.state().exerted_this_turn.contains(&paincaster));
 }
 
 /// CR 603.4 + CR 701.43b: Celebrant's explicit gate is a permission restriction,
@@ -922,6 +1463,7 @@ fn celebrant_gate_restricts_payment_but_not_the_paid_trigger() {
             assert!(runner.state().exerted_this_turn.contains(&celebrant));
         }
         assert!(runner.state().stack.is_empty());
+        assert_exert_priority(&runner, 0);
     }
 }
 

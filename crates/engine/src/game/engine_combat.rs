@@ -1,6 +1,6 @@
 use crate::game::combat::{AttackTarget, DamageAssignment, DamageTarget, TrampleKind};
 use crate::types::ability::{
-    CostPaidObjectSnapshot, TargetFilter, TargetRef, TriggerDefinition, TriggerDefinitionRef,
+    CostPaidObjectSnapshot, TargetFilter, TargetRef, TriggerDefinitionRef,
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
@@ -111,7 +111,7 @@ fn exert_candidates(
                 .flat_map(move |object| {
                     super::functioning_abilities::active_trigger_definitions(state, object)
                         .filter(move |active| {
-                            is_attack_exert_permission(active.definition)
+                            active.definition.is_attack_exert_permission()
                                 && active.definition.attack_cost_condition.as_ref().is_none_or(
                                     |condition| {
                                         super::layers::evaluate_condition(
@@ -130,12 +130,6 @@ fn exert_candidates(
                 })
         })
         .collect()
-}
-
-fn is_attack_exert_permission(definition: &TriggerDefinition) -> bool {
-    definition.mode == crate::types::triggers::TriggerMode::Exerted
-        && definition.valid_card == Some(TargetFilter::SelfRef)
-        && definition.valid_target.is_none()
 }
 
 /// CR 400.7 + CR 508.1g: A queued cost cannot be rebound to a replacement source
@@ -158,7 +152,7 @@ pub(super) fn validate_attack_exert_permission(
             && super::functioning_abilities::active_trigger_definitions(state, object).any(
                 |active| {
                     active.definition_ref == *permission
-                        && is_attack_exert_permission(active.definition)
+                        && active.definition.is_attack_exert_permission()
                 },
             )
     });

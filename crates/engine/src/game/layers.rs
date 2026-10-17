@@ -8226,6 +8226,11 @@ fn expand_granted_triggered_abilities(
                 continue;
             };
             for entry in provider.trigger_definitions.iter_all() {
+                // CR 701.43d + CR 603.1: A triggered-only grant does not copy
+                // a standalone static attack permission from the aggregate.
+                if entry.definition.is_standalone_attack_exert_permission() {
+                    continue;
+                }
                 let provider_ref = provider.trigger_definition_ref(entry);
                 let modification = ContinuousModification::GrantTrigger {
                     trigger: Box::new(entry.definition.clone()),

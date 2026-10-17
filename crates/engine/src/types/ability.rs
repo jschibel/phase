@@ -32509,6 +32509,20 @@ impl Default for TriggerOccurrenceState {
 }
 
 impl TriggerDefinition {
+    /// CR 701.43d: The self-referential exert component grants an optional
+    /// attack cost; an actor-filtered exert observer grants no such permission.
+    pub fn is_attack_exert_permission(&self) -> bool {
+        self.mode == TriggerMode::Exerted
+            && self.valid_card == Some(TargetFilter::SelfRef)
+            && self.valid_target.is_none()
+    }
+
+    /// CR 701.43d + CR 603.1: Without a linked effect, this aggregate contains
+    /// only the static attack permission, not a triggered ability.
+    pub fn is_standalone_attack_exert_permission(&self) -> bool {
+        self.is_attack_exert_permission() && self.execute.is_none()
+    }
+
     pub fn new(mode: TriggerMode) -> Self {
         Self {
             mode,
@@ -40740,6 +40754,35 @@ mod tests {
         assert_eq!(json["count"], 2);
         let deserialized: AbilityCost = serde_json::from_value(json).unwrap();
         assert_eq!(deserialized, cost);
+    }
+
+    #[test]
+    fn attack_exert_permission_classification_preserves_triggered_components() {
+        // CR 701.43d + CR 603.1: Only the permission with no linked effect
+        // lacks a triggered component; unsupported effects still have one.
+        let permission =
+            TriggerDefinition::new(TriggerMode::Exerted).valid_card(TargetFilter::SelfRef);
+        assert!(permission.is_attack_exert_permission());
+        assert!(permission.is_standalone_attack_exert_permission());
+        for effect in [
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            Effect::unimplemented("ExertLinkedBody", "unsupported linked effect"),
+        ] {
+            let linked = permission
+                .clone()
+                .execute(AbilityDefinition::new(AbilityKind::Spell, effect));
+            assert!(linked.is_attack_exert_permission());
+            assert!(!linked.is_standalone_attack_exert_permission());
+        }
+        let observer = permission.valid_target(TargetFilter::Controller);
+        assert!(!observer.is_attack_exert_permission());
+        assert!(!observer.is_standalone_attack_exert_permission());
+        let unrelated = TriggerDefinition::new(TriggerMode::ChangesZone);
+        assert!(unrelated.execute.is_none());
+        assert!(!unrelated.is_standalone_attack_exert_permission());
     }
 
     // --- Serde roundtrip tests for new typed definitions ---
