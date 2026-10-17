@@ -12732,8 +12732,9 @@ pub(crate) fn validate_trigger_firing_coherence(state: &GameState) -> Result<(),
 
 /// CR 608.2n: an owed final part belongs to the instant or sorcery whose
 /// resolution carrier is installed. A restored marker that names no carrier, a
-/// non-spell carrier, a different spell, or a permanent spell (CR 608.3: its
-/// resolution is not the instant/sorcery path) is rejected rather than published.
+/// non-spell carrier, a different spell, a spell with no object, or a permanent
+/// spell (CR 608.3: its resolution is not the instant/sorcery path) is rejected
+/// rather than published.
 pub(crate) fn validate_owed_spell_final_part_coherence(state: &GameState) -> Result<(), String> {
     let Some(owed) = state.resolving_spell_final_part else {
         return Ok(());
@@ -12751,6 +12752,9 @@ pub(crate) fn validate_owed_spell_final_part_coherence(state: &GameState) -> Res
             });
     if !names_installed_spell {
         return Err("an owed spell final part must name the installed spell carrier".to_string());
+    }
+    if !state.objects.contains_key(&owed.spell) {
+        return Err("an owed spell final part must name an existing spell object".to_string());
     }
     if crate::game::stack::is_permanent_spell(state, owed.spell) {
         return Err(
@@ -38692,11 +38696,12 @@ mod tests {
     }
 
     /// CR 608.2n: a restored owed final part must name the installed instant
-    /// or sorcery carrier. A marker with no carrier, a non-spell carrier, or a
-    /// different spell is rejected on the transport decode and on the persisted
-    /// decode of a current-version payload alike; a coherent one decodes and
-    /// round-trips. (An unversioned payload with no frames is a v1 one, whose
-    /// completed-carrier normalization clears the marker with its carrier.)
+    /// or sorcery carrier. A marker with no carrier, a non-spell carrier, a
+    /// different spell, or a carrier naming no object is rejected on the
+    /// transport decode and on the persisted decode of a current-version
+    /// payload alike; a coherent one decodes and round-trips. (An unversioned
+    /// payload with no frames is a v1 one, whose completed-carrier
+    /// normalization clears the marker with its carrier.)
     #[test]
     fn an_owed_final_part_that_names_no_installed_spell_carrier_is_rejected_on_decode() {
         let spell = ObjectId(4_201);
@@ -38746,7 +38751,39 @@ mod tests {
             );
         }
 
-        let coherent = owed_final_part_state(Some(owed_final_part_spell_carrier(spell)), spell);
+        let absent = owed_final_part_state(Some(owed_final_part_spell_carrier(spell)), spell);
+        assert!(
+            !absent.objects.contains_key(&spell),
+            "reach guard: the installed carrier names no object"
+        );
+        const ABSENT: &str = "an owed spell final part must name an existing spell object";
+        let transport = serde_json::from_value::<GameState>(
+            serde_json::to_value(&absent).expect("the fixture serializes"),
+        )
+        .expect_err("the transport decode rejects a marker naming no object");
+        assert!(transport.to_string().contains(ABSENT), "{transport}");
+        let persisted = serde_json::from_value::<PersistedGameState>(
+            current_version_persisted_payload(&absent),
+        )
+        .expect_err("the persisted decode rejects a marker naming no object");
+        assert!(persisted.to_string().contains(ABSENT), "{persisted}");
+
+        let mut coherent = owed_final_part_state(None, ObjectId(0));
+        let spell = crate::game::zones::create_object(
+            &mut coherent,
+            CardId(4_201),
+            PlayerId(0),
+            "Owed Spell".to_string(),
+            crate::types::zones::Zone::Stack,
+        );
+        coherent
+            .objects
+            .get_mut(&spell)
+            .expect("the spell object exists")
+            .card_types
+            .core_types = vec![crate::types::card_type::CoreType::Sorcery];
+        coherent.resolving_stack_entry = Some(owed_final_part_spell_carrier(spell));
+        coherent.resolving_spell_final_part = Some(OwedSpellFinalPart { spell });
         let raw = serde_json::to_value(&coherent).expect("the fixture serializes");
         let decoded = serde_json::from_value::<GameState>(raw.clone())
             .expect("a marker naming its installed spell carrier decodes");
