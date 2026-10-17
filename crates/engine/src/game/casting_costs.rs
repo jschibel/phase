@@ -3744,7 +3744,7 @@ fn pause_sacrifice_for_cost(
     state.waiting_for.clone()
 }
 
-/// CR 603.2 + CR 603.3b: The typed sacrifice root owns every cost event that
+/// CR 603.2c + CR 603.3b: The typed sacrifice root owns every cost event that
 /// crossed a replacement-choice action boundary. Collect the full stamped set
 /// once, and claim the current action occurrences so its normal Priority
 /// pipeline cannot collect the same events again.
@@ -3756,65 +3756,6 @@ pub(crate) fn settle_sacrifice_for_cost_events(
     current_start: usize,
     current_end: usize,
 ) {
-    if let Some(collection) =
-        pending.and_then(|pending| pending.activation_trigger_collection.as_mut())
-    {
-        // Two occurrence bases, filtered separately and never rebased into each
-        // other (see below): the carried fragments carry no ordinal in THIS
-        // buffer, so the consumed journal — whose ordinals are absolute within
-        // the current action — must not be applied to them. The queued-context
-        // witness is occurrence-exact independently of any buffer;
-        // `turn_zone_change_index` separates distinct occurrences within a turn.
-        let carried_cost_events =
-            crate::game::triggers::filter_already_collected_trigger_events_from(
-                state,
-                &deferred_cost_events,
-                0,
-                &[],
-            );
-        // CR 602.2b + CR 603.2c + CR 603.10a: the carried fragments and the
-        // current one are ONE simultaneous sacrifice group, so they are
-        // collected in a single call (as the carrier-less path below does):
-        // collected separately, a batched leave trigger would fire once per
-        // call. The current fragment is claimed for the ordinary collector so
-        // the stack push does not collect it a second time.
-        let current_cost_events = super::announcement_triggers::unclaimed_events(
-            state,
-            &events[..current_end],
-            current_start,
-        );
-        // CR 603.7b: the retained fragment's delayed observers are scanned here,
-        // once, because no later scan can reach it: the stack push scans only the
-        // current action buffer, and the ordinary claim below is
-        // `OrdinaryCollectorsOnly`, so the CURRENT fragment's delayed scan is
-        // left to that push (scanning it here too would double-fire a
-        // repeating delayed trigger; for the same reason a repeating batched
-        // delayed trigger sees the two fragments as separate batches, while
-        // ordinary triggers merge them). The context joins the deferred queue
-        // the push commits the collection into, so it is one batch (CR 603.3b).
-        let carried_for_delayed = carried_cost_events.clone();
-        let group: Vec<GameEvent> = carried_cost_events
-            .into_iter()
-            .chain(current_cost_events)
-            .collect();
-        if !group.is_empty() {
-            collection.collect(state, &group);
-        }
-        if !carried_for_delayed.is_empty() {
-            crate::game::triggers::collect_delayed_trigger_contexts_into_deferred(
-                state,
-                &carried_for_delayed,
-            );
-        }
-        super::announcement_triggers::claim_ordinary_collected_span(
-            state,
-            events,
-            current_start,
-            current_end,
-        );
-        return;
-    }
-
     // Two occurrence bases, filtered separately and never rebased into each
     // other: the carried fragments against the buffer-independent queued-context
     // witness, the current fragment against this action's buffer with its
@@ -3832,13 +3773,38 @@ pub(crate) fn settle_sacrifice_for_cost_events(
         current_start,
         &state.consumed_before_priority_trigger_events,
     );
-    let deferred_cost_events: Vec<GameEvent> = carried_cost_events
+    let ordinary_group: Vec<GameEvent> = carried_cost_events
         .into_iter()
         .chain(current_cost_events)
         .collect();
-    if !deferred_cost_events.is_empty() {
-        crate::game::triggers::collect_triggers_into_deferred(state, &deferred_cost_events);
-        crate::game::triggers::collect_delayed_triggers_into_deferred(state, &deferred_cost_events);
+    // CR 603.2c + CR 603.7b + CR 603.10a: delayed observers must see the same
+    // complete simultaneous departure group. Ordinary queued contexts are not
+    // evidence that delayed observers scanned it, and the retained fragments
+    // have no occurrence ordinal in this action's buffer.
+    let delayed_group: Vec<GameEvent> = deferred_cost_events
+        .into_iter()
+        .chain(crate::game::triggers::filter_consumed_trigger_events_from(
+            &events[..current_end],
+            current_start,
+            crate::game::triggers::TriggerCollectionRequester::Delayed,
+            &state.consumed_before_priority_trigger_events,
+        ))
+        .collect();
+    if !ordinary_group.is_empty() {
+        if let Some(collection) =
+            pending.and_then(|pending| pending.activation_trigger_collection.as_mut())
+        {
+            collection.collect(state, &ordinary_group);
+        } else {
+            crate::game::triggers::collect_triggers_into_deferred(state, &ordinary_group);
+        }
+    }
+    if !delayed_group.is_empty() {
+        // Claims below use the original full buffer, never this combined slice.
+        crate::game::triggers::collect_delayed_trigger_contexts_into_deferred(
+            state,
+            &delayed_group,
+        );
     }
     // The journal claims the whole current fragment, not just what survived the
     // filter: an occurrence the filter dropped is one an earlier collector
@@ -7284,12 +7250,20 @@ pub(super) fn push_ability_entry(
         let mut deferred_contexts = std::mem::take(&mut state.deferred_triggers);
         collection.commit_into(state, &mut deferred_contexts);
         state.deferred_triggers = deferred_contexts;
-        // CR 602.2b + CR 603.3b + CR 603.7c: Cost-payment events are claimed
-        // below because the activation transaction owns their trigger batch.
-        // Collect delayed triggers before that claim too; otherwise a one-shot
-        // delayed trigger such as Earthbend's dies-or-exiled return is hidden
-        // from the later priority scan and never reaches the stack.
-        super::triggers::collect_delayed_triggers_into_deferred(state, events);
+        // CR 603.2c + CR 603.7b: terminal cost groups already claimed for both
+        // collectors must not fire again. Keep ordinary-only claims and new
+        // finishing events visible, with their original full-buffer positions.
+        let delayed_input = super::triggers::unclaimed_trigger_events_from(
+            events,
+            0,
+            super::triggers::TriggerCollectionRequester::Delayed,
+            &state.consumed_before_priority_trigger_events,
+        );
+        super::triggers::collect_unclaimed_delayed_triggers_into_deferred(
+            state,
+            events,
+            &delayed_input,
+        );
         state
             .consumed_before_priority_trigger_events
             .extend(events.iter().enumerate().map(|(index, event)| {
