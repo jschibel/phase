@@ -14,22 +14,28 @@
 use engine::game::ability_utils::build_resolved_from_def;
 use engine::game::effects::resolve_ability_chain;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::game::scenario_db::GameScenarioDbExt;
 use engine::game::zones::{create_object, move_to_zone};
 use engine::parser::parse_oracle_text;
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::counter::CounterType;
 use engine::types::game_state::{
-    AutoMayChoice, GameState, MayTriggerAutoChoiceKey, MayTriggerOrigin, WaitingFor,
+    AutoMayChoice, GameState, MayTriggerAutoChoiceKey, MayTriggerAutoChoiceScope, MayTriggerOrigin,
+    PersistedGameState, PersistedRestoreFinalization, WaitingFor,
 };
 use engine::types::identifiers::{CardId, ObjectId};
+use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::phase::Phase;
+use engine::types::resolution::ResolutionFrame;
 use engine::types::zones::Zone;
 
+use crate::support::shared_card_db;
+
 const GRIST: &str = "As long as Grist isn't on the battlefield, it's a 1/1 Insect creature in addition to its other types.\n+1: Create a 1/1 black and green Insect creature token, then mill a card. If an Insect card was milled this way, put a loyalty counter on Grist and repeat this process.\n\u{2212}2: You may sacrifice a creature. When you do, destroy target creature or planeswalker.\n\u{2212}5: Each opponent loses life equal to the number of creature cards in your graveyard.";
-const COLOSSUS: &str = "Trample\nWhen this creature enters, you may put a land card from your hand onto the battlefield tapped. If you do, draw a card and repeat this process.";
-const CRUSHER: &str = "At the beginning of your upkeep, reveal the top card of your library. If it's a land card, put it into your graveyard and repeat this process.";
-const TAMIYO: &str = "I, II, III \u{2014} Mill two cards. If two cards that share a card type were milled this way, draw a card and repeat this process.";
+const COLOSSUS: &str = "Trample\nCultivator Colossus's power and toughness are each equal to the number of lands you control.\nWhen this creature enters, you may put a land card from your hand onto the battlefield tapped. If you do, draw a card and repeat this process.";
+const CRUSHER: &str = "At the beginning of your upkeep, reveal the top card of your library. If it's a land card, put it into your graveyard and repeat this process.\nWhenever a land card is put into your graveyard from anywhere, put a +1/+1 counter on this creature.";
+const TAMIYO: &str = "(As this Saga enters and after your draw step, add a lore counter. Sacrifice after IV.)\nI, II, III \u{2014} Mill two cards. If two cards that share a card type were milled this way, draw a card and repeat this process.\nIV \u{2014} Exile any number of target instant, sorcery, and/or Tamiyo planeswalker cards from your graveyard. Copy them. You may cast any number of the copies.";
 const REST_IN_PEACE: &str = "When this enchantment enters, exile all graveyards.\nIf a card or token would be put into a graveyard from anywhere, exile it instead.";
 
 #[derive(Clone, Copy, Debug)]
@@ -660,4 +666,544 @@ fn a_milled_grist_repeats_the_plus_one_and_counts_at_minus_five() {
         (17, 0),
         "Mite, Elves and the dying Grist herself"
     );
+}
+
+// Production CardDB consumers. The direct-body rows above are supplementary
+// building-block tests. Regenerate integration_cards.json.gz from the fresh
+// production export with scripts/gen-test-fixture.py (including canonical gzip).
+fn colossus_scenario(
+    hand_lands: usize,
+    library: &[&str],
+) -> (GameScenario, ObjectId, Vec<ObjectId>, Vec<ObjectId>) {
+    let db = shared_card_db().expect("production repeat fixtures must load");
+    assert_eq!(
+        db.get_face_by_name("Cultivator Colossus")
+            .unwrap()
+            .oracle_text
+            .as_deref(),
+        Some(COLOSSUS)
+    );
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_real_card(P0, "Forest", Zone::Battlefield, db);
+    let source = scenario.add_real_card(P0, "Cultivator Colossus", Zone::Hand, db);
+    let hand = (0..hand_lands)
+        .map(|_| scenario.add_real_card(P0, "Forest", Zone::Hand, db))
+        .collect();
+    let library = library
+        .iter()
+        .map(|name| scenario.add_real_card(P0, name, Zone::Library, db))
+        .collect();
+    scenario.with_mana_pool(
+        P0,
+        (0..40)
+            .flat_map(|_| [ManaType::Green, ManaType::Blue])
+            .map(|color| ManaUnit::new(color, ObjectId(0), false, vec![]))
+            .collect(),
+    );
+    (scenario, source, hand, library)
+}
+
+fn cast_colossus_etb(runner: &mut GameRunner, source: ObjectId) {
+    runner.cast(source).commit();
+    assert_eq!(runner.state().stack.len(), 1);
+    runner.act(GameAction::PassPriority).expect("caster passes");
+    runner
+        .act(GameAction::PassPriority)
+        .expect("opponent passes to resolve the permanent");
+    assert_eq!(runner.state().objects[&source].zone, Zone::Battlefield);
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "the actual ETB trigger was collected"
+    );
+    assert_eq!(runner.state().stack.last().unwrap().source_id, source);
+    runner.resolve_top();
+}
+
+fn colossus_prompt_key(runner: &GameRunner, source: ObjectId) -> MayTriggerAutoChoiceKey {
+    match &runner.state().waiting_for {
+        WaitingFor::OptionalEffectChoice {
+            player,
+            source_id,
+            may_trigger_key: Some(key),
+            ..
+        } => {
+            assert_eq!((*player, *source_id), (P0, source));
+            assert_eq!((key.player, key.source_id), (P0, source));
+            assert!(matches!(key.origin, MayTriggerOrigin::Definition { .. }));
+            key.clone()
+        }
+        other => panic!("expected the live Colossus optional prompt, got {other:?}"),
+    }
+}
+
+fn assert_repeat_idle(runner: &GameRunner) {
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { player: P0 }
+    ));
+    assert!(runner.state().stack.is_empty());
+    assert!(runner.state().resolution_stack.is_empty());
+}
+
+#[test]
+fn colossus_real_etb_remembered_accept_26_puts() {
+    let mut names = vec!["Forest"; 25];
+    names.extend(["Shock", "Lightning Bolt"]);
+    let (scenario, source, hand, library) = colossus_scenario(1, &names);
+    let mut runner = scenario.build();
+    engine::game::rehydrate_game_from_card_db(runner.state_mut(), shared_card_db().unwrap());
+    cast_colossus_etb(&mut runner, source);
+    colossus_prompt_key(&runner, source);
+    assert_eq!(
+        runner.state().players[0]
+            .hand
+            .iter()
+            .filter(|id| runner.state().objects[id]
+                .card_types
+                .core_types
+                .contains(&CoreType::Land))
+            .count(),
+        1,
+        "the synchronous segment has exactly one eligible land"
+    );
+    let draws_before = runner.state().players[0].cards_drawn_this_turn;
+    runner
+        .act(GameAction::DecideOptionalEffectAndRemember {
+            choice: AutoMayChoice::Accept,
+            scope: MayTriggerAutoChoiceScope::ExactInstance,
+        })
+        .expect("26 synchronous passes finish");
+    // CR 608.2c + CR 608.2d: the initial land and 25 drawn lands each
+    // produce one draw; a nonland draw leaves the next put infeasible.
+    let put: Vec<_> = hand.iter().chain(library.iter().take(25)).collect();
+    assert_eq!(put.len(), 26);
+    for id in put {
+        assert_eq!(runner.state().objects[id].zone, Zone::Battlefield);
+        assert!(runner.state().objects[id].tapped);
+    }
+    assert_eq!(
+        runner.state().players[0].cards_drawn_this_turn - draws_before,
+        26
+    );
+    assert_eq!(runner.state().objects[&library[25]].zone, Zone::Hand);
+    assert_eq!(
+        runner.state().players[0]
+            .library
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![library[26]]
+    );
+    assert_repeat_idle(&runner);
+}
+
+#[test]
+fn colossus_real_etb_prompted_inner_pause_and_decline() {
+    for (lands, answers, expected_puts) in [(2, "AD", 1), (1, "AAD", 2), (1, "D", 0), (0, "", 0)] {
+        let (scenario, source, hand, library) =
+            colossus_scenario(lands, &["Forest", "Forest", "Shock"]);
+        let mut runner = scenario.build();
+        engine::game::rehydrate_game_from_card_db(runner.state_mut(), shared_card_db().unwrap());
+        cast_colossus_etb(&mut runner, source);
+        for answer in answers.chars() {
+            colossus_prompt_key(&runner, source);
+            runner
+                .act(GameAction::DecideOptionalEffect {
+                    accept: answer == 'A',
+                })
+                .unwrap();
+            if lands == 2 && answer == 'A' {
+                let cards = match &runner.state().waiting_for {
+                    WaitingFor::EffectZoneChoice { player, cards, .. } => {
+                        assert_eq!(*player, P0);
+                        assert_eq!(cards.len(), 2);
+                        assert!(hand.iter().all(|id| cards.contains(id)));
+                        cards.clone()
+                    }
+                    other => panic!("accepting with two eligible lands must pause: {other:?}"),
+                };
+                assert!(
+                    runner.state().resolution_stack.len() >= 2,
+                    "the loop owner remains below the choice tail"
+                );
+                runner
+                    .act(GameAction::SelectCards {
+                        cards: vec![cards[0]],
+                    })
+                    .unwrap();
+            }
+        }
+        let additional_lands = runner
+            .state()
+            .battlefield
+            .iter()
+            .filter(|id| {
+                runner.state().objects[id]
+                    .card_types
+                    .core_types
+                    .contains(&CoreType::Land)
+            })
+            .count()
+            - 1;
+        assert_eq!(additional_lands, expected_puts);
+        assert_eq!(
+            runner.state().players[0].cards_drawn_this_turn,
+            expected_puts as u32
+        );
+        assert_eq!(
+            runner.state().players[0].library.len(),
+            library.len() - expected_puts
+        );
+        assert_repeat_idle(&runner);
+    }
+}
+
+#[test]
+fn colossus_real_etb_exact_instance_decline_reprompts_after_reentry() {
+    let (mut scenario, source, hand, library) = colossus_scenario(1, &["Forest", "Shock"]);
+    let db = shared_card_db().unwrap();
+    let capsize = scenario.add_real_card(P0, "Capsize", Zone::Hand, db);
+    let sibling = scenario.add_real_card(P0, "Cultivator Colossus", Zone::Hand, db);
+    let mut runner = scenario.build();
+    engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
+    cast_colossus_etb(&mut runner, source);
+    let saved = colossus_prompt_key(&runner, source);
+    runner
+        .act(GameAction::DecideOptionalEffectAndRemember {
+            choice: AutoMayChoice::Decline,
+            scope: MayTriggerAutoChoiceScope::ExactInstance,
+        })
+        .unwrap();
+    assert_repeat_idle(&runner);
+    runner.cast(capsize).target_object(source).resolve();
+    assert_eq!(runner.state().objects[&source].zone, Zone::Hand);
+    cast_colossus_etb(&mut runner, source);
+    let reentered = colossus_prompt_key(&runner, source);
+    // CR 400.7 + CR 603.5: reentry produces a new trigger-source occurrence.
+    assert_ne!(reentered.origin, saved.origin);
+    assert_eq!(reentered.source_id, saved.source_id);
+    runner
+        .act(GameAction::DecideOptionalEffect { accept: false })
+        .unwrap();
+    assert_repeat_idle(&runner);
+    cast_colossus_etb(&mut runner, sibling);
+    let sibling_key = colossus_prompt_key(&runner, sibling);
+    assert_ne!(sibling_key.source_id, saved.source_id);
+    runner
+        .act(GameAction::DecideOptionalEffect { accept: false })
+        .unwrap();
+    assert_eq!(runner.state().objects[&hand[0]].zone, Zone::Hand);
+    assert_eq!(runner.state().players[0].cards_drawn_this_turn, 0);
+    assert_eq!(runner.state().players[0].library.len(), library.len());
+    assert_repeat_idle(&runner);
+}
+
+#[test]
+fn crusher_real_upkeep_repeats_and_publishes_counters() {
+    let db = shared_card_db().expect("production repeat fixtures must load");
+    assert_eq!(
+        db.get_face_by_name("Countryside Crusher")
+            .unwrap()
+            .oracle_text
+            .as_deref(),
+        Some(CRUSHER)
+    );
+    for names in [vec!["Forest", "Island", "Shock"], vec!["Shock"], vec![]] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::Untap);
+        let crusher = scenario.add_real_card(P0, "Countryside Crusher", Zone::Battlefield, db);
+        let library: Vec<_> = names
+            .iter()
+            .map(|name| scenario.add_real_card(P0, name, Zone::Library, db))
+            .collect();
+        let mut runner = scenario.build();
+        engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
+        runner.advance_to_upkeep();
+        // CR 603.2b: phase advancement collects the real upkeep trigger.
+        assert_eq!(runner.state().phase, Phase::Upkeep);
+        assert_eq!(runner.state().stack.len(), 1);
+        assert_eq!(runner.state().stack.last().unwrap().source_id, crusher);
+        runner.act(GameAction::PassPriority).unwrap();
+        runner.act(GameAction::PassPriority).unwrap();
+        let milled = if names.len() == 3 { 2 } else { 0 };
+        assert_eq!(runner.state().players[0].graveyard.len(), milled);
+        if milled > 0 {
+            assert_eq!(
+                runner.state().stack.len(),
+                2,
+                "each land created its separate counter trigger"
+            );
+            assert_eq!(runner.state().players[0].library[0], library[2]);
+        }
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            runner.state().objects[&crusher]
+                .counters
+                .get(&CounterType::Plus1Plus1)
+                .copied()
+                .unwrap_or(0),
+            milled as u32
+        );
+        assert_repeat_idle(&runner);
+    }
+}
+
+#[test]
+fn tamiyo_real_chapter_repeats_only_for_shared_pair() {
+    let db = shared_card_db().expect("production repeat fixtures must load");
+    assert_eq!(
+        db.get_face_by_name("The Tale of Tamiyo")
+            .unwrap()
+            .oracle_text
+            .as_deref(),
+        Some(TAMIYO)
+    );
+    for (names, milled, chapter_draws) in [
+        (
+            vec![
+                "Llanowar Elves",
+                "Llanowar Elves",
+                "Forest",
+                "Island",
+                "Shock",
+                "Llanowar Elves",
+            ],
+            4,
+            1,
+        ),
+        (vec!["Llanowar Elves", "Forest", "Shock"], 2, 0),
+        (vec!["Forest", "Island", "Shock", "Forest"], 3, 1),
+    ] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::Untap);
+        let saga = scenario.add_real_card(P0, "The Tale of Tamiyo", Zone::Battlefield, db);
+        let normal_draw = scenario.add_real_card(P0, "Lightning Bolt", Zone::Library, db);
+        let library: Vec<_> = names
+            .iter()
+            .map(|name| scenario.add_real_card(P0, name, Zone::Library, db))
+            .collect();
+        let mut runner = scenario.build();
+        engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
+        let lore_before = runner.state().objects[&saga]
+            .counters
+            .get(&CounterType::Lore)
+            .copied()
+            .unwrap_or(0);
+        runner.advance_to_phase(Phase::PreCombatMain);
+        // CR 714.3c: the precombat-main turn action adds lore and dispatches
+        // the next real chapter. Normal draw is separate from chapter output.
+        assert_eq!(runner.state().phase, Phase::PreCombatMain);
+        assert_eq!(
+            runner.state().objects[&saga]
+                .counters
+                .get(&CounterType::Lore)
+                .copied()
+                .unwrap_or(0),
+            lore_before + 1
+        );
+        assert_eq!(runner.state().objects[&normal_draw].zone, Zone::Hand);
+        assert_eq!(runner.state().stack.len(), 1);
+        assert_eq!(runner.state().stack.last().unwrap().source_id, saga);
+        runner.resolve_top();
+        assert_eq!(runner.state().players[0].graveyard.len(), milled);
+        assert_eq!(
+            runner.state().players[0].cards_drawn_this_turn,
+            chapter_draws + 1
+        );
+        assert_eq!(
+            runner.state().players[0].library.len(),
+            library.len() - milled - chapter_draws as usize
+        );
+        if names.len() == 6 {
+            assert_eq!(runner.state().players[0].library[0], library[5]);
+        }
+        assert_repeat_idle(&runner);
+    }
+}
+
+fn saved_repeat_state(runner: &GameRunner, trusted: bool) -> serde_json::Value {
+    let persisted = if trusted {
+        PersistedGameState::capture(runner.state().clone())
+    } else {
+        PersistedGameState::Raw(Box::new(runner.state().clone()))
+    };
+    serde_json::to_value(persisted).expect("live continuation serializes")
+}
+
+fn restore_repeat_state(value: serde_json::Value) -> GameRunner {
+    let db = shared_card_db().expect("restore requires the candidate production fixture");
+    let state = serde_json::from_value::<PersistedGameState>(value)
+        .expect("historical continuation decodes")
+        .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+        .expect("historical continuation prepares")
+        .finalize_after_rehydration(|state| {
+            engine::game::rehydrate_game_from_card_db(state, db);
+            Ok(())
+        })
+        .expect("historical continuation finalizes after rehydration");
+    GameRunner::from_state(state)
+}
+
+#[test]
+fn legacy_optional_repeat_carriers_restore_and_resume() {
+    let (scenario, source, hand, library) = colossus_scenario(2, &["Shock", "Lightning Bolt"]);
+    let mut original = scenario.build();
+    engine::game::rehydrate_game_from_card_db(original.state_mut(), shared_card_db().unwrap());
+    cast_colossus_etb(&mut original, source);
+    let origin = colossus_prompt_key(&original, source);
+    assert!(matches!(
+        original.state().resolution_stack.last(),
+        Some(ResolutionFrame::OptionalEffect(_))
+    ));
+    for trusted in [false, true] {
+        for historical in [
+            None,
+            Some(serde_json::json!(false)),
+            Some(serde_json::json!(true)),
+            Some(serde_json::json!("Optional")),
+        ] {
+            for accept in [false, true] {
+                let mut value = saved_repeat_state(&original, trusted);
+                let game = if trusted {
+                    &mut value["state"]
+                } else {
+                    &mut value
+                };
+                let frames = game["resolution_frames"]["frames"].as_array_mut().unwrap();
+                let owner_index = frames
+                    .iter()
+                    .position(|frame| frame["type"] == "RepeatUntil")
+                    .expect("live loop owner");
+                let template = frames.remove(owner_index)["data"]["ability"].clone();
+                let carrier = &mut frames
+                    .iter_mut()
+                    .find(|frame| frame["type"] == "OptionalEffect")
+                    .unwrap()["data"]["ability"];
+                // The historical optional frame itself carried the full loop;
+                // retain the live engine-issued source origin and object targets.
+                carrier["repeat_until"] = template["repeat_until"].clone();
+                let context = carrier["context"].as_object_mut().unwrap();
+                context.remove("loop_root_kind");
+                match &historical {
+                    None => {}
+                    Some(serde_json::Value::Bool(value)) => {
+                        context.insert("loop_root_was_optional".into(), serde_json::json!(value));
+                    }
+                    Some(value) => {
+                        context.insert("loop_root_kind".into(), value.clone());
+                    }
+                }
+                let mut restored = restore_repeat_state(value);
+                assert_eq!(colossus_prompt_key(&restored, source), origin);
+                restored
+                    .act(GameAction::DecideOptionalEffect { accept })
+                    .unwrap();
+                if accept {
+                    match &restored.state().waiting_for {
+                        WaitingFor::EffectZoneChoice { player, cards, .. } => {
+                            assert_eq!(*player, P0);
+                            assert!(hand.iter().all(|id| cards.contains(id)));
+                        }
+                        other => {
+                            panic!("restored accept must reach the real inner choice: {other:?}")
+                        }
+                    }
+                    restored
+                        .act(GameAction::SelectCards {
+                            cards: vec![hand[0]],
+                        })
+                        .unwrap();
+                    assert_eq!(colossus_prompt_key(&restored, source), origin);
+                    restored
+                        .act(GameAction::DecideOptionalEffect { accept: false })
+                        .unwrap();
+                }
+                assert_eq!(
+                    restored.state().players[0].cards_drawn_this_turn,
+                    u32::from(accept)
+                );
+                assert_eq!(
+                    restored.state().players[0].library.len(),
+                    library.len() - usize::from(accept)
+                );
+                assert_eq!(
+                    restored.state().objects[&hand[0]].zone,
+                    if accept {
+                        Zone::Battlefield
+                    } else {
+                        Zone::Hand
+                    }
+                );
+                assert_repeat_idle(&restored);
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_accepted_repeat_until_inner_choice_restores_and_rearms_next_pass() {
+    let (scenario, source, hand, library) = colossus_scenario(2, &["Shock", "Lightning Bolt"]);
+    let mut original = scenario.build();
+    engine::game::rehydrate_game_from_card_db(original.state_mut(), shared_card_db().unwrap());
+    cast_colossus_etb(&mut original, source);
+    let origin = colossus_prompt_key(&original, source);
+    original
+        .act(GameAction::DecideOptionalEffect { accept: true })
+        .unwrap();
+    assert!(matches!(
+        original.state().waiting_for,
+        WaitingFor::EffectZoneChoice { player: P0, .. }
+    ));
+    for trusted in [false, true] {
+        for historical in [true, false] {
+            let mut value = saved_repeat_state(&original, trusted);
+            let game = if trusted {
+                &mut value["state"]
+            } else {
+                &mut value
+            };
+            let owner = &mut game["resolution_frames"]["frames"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|frame| frame["type"] == "RepeatUntil")
+                .unwrap()["data"]["ability"];
+            owner["optional"] = serde_json::json!(false);
+            owner["context"]["optional_effect_performed"] = serde_json::json!(true);
+            if historical {
+                owner["context"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("loop_root_kind");
+                owner["context"]["loop_root_was_optional"] = serde_json::json!(true);
+            }
+            let mut restored = restore_repeat_state(value);
+            match &restored.state().waiting_for {
+                WaitingFor::EffectZoneChoice { player, cards, .. } => {
+                    assert_eq!(*player, P0);
+                    assert!(hand.iter().all(|id| cards.contains(id)));
+                }
+                other => panic!("saved inner choice survives restore: {other:?}"),
+            }
+            restored
+                .act(GameAction::SelectCards {
+                    cards: vec![hand[0]],
+                })
+                .unwrap();
+            assert_eq!(colossus_prompt_key(&restored, source), origin);
+            assert_eq!(
+                restored.state().players[0].cards_drawn_this_turn,
+                1,
+                "the accepted current pass finishes exactly once before the next gate"
+            );
+            restored
+                .act(GameAction::DecideOptionalEffect { accept: false })
+                .unwrap();
+            assert_eq!(restored.state().players[0].library.len(), library.len() - 1);
+            assert_eq!(restored.state().objects[&hand[0]].zone, Zone::Battlefield);
+            assert_repeat_idle(&restored);
+        }
+    }
 }

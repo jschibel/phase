@@ -211,6 +211,10 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 146 — SpellContext.loop_root_kind replaces loop_root_was_optional with the
+ *       typed Mandatory/Optional instruction lifecycle. A v145 peer drops the
+ *       field and cannot safely resume optional repeats. Wire 128 moves with it;
+ *       saved-state compatibility is handled separately by the engine decoder.
  * 145 — The "repeat this process" directive adds two serialized tags to ability
  *      trees: `RuntimeHandler::RepeatProcess` and
  *      `EffectOutcomeSignal::RepeatDirectiveReached`; a v144 peer cannot parse
@@ -884,7 +888,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 145;
+export const PROTOCOL_VERSION = 146;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

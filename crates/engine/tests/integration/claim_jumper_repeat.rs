@@ -27,6 +27,7 @@
 use engine::game::ability_utils::build_resolved_from_def;
 use engine::game::effects::resolve_ability_chain;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::game::scenario_db::GameScenarioDbExt;
 use engine::game::zones::create_object;
 use engine::parser::parse_oracle_text;
 use engine::types::ability::{
@@ -36,12 +37,15 @@ use engine::types::ability::{
 use engine::types::actions::GameAction;
 use engine::types::card_type::{CoreType, Supertype};
 use engine::types::game_state::{
-    AutoMayChoice, GameState, MayTriggerAutoChoiceKey, MayTriggerOrigin, WaitingFor,
+    AutoMayChoice, GameState, MayTriggerAutoChoiceKey, MayTriggerAutoChoiceScope, MayTriggerOrigin,
+    WaitingFor,
 };
 use engine::types::identifiers::{CardId, ObjectId};
-use engine::types::mana::ManaColor;
+use engine::types::mana::{ManaColor, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
+
+use crate::support::shared_card_db;
 
 const CLAIM_JUMPER_ORACLE: &str = "Vigilance\nWhen this creature enters, if an opponent controls more lands than you, you may search your library for a Plains card and put it onto the battlefield tapped. Then if an opponent controls more lands than you, repeat this process once. If you search your library this way, shuffle.";
 
@@ -601,4 +605,189 @@ fn claim_jumper_decline_branch_that_pauses_is_resumed_then_the_repeat_check_runs
     assert_outcome(&o, 1, "OYOS", "decline (scry), accept");
     let o = run(2, 8, "DD", Gate::Prompted, Graft::DeclineScry, None);
     assert_outcome(&o, 0, "OYOY", "decline (scry), decline (scry)");
+}
+
+// Production ETB consumers; the direct-body rows above supplement these
+// with synthetic cap/tail/decline instruments. Regenerate the compressed
+// integration CardDB fixture from the fresh production export with its generator.
+fn real_claim_jumper(opponent_lands: usize, library: &[&str]) -> (GameRunner, ObjectId) {
+    let db = shared_card_db().expect("production repeat fixtures must load");
+    assert_eq!(
+        db.get_face_by_name("Claim Jumper")
+            .unwrap()
+            .oracle_text
+            .as_deref(),
+        Some(CLAIM_JUMPER_ORACLE)
+    );
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario.add_real_card(P0, "Claim Jumper", Zone::Hand, db);
+    for _ in 0..opponent_lands {
+        scenario.add_real_card(P1, "Island", Zone::Battlefield, db);
+    }
+    for name in library {
+        scenario.add_real_card(P0, name, Zone::Library, db);
+    }
+    scenario.with_mana_pool(
+        P0,
+        (0..10)
+            .map(|_| ManaUnit::new(ManaType::White, ObjectId(0), false, vec![]))
+            .collect(),
+    );
+    let mut runner = scenario.build();
+    engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
+    runner.cast(source).commit();
+    runner.act(GameAction::PassPriority).unwrap();
+    runner.act(GameAction::PassPriority).unwrap();
+    assert_eq!(runner.state().objects[&source].zone, Zone::Battlefield);
+    if opponent_lands > 0 {
+        // CR 603.4: the actual entry satisfied the intervening-if clause.
+        assert_eq!(runner.state().stack.len(), 1);
+        assert_eq!(runner.state().stack.last().unwrap().source_id, source);
+        runner.resolve_top();
+    } else {
+        assert!(
+            runner.state().stack.is_empty(),
+            "equal counts prevent the ETB trigger"
+        );
+    }
+    (runner, source)
+}
+
+fn assert_claim_prompt(runner: &GameRunner, source: ObjectId) -> MayTriggerAutoChoiceKey {
+    match &runner.state().waiting_for {
+        WaitingFor::OptionalEffectChoice {
+            player,
+            source_id,
+            may_trigger_key: Some(key),
+            ..
+        } => {
+            assert_eq!((*player, *source_id), (P0, source));
+            assert_eq!((key.player, key.source_id), (P0, source));
+            assert!(matches!(key.origin, MayTriggerOrigin::Definition { .. }));
+            key.clone()
+        }
+        other => panic!("expected the live Claim Jumper optional offer: {other:?}"),
+    }
+}
+
+fn assert_claim_idle(runner: &GameRunner) {
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { player: P0 }
+    ));
+    assert!(runner.state().stack.is_empty());
+    assert!(runner.state().resolution_stack.is_empty());
+}
+
+#[test]
+fn claim_jumper_real_etb_once_cap_and_decline_matrix() {
+    for (answers, expected_trace, plains) in [
+        ("AA", "OSOS", 2),
+        ("AD", "OSO", 1),
+        ("DA", "OOS", 1),
+        ("DD", "OO", 0),
+    ] {
+        let (mut runner, source) = real_claim_jumper(4, &["Plains", "Plains", "Plains"]);
+        let key = assert_claim_prompt(&runner, source);
+        let mut trace = String::new();
+        for answer in answers.chars() {
+            assert_eq!(
+                assert_claim_prompt(&runner, source),
+                key,
+                "both passes retain the same trigger origin"
+            );
+            trace.push('O');
+            runner
+                .act(GameAction::DecideOptionalEffect {
+                    accept: answer == 'A',
+                })
+                .unwrap();
+            if answer == 'A' {
+                let chosen = match &runner.state().waiting_for {
+                    WaitingFor::SearchChoice { player, cards, .. } => {
+                        assert_eq!(*player, P0);
+                        assert!(!cards.is_empty());
+                        cards[0]
+                    }
+                    other => panic!("an accepted search must pause: {other:?}"),
+                };
+                trace.push('S');
+                runner
+                    .act(GameAction::SelectCards {
+                        cards: vec![chosen],
+                    })
+                    .unwrap();
+                assert_eq!(runner.state().objects[&chosen].zone, Zone::Battlefield);
+                assert!(runner.state().objects[&chosen].tapped);
+            }
+        }
+        // CR 608.2c: "once" is one additional pass even while four opposing
+        // lands keep the live predicate true after both successful searches.
+        assert_eq!(trace, expected_trace);
+        assert_eq!(plains_on_battlefield(runner.state()), plains);
+        assert_claim_idle(&runner);
+    }
+    let (mut equality, _) = real_claim_jumper(1, &["Plains", "Plains"]);
+    assert_eq!(drive(&mut equality, "A"), "OS");
+    assert_eq!(plains_on_battlefield(equality.state()), 1);
+    assert_claim_idle(&equality);
+    let (equal_initially, _) = real_claim_jumper(0, &["Plains", "Plains"]);
+    assert_eq!(plains_on_battlefield(equal_initially.state()), 0);
+    assert_claim_idle(&equal_initially);
+}
+
+#[test]
+fn claim_jumper_real_etb_empty_search_still_checks_repeat_and_cap() {
+    for library in [vec![], vec!["Shock"], vec!["Plains", "Plains"]] {
+        let (mut runner, source) = real_claim_jumper(4, &library);
+        for _ in 0..2 {
+            assert_claim_prompt(&runner, source);
+            runner
+                .act(GameAction::DecideOptionalEffect { accept: true })
+                .unwrap();
+            if library.first() == Some(&"Plains") {
+                match &runner.state().waiting_for {
+                    WaitingFor::SearchChoice { player, cards, .. } => {
+                        assert_eq!(*player, P0);
+                        assert_eq!(cards.len(), 2);
+                    }
+                    other => {
+                        panic!("matching Plains produce the public fail-to-find choice: {other:?}")
+                    }
+                }
+                runner
+                    .act(GameAction::SelectCards { cards: vec![] })
+                    .unwrap();
+            }
+        }
+        assert_eq!(plains_on_battlefield(runner.state()), 0);
+        assert_claim_idle(&runner);
+    }
+}
+
+#[test]
+fn claim_jumper_real_etb_remembered_decline_reused_within_trigger() {
+    let (mut runner, source) = real_claim_jumper(4, &["Plains", "Plains", "Plains"]);
+    let key = assert_claim_prompt(&runner, source);
+    assert_eq!(
+        runner.state().players[0].library.len(),
+        3,
+        "feasible search, with the repeat predicate still true"
+    );
+    runner
+        .act(GameAction::DecideOptionalEffectAndRemember {
+            choice: AutoMayChoice::Decline,
+            scope: MayTriggerAutoChoiceScope::ExactInstance,
+        })
+        .unwrap();
+    // CR 603.5 + CR 608.2c: the independent repeat still follows the first
+    // decline; its unchanged trigger identity reuses the remembered answer.
+    assert_eq!(
+        runner.state().may_trigger_auto_choice_for_live_prompt(&key),
+        Some(AutoMayChoice::Decline)
+    );
+    assert_eq!(plains_on_battlefield(runner.state()), 0);
+    assert_eq!(runner.state().players[0].library.len(), 3);
+    assert_claim_idle(&runner);
 }

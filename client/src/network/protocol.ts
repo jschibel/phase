@@ -106,6 +106,10 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  128 — game_setup and state_update carry SpellContext.loop_root_kind, the
+ *        typed Mandatory/Optional lifecycle replacing loop_root_was_optional.
+ *        A wire 127 peer drops it and cannot safely resume optional repeats.
+ *        Bumped with full-game protocol 146.
  *  127 — game_setup and state_update carry ability trees that may hold the
  *       RuntimeHandler::RepeatProcess node and the
  *       EffectOutcomeSignal::RepeatDirectiveReached loop predicate; a v126 peer
@@ -689,7 +693,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 127 as const;
+export const WIRE_PROTOCOL_VERSION = 128 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

@@ -3346,6 +3346,10 @@ mod tests {
         }
     }
 
+    /// v146: `SpellContext::loop_root_kind` carries the typed optional-root
+    /// lifecycle. A v145 peer drops it and cannot safely resume the process,
+    /// so it is refused before receiving v146 state.
+    ///
     /// v145: the "repeat this process" directive adds two serialized tags to
     /// ability trees, `RuntimeHandler::RepeatProcess` and
     /// `EffectOutcomeSignal::RepeatDirectiveReached` (CR 608.2c); a v144 peer
@@ -3569,8 +3573,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_145_for_repeat_process_directive() {
-        assert_eq!(PROTOCOL_VERSION, 145);
+    fn protocol_version_is_146_for_typed_loop_root_lifecycle() {
+        assert_eq!(PROTOCOL_VERSION, 146);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3581,7 +3585,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_145_for_repeat_process_directive` stays
+    /// `protocol_version_is_146_for_typed_loop_root_lifecycle` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

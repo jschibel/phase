@@ -15,7 +15,7 @@ use crate::types::ability::{
     ContinuousModification, ControllerRef, CopyRetargetPermission, CostPaidObjectSnapshot,
     CounterKindDomain, DetachedRemainder, Duration, EachDamageRecipient, Effect, EffectError,
     EffectKind, EffectOutcomeSignal, EffectResolutionResult, EffectScope, ExtraPhaseRecipient,
-    FilterProp, ForEachCategoryAction, ForwardedResultContext, ManaProduction,
+    FilterProp, ForEachCategoryAction, ForwardedResultContext, LoopRootKind, ManaProduction,
     MassLibraryShuffleMode, NameStickerSet, ObjectSelectionCardinality, OpponentMayScope,
     PlayerFilter, PlayerRelation, PlayerScope, PossessionAxis, PtValue, QuantityExpr, QuantityRef,
     ReciprocalZoneChoiceRole, RepeatContinuation, ResolvedAbility, RevealUntilDisposition,
@@ -1902,10 +1902,9 @@ fn root_optional_gate_applies(state: &GameState, ability: &ResolvedAbility) -> b
 /// cap threaded (the one owner of the cap threading for the driver, the drain
 /// and the decline arm).
 ///
-/// CR 608.2c + CR 608.2d: when the root's optional decision was answered this
-/// pass (`loop_root_was_optional`), the next pass follows the whole instruction
-/// again, "you may" included, with no memory of the last pass's decision so an
-/// "if you do" rider reads this pass's decision.
+/// CR 608.2c + CR 608.2d: an optional root's instruction kind persists across
+/// passes. The next pass follows its "you may" again and clears the previous
+/// performed outcome so an "if you do" rider reads only the new decision.
 fn next_pass_ability(
     ability: &ResolvedAbility,
     condition: &AbilityCondition,
@@ -1916,9 +1915,8 @@ fn next_pass_ability(
         condition: Box::new(condition.clone()),
         max_iterations: remaining,
     });
-    if next.context.loop_root_was_optional {
+    if next.context.loop_root_kind == LoopRootKind::Optional {
         next.optional = true;
-        next.context.loop_root_was_optional = false;
         next.context.optional_effect_performed = false;
     }
     next
@@ -4321,7 +4319,11 @@ pub(crate) fn apply_parent_chain_context(
     // latch is node-local: a non-ChangeZone parent (a hand reveal, a target
     // declaration) carries none, so the wholesale hand-off must not erase it.
     let child_duration_events = std::mem::take(&mut child.context.duration_events);
+    // CR 608.2c + CR 608.2d: optionality belongs to the child's own instruction,
+    // so an optional parent must not rearm a mandatory child loop's root.
+    let loop_root_kind = child.context.loop_root_kind;
     child.context = parent.context.clone();
+    child.context.loop_root_kind = loop_root_kind;
     child.context.face_down_in_exile |= child_face_down_in_exile;
     for event in child_duration_events {
         if !child.context.duration_events.contains(&event) {
@@ -4747,14 +4749,15 @@ pub(super) fn resolve_optional_effect_decision(
     match choice {
         AutoMayChoice::Accept => {
             ability.context.optional_effect_performed = true;
-            // CR 608.2c + CR 608.2d: a `WhileCondition` root's accepted "you may"
-            // is asked again on the next pass (`next_pass_ability`). Only that
-            // variant reads the flag; `ControllerChoice` re-prompts through
-            // `RepeatDecision` on its own.
-            ability.context.loop_root_was_optional = matches!(
+            // CR 608.2c + CR 608.2d: a legacy full-metadata carrier still needs
+            // its instruction kind latched. New per-pass bodies already retain
+            // their owner's kind; cleared metadata must never erase that kind.
+            if matches!(
                 ability.repeat_until,
                 Some(RepeatContinuation::WhileCondition { .. })
-            );
+            ) {
+                ability.context.loop_root_kind = LoopRootKind::Optional;
+            }
             state
                 .player_actions_this_way
                 .insert((ability.controller, PlayerActionKind::AcceptedOptionalEffect));
@@ -4818,7 +4821,9 @@ pub(super) fn resolve_optional_effect_decision(
                 {
                     resolved.mirror_targets_from(&ability);
                 }
+                let loop_root_kind = resolved.context.loop_root_kind;
                 resolved.context = ability.context.clone();
+                resolved.context.loop_root_kind = loop_root_kind;
                 // CR 608.2c: This optional effect was DECLINED — the decline
                 // branch's `Not{IfYouDo}` / `IfYouDo` gate must evaluate
                 // relative to *this* decision, not a stale `true` inherited
@@ -4853,7 +4858,8 @@ pub(super) fn resolve_optional_effect_decision(
     Ok(())
 }
 
-/// Was this `WhileCondition` root's decision the answer to its own up-front gate?
+/// Was this legacy full-metadata root's decision its own up-front gate?
+/// New per-pass bodies leave continuation ownership with the outer driver.
 fn declined_while_root_was_gate_asked(state: &GameState, ability: &ResolvedAbility) -> bool {
     matches!(
         ability.repeat_until,
@@ -4887,7 +4893,7 @@ fn continue_loop_after_declined_root(
         return Ok(());
     };
     let mut declined = ability.clone();
-    declined.context.loop_root_was_optional = true;
+    declined.context.loop_root_kind = LoopRootKind::Optional;
     if state.waiting_for != *waiting_before {
         park_repeat_until_after_inner_pause(state, Box::new(declined), None, boundary);
         return Ok(());
@@ -15122,13 +15128,6 @@ pub fn resolve_ability_chain(
         // `depth == 0` prelude above ran exactly once — a repeated process is one
         // resolution (CR 608.2c), so per-resolution accumulators and the
         // resolution counter must not re-fire per iteration.
-        // Exception: a `WhileCondition` loop whose optional root was accepted this pass
-        // (`SpellContext::loop_root_was_optional`) re-enters this function for its next
-        // pass, so the root's 'you may' is asked again (CR 608.2c + CR 608.2d). That
-        // re-entry keeps `depth` and nests one call level per consecutive pass that
-        // neither pauses nor is handed to a prompt; a stored answer answers in line at
-        // `depth + 1`. It is bounded by the player's pauses, by the `depth > 20` guard
-        // and by the stack.
         debug_assert!(
             !(ability.repeat_for.is_some() && ability.repeat_until.is_some()),
             "repeat_for (count) and repeat_until (predicate) are mutually exclusive"
@@ -15219,6 +15218,13 @@ pub fn resolve_ability_chain(
                 max_iterations,
             }) => {
                 let mut remaining = max_iterations;
+                let mut pass = ability.clone();
+                // CR 608.2c + CR 608.2d: latch the instruction, not its answer.
+                // A restored accepted legacy root keeps optional=false for its
+                // current pass, then rearms only at the next pass boundary.
+                if pass.optional {
+                    pass.context.loop_root_kind = LoopRootKind::Optional;
+                }
                 loop {
                     // CR 608.2c: each repeated process is a FRESH execution of the
                     // instructions, so its "that card"/"those cards" tracked set must
@@ -15246,21 +15252,15 @@ pub fn resolve_ability_chain(
                     let initial_waiting_for = state.waiting_for.clone();
                     let stack_depth_before_iteration =
                         state.resolution_stack.capture_child_boundary();
-                    // CR 608.2c + CR 608.2d: a pass that runs the root's own up-front
-                    // "you may" gate hands the loop's continuation to the optional-decision
-                    // machinery, however the gate is answered (a prompt resumes in the
-                    // engine handler; a stored answer runs the decision nested in line).
-                    let root_gate_decides = root_optional_gate_applies(state, ability);
-                    with_iteration_return_result_occurrence(state, ability, |state| {
-                        resolve_chain_body(state, ability, events, depth)
+                    let mut body = pass.clone();
+                    body.repeat_until = None;
+                    with_iteration_return_result_occurrence(state, &body, |state| {
+                        resolve_chain_body(state, &body, events, depth)
                     })?;
-                    if root_gate_decides {
-                        return Ok(());
-                    }
                     if state.waiting_for != initial_waiting_for {
                         // Inner pause: stash the loop ability with its remaining cap
                         // so the drain re-evaluates the condition after the choice.
-                        let mut paused = ability.clone();
+                        let mut paused = pass.clone();
                         paused.repeat_until = Some(RepeatContinuation::WhileCondition {
                             condition: condition.clone(),
                             max_iterations: remaining,
@@ -15276,15 +15276,10 @@ pub fn resolve_ability_chain(
                         );
                         return Ok(());
                     }
-                    if !should_repeat_while_condition(state, ability, &condition, &mut remaining) {
+                    if !should_repeat_while_condition(state, &pass, &condition, &mut remaining) {
                         return Ok(());
                     }
-                    // CR 608.2c + CR 608.2d: an accepted optional root is asked again, so
-                    // the next pass re-enters through the ordinary entry gate.
-                    if ability.context.loop_root_was_optional {
-                        let next = next_pass_ability(ability, &condition, remaining);
-                        return resolve_ability_chain(state, &next, events, depth);
-                    }
+                    pass = next_pass_ability(&pass, &condition, remaining);
                 }
             }
         }
@@ -16514,7 +16509,9 @@ fn resolve_chain_body(
                 if should_propagate_parent_targets(ability, &else_resolved) {
                     else_resolved.mirror_targets_from(ability);
                 }
+                let loop_root_kind = else_resolved.context.loop_root_kind;
                 else_resolved.context = ability.context.clone();
+                else_resolved.context.loop_root_kind = loop_root_kind;
                 if try_begin_deferred_else_branch_target_selection(
                     state,
                     &mut else_resolved,
@@ -16624,7 +16621,9 @@ fn resolve_chain_body(
                     if should_propagate_parent_targets(ability, &sub_resolved) {
                         sub_resolved.mirror_targets_from(ability);
                     }
+                    let loop_root_kind = sub_resolved.context.loop_root_kind;
                     sub_resolved.context = ability.context.clone();
+                    sub_resolved.context.loop_root_kind = loop_root_kind;
                     // CR 608.2c: The false-parent ordinal escape bypasses the
                     // ordinary post-effect chain handoff, so it must explicitly
                     // carry this printed ability's index to the next ordinal
@@ -33765,11 +33764,9 @@ mod tests {
     }
 
     #[test]
-    fn loop_root_flag_stamps_only_while_condition_and_next_pass_restores_the_root() {
+    fn loop_root_kind_stamps_only_while_condition_and_next_pass_restores_the_root() {
         // CR 608.2c + CR 608.2d: an accepted optional `WhileCondition` root is
         // asked again on the next pass; a `ControllerChoice` root is not stamped.
-        use crate::types::ability::AbilityCondition;
-        use crate::types::game_state::AutoMayChoice;
         let mk = |effect: Effect| {
             let mut a = ResolvedAbility::new(effect, vec![], ObjectId(100), PlayerId(0));
             a.optional = true;
@@ -33797,7 +33794,7 @@ mod tests {
                     ability.context.optional_effect_performed,
                     "reach guard: the accept ran"
                 );
-                assert!(!ability.context.loop_root_was_optional);
+                assert_eq!(ability.context.loop_root_kind, LoopRootKind::Mandatory);
             }
             other => panic!("expected RepeatDecision, got {other:?}"),
         }
@@ -33827,13 +33824,13 @@ mod tests {
             .expect("the paused pass parked the loop")
             .ability
             .clone();
-        assert!(parked.context.loop_root_was_optional);
+        assert_eq!(parked.context.loop_root_kind, LoopRootKind::Optional);
         assert!(parked.context.optional_effect_performed);
 
         // The next pass restores the root's "you may" and forgets the decision.
         let next = next_pass_ability(&parked, &cond, Some(0));
         assert!(next.optional);
-        assert!(!next.context.loop_root_was_optional);
+        assert_eq!(next.context.loop_root_kind, LoopRootKind::Optional);
         assert!(!next.context.optional_effect_performed);
         assert!(matches!(
             next.repeat_until,
@@ -33854,7 +33851,171 @@ mod tests {
         let n = next_pass_ability(&plain, &cond, Some(0));
         assert!(!n.optional);
         assert!(n.context.optional_effect_performed);
-        assert!(!n.context.loop_root_was_optional);
+        assert_eq!(n.context.loop_root_kind, LoopRootKind::Mandatory);
+    }
+
+    #[test]
+    fn accepted_metadata_cleared_body_preserves_optional_root_kind() {
+        let mut state = GameState::new_two_player(42);
+        let mut body = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        body.optional = true;
+        body.context.loop_root_kind = LoopRootKind::Optional;
+        body.sub_ability = Some(Box::new(ResolvedAbility::new(
+            Effect::Scry {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        )));
+        crate::game::zones::create_object(
+            &mut state,
+            crate::types::identifiers::CardId(900),
+            PlayerId(0),
+            "Filler".into(),
+            Zone::Library,
+        );
+        let mut events = Vec::new();
+        resolve_optional_effect_decision(&mut state, body, AutoMayChoice::Accept, &mut events, 1)
+            .unwrap();
+        assert_eq!(state.players[0].life, 21);
+        assert!(matches!(state.waiting_for, WaitingFor::ScryChoice { .. }));
+        assert!(
+            state.active_repeat_until().is_none(),
+            "a body never becomes a second loop owner"
+        );
+    }
+
+    #[test]
+    fn legacy_accepted_root_executes_current_pass_before_rearming() {
+        let mut state = GameState::new_two_player(42);
+        let mut ability = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        ability.context.loop_root_kind = LoopRootKind::Optional;
+        ability.context.optional_effect_performed = true;
+        ability.repeat_until = Some(RepeatContinuation::WhileCondition {
+            condition: Box::new(AbilityCondition::IsYourTurn),
+            max_iterations: Some(1),
+        });
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 1).unwrap();
+        assert_eq!(
+            state.players[0].life, 21,
+            "the legacy current pass was already accepted"
+        );
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::OptionalEffectChoice {
+                player: PlayerId(0),
+                ..
+            }
+        ));
+        let frame = &state
+            .active_optional_effect_frame()
+            .expect("only the next pass asks again")
+            .ability;
+        assert!(frame.optional);
+        assert_eq!(frame.context.loop_root_kind, LoopRootKind::Optional);
+        assert!(!frame.context.optional_effect_performed);
+        assert!(
+            frame.repeat_until.is_none(),
+            "the new prompt carries a body, not another owner"
+        );
+    }
+
+    #[test]
+    fn while_root_kind_is_node_local() {
+        let mut state = GameState::new_two_player(42);
+        let gain = || {
+            ResolvedAbility::new(
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    player: TargetFilter::Controller,
+                },
+                vec![],
+                ObjectId(100),
+                PlayerId(0),
+            )
+        };
+        let mut child = gain();
+        child.repeat_until = Some(RepeatContinuation::WhileCondition {
+            condition: Box::new(AbilityCondition::IsYourTurn),
+            max_iterations: Some(1),
+        });
+        let mut parent = gain();
+        parent.optional = true;
+        parent.repeat_until = Some(RepeatContinuation::WhileCondition {
+            condition: Box::new(AbilityCondition::IsYourTurn),
+            max_iterations: Some(0),
+        });
+        parent.sub_ability = Some(Box::new(child));
+        let mut events = Vec::new();
+        resolve_optional_effect_decision(&mut state, parent, AutoMayChoice::Accept, &mut events, 1)
+            .unwrap();
+        // CR 608.2c + CR 608.2d: the mandatory child executes twice without
+        // inheriting its parent's optional instruction on its second pass.
+        assert_eq!(state.players[0].life, 23);
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::Priority {
+                player: PlayerId(0)
+            }
+        ));
+        assert!(state.resolution_stack.is_empty());
+    }
+
+    #[test]
+    fn while_passes_preserve_structural_depth() {
+        let mut state = GameState::new_two_player(42);
+        let mut ability = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        ability.repeat_until = Some(RepeatContinuation::WhileCondition {
+            condition: Box::new(AbilityCondition::IsYourTurn),
+            max_iterations: Some(25),
+        });
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        assert_eq!(
+            state.players[0].life, 46,
+            "26 synchronous passes do not consume structural depth"
+        );
+        ability.repeat_until = None;
+        let mut nested = ability.clone();
+        for _ in 0..22 {
+            let mut parent = ability.clone();
+            parent.sub_ability = Some(Box::new(nested));
+            nested = parent;
+        }
+        assert!(
+            matches!(
+                resolve_ability_chain(&mut state, &nested, &mut events, 0),
+                Err(EffectError::ChainTooDeep)
+            ),
+            "real child structure retains its guard"
+        );
     }
 
     #[test]
