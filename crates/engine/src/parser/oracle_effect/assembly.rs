@@ -27,8 +27,9 @@ use crate::parser::oracle_nom::target::chain_text_mentions_chosen_object;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
     CastFromZoneDriver, CastingPermission, ChoiceType, ChosenGroupId, Comparator, ControllerRef,
-    DamageChannel, Effect, PlayerFilter, PlayerScope, QuantityExpr, QuantityRef, ReturnResultId,
-    SiblingCondition, StaticCondition, SubAbilityLink, TapStateChange, TargetFilter,
+    DamageChannel, Effect, EffectScope, FilterProp, PlayerFilter, PlayerScope, QuantityExpr,
+    QuantityRef, ReturnResultId, SharedQuality, SharedQualityRelation, SiblingCondition,
+    StaticCondition, SubAbilityLink, TapStateChange, TargetFilter, TypedFilter,
 };
 use crate::types::game_state::TargetSelectionConstraint;
 use crate::types::zones::Zone;
@@ -67,6 +68,7 @@ use super::lower::{
     rewrite_else_parent_target_to_self_ref, rewrite_player_anaphor_targets_in_definition,
     rewrite_those_tokens_from_antecedent, rewrite_two_target_counter_chain,
     target_choice_timing_for_clause, thread_chosen_damage_source_into_oneshot_effects,
+    timed_clause_sub_chain,
 };
 use super::sequence::{apply_clause_continuation, def_bears_retargetable_copy};
 use super::{
@@ -1941,6 +1943,89 @@ fn declares_published_object_target(effect: &Effect) -> bool {
             .is_some_and(|filter| !filter.is_context_ref() && !matches!(filter, TargetFilter::Any))
 }
 
+/// CR 207.2c + CR 608.2c: the "each other `<X>` that shares a color with it"
+/// population of a Radiance fan-out — a mass effect (Untap-all, `DamageAll`)
+/// whose filter is `SharesQuality { Color, ParentTarget }` and excludes "other"
+/// objects, spelled `DistinctFrom { ParentTarget }` (damage fan-out) or the
+/// generic `Another` (the compound-untap splitter). The chosen target itself is
+/// reached by the head instruction, not by this population.
+fn radiance_fanout_population(effect: &Effect) -> Option<&TypedFilter> {
+    let (Effect::SetTapState {
+        scope: EffectScope::All,
+        target: TargetFilter::Typed(typed),
+        ..
+    }
+    | Effect::DamageAll {
+        target: TargetFilter::Typed(typed),
+        ..
+    }) = effect
+    else {
+        return None;
+    };
+    let shares_color_with_target = typed.properties.iter().any(|prop| {
+        matches!(
+            prop,
+            FilterProp::SharesQuality {
+                quality: SharedQuality::Color,
+                reference: Some(reference),
+                relation: SharedQualityRelation::Shares,
+            } if matches!(**reference, TargetFilter::ParentTarget)
+        )
+    });
+    let excludes_others = typed
+        .properties
+        .iter()
+        .any(|prop| matches!(prop, FilterProp::Another | FilterProp::DistinctFrom { .. }));
+    (shares_color_with_target && excludes_others).then_some(typed)
+}
+
+/// CR 701.26a/b: a mass tap/untap instruction — its affected population is a
+/// filter, not the chosen target a `ParentTarget` binding would name.
+fn mass_tap_state_population(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::SetTapState {
+            scope: EffectScope::All,
+            ..
+        }
+    )
+}
+
+/// CR 611.2a + CR 608.2c: the mass counterpart of a "those creatures get +N/+M"
+/// rider bound to the chosen target (`Pump { ParentTarget }`) — a `PumpAll` over
+/// the Radiance fan-out `population`, chained after the target's own `Pump`.
+/// `Another` is "other than the source", which would not exclude the chosen
+/// target (already pumped by its own `Pump`), so it is restated as
+/// `DistinctFrom { ParentTarget }`.
+fn radiance_fanout_rider(
+    rider: &AbilityDefinition,
+    population: &TypedFilter,
+) -> Option<AbilityDefinition> {
+    let Effect::Pump {
+        power,
+        toughness,
+        target: TargetFilter::ParentTarget,
+    } = &*rider.effect
+    else {
+        return None;
+    };
+    let mut filter = population.clone();
+    filter
+        .properties
+        .retain(|prop| !matches!(prop, FilterProp::Another | FilterProp::DistinctFrom { .. }));
+    filter.properties.push(FilterProp::DistinctFrom {
+        reference: Box::new(TargetFilter::ParentTarget),
+    });
+    let mut fanout = rider.clone();
+    fanout.sub_ability = None;
+    *fanout.effect = Effect::PumpAll {
+        power: power.clone(),
+        toughness: toughness.clone(),
+        target: TargetFilter::Typed(filter),
+    };
+    Some(fanout)
+}
+
 /// CR 601.2c: a `Pump` whose target is its own declared target instance
 /// ("[up to one] [other] target creature gets +N/+M"), not an inherited anaphor.
 fn declares_pump_target(effect: &Effect) -> bool {
@@ -2957,7 +3042,7 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
         // CDT{Attach} instead of CDT{ChangeZone[+Attach]}. TargetOnly already
         // nests before wrap; mirror that for this attach-on-return shape.
         let clause_sub = if is_target_only {
-            def.sub_ability = clause_ir.parsed.sub_ability.clone();
+            def.sub_ability = timed_clause_sub_chain(clause_ir);
             // CR 701.3a + CR 303.4f: TargetOnly → ChangeZone[+Attach] (Necrotic
             // Plague) must stamp `forward_result` on the nested return so the
             // chosen host propagates into Attach (see
@@ -2980,10 +3065,10 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
             // `resolve_forward_result_search_attach_host` stamps `attach_to`
             // and skips the CR 303.4f host-choice consult.
             def.forward_result = true;
-            def.sub_ability = clause_ir.parsed.sub_ability.clone();
+            def.sub_ability = timed_clause_sub_chain(clause_ir);
             None
         } else {
-            clause_ir.parsed.sub_ability.clone()
+            timed_clause_sub_chain(clause_ir)
         };
 
         // CR 118.9 + CR 608.2g: A *standing-duration* `CastFromZone` lingering
@@ -3565,6 +3650,46 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                 .fragment()
                 .unwrap_or_default()
                 .to_lowercase();
+            // CR 608.2c: a plural subject anaphor ("those creatures") names the
+            // population of the clause immediately before it — written order,
+            // not a search of older history. `AntecedentSelector::LastEmitted`
+            // binds that antecedent through `AssemblyEnv::resolve`.
+            if starts_with_plural_subject_anaphor(&source_text_lower) {
+                if let Some(bound_index) =
+                    env.resolve(&defs, AntecedentSelector::LastEmitted, None, OnMiss::Ignore)
+                {
+                    let antecedent = &defs[bound_index];
+                    if let Some(population) = radiance_fanout_population(&antecedent.effect) {
+                        // CR 207.2c: after a Radiance fan-out, "those creatures" is
+                        // the target AND every other object the fan-out reached, so
+                        // the rider fans out over the same population.
+                        let fanout_riders: Vec<AbilityDefinition> = current_defs
+                            .iter()
+                            .filter_map(|current| radiance_fanout_rider(current, population))
+                            .collect();
+                        current_defs.extend(fanout_riders);
+                    } else if mass_tap_state_population(&antecedent.effect) {
+                        // CR 608.2c: the antecedent is a mass tap/untap population
+                        // that no `ParentTarget` binding can represent. Pumping only
+                        // the chosen target would silently name the wrong creatures,
+                        // so the rider fails closed.
+                        for current in &mut current_defs {
+                            if matches!(
+                                &*current.effect,
+                                Effect::Pump {
+                                    target: TargetFilter::ParentTarget,
+                                    ..
+                                }
+                            ) {
+                                *current.effect = Effect::unimplemented(
+                                    "plural_rider_after_mass_tap_population",
+                                    clause_ir.source.fragment().unwrap_or_default(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             // CR 603.7: Scan ALL prior clauses for a tracked-set publisher — an
             // intermediate non-publishing clause (e.g. Investigate) must not
             // shadow an earlier exile clause. Example: Disorder in the Court
@@ -4341,6 +4466,14 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     // CR 608.2d: gate the whole "if they guessed wrong/right" branch, including
     // any "and ..." continuation steps.
     super::propagate_guess_branch_condition_to_continuations(&mut result);
+
+    // CR 608.2d + CR 202.3 + CR 115.1: the assembled tree is where both halves of
+    // an aggregate-budget clause first exist together — the typed constraint the
+    // parser recovered and the resolution timing it routed the pick to. A refusal,
+    // not a repair: it REPLACES an effect in place, so it runs here, after every
+    // other final-fold gate has read the assembled tree. See
+    // `refuse_unenforced_aggregate_resolution_selection`.
+    super::lower::refuse_unenforced_aggregate_resolution_selection(&mut result);
 
     result
 }
@@ -5623,6 +5756,67 @@ mod arena_tests {
             node = def.sub_ability.as_deref();
         }
         false
+    }
+
+    /// CR 207.2c + CR 608.2c: "those creatures" binds the clause immediately
+    /// before it. Positive reach guard: Rally's own sentence pair gains the
+    /// fan-out `PumpAll`.
+    #[test]
+    fn plural_rider_after_radiance_fanout_gains_pump_all() {
+        let parsed = crate::parser::parse_oracle_text(
+            RALLY_TEXT,
+            "Rally Probe",
+            &[],
+            &["Instant".to_string()],
+            &[],
+        );
+        assert!(
+            chain_effects(&parsed.abilities[0])
+                .iter()
+                .any(|effect| matches!(effect, Effect::PumpAll { .. })),
+            "reach guard: the Radiance rider must fan out"
+        );
+    }
+
+    /// CR 608.2c: an intervening mass untap clause is the antecedent of "those
+    /// creatures", not the older Radiance population — so the rider must not be
+    /// bound to Rally's color fan-out, and (the referent being a mass population
+    /// `ParentTarget` cannot name) fails closed.
+    #[test]
+    fn plural_rider_after_intervening_population_ignores_older_radiance() {
+        let text = "Untap target creature and each other creature that shares a color with it. Untap all creatures you control. Those creatures get +2/+0 until end of turn.";
+        let parsed = crate::parser::parse_oracle_text(
+            text,
+            "Intervening Probe",
+            &[],
+            &["Instant".to_string()],
+            &[],
+        );
+        let effects = chain_effects(&parsed.abilities[0]);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PumpAll { .. })),
+            "the older color fan-out must not be the antecedent: {effects:?}"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| effect.unimplemented_description().is_some()),
+            "the unrepresentable referent must fail honestly: {effects:?}"
+        );
+    }
+
+    const RALLY_TEXT: &str = "Radiance \u{2014} Untap target creature and each other creature that shares a color with it. Those creatures get +2/+0 until end of turn.";
+
+    fn chain_effects(root: &AbilityDefinition) -> Vec<Effect> {
+        let mut out = Vec::new();
+        let mut node = Some(root);
+        while let Some(def) = node {
+            out.push((*def.effect).clone());
+            node = def.sub_ability.as_deref();
+        }
+        out
     }
 
     /// CR 608.2c: the chain tracked set also holds an earlier producer's object,

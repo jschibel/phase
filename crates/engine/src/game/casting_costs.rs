@@ -12111,6 +12111,7 @@ fn finalize_cast_with_phyrexian_choices_inner(
     let mut ability = ability;
     ability.context.cast_from_zone = Some(source_zone);
     ability.context.cast_controller = Some(player);
+    ability.context.cast_active_player = Some(state.active_player);
     ability.context.cast_phase = Some(state.phase);
     // CR 601.2c + CR 608.2c: latch the declared object targets so a nested
     // sub-ability — whose own `targets` may hold a resolution-chosen recipient
@@ -29199,7 +29200,7 @@ its replicate cost was paid.)\nDraw a card.";
                 let (mut state, source, targets, fodder, tapper, cost, mut resolved) =
                     defensive_x_target_fixture(target_count, mixed);
                 match route {
-                    Route::Assigned => resolved.targets.push(TargetRef::Object(targets[0])),
+                    Route::Assigned => resolved.push_chosen_target(TargetRef::Object(targets[0])),
                     Route::Random => {
                         resolved.target_selection_mode =
                             crate::types::ability::TargetSelectionMode::Random;

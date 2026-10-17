@@ -5765,6 +5765,7 @@ fn bind_search_found_definition(
                         single_use: false,
                         cast_cost_modifier: None,
                         alt_ability_cost: None,
+                        without_paying_mana_cost: false,
                         land_enter_tapped,
                         invalidation: None,
                         provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
@@ -12778,11 +12779,11 @@ mod tests {
     use crate::game::game_object::{AttachTarget, GameObject};
     use crate::types::ability::{
         AbilityCost, AbilityDefinition, AbilityKind, CastManaObjectScope, CastManaSpentMetric,
-        ChosenAttribute, Comparator, ContinuousModification, ControllerRef, Effect, EffectScope,
-        FilterProp, OriginConstraint, PlayerFilter, PtValue, QuantityExpr, QuantityModification,
-        QuantityRef, ReplacementDefinition, ReplacementMode, ReplacementPlayerScope,
-        SourceExclusion, TapStateChange, TargetFilter, TargetRef, TriggerDefinition, TypeFilter,
-        TypedFilter,
+        ChooseOneOfKind, ChosenAttribute, Comparator, ContinuousModification, ControllerRef,
+        Effect, EffectScope, FilterProp, OriginConstraint, PlayerFilter, PtValue, QuantityExpr,
+        QuantityModification, QuantityRef, ReplacementDefinition, ReplacementMode,
+        ReplacementPlayerScope, SourceExclusion, TapStateChange, TargetFilter, TargetRef,
+        TriggerDefinition, TypeFilter, TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
@@ -22371,6 +22372,7 @@ mod tests {
                 Effect::ChooseOneOf {
                     chooser: PlayerFilter::Controller,
                     branches: vec![token_branch("Cat", 2, 2), token_branch("Dog", 3, 1)],
+                    kind: ChooseOneOfKind::Ordinary,
                 },
             ));
 

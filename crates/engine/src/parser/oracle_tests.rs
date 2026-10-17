@@ -7,9 +7,9 @@ use crate::parser::oracle_ir::doc::{
 use crate::parser::oracle_ir::static_ir::StaticIr;
 use crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER;
 use crate::types::ability::{
-    AdditionalCostOrigin, AdditionalCostPaymentSource, CountScope, CounterAdjustment,
-    DamageKindFilter, DoorLockOp, PlayerRelation, SpellStackToGraveyardReplacement, SubAbilityLink,
-    TargetReadOrigin,
+    AdditionalCostOrigin, AdditionalCostPaymentSource, ChooseOneOfKind, CountScope,
+    CounterAdjustment, DamageKindFilter, DoorLockOp, PlayerRelation,
+    SpellStackToGraveyardReplacement, SubAbilityLink, TargetReadOrigin,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::phase::{PhaseGroup, TurnSegment};
@@ -5203,7 +5203,9 @@ fn leadership_vacuum_returns_target_players_commanders_to_command_zone() {
                 TargetFilter::Typed(TypedFilter {
                     // CR 109.4 + CR 115.10a (issue #6505): "each commander THEY
                     // control" is the TARGET player's commanders, not the
-                    // caster's. The anaphoric "they" now lowers to `ScopedPlayer`
+                    // caster's. The subject "Target player" seeds the anaphoric
+                    // "they" with the declared target player, and the
+                    // resolution-pick leg rebinds that seed to `ScopedPlayer`
                     // (bound to the declared target player by the resolution-time
                     // `scoped_player` stamp), fixing the same class as Strategic
                     // Betrayal. Previously it wrongly resolved to `You` (the
@@ -5611,6 +5613,325 @@ fn rottenmouth_viper_parses_optional_sacrifice_and_cost_reduction() {
         "expected sacrificed-this-way reduction static, got statics: {:?}",
         r.statics
     );
+}
+
+/// Redemptor Dreadnought's printed Oracle text.
+const REDEMPTOR_DREADNOUGHT: &str = "Fallen Warrior — As an additional cost to cast this spell, \
+you may exile a creature card from your graveyard.\n\
+Trample\n\
+Plasma Incinerator — Whenever this creature attacks, if a card is exiled with it, it gets +X/+X \
+until end of turn, where X is the power of the exiled card.";
+
+/// Hierophant Bio-Titan's printed Oracle text.
+const HIEROPHANT_BIO_TITAN: &str = "Frenzied Metabolism — As an additional cost to cast this \
+spell, you may remove any number of +1/+1 counters from among creatures you control. This spell \
+costs {2} less to cast for each counter removed this way.\n\
+Reach, vigilance, ward {2}\n\
+Titanic — This creature can't be blocked by creatures with power 2 or less.";
+
+/// K2. CR 118.8b + CR 207.2d: the flavor word "Fallen Warrior" has no rules
+/// meaning, so the line is the spell's optional additional cost.
+#[test]
+fn redemptor_dreadnought_flavor_word_line_is_its_additional_cost() {
+    let r = parse(
+        REDEMPTOR_DREADNOUGHT,
+        "Redemptor Dreadnought",
+        &[Keyword::Trample],
+        &["Artifact", "Creature"],
+        &["Astartes", "Dreadnought"],
+    );
+    assert_eq!(
+        r.additional_cost,
+        Some(AdditionalCost::Optional {
+            cost: AbilityCost::Exile {
+                count: 1,
+                zone: Some(Zone::Graveyard),
+                filter: Some(TargetFilter::Typed(
+                    TypedFilter::creature()
+                        .controller(ControllerRef::You)
+                        .properties(vec![FilterProp::InZone {
+                            zone: Zone::Graveyard
+                        }]),
+                )),
+            },
+            repeatability: crate::types::ability::AdditionalCostRepeatability::Once,
+        })
+    );
+    assert!(
+        !r.abilities
+            .iter()
+            .any(|a| matches!(*a.effect, Effect::Unimplemented { .. })),
+        "no line is left unparsed, got abilities: {:?}",
+        r.abilities
+    );
+}
+
+/// K3. CR 601.2f + CR 608.2c: Hierophant Bio-Titan's flavor-word line is its
+/// optional counter-removal cost, and its "for each counter removed this way"
+/// reduction is surfaced as unsupported instead of lowered to a static that
+/// reads a resolution look-back.
+#[test]
+fn hierophant_bio_titan_flavor_word_cost_is_typed_and_its_reduction_is_honest() {
+    let r = parse(
+        HIEROPHANT_BIO_TITAN,
+        "Hierophant Bio-Titan",
+        &[
+            Keyword::Reach,
+            Keyword::Vigilance,
+            Keyword::Ward(WardCost::Mana(ManaCost::generic(2))),
+        ],
+        &["Creature"],
+        &["Tyranid"],
+    );
+    assert!(
+        matches!(
+            r.additional_cost,
+            Some(AdditionalCost::Optional {
+                cost: AbilityCost::RemoveCounter {
+                    selection: crate::types::ability::CounterCostSelection::AmongObjects,
+                    target: Some(_),
+                    ..
+                },
+                ..
+            })
+        ),
+        "the cost is an optional counter removal from among creatures, got {:?}",
+        r.additional_cost
+    );
+    assert!(
+        !r.statics.iter().any(|s| matches!(
+            s.mode,
+            StaticMode::ModifyCost {
+                dynamic_count: Some(QuantityRef::PreviousEffectAmount { .. }),
+                ..
+            }
+        )),
+        "no static reduction reads the resolution look-back, got statics: {:?}",
+        r.statics
+    );
+    assert!(
+        r.abilities.iter().any(|a| matches!(
+            &*a.effect,
+            Effect::Unimplemented { name, description }
+                if name == "static_structure"
+                    && description.as_deref()
+                        == Some("This spell costs {2} less to cast for each counter removed this way.")
+        )),
+        "the reduction is an honest gap, got abilities: {:?}",
+        r.abilities
+    );
+    assert!(
+        r.statics
+            .iter()
+            .any(|s| matches!(s.mode, StaticMode::CantBeBlockedBy { .. })),
+        "sibling guard: Titanic's evasion static still parses, got statics: {:?}",
+        r.statics
+    );
+}
+
+/// K4b. CR 207.2d: a flavor word of five words is still a label; the line
+/// after it is the spell's additional cost.
+#[test]
+fn five_word_label_before_additional_cost_is_read_as_the_cost() {
+    let r = parse(
+        "One Two Three Four Five — As an additional cost to cast this spell, discard a card.\n\
+         Draw two cards.",
+        "Test Sorcery",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+    assert!(
+        matches!(
+            r.additional_cost,
+            Some(AdditionalCost::Required(AbilityCost::Discard { .. }))
+        ),
+        "got {:?}",
+        r.additional_cost
+    );
+    assert_eq!(r.abilities.len(), 1, "got abilities: {:?}", r.abilities);
+    assert!(matches!(*r.abilities[0].effect, Effect::Draw { .. }));
+}
+
+/// K5. CR 207.2d: a labeled additional-cost line after the spell body ends
+/// the body exactly as an unlabeled one does.
+#[test]
+fn labeled_additional_cost_line_after_a_spell_body_is_the_cost() {
+    let r = parse(
+        "Draw two cards.\n\
+         One Two Three Four Five — As an additional cost to cast this spell, discard a card.",
+        "Test Sorcery",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+    assert!(
+        matches!(
+            r.additional_cost,
+            Some(AdditionalCost::Required(AbilityCost::Discard { .. }))
+        ),
+        "got {:?}",
+        r.additional_cost
+    );
+    assert_eq!(r.abilities.len(), 1, "got abilities: {:?}", r.abilities);
+    assert!(matches!(*r.abilities[0].effect, Effect::Draw { .. }));
+}
+
+/// Parses a one-line creature and asserts the line is not read as an
+/// additional cost: it stays the single unrecognized ability it was before
+/// labeled additional-cost lines were read.
+fn assert_labeled_line_is_not_an_additional_cost(line: &str) {
+    let r = parse(line, "Test Creature", &[], &["Creature"], &[]);
+    assert_eq!(r.additional_cost, None, "line: {line}");
+    assert_eq!(r.abilities.len(), 1, "got abilities: {:?}", r.abilities);
+    assert!(
+        matches!(
+            &*r.abilities[0].effect,
+            Effect::Unimplemented { name, description }
+                if name == "unknown" && description.as_deref() == Some(line)
+        ),
+        "the line is reported as unrecognized, got abilities: {:?}",
+        r.abilities
+    );
+}
+
+/// CR 702.178a: "Max speed" is a keyword ability that gates the text after
+/// it, so a cost behind it is not read as an ungated additional cost.
+#[test]
+fn max_speed_labeled_additional_cost_line_is_not_an_ungated_cost() {
+    assert_labeled_line_is_not_an_additional_cost(
+        "Max speed — As an additional cost to cast this spell, discard a card.",
+    );
+}
+
+/// CR 702.186a + CR 702.186b: "∞" is a keyword ability that gates the text
+/// after it, so a cost behind it is not read as an ungated additional cost.
+#[test]
+fn infinity_labeled_additional_cost_line_is_not_an_ungated_cost() {
+    assert_labeled_line_is_not_an_additional_cost(
+        "∞ — As an additional cost to cast this spell, discard a card.",
+    );
+}
+
+/// CR 118.8 + CR 207.2c: a labeled line that imposes a cost on other spells
+/// is not this spell's additional cost, and the line is not consumed silently.
+#[test]
+fn labeled_additional_cost_on_other_spells_is_not_consumed_silently() {
+    assert_labeled_line_is_not_an_additional_cost(
+        "Rally — As an additional cost to cast creature spells, sacrifice a creature.",
+    );
+}
+
+/// CR 702.169b: "Solved" is a keyword ability whose label gives the text after
+/// it rules meaning, so a cost behind it is not read as an ungated cost.
+#[test]
+fn solved_labeled_additional_cost_line_is_not_an_ungated_cost() {
+    assert_labeled_line_is_not_an_additional_cost(
+        "Solved — As an additional cost to cast this spell, discard a card.",
+    );
+}
+
+/// CR 719.3a: "To solve — [Condition]" is the Case's solve condition, so the
+/// text after it is read as that condition and never as an additional cost.
+#[test]
+fn to_solve_labeled_additional_cost_line_is_not_an_ungated_cost() {
+    let line = "To solve — As an additional cost to cast this spell, discard a card.";
+    let r = parse(line, "Test Creature", &[], &["Creature"], &[]);
+    assert_eq!(r.additional_cost, None);
+    assert!(r.abilities.is_empty(), "got abilities: {:?}", r.abilities);
+    assert_eq!(
+        r.solve_condition,
+        Some(SolveCondition::Text {
+            description: "as an additional cost to cast this spell, discard a card.".to_string(),
+        })
+    );
+}
+
+/// CR 207.2d + CR 702.139a + CR 702.124i: a label that contains a keyword term keeps the line on
+/// its base route (one unrecognized ability). "Echo of the Lost" is a flavor word refused
+/// fail-closed because it contains "echo"; its row pins that known gap.
+#[test]
+fn labels_that_name_a_rules_term_keep_their_base_parse() {
+    for label in [
+        "Companion",
+        "Partner",
+        "Ward",
+        "Flying",
+        "Discover 3",
+        "Increment",
+        "Echo of the Lost",
+        "Level 2",
+    ] {
+        assert_labeled_line_is_not_an_additional_cost(&format!(
+            "{label} — As an additional cost to cast this spell, discard a card."
+        ));
+    }
+}
+
+/// CR 702.62a: "Suspend 4" is a keyword with a parameter, so its labeled line
+/// stays on the suspend keyword route and is not an additional cost.
+#[test]
+fn suspend_labeled_additional_cost_line_stays_a_suspend_line() {
+    let r = parse(
+        "Suspend 4 — As an additional cost to cast this spell, discard a card.",
+        "Test Creature",
+        &[],
+        &["Creature"],
+        &[],
+    );
+    assert_eq!(r.additional_cost, None);
+    assert!(
+        r.extracted_keywords
+            .iter()
+            .any(|k| matches!(k, Keyword::Suspend { count: 4, .. })),
+        "the line stays on the suspend keyword route, got keywords: {:?}",
+        r.extracted_keywords
+    );
+}
+
+/// CR 702.159b: the "Prize" paragraph is part of an Attraction's visit
+/// ability, never a cost to cast it.
+#[test]
+fn attraction_prize_labeled_additional_cost_line_is_part_of_the_visit_ability() {
+    let r = parse(
+        "Visit — Draw a card.\nPrize — As an additional cost to cast this spell, discard a card.",
+        "Test Attraction",
+        &[],
+        &["Artifact"],
+        &["Attraction"],
+    );
+    assert_eq!(r.additional_cost, None);
+    assert_eq!(
+        r.abilities
+            .iter()
+            .filter(|a| matches!(
+                &*a.effect,
+                Effect::Unimplemented { name, description }
+                    if name == "unknown"
+                        && description.as_deref()
+                            == Some("Prize — As an additional cost to cast this spell, discard a card.")
+            ))
+            .count(),
+        1,
+        "the Prize line is reported as unrecognized, got abilities: {:?}",
+        r.abilities
+    );
+    assert_eq!(r.triggers.len(), 1, "got triggers: {:?}", r.triggers);
+    assert_eq!(r.triggers[0].mode, TriggerMode::VisitAttraction);
+}
+
+/// CR 702.41a + CR 207.2d: "Affinity" is a keyword, so the line stays off the additional cost, and
+/// its keyword route does not panic on the dash.
+#[test]
+fn affinity_labeled_additional_cost_line_is_not_an_additional_cost() {
+    let r = parse(
+        "Affinity — As an additional cost to cast this spell, discard a card.",
+        "Test Creature",
+        &[],
+        &["Creature"],
+        &[],
+    );
+    assert_eq!(r.additional_cost, None);
 }
 
 #[test]
@@ -8412,7 +8733,10 @@ fn owen_grady_shared_noun_counter_choice_activated() {
         .sub_ability
         .as_deref()
         .expect("counter choice must be chained as a sub-ability");
-    let Effect::ChooseOneOf { chooser, branches } = &*choice.effect else {
+    let Effect::ChooseOneOf {
+        chooser, branches, ..
+    } = &*choice.effect
+    else {
         panic!("expected ChooseOneOf sub-ability, got {:?}", choice.effect);
     };
     assert_eq!(*chooser, PlayerFilter::Controller);
@@ -10907,6 +11231,111 @@ fn parses_activate_only_if_condition_and_only_once_each_turn() {
             }
         )),
         "expected RequiresCondition with OpponentLostLife"
+    );
+}
+
+/// CR 602.5: Grim Repriser's graveyard return — "Activate only if an opponent
+/// has been dealt noncombat damage this turn" must parse to a RequiresCondition
+/// gate over `DamageDealtThisTurn { NoncombatOnly } >= 1`, with no
+/// Unimplemented clause. The bare "was dealt damage" form (Skarrgan Pit-Skulk's
+/// Bloodthirst gate) is re-asserted as `Any` in the same test so the qualifier
+/// threading cannot collapse the unqualified cell.
+#[test]
+fn parses_grim_repriser_noncombat_damage_activation_gate() {
+    const GRIM_ACTIVATED: &str = "{B}{R}: Return this card from your graveyard to the battlefield with a finality counter on it. Activate only if an opponent has been dealt noncombat damage this turn. (If a creature with a finality counter on it would die, exile it instead.)";
+    const BARE_ACTIVATED: &str = "{B}{R}: Return this card from your graveyard to the battlefield with a finality counter on it. Activate only if an opponent was dealt damage this turn. (If a creature with a finality counter on it would die, exile it instead.)";
+    let r = parse(
+        GRIM_ACTIVATED,
+        "Grim Repriser",
+        &[],
+        &["Creature"],
+        &["Zombie", "Bard"],
+    );
+    assert_eq!(r.abilities.len(), 1);
+    // CR 113.6m: the effect moves the source out of the graveyard, so the
+    // ability functions only from the graveyard.
+    assert_eq!(
+        r.abilities[0].activation_zone,
+        Some(Zone::Graveyard),
+        "CR 113.6m: a graveyard self-return functions only from the graveyard"
+    );
+    let restrictions = &r.abilities[0].activation_restrictions;
+    match restrictions.iter().find_map(|r| match r {
+        ActivationRestriction::RequiresCondition { condition } => condition.clone(),
+        _ => None,
+    }) {
+        Some(ParsedCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty:
+                        QuantityRef::DamageDealtThisTurn {
+                            source,
+                            target,
+                            aggregate: AggregateFunction::Sum,
+                            group_by: None,
+                            damage_kind: DamageKindFilter::NoncombatOnly,
+                            ..
+                        },
+                },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        }) => {
+            assert_eq!(
+                *source,
+                TargetFilter::Any,
+                "the gate counts damage from any source"
+            );
+            match target.as_ref() {
+                TargetFilter::And { filters }
+                    if filters.len() == 2
+                        && filters[0] == TargetFilter::Player
+                        && matches!(
+                            &filters[1],
+                            TargetFilter::Typed(tf)
+                                if tf.controller == Some(ControllerRef::Opponent)
+                        ) => {}
+                other => panic!("expected the opponent player-only recipient, got {other:?}"),
+            }
+        }
+        other => panic!(
+            "expected RequiresCondition with NoncombatOnly DamageDealtThisTurn, got {other:?}"
+        ),
+    }
+    assert!(r.parse_warnings.is_empty());
+    assert!(
+        !parsed_has_unimplemented(&r),
+        "no clause of Grim Repriser may fall through to Unimplemented"
+    );
+
+    // Regression tripwire: the bare Skarrgan form keeps the `Any` damage class.
+    let bare = parse(
+        BARE_ACTIVATED,
+        "Grim Repriser",
+        &[],
+        &["Creature"],
+        &["Zombie", "Bard"],
+    );
+    assert!(bare.parse_warnings.is_empty());
+    assert!(
+        bare.abilities[0]
+            .activation_restrictions
+            .iter()
+            .any(|r| matches!(
+                r,
+                ActivationRestriction::RequiresCondition {
+                    condition: Some(ParsedCondition::QuantityComparison {
+                        lhs: QuantityExpr::Ref {
+                            qty: QuantityRef::DamageDealtThisTurn {
+                                damage_kind: DamageKindFilter::Any,
+                                ..
+                            }
+                        },
+                        comparator: Comparator::GE,
+                        rhs: QuantityExpr::Fixed { value: 1 },
+                    })
+                }
+            )),
+        "the bare 'was dealt damage' gate must stay DamageKindFilter::Any"
     );
 }
 
@@ -21342,6 +21771,73 @@ fn spell_counter_tap_plus_doesnt_untap() {
 }
 
 #[test]
+fn spell_code_of_constraint_addendum_tap_and_cant_untap() {
+    let r = parse(
+        "Target creature gets -4/-0 until end of turn.\nDraw a card.\nAddendum — If you cast this spell during your main phase, tap that creature and it doesn't untap during its controller's next untap step.",
+        "Code of Constraint",
+        &[],
+        &["Instant"],
+        &[],
+    );
+    assert!(
+        r.statics.is_empty(),
+        "Code of Constraint should not produce static abilities, got {:?}",
+        r.statics
+    );
+    assert_eq!(
+        r.abilities.len(),
+        2,
+        "should produce two top-level abilities: {r:?}"
+    );
+    assert!(matches!(*r.abilities[0].effect, Effect::Pump { .. }));
+    let sub = r.abilities[0]
+        .sub_ability
+        .as_ref()
+        .expect("sub_ability Draw");
+    assert!(matches!(*sub.effect, Effect::Draw { .. }));
+
+    let addendum = &r.abilities[1];
+    assert_eq!(
+        addendum.condition,
+        Some(AbilityCondition::CastDuringPhase {
+            phases: vec![Phase::PreCombatMain, Phase::PostCombatMain],
+        })
+    );
+    assert!(
+        matches!(
+            *addendum.effect,
+            Effect::SetTapState {
+                state: TapStateChange::Tap,
+                target: TargetFilter::ParentTarget,
+                ..
+            }
+        ),
+        "expected Tap ParentTarget, got {:?}",
+        addendum.effect
+    );
+    let cant_untap = addendum
+        .sub_ability
+        .as_ref()
+        .expect("sub_ability CantUntap");
+    let Effect::GenericEffect {
+        static_abilities, ..
+    } = cant_untap.effect.as_ref()
+    else {
+        panic!(
+            "expected GenericEffect CantUntap, got {:?}",
+            cant_untap.effect
+        );
+    };
+    assert_eq!(static_abilities.len(), 1);
+    assert_eq!(
+        static_abilities[0].affected,
+        Some(TargetFilter::ParentTarget),
+        "CantUntap static must affect ParentTarget, got {:?}",
+        static_abilities[0].affected
+    );
+}
+
+#[test]
 fn creature_cant_block_still_produces_static() {
     // Regression guard: non-spell "can't block" must still produce static.
     let r = parse(
@@ -22997,6 +23493,201 @@ fn leveler_activated_abilities_get_level_counter_range() {
 
     // No spurious triggers
     assert_eq!(r.triggers.len(), 0);
+}
+
+/// CR 711.2 + CR 711.2a + CR 711.2b: Kargan Dragonlord's `LEVEL 8+` striation
+/// grants the printed `{R}: This creature gets +1/+0 until end of turn.` — an
+/// ACTIVATED ability gated on level counters (CR 602.1: cost before the colon),
+/// never a bare static P/T grant.
+///
+/// `oracle_level.rs` normalizes the self-reference before handing the striation to
+/// the static parser, so the costed line reached the static-line "~ has/gets …"
+/// arm and flattened to `Continuous { SelfRef, [AddPower 1, AddToughness 0] }`
+/// under `HasCounters { level, min 8 }` — the `{R}` cost and the until-end-of-turn
+/// duration dropped outright. Guul Draz Assassin survived the same arm only by
+/// accident (its subject slice contains "creature").
+#[test]
+fn kargan_dragonlord_level_band_grants_an_activated_pump() {
+    const KARGAN_DRAGONLORD: &str = "Level up {R} ({R}: Put a level counter on this. Level up only as a sorcery.)\nLEVEL 4-7\n4/4\nFlying\nLEVEL 8+\n8/8\nFlying, trample\n{R}: This creature gets +1/+0 until end of turn.";
+    let r = parse(
+        KARGAN_DRAGONLORD,
+        "Kargan Dragonlord",
+        &[Keyword::LevelUp(ManaCost::Cost {
+            shards: vec![ManaCostShard::Red],
+            generic: 0,
+        })],
+        &["Creature"],
+        &["Human", "Warrior"],
+    );
+    let level = CounterType::Generic("level".to_string());
+
+    // Reach guard: the level preprocessor actually ran over both striations, and the
+    // parse left no `Effect::Unimplemented` behind — so the ability assertions below
+    // cannot pass vacuously.
+    //
+    // The level-up `PutCounter` is deliberately NOT asserted here: CR 702.87a's
+    // level-up ability is synthesized at the DATABASE layer from the MTGJSON `LevelUp`
+    // keyword (`database/synthesis.rs::synthesize_level_up`), never by
+    // `parse_oracle_text`, so it is not observable in this venue. It stays covered by
+    // the export-level metric checks.
+    let band_8_plus = r
+        .statics
+        .iter()
+        .find(|definition| {
+            definition.condition
+                == Some(StaticCondition::HasCounters {
+                    counters: CounterMatch::OfType(level.clone()),
+                    minimum: 8,
+                    maximum: None,
+                })
+        })
+        .unwrap_or_else(|| panic!("LEVEL 8+ band static missing: {:#?}", r.statics));
+    for expected in [
+        ContinuousModification::SetPower { value: 8 },
+        ContinuousModification::SetToughness { value: 8 },
+        ContinuousModification::AddKeyword {
+            keyword: Keyword::Trample,
+        },
+    ] {
+        assert!(
+            band_8_plus.modifications.contains(&expected),
+            "LEVEL 8+ lost {expected:?}: {:#?}",
+            band_8_plus.modifications
+        );
+    }
+    assert!(
+        !r.abilities
+            .iter()
+            .any(|ability| matches!(&*ability.effect, Effect::Unimplemented { .. })),
+        "the leveler must parse with no residual Unimplemented ability: {:#?}",
+        r.abilities
+    );
+
+    // (a) The printed costed line is an activated ability bound to LEVEL 8+.
+    let pump = r
+        .abilities
+        .iter()
+        .find(|ability| {
+            ability
+                .activation_restrictions
+                .contains(&ActivationRestriction::LevelCounterRange {
+                    minimum: 8,
+                    maximum: None,
+                })
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no LEVEL 8+ activated ability — the costed line is still a static: {:#?}",
+                r.abilities
+            )
+        });
+    assert_eq!(pump.kind, AbilityKind::Activated);
+    assert_eq!(
+        pump.cost,
+        Some(AbilityCost::Mana {
+            cost: ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 0,
+            },
+        }),
+        "the {{R}} activation cost must be carried, not dropped"
+    );
+    let Effect::Pump {
+        power,
+        toughness,
+        target,
+    } = &*pump.effect
+    else {
+        panic!("expected Pump, got {:?}", pump.effect);
+    };
+    assert_eq!(
+        (power, toughness),
+        (&PtValue::Fixed(1), &PtValue::Fixed(0)),
+        "expected +1/+0"
+    );
+    assert_eq!(target, &TargetFilter::SelfRef);
+    assert_eq!(
+        pump.duration,
+        Some(Duration::UntilEndOfTurn),
+        "the duration must be carried, not dropped"
+    );
+    // Sibling/negative: the costed line sits in the LEVEL 8+ block only — it must
+    // not inherit the LEVEL 4-7 band.
+    assert!(
+        !r.abilities
+            .iter()
+            .any(|ability| ability.activation_restrictions.contains(
+                &ActivationRestriction::LevelCounterRange {
+                    minimum: 4,
+                    maximum: Some(7),
+                }
+            )),
+        "Kargan's costed line must not inherit the LEVEL 4-7 band: {:#?}",
+        r.abilities
+    );
+
+    // (b) No static reclaims it as a bare P/T grant.
+    assert!(
+        !r.statics
+            .iter()
+            .flat_map(|definition| definition.modifications.iter())
+            .any(|modification| matches!(
+                modification,
+                ContinuousModification::AddPower { .. }
+                    | ContinuousModification::AddToughness { .. }
+            )),
+        "the flattened pump must be gone from the statics: {:#?}",
+        r.statics
+    );
+
+    // (c) The LEVEL 4-7 summary static is unchanged.
+    let band_4_7 = r
+        .statics
+        .iter()
+        .find(|definition| {
+            definition.condition
+                == Some(StaticCondition::HasCounters {
+                    counters: CounterMatch::OfType(level.clone()),
+                    minimum: 4,
+                    maximum: Some(7),
+                })
+        })
+        .unwrap_or_else(|| panic!("LEVEL 4-7 band static missing: {:#?}", r.statics));
+    for expected in [
+        ContinuousModification::SetPower { value: 4 },
+        ContinuousModification::SetToughness { value: 4 },
+        ContinuousModification::AddKeyword {
+            keyword: Keyword::Flying,
+        },
+    ] {
+        assert!(
+            band_4_7.modifications.contains(&expected),
+            "LEVEL 4-7 lost {expected:?}: {:#?}",
+            band_4_7.modifications
+        );
+    }
+
+    // Reach guard / sibling: the two-band leveler shape is untouched.
+    const GUUL_DRAZ: &str = "Level up {1}{B} ({1}{B}: Put a level counter on this. Level up only as a sorcery.)\nLEVEL 2-3\n2/2\n{B}, {T}: Target creature gets -2/-2 until end of turn.\nLEVEL 4+\n4/4\n{B}, {T}: Target creature gets -4/-4 until end of turn.";
+    let guul = parse(
+        GUUL_DRAZ,
+        "Guul Draz Assassin",
+        &[Keyword::LevelUp(ManaCost::Cost {
+            shards: vec![ManaCostShard::Black],
+            generic: 1,
+        })],
+        &["Creature"],
+        &["Vampire", "Assassin"],
+    );
+    for (minimum, maximum) in [(2u32, Some(3u32)), (4, None)] {
+        assert!(
+            guul.abilities.iter().any(|ability| ability
+                .activation_restrictions
+                .contains(&ActivationRestriction::LevelCounterRange { minimum, maximum })),
+            "Guul Draz's {{minimum: {minimum}, maximum: {maximum:?}}} band must survive: {:#?}",
+            guul.abilities
+        );
+    }
 }
 
 #[test]
@@ -27256,16 +27947,78 @@ fn enters_with_n_additional_counters_parses_canonical_type() {
         (counter_type.clone(), count.clone())
     }
 
-    // "that creature enters with two additional +1/+1 counters on it" (Necromantic Summons)
-    let (ct, count) = enters_counter(
-        "Put target creature card from a graveyard onto the battlefield under your control.\n\
-         Spell mastery — If there are two or more instant and/or sorcery cards in your graveyard, \
-         that creature enters with two additional +1/+1 counters on it.",
-        "Necromantic Summons",
-        &["Sorcery"],
-    );
-    assert_eq!(ct, CounterType::Plus1Plus1, "Necromantic Summons type");
-    assert_eq!(count, QuantityExpr::Fixed { value: 2 }, "count");
+    // CR 608.2c + CR 614.12: riders whose subject a preceding mover supplies are
+    // not replacements on the card. Necromantic Summons gates its rider on spell
+    // mastery and Turntimber Symbiosis on the card's mana value — neither is an
+    // "enters this way" gate the mover's entry counters can carry — so each rider
+    // is an explicit gap, never a `PutCounter` replacement on the sorcery itself.
+    let battlefield_mover = |effect: &Effect| {
+        matches!(
+            effect,
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                ..
+            }
+        )
+    };
+    let dig = |effect: &Effect| matches!(effect, Effect::Dig { .. });
+    struct PrimaryMoverCase {
+        card: &'static str,
+        text: &'static str,
+        is_primary_mover: fn(&Effect) -> bool,
+    }
+    let cases = [
+        PrimaryMoverCase {
+            card: "Necromantic Summons",
+            text: "Put target creature card from a graveyard onto the battlefield under your control.\n\
+             Spell mastery — If there are two or more instant and/or sorcery cards in your graveyard, \
+             that creature enters with two additional +1/+1 counters on it.",
+            is_primary_mover: battlefield_mover,
+        },
+        PrimaryMoverCase {
+            card: "Turntimber Symbiosis",
+            text: "Look at the top seven cards of your library. You may put a creature card from among them \
+             onto the battlefield. If that card has mana value 3 or less, it enters with three \
+             additional +1/+1 counters on it. Put the rest on the bottom of your library in a random order.",
+            is_primary_mover: dig,
+        },
+    ];
+    for PrimaryMoverCase {
+        card: name,
+        text: oracle,
+        is_primary_mover: primary_mover,
+    } in cases
+    {
+        let parsed = parse_oracle_text(oracle, name, &[], &["Sorcery".to_string()], &[]);
+        fn chain_nodes(ability: &AbilityDefinition) -> impl Iterator<Item = &AbilityDefinition> {
+            let mut cursor = Some(ability);
+            std::iter::from_fn(move || {
+                let node = cursor?;
+                cursor = node.sub_ability.as_deref();
+                Some(node)
+            })
+        }
+        assert!(
+            parsed
+                .abilities
+                .iter()
+                .flat_map(chain_nodes)
+                .any(|node| primary_mover(&node.effect)),
+            "{name}: reach guard: the primary mover parses: {parsed:?}"
+        );
+        assert!(
+            parsed.replacements.is_empty(),
+            "{name}: the rider is not a replacement on the sorcery: {parsed:?}"
+        );
+        assert!(
+            parsed.abilities.iter().flat_map(chain_nodes).any(|node| {
+                node.effect
+                    .unimplemented_description()
+                    .is_some_and(|text| text.contains("enters with"))
+            }),
+            "{name}: the rider stays an explicit gap: {parsed:?}"
+        );
+    }
 
     // "it enters with two additional +1/+1 counters on it" (Heroic Return).
     //
@@ -27305,17 +28058,6 @@ fn enters_with_n_additional_counters_parses_canonical_type() {
     assert_eq!(*ct, CounterType::Plus1Plus1, "Heroic Return type");
     assert_eq!(*count, QuantityExpr::Fixed { value: 2 }, "count");
 
-    // "it enters with three additional +1/+1 counters on it" (Turntimber Symbiosis)
-    let (ct, count) = enters_counter(
-        "Look at the top seven cards of your library. You may put a creature card from among them \
-         onto the battlefield. If that card has mana value 3 or less, it enters with three \
-         additional +1/+1 counters on it. Put the rest on the bottom of your library in a random order.",
-        "Turntimber Symbiosis",
-        &["Sorcery"],
-    );
-    assert_eq!(ct, CounterType::Plus1Plus1, "Turntimber Symbiosis type");
-    assert_eq!(count, QuantityExpr::Fixed { value: 3 }, "count");
-
     // Non-P/T counter class: "it enters with three additional time counters on it" (Ravaging Riftwurm)
     let (ct, count) = enters_counter(
         "If this creature was kicked, it enters with three additional time counters on it.",
@@ -27350,17 +28092,19 @@ fn reflexive_entry_rider_voices_all_stay_on_the_trigger_path() {
          from your graveyard to the battlefield. If a creature is put onto the battlefield \
          this way, it enters with an additional +1/+1 counter on it.";
 
-    // Premise for the Passive Voice row (this is what makes its negative below
-    // non-vacuous and pins the revert): handed the WHOLE line, the replacement
-    // parser really does claim it. Only the head-scoped `enters with` gate keeps
-    // the interceptor from reaching this and dropping the reanimation instruction.
+    // Premise for the Passive Voice row: handed the WHOLE line, the replacement
+    // parser no longer claims it either (CR 614.1c + CR 608.2c, #9658: a line of
+    // several sentences is never one replacement, and the rider's pronoun names
+    // the reanimated card, not this creature). The head-scoped `enters with` gate
+    // and the whole-line gate are now two independent guards against publishing
+    // a replacement and dropping the head reanimation.
     assert!(
         crate::parser::oracle_replacement::parse_replacement_line(
             PASSIVE_VOICE,
             "Passive Voice Reanimator"
         )
-        .is_some(),
-        "Passive Voice Reanimator: premise — the un-scoped line is claimable by the \
+        .is_none(),
+        "Passive Voice Reanimator: premise — the un-scoped line is not claimable by the \
          replacement parser"
     );
     // Premise for the Winter Soldier row (#9657): its first "with" belongs to the
@@ -29321,6 +30065,7 @@ fn demote_net_reaches_every_ability_carrier() {
     parsed.abilities.push(holder(Effect::ChooseOneOf {
         chooser: crate::types::ability::PlayerFilter::Controller,
         branches: vec![refused()],
+        kind: ChooseOneOfKind::Ordinary,
     }));
 
     // 8 — a trigger's payload.
@@ -30736,7 +31481,7 @@ fn census_variant_names(body: &str) -> Vec<String> {
 /// it.
 #[test]
 fn render_net_effect_carrier_census() {
-    const EFFECT_VARIANT_PIN: usize = 234;
+    const EFFECT_VARIANT_PIN: usize = 237;
     /// `(enum header, pinned variant count, the ONE variant the net destructures)`.
     const PAYLOAD_ENUM_PINS: &[(&str, usize, &str)] = &[
         ("pub enum CastingPermission {", 8, "ExileWithAltCost"),
@@ -30752,6 +31497,7 @@ fn render_net_effect_carrier_census() {
         "CopySpell",
         "CopyTokenOf",
         "Counter",
+        "CreateBoon",
         "CreateDelayedTrigger",
         "CreateDrawReplacement",
         "CreateEmblem",
@@ -31047,6 +31793,7 @@ fn render_net_reaches_every_nested_description_carrier() {
     parsed.abilities.push(carrier(Effect::ChooseOneOf {
         chooser: PlayerFilter::Controller,
         branches: vec![ability("choose_one_of")],
+        kind: ChooseOneOfKind::Ordinary,
     }));
     tags.push("choose_one_of");
 
@@ -33321,11 +34068,15 @@ fn phylactery_lich_as_enters_object_effect_body_keeps_prior_shape() {
 }
 
 /// The static-shaped routing site runs before Priority 8. Static-shaped frame
-/// lines that a Priority-8 arm claims today (Thief of Blood's population
-/// counter removal, Arsenal Thresher's optional reveal) are declined by the
-/// gate and keep their Priority-8 replacement.
+/// lines (Thief of Blood's population counter removal, Arsenal Thresher's
+/// optional reveal) are declined by the one-shot gate and reach Priority 8.
+/// CR 614.1c + CR 608.2c: there the frame's instruction and the source
+/// enters-with sentence are two instructions; one replacement cannot carry
+/// both, and the counter count depends on the frame's result ("removed this
+/// way" / "revealed this way"), so the whole line is one `enters_with_clause`
+/// gap, never a counter replacement that drops the frame's instruction.
 #[test]
-fn static_shaped_as_enters_lines_keep_priority_eight_replacement() {
+fn static_shaped_as_enters_lines_are_one_enters_with_clause_gap() {
     for (name, oracle, line, description, keywords, types, subtypes) in [
         (
             "Thief of Blood",
@@ -33347,20 +34098,22 @@ fn static_shaped_as_enters_lines_keep_priority_eight_replacement() {
         ),
     ] {
         let parsed = parse_oracle_text(oracle, name, &keywords, &types, &subtypes);
-        let moved: Vec<&ReplacementDefinition> = parsed
-            .replacements
-            .iter()
-            .filter(|repl| repl.event == ReplacementEvent::Moved)
-            .collect();
-        assert_eq!(moved.len(), 1, "{name}: {:?}", parsed.replacements);
-        assert_eq!(moved[0].description.as_deref(), Some(description), "{name}");
         assert!(
-            matches!(
-                moved[0].execute.as_deref().map(|e| &*e.effect),
-                Some(Effect::PutCounter { .. })
-            ),
-            "{name}: {:?}",
-            moved[0].execute
+            parsed
+                .replacements
+                .iter()
+                .all(|repl| repl.event != ReplacementEvent::Moved),
+            "{name}: no replacement may carry half of the line, got {:?}",
+            parsed.replacements
+        );
+        assert!(
+            parsed.abilities.iter().any(|ability| matches!(
+                &*ability.effect,
+                Effect::Unimplemented { name, description: Some(text) }
+                    if name == "enters_with_clause" && text == description
+            )),
+            "{name}: the whole line is one enters_with_clause gap, got {:?}",
+            parsed.abilities
         );
         // Reach-guard: the static-shaped routing site sees the frame and the gate declines the body.
         assert!(
@@ -33373,6 +34126,131 @@ fn static_shaped_as_enters_lines_keep_priority_eight_replacement() {
         );
         assert!(parse_as_enters_one_shot_replacement(AS_ENTERS_LOSE_TWO, name).is_some());
     }
+}
+
+/// CR 614.1c + CR 608.2c: Gluttonous Hellkite's trigger-prefixed line (the
+/// Priority 5-pre route) prints the trigger's own instruction and a source
+/// enters-with sentence whose count depends on it ("sacrificed this way"). One
+/// replacement cannot carry both, so the whole line is one `enters_with_clause`
+/// gap rather than a cast trigger whose body silently carries the replacement's
+/// sentence.
+#[test]
+fn trigger_prefixed_enters_with_sentence_is_one_enters_with_clause_gap() {
+    let oracle = "When you cast this spell, each player sacrifices X creatures. This creature enters with two +1/+1 counters on it for each creature sacrificed this way.\nFlying, trample";
+    let line = "When you cast this spell, each player sacrifices X creatures. This creature enters with two +1/+1 counters on it for each creature sacrificed this way.";
+    let description = "When you cast this spell, each player sacrifices X creatures. ~ enters with two +1/+1 counters on it for each creature sacrificed this way.";
+    let parsed = parse_oracle_text(
+        oracle,
+        "Gluttonous Hellkite",
+        &["Flying".into(), "Trample".into()],
+        &["Creature".into()],
+        &["Dragon".into()],
+    );
+    let gaps: Vec<&AbilityDefinition> = parsed
+        .abilities
+        .iter()
+        .filter(|ability| {
+            matches!(
+                &*ability.effect,
+                Effect::Unimplemented { name, .. } if name == "enters_with_clause"
+            )
+        })
+        .collect();
+    assert_eq!(gaps.len(), 1, "{:?}", parsed.abilities);
+    assert!(
+        matches!(
+            &*gaps[0].effect,
+            Effect::Unimplemented { description: Some(text), .. } if text == description
+        ),
+        "the whole line is the gap, got {:?}",
+        gaps[0]
+    );
+    assert!(parsed.replacements.is_empty(), "{:?}", parsed.replacements);
+    assert!(
+        parsed.triggers.is_empty(),
+        "no trigger may carry the enters-with sentence, got {:?}",
+        parsed.triggers
+    );
+    // Reach guards: the enters-with parser fails the line closed with `Clause`,
+    // and the keyword line beside it still parses.
+    assert_eq!(
+        enters_with_fails_closed(line, "Gluttonous Hellkite"),
+        Some(EntersWithGap::Clause)
+    );
+    assert_eq!(parsed.abilities.len(), 1, "{:?}", parsed.abilities);
+    assert!(
+        parsed
+            .extracted_keywords
+            .iter()
+            .any(|keyword| matches!(keyword, Keyword::Flying))
+            && parsed
+                .extracted_keywords
+                .iter()
+                .any(|keyword| matches!(keyword, Keyword::Trample)),
+        "{:?}",
+        parsed.extracted_keywords
+    );
+}
+
+/// CR 614.1c + CR 608.2c: a distributive for-each enters-with line (the
+/// Priority 7 route) the parser owns but cannot carry is one
+/// `enters_with_clause` gap; it does not fall to the static parser. Gev, Scaled
+/// Scorch's sentence beside an anthem sentence (synthetic) is the case the
+/// static parser would otherwise claim in part, keeping the anthem and dropping
+/// the enters-with sentence. A subject clause the typed filter cannot carry
+/// ("that was cast this turn", synthetic) lands on the same gap.
+#[test]
+fn for_each_enters_with_clause_line_is_one_enters_with_clause_gap() {
+    for line in [
+        "Other creatures you control enter with an additional +1/+1 counter on them for each opponent who lost life this turn. Creatures you control get +1/+1.",
+        "Each creature you control that was cast this turn enters with an additional +1/+1 counter on it for each creature you control.",
+    ] {
+        let parsed = parse_oracle_text(line, "Test Enchantment", &[], &["Enchantment".into()], &[]);
+        let gaps: Vec<&AbilityDefinition> = parsed
+            .abilities
+            .iter()
+            .filter(|ability| {
+                matches!(
+                    &*ability.effect,
+                    Effect::Unimplemented { name, description: Some(text) }
+                        if name == "enters_with_clause" && text == line
+                )
+            })
+            .collect();
+        assert_eq!(gaps.len(), 1, "{line:?}: {:?}", parsed.abilities);
+        assert_eq!(parsed.abilities.len(), 1, "{line:?}: {:?}", parsed.abilities);
+        assert!(parsed.statics.is_empty(), "{line:?}: {:?}", parsed.statics);
+        assert!(
+            parsed.replacements.iter().all(|repl| !matches!(
+                repl.event,
+                ReplacementEvent::Moved | ReplacementEvent::ChangeZone
+            )),
+            "{line:?}: {:?}",
+            parsed.replacements
+        );
+        // Reach guards: the line reaches the Priority 7 enters-with branch and
+        // fails closed with `Clause`.
+        assert!(
+            is_enters_with_counter_replacement_line(&line.to_lowercase()),
+            "{line:?}"
+        );
+        assert_eq!(
+            enters_with_fails_closed(line, "Test Enchantment"),
+            Some(EntersWithGap::Clause),
+            "{line:?}"
+        );
+    }
+    // Reach guard: the single-sentence twin stays claimed.
+    let twin = parse_oracle_text(
+        "Each other creature you control enters with an additional +1/+1 counter on it for each creature you control.",
+        "Test Enchantment",
+        &[],
+        &["Enchantment".into()],
+        &[],
+    );
+    assert_eq!(twin.replacements.len(), 1, "{twin:?}");
+    assert_eq!(twin.replacements[0].event, ReplacementEvent::ChangeZone);
+    assert!(twin.abilities.is_empty(), "{:?}", twin.abilities);
 }
 
 /// Admitted class face (CR 614.1c + CR 603.6d + CR 119.3): Lich's "As this
