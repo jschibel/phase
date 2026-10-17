@@ -34617,7 +34617,7 @@ mod tests {
 
     #[test]
     fn reject_legacy_deferred_spell_delivery_refuses_only_a_present_record() {
-        // CR 608.2n + CR 702.88a/c: absent and `null` are not a record.
+        // CR 608.2n + CR 702.88a: absent and `null` are not a record.
         reject_legacy_deferred_spell_delivery(&serde_json::json!({ "turn_number": 3 }))
             .expect("an absent key is a current-format state");
         reject_legacy_deferred_spell_delivery(

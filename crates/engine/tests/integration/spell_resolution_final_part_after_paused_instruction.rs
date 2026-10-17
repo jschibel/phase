@@ -18,9 +18,10 @@
 //! * Every rule that sends a resolving spell somewhere other than the
 //!   graveyard still applies to the deferred final part: flashback (exile),
 //!   rebound (exile, with its upkeep cast), an Adventure (exile, with the
-//!   creature castable), buyback (its owner's hand), a CR 616.1 ordering of two
-//!   graveyard replacements, and an "end the combat phase" spell's exile
-//!   (CR 724.2b), decided by the phase the resolution began in.
+//!   creature castable), buyback (its owner's hand), and a CR 616.1 ordering of
+//!   two graveyard replacements.
+//! * CR 724.1b / CR 724.2b: a spell whose own end procedure exiles it is exiled
+//!   at that step, and owes no final part when a later instruction pauses.
 //! * CR 800.4a: a player who leaves the game while their spell is paused takes
 //!   it with them — its owner leaving exiles it (and its controller still
 //!   finishes it, CR 608.2m), its controller leaving exiles it when that player
@@ -601,11 +602,11 @@ fn a_replacement_ordering_choice_on_the_deferred_move_is_asked_and_completed() {
     assert_settled(state);
 }
 
-/// CR 724.2b + CR 608.2n: "end the combat phase" exiles every object on the
+/// CR 724.2b + CR 608.2m: "end the combat phase" exiles every object on the
 /// stack, including the resolving one — when the procedure ran during combat.
-/// The spell's later discard pauses the resolution after the turn has moved to
-/// the postcombat main phase; the deferred final part still exiles it, because
-/// the phase that matters is the one its resolution began in.
+/// The spell is exiled at that step, so when its later discard pauses the
+/// resolution after combat has ended it is already in exile and owes no final
+/// part.
 #[test]
 fn an_end_the_combat_phase_spell_paused_after_combat_ended_is_still_exiled() {
     let mut scenario = GameScenario::new();
@@ -628,13 +629,15 @@ fn an_end_the_combat_phase_spell_paused_after_combat_ended_is_still_exiled() {
     run_until_settled(&mut runner, |state| {
         if matches!(state.waiting_for, WaitingFor::DiscardChoice { .. }) {
             paused_after_combat = !state.phase.is_combat();
-            let latched = state
-                .owed_spell_final_part()
-                .map(|owed| owed.resolution_start_phase);
             assert_eq!(
-                latched,
-                Some(Phase::DeclareAttackers),
-                "the carrier latches the phase the resolution began in"
+                state.objects[&interrupt].zone,
+                Zone::Exile,
+                "CR 724.2b: exiled by its own procedure before its discard"
+            );
+            assert_eq!(
+                state.owed_spell_final_part(),
+                None,
+                "a spell exiled by its own end procedure owes no final part"
             );
         }
         None
@@ -2642,19 +2645,15 @@ fn a_clone_copying_a_vanilla_creature_leaves_reanimate_in_the_graveyard() {
 /// Omnath, Locus of Mana ("You don't lose unspent green mana as steps and phases
 /// end.") and Horizon Stone ("If you would lose unspent mana, that mana becomes
 /// colorless instead.") both apply to the mana emptying of the cleanup step, so
-/// CR 616.1 has P0 order them.
-///
-/// CR 724.1b + CR 724.1d: Time Stop ("End the turn.") exiles every object on
-/// the stack, including the resolving Time Stop, before the turn skips to the
-/// cleanup step; the ordering prompt belongs to that transition, so Time Stop
-/// is already in exile when it is asked, not on the stack beside it.
-#[test]
-fn time_stop_is_exiled_before_the_cleanup_mana_order_prompt() {
+/// CR 616.1 has P0 order them. Casts the spell `add_spell` puts in P0's hand
+/// and passes until that ordering is asked.
+fn cast_into_the_cleanup_mana_order(
+    add_spell: impl FnOnce(&mut GameScenario) -> ObjectId,
+    pool: Vec<ManaUnit>,
+) -> (GameRunner, ObjectId) {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    let stop = scenario
-        .add_spell_to_hand_from_oracle(P0, "Time Stop", true, "End the turn.")
-        .id();
+    let spell = add_spell(&mut scenario);
     let omnath = scenario.add_real_card(P0, "Omnath, Locus of Mana", Zone::Battlefield, db());
     let stone = scenario
         .add_artifact_from_oracle(
@@ -2663,10 +2662,10 @@ fn time_stop_is_exiled_before_the_cleanup_mana_order_prompt() {
             "If you would lose unspent mana, that mana becomes colorless instead.",
         )
         .id();
-    scenario.with_mana_pool(P0, mana(ManaType::Green, 2));
+    scenario.with_mana_pool(P0, pool);
     let mut runner = scenario.build();
 
-    runner.cast(stop).commit();
+    runner.cast(spell).commit();
     pass_until_a_prompt(&mut runner);
 
     let state = runner.state();
@@ -2682,8 +2681,25 @@ fn time_stop_is_exiled_before_the_cleanup_mana_order_prompt() {
     expected.sort();
     assert_eq!(sources, expected, "reach guard: both replacements compete");
     assert_eq!(state.phase, Phase::Cleanup);
+    (runner, spell)
+}
+
+/// CR 724.1b + CR 724.1d: Time Stop ("End the turn.") exiles every object on
+/// the stack, including the resolving Time Stop, before the turn skips to the
+/// cleanup step; the ordering prompt belongs to that transition, so Time Stop
+/// is already in exile when it is asked, not on the stack beside it.
+#[test]
+fn time_stop_is_exiled_before_the_cleanup_mana_order_prompt() {
+    let (mut runner, stop) = cast_into_the_cleanup_mana_order(
+        |scenario| {
+            scenario
+                .add_spell_to_hand_from_oracle(P0, "Time Stop", true, "End the turn.")
+                .id()
+        },
+        mana(ManaType::Green, 2),
+    );
     assert_eq!(
-        state.objects[&stop].zone,
+        runner.state().objects[&stop].zone,
         Zone::Exile,
         "CR 724.1b: Time Stop was exiled by its own procedure before the prompt"
     );
@@ -2694,6 +2710,54 @@ fn time_stop_is_exiled_before_the_cleanup_mana_order_prompt() {
     run_until_settled(&mut runner, |_| None);
     let state = runner.state();
     assert_eq!(state.objects[&stop].zone, Zone::Exile);
+    assert_settled(state);
+}
+
+const GLORIOUS_END: &str = "End the turn. (Exile all spells and abilities from the stack, \
+including this card. The player whose turn it is discards down to their maximum hand size. \
+Damage wears off, and \"this turn\" and \"until end of turn\" effects end.)\n\
+At the beginning of your next end step, you lose the game.";
+
+/// CR 724.1b + CR 608.2m: Glorious End ("End the turn. ... At the beginning of
+/// your next end step, you lose the game.") is exiled by its own end procedure
+/// before the cleanup ordering prompt, even though an instruction follows it;
+/// it then finishes resolving from exile and creates its delayed trigger once.
+#[test]
+fn glorious_end_is_exiled_before_the_cleanup_mana_order_prompt() {
+    let (mut runner, glorious) = cast_into_the_cleanup_mana_order(
+        |scenario| {
+            scenario
+                .add_spell_to_hand_from_oracle(P0, "Glorious End", true, GLORIOUS_END)
+                .id()
+        },
+        mana(ManaType::Green, 2),
+    );
+    let state = runner.state();
+    assert_eq!(
+        state.objects[&glorious].zone,
+        Zone::Exile,
+        "CR 724.1b: Glorious End was exiled by its own procedure before the prompt"
+    );
+    assert!(
+        state.owed_spell_final_part().is_none(),
+        "a spell exiled by its own end procedure owes no final part"
+    );
+
+    runner
+        .act(GameAction::ChooseReplacement { index: 0 })
+        .expect("P0 orders the replacements");
+    run_until_settled(&mut runner, |_| None);
+    let state = runner.state();
+    assert_eq!(state.objects[&glorious].zone, Zone::Exile);
+    assert_eq!(
+        state
+            .delayed_triggers
+            .iter()
+            .filter(|trigger| trigger.source_id == glorious)
+            .count(),
+        1,
+        "CR 608.2m: the rider after the end procedure still ran, once"
+    );
     assert_settled(state);
 }
 

@@ -2716,25 +2716,18 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // "end the combat phase" exiles the resolving object only during combat),
     // is latched on the resolution carrier (`GameState::resolving_spell_final_part`),
     // never on the spell's ability, so a copy cannot inherit it (CR 707.10).
-    // The phase is latched because the paused instructions may still move the
-    // turn on before the final part runs.
     //
     // Permanent spells are CR 608.3, not CR 608.2n: their entry is its own
     // pipeline below, with its own paused-entry carrier (`PendingSpellResolution`).
     //
-    // CR 724.1b + CR 724.1d: a spell whose own end procedure is the whole of its
-    // instructions exiles the resolving object itself, before the phase ends;
-    // the cleanup prompt a turn transition raises belongs to that transition
-    // and is not a pending instruction of the spell, so it owes no final part.
-    let end_procedure_is_the_whole_spell =
-        end_procedure_exiles_resolving_object(ability.as_deref(), resolution_start_phase)
-            && ability
-                .as_deref()
-                .is_some_and(|ability| ability.sub_ability.is_none());
+    // CR 724.1b / CR 724.2b + CR 608.2m: a spell whose own end procedure exiles
+    // the resolving object is exiled at that step, before its later
+    // instructions and the prompts its turn transition raises, and finishes
+    // resolving from exile, so it owes no final part.
     if is_spell
         && !is_permanent_spell(state, entry.id)
         && resolution_is_paused(state)
-        && !end_procedure_is_the_whole_spell
+        && !end_procedure_exiles_resolving_object(ability.as_deref(), resolution_start_phase)
     {
         let carrier_is_this_spell = state
             .resolving_stack_entry
