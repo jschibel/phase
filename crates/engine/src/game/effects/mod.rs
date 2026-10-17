@@ -33982,40 +33982,47 @@ mod tests {
 
     #[test]
     fn while_passes_preserve_structural_depth() {
-        let mut state = GameState::new_two_player(42);
-        let mut ability = ResolvedAbility::new(
-            Effect::GainLife {
-                amount: QuantityExpr::Fixed { value: 1 },
-                player: TargetFilter::Controller,
-            },
-            vec![],
-            ObjectId(100),
-            PlayerId(0),
-        );
-        ability.repeat_until = Some(RepeatContinuation::WhileCondition {
-            condition: Box::new(AbilityCondition::IsYourTurn),
-            max_iterations: Some(25),
-        });
-        let mut events = Vec::new();
-        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
-        assert_eq!(
-            state.players[0].life, 46,
-            "26 synchronous passes do not consume structural depth"
-        );
-        ability.repeat_until = None;
-        let mut nested = ability.clone();
-        for _ in 0..22 {
-            let mut parent = ability.clone();
-            parent.sub_ability = Some(Box::new(nested));
-            nested = parent;
-        }
-        assert!(
-            matches!(
-                resolve_ability_chain(&mut state, &nested, &mut events, 0),
-                Err(EffectError::ChainTooDeep)
-            ),
-            "real child structure retains its guard"
-        );
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                let mut state = GameState::new_two_player(42);
+                let mut ability = ResolvedAbility::new(
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        player: TargetFilter::Controller,
+                    },
+                    vec![],
+                    ObjectId(100),
+                    PlayerId(0),
+                );
+                ability.repeat_until = Some(RepeatContinuation::WhileCondition {
+                    condition: Box::new(AbilityCondition::IsYourTurn),
+                    max_iterations: Some(25),
+                });
+                let mut events = Vec::new();
+                resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+                assert_eq!(
+                    state.players[0].life, 46,
+                    "26 synchronous passes do not consume structural depth"
+                );
+                ability.repeat_until = None;
+                let mut nested = ability.clone();
+                for _ in 0..22 {
+                    let mut parent = ability.clone();
+                    parent.sub_ability = Some(Box::new(nested));
+                    nested = parent;
+                }
+                assert!(
+                    matches!(
+                        resolve_ability_chain(&mut state, &nested, &mut events, 0),
+                        Err(EffectError::ChainTooDeep)
+                    ),
+                    "real child structure retains its guard"
+                );
+            })
+            .expect("spawn 256 MiB structural-depth thread")
+            .join()
+            .expect("structural-depth fixture thread must not panic");
     }
 
     #[test]

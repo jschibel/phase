@@ -845,6 +845,9 @@ mod tests {
             P0,
             PlayerId(1),
         );
+        for _ in 0..32 {
+            scenario.add_artifact_from_oracle(P0, "Projection Filler", "");
+        }
         let bolt = scenario
             .add_spell_to_hand_from_oracle(P0, "Lightning Bolt", true, LIGHTNING_BOLT_ORACLE)
             .with_mana_cost(ManaCost::Cost {
