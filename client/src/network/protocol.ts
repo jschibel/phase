@@ -107,7 +107,7 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  *
  * Bumps to date:
  *  130 — GameState.deferred_spell_delivery is removed and GameState.resolving_spell_final_part
- *       ({ spell, resolution_start_phase }) marks the CR 608.2n final part a paused instant or
+ *       ({ spell }) marks the CR 608.2n final part a paused instant or
  *       sorcery still owes, in game_setup and state_update; a v129 peer drops the key and would
  *       move the spell too early. Bumped with full-game protocol 148.
  *  129 — game_setup and state_update carry GameState whose waiting_for may be

@@ -17716,10 +17716,8 @@ mod tests {
             vec![completed, stale],
             0,
         );
-        state.resolving_spell_final_part = Some(crate::types::game_state::OwedSpellFinalPart {
-            spell,
-            resolution_start_phase: state.phase,
-        });
+        state.resolving_spell_final_part =
+            Some(crate::types::game_state::OwedSpellFinalPart { spell });
         state.objects.get_mut(&stale).unwrap().incarnation += 1;
 
         let mut events = Vec::new();

@@ -41383,10 +41383,8 @@ pub mod tests {
             make_draw_pending_trigger(&mut state, "Watcher B", PlayerId(0)),
         ];
         let spell = install_resolving_sorcery_carrier(&mut state);
-        state.resolving_spell_final_part = Some(crate::types::game_state::OwedSpellFinalPart {
-            spell,
-            resolution_start_phase: state.phase,
-        });
+        state.resolving_spell_final_part =
+            Some(crate::types::game_state::OwedSpellFinalPart { spell });
         state.waiting_for = WaitingFor::Priority {
             player: PlayerId(0),
         };

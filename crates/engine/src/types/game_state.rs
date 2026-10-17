@@ -6891,13 +6891,9 @@ pub enum BatchCompletion {
 /// leaving the stack — once those instructions are done. Owned by the resolution
 /// carrier it names (`resolving_stack_entry`), never by the spell's ability or
 /// stack entry, so a copy of the spell (CR 707.10) cannot inherit it.
-/// CR 724.1b / CR 724.2b: `resolution_start_phase` is the phase the resolution
-/// began in — "end the combat phase" exiles the resolving object only when it
-/// began resolving during combat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwedSpellFinalPart {
     pub spell: ObjectId,
-    pub resolution_start_phase: crate::types::phase::Phase,
 }
 
 /// CR 603.3b + CR 608.2g: terminal settlement that must wait until the
@@ -38646,10 +38642,7 @@ mod tests {
     fn owed_final_part_state(carrier: Option<StackEntry>, spell: ObjectId) -> GameState {
         let mut state = GameState::new_two_player(42);
         state.resolving_stack_entry = carrier;
-        state.resolving_spell_final_part = Some(OwedSpellFinalPart {
-            spell,
-            resolution_start_phase: state.phase,
-        });
+        state.resolving_spell_final_part = Some(OwedSpellFinalPart { spell });
         state
     }
 
@@ -38767,10 +38760,7 @@ mod tests {
                 .card_types
                 .core_types = vec![core];
             state.resolving_stack_entry = Some(owed_final_part_spell_carrier(spell));
-            state.resolving_spell_final_part = Some(OwedSpellFinalPart {
-                spell,
-                resolution_start_phase: state.phase,
-            });
+            state.resolving_spell_final_part = Some(OwedSpellFinalPart { spell });
             let raw = serde_json::to_value(&state).expect("the fixture serializes");
             let transport = serde_json::from_value::<GameState>(raw);
             let persisted = serde_json::from_value::<PersistedGameState>(

@@ -436,11 +436,8 @@ fn owing_devour_rest() -> (serde_json::Value, ObjectId) {
     state.push_devour_change_zone_snapshot([ObjectId(27), ObjectId(31)].into_iter().collect());
 
     let mut raw = serde_json::to_value(state).expect("raw state serializes");
-    raw["resolving_spell_final_part"] = serde_json::to_value(OwedSpellFinalPart {
-        spell,
-        resolution_start_phase: Phase::Cleanup,
-    })
-    .expect("the marker serializes");
+    raw["resolving_spell_final_part"] =
+        serde_json::to_value(OwedSpellFinalPart { spell }).expect("the marker serializes");
     (raw, spell)
 }
 
@@ -482,10 +479,7 @@ fn a_stale_pass_does_not_recover_a_devour_rest_owing_a_final_part() {
         serde_json::from_value(raw).expect("the owing rest decodes as a game state");
     assert_eq!(
         state.owed_spell_final_part(),
-        Some(&OwedSpellFinalPart {
-            spell,
-            resolution_start_phase: Phase::Cleanup,
-        }),
+        Some(&OwedSpellFinalPart { spell }),
         "reach guard: the decoded state carries the owed final part"
     );
 

@@ -26994,10 +26994,7 @@ mod resolving_carrier_settle_tests {
                 actual_mana_spent: 0,
             },
         });
-        state.resolving_spell_final_part = Some(OwedSpellFinalPart {
-            spell,
-            resolution_start_phase: Phase::End,
-        });
+        state.resolving_spell_final_part = Some(OwedSpellFinalPart { spell });
         state.waiting_for = WaitingFor::Priority { player: P0 };
         let starting_turn = state.turn_number;
 

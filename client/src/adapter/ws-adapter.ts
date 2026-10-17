@@ -217,10 +217,10 @@ export class NativeEngineVersionMismatchError extends Error {
  *
  * 148 — The CR 608.2n final part of a spell's resolution is owed on the
  *      resolution carrier: `GameState::deferred_spell_delivery` (v110) is removed
- *      and `GameState::resolving_spell_final_part` (`{ spell,
- *      resolution_start_phase }`) marks an instant or sorcery whose paused
- *      instructions have not finished. A v147 peer drops the key and would move
- *      the spell too early (or leave it on the stack after a free-cast window).
+ *      and `GameState::resolving_spell_final_part` (`{ spell }`) marks an
+ *      instant or sorcery whose paused instructions have not finished. A v147
+ *      peer drops the key and would move the spell too early (or leave it on
+ *      the stack after a free-cast window).
  *      Wire 130 moves with it; no lobby frame names it.
  * 147 — Online physical contests: WaitingFor::PhysicalContest, Effect::PhysicalContest,
  *      the two PhysicalContest* GameEvents, ClientMessage::ContestClick and

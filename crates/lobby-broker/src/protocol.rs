@@ -64,7 +64,7 @@ pub struct TournamentRequestId(pub u64);
 ///      resolution carrier. `GameState::deferred_spell_delivery` (v110: the
 ///      destination recorded while a spell paused on its own free-cast window)
 ///      is removed, and `GameState` gains `resolving_spell_final_part`
-///      (`{ spell, resolution_start_phase }`, omitted when none): an instant or
+///      (`{ spell }`, omitted when none): an instant or
 ///      sorcery whose instructions paused for a choice (Faithless Looting's
 ///      discard, Doomsday's search, a free-cast window) stays on the stack, and
 ///      the marker says it still owes its on-resolution hooks, destination and

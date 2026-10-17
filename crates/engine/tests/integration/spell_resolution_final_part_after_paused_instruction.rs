@@ -21,7 +21,8 @@
 //!   creature castable), buyback (its owner's hand), and a CR 616.1 ordering of
 //!   two graveyard replacements.
 //! * CR 724.1b / CR 724.2b: a spell whose own end procedure exiles it is exiled
-//!   at that step, and owes no final part when a later instruction pauses.
+//!   at that step, and finishes resolving from exile (CR 608.2m) when a later
+//!   instruction pauses.
 //! * CR 800.4a: a player who leaves the game while their spell is paused takes
 //!   it with them — its owner leaving exiles it (and its controller still
 //!   finishes it, CR 608.2m), its controller leaving exiles it when that player
@@ -605,8 +606,8 @@ fn a_replacement_ordering_choice_on_the_deferred_move_is_asked_and_completed() {
 /// CR 724.2b + CR 608.2m: "end the combat phase" exiles every object on the
 /// stack, including the resolving one — when the procedure ran during combat.
 /// The spell is exiled at that step, so when its later discard pauses the
-/// resolution after combat has ended it is already in exile and owes no final
-/// part.
+/// resolution after combat has ended it is already in exile and its final part
+/// leaves it there.
 #[test]
 fn an_end_the_combat_phase_spell_paused_after_combat_ended_is_still_exiled() {
     let mut scenario = GameScenario::new();
@@ -626,18 +627,13 @@ fn an_end_the_combat_phase_spell_paused_after_combat_ended_is_still_exiled() {
 
     runner.cast(interrupt).commit();
     let mut paused_after_combat = false;
-    run_until_settled(&mut runner, |state| {
+    let events = run_until_settled(&mut runner, |state| {
         if matches!(state.waiting_for, WaitingFor::DiscardChoice { .. }) {
             paused_after_combat = !state.phase.is_combat();
             assert_eq!(
                 state.objects[&interrupt].zone,
                 Zone::Exile,
                 "CR 724.2b: exiled by its own procedure before its discard"
-            );
-            assert_eq!(
-                state.owed_spell_final_part(),
-                None,
-                "a spell exiled by its own end procedure owes no final part"
             );
         }
         None
@@ -654,6 +650,7 @@ fn an_end_the_combat_phase_spell_paused_after_combat_ended_is_still_exiled() {
         "CR 724.2b: the resolving object is exiled by the end-of-combat procedure"
     );
     assert_eq!(graveyard(state, P0).len(), 2, "only the discards");
+    assert_eq!(stack_resolved_count(&events, interrupt), 1);
     assert_settled(state);
 }
 
@@ -1042,10 +1039,7 @@ fn a_copy_of_a_paused_spell_inherits_no_owed_final_part() {
                     assert_eq!(*player, P1, "Chain of Smog's target discards");
                     assert_eq!(
                         state.owed_spell_final_part(),
-                        Some(&OwedSpellFinalPart {
-                            spell: smog,
-                            resolution_start_phase: Phase::PreCombatMain,
-                        }),
+                        Some(&OwedSpellFinalPart { spell: smog }),
                         "the paused Chain of Smog's carrier owes its final part"
                     );
                     smog_owed_at_its_discard = true;
@@ -2738,10 +2732,6 @@ fn glorious_end_is_exiled_before_the_cleanup_mana_order_prompt() {
         Zone::Exile,
         "CR 724.1b: Glorious End was exiled by its own procedure before the prompt"
     );
-    assert!(
-        state.owed_spell_final_part().is_none(),
-        "a spell exiled by its own end procedure owes no final part"
-    );
 
     runner
         .act(GameAction::ChooseReplacement { index: 0 })
@@ -2758,6 +2748,184 @@ fn glorious_end_is_exiled_before_the_cleanup_mana_order_prompt() {
         1,
         "CR 608.2m: the rider after the end procedure still ran, once"
     );
+    assert_settled(state);
+}
+
+const DAYS_UNDOING: &str = "Each player shuffles their hand and graveyard into their library, \
+then draws seven cards. If it's your turn, end the turn. (Exile all spells and abilities from \
+the stack, including this card. Discard down to your maximum hand size. Damage wears off, and \
+\"this turn\" and \"until end of turn\" effects end.)";
+const HURKYLS_FINAL_MEDITATION: &str = "During turns other than yours, this spell costs {3} more \
+to cast.\nReturn all nonland permanents to their owners' hands. End the turn. (Exile all spells \
+and abilities from the stack, including this card. The player whose turn it is discards down to \
+their maximum hand size. Damage wears off, and \"this turn\" and \"until end of turn\" effects \
+end.)";
+const ULTIMA: &str = "Destroy all artifacts and creatures. End the turn. (Exile all spells and \
+abilities from the stack, including this card. The player whose turn it is discards down to \
+their maximum hand size. Damage wears off, and \"this turn\" and \"until end of turn\" effects \
+end.)";
+const MANDATE_OF_PEACE: &str = "Cast this spell only during combat.\nYour opponents can't cast \
+spells this turn.\nEnd the combat phase. (Remove all attackers and blockers from combat. Exile \
+all spells and abilities from the stack, including this spell.)";
+const LEYLINE_OF_ANTICIPATION: &str = "If this card is in your opening hand, you may begin the \
+game with it on the battlefield.\nYou may cast spells as though they had flash.";
+const LIBRARY: [&str; 9] = ["L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", "L9"];
+
+/// CR 724.1b + CR 608.2m: Day's Undoing's end procedure, reached only after its
+/// shuffle-and-draw instruction, exiles the resolving Day's Undoing before the
+/// cleanup ordering prompt, and it finishes resolving from exile.
+#[test]
+fn days_undoing_on_its_controllers_turn_is_exiled_by_its_own_end_procedure() {
+    let (mut runner, undoing) = cast_into_the_cleanup_mana_order(
+        |scenario| {
+            scenario.with_library_top(P0, &LIBRARY);
+            scenario.with_library_top(P1, &LIBRARY);
+            scenario
+                .add_spell_to_hand_from_oracle(P0, "Day's Undoing", false, DAYS_UNDOING)
+                .id()
+        },
+        mana(ManaType::Green, 2),
+    );
+    assert_eq!(
+        runner.state().objects[&undoing].zone,
+        Zone::Exile,
+        "CR 724.1b: Day's Undoing was exiled by its own procedure before the prompt"
+    );
+
+    let mut events = runner
+        .act(GameAction::ChooseReplacement { index: 0 })
+        .expect("P0 orders the replacements")
+        .events;
+    events.extend(run_until_settled(&mut runner, |_| None));
+    let state = runner.state();
+    assert_eq!(state.objects[&undoing].zone, Zone::Exile);
+    assert!(!graveyard(state, P0).contains(&undoing));
+    assert_eq!(stack_resolved_count(&events, undoing), 1);
+    assert_eq!(state.players[0].hand.len(), 7, "reach: the draw ran");
+    assert_settled(state);
+}
+
+/// CR 724.1b: an "end the turn" spell whose resolution never pauses is exiled
+/// by its own procedure, not put into the graveyard.
+#[test]
+fn an_end_the_turn_spell_with_no_pause_is_exiled() {
+    for (name, is_instant, text, bear_zone) in [
+        (
+            "Hurkyl's Final Meditation",
+            true,
+            HURKYLS_FINAL_MEDITATION,
+            Zone::Hand,
+        ),
+        ("Ultima", false, ULTIMA, Zone::Graveyard),
+    ] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.with_library_top(P0, &LIBRARY);
+        scenario.with_library_top(P1, &LIBRARY);
+        let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+        let spell = scenario
+            .add_spell_to_hand_from_oracle(P0, name, is_instant, text)
+            .id();
+        let mut runner = scenario.build();
+
+        runner.cast(spell).commit();
+        let events = run_until_settled(&mut runner, |_| None);
+        let state = runner.state();
+        assert_eq!(
+            state.objects[&bear].zone, bear_zone,
+            "reach: {name} resolved"
+        );
+        assert_eq!(state.phase, Phase::Cleanup, "reach: {name} ended the turn");
+        assert_eq!(
+            state.objects[&spell].zone,
+            Zone::Exile,
+            "CR 724.1b: {name} is exiled by its own procedure"
+        );
+        assert_eq!(stack_resolved_count(&events, spell), 1);
+        assert_settled(state);
+    }
+}
+
+/// CR 724.2b: Mandate of Peace, cast during combat, is exiled by its own
+/// "end the combat phase" procedure.
+#[test]
+fn mandate_of_peace_is_exiled_by_ending_the_combat_phase() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::DeclareAttackers);
+    let mandate = scenario
+        .add_spell_to_hand_from_oracle(P0, "Mandate of Peace", true, MANDATE_OF_PEACE)
+        .id();
+    let mut runner = scenario.build();
+
+    runner.cast(mandate).commit();
+    run_until_settled(&mut runner, |_| None);
+    let state = runner.state();
+    assert_eq!(state.phase, Phase::PostCombatMain, "reach: combat ended");
+    assert_eq!(state.objects[&mandate].zone, Zone::Exile);
+    assert_settled(state);
+}
+
+/// Day's Undoing cast on an opponent's turn runs no end procedure ("If it's
+/// your turn"), so it goes to its owner's graveyard and the spell below it
+/// stays on the stack.
+#[test]
+fn days_undoing_on_an_opponents_turn_is_not_exiled() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P0, &LIBRARY);
+    scenario.with_library_top(P1, &LIBRARY);
+    scenario.add_enchantment_from_oracle(P1, "Leyline of Anticipation", LEYLINE_OF_ANTICIPATION);
+    let below = scenario
+        .add_spell_to_hand_from_oracle(P0, "Below", true, "Draw a card.")
+        .id();
+    let undoing = scenario
+        .add_spell_to_hand_from_oracle(P1, "Day's Undoing", false, DAYS_UNDOING)
+        .id();
+    let mut runner = scenario.build();
+
+    runner.cast(below).commit();
+    runner
+        .act(GameAction::PassPriority)
+        .expect("P0 passes with Below on the stack");
+    runner.cast(undoing).commit();
+    for _ in 0..2 {
+        runner
+            .act(GameAction::PassPriority)
+            .expect("both players pass");
+    }
+    let state = runner.state();
+    assert_eq!(
+        state.objects[&below].zone,
+        Zone::Stack,
+        "reach: no end procedure exiled the spell below"
+    );
+    assert_eq!(state.phase, Phase::PreCombatMain);
+    assert!(graveyard(state, P1).contains(&undoing));
+}
+
+/// CR 724.2g: "end the combat phase" outside combat does nothing, so the
+/// resolving spell is not exiled and goes to the graveyard.
+#[test]
+fn ending_the_combat_phase_outside_combat_does_nothing() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P0, &LIBRARY);
+    let interrupt = scenario
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Combat Interrupt",
+            true,
+            "End the combat phase. Draw a card.",
+        )
+        .id();
+    let mut runner = scenario.build();
+
+    runner.cast(interrupt).commit();
+    run_until_settled(&mut runner, |_| None);
+    let state = runner.state();
+    assert_eq!(state.players[0].hand.len(), 1, "reach: the draw ran");
+    assert_eq!(state.phase, Phase::PreCombatMain);
+    assert_eq!(state.objects[&interrupt].zone, Zone::Graveyard);
     assert_settled(state);
 }
 
@@ -2885,11 +3053,8 @@ fn a_persisted_bare_spell_rest_naming_a_spell_that_has_left_the_stack_still_sett
 fn a_persisted_bare_spell_rest_owing_a_final_part_fails_closed() {
     let (state, spell) = bare_spell_resolution_frame(CoreType::Sorcery, Zone::Stack);
     let mut raw = serde_json::to_value(&state).expect("the state serializes");
-    raw["resolving_spell_final_part"] = serde_json::to_value(OwedSpellFinalPart {
-        spell,
-        resolution_start_phase: Phase::PreCombatMain,
-    })
-    .expect("the marker serializes");
+    raw["resolving_spell_final_part"] =
+        serde_json::to_value(OwedSpellFinalPart { spell }).expect("the marker serializes");
     let persisted: PersistedGameState =
         serde_json::from_value(raw.clone()).expect("the snapshot decodes");
     assert!(

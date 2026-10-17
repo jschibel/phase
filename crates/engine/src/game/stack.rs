@@ -1868,48 +1868,20 @@ fn arm_on_resolution_hooks(
     })
 }
 
-/// Whether the spell's own root effect is the "end the turn" or "end the combat
-/// phase" procedure, which exiles the resolving object itself. "End the combat
-/// phase" does so only when the resolution began during combat.
-///
-/// CR 724.1b + CR 724.2b: the procedure exiles every object on the stack,
-/// including the resolving object.
-fn end_procedure_exiles_resolving_object(
-    ability: Option<&ResolvedAbility>,
-    resolution_start_phase: crate::types::phase::Phase,
-) -> bool {
-    ability.is_some_and(|ability| {
-        matches!(ability.effect, Effect::EndTheTurn)
-            || (matches!(ability.effect, Effect::EndCombatPhase)
-                && resolution_start_phase.is_combat())
-    })
-}
-
 /// The zone a resolving spell leaves the stack for once its instructions are
 /// done: the battlefield for a permanent spell (CR 608.3), its owner's
 /// graveyard for an instant or sorcery (CR 608.2n), or wherever a keyword,
 /// an alternative cost, a casting permission's rider or an armed hook sends it
 /// instead. One rule for the inline and the deferred (`finish_deferred_spell_resolution`)
 /// completion of a resolution.
-///
-/// `resolution_start_phase` is the phase the resolution began in: "end the
-/// combat phase" exiles the resolving object only when it resolves during
-/// combat (CR 724.2b).
 fn resolved_spell_destination(
     state: &GameState,
     entry_id: ObjectId,
     ability: Option<&ResolvedAbility>,
     casting_variant: CastingVariant,
     arming: OnResolutionArming,
-    resolution_start_phase: crate::types::phase::Phase,
 ) -> Zone {
-    if end_procedure_exiles_resolving_object(ability, resolution_start_phase) {
-        // CR 724.1b / CR 724.2b: The "end the turn" and "end the combat
-        // phase" procedures exile every object on the stack, including the
-        // resolving object that `resolve_top` already popped before
-        // executing its effect.
-        Zone::Exile
-    } else if arming.paradigm_armed {
+    if arming.paradigm_armed {
         // CR 702.192a: Paradigm-armed spell exiles instead of going to
         // graveyard. The ExileLink is already created by arm_paradigm.
         Zone::Exile
@@ -2041,7 +2013,8 @@ pub(super) fn spell_awaiting_final_part(state: &GameState) -> Option<&StackEntry
 /// owed or already ran and parked a question of its own (a CR 616.1 ordering of
 /// its own move). `resolve_top` popped it from `state.stack` as it began
 /// resolving, so `targeting::zone_object_ids(Zone::Stack)` cannot list it; the
-/// player-leaves-the-game procedure asks for it here. A card that is again a
+/// player-leaves-the-game procedure and the end procedures (CR 724.1b /
+/// CR 724.2b) ask for it here. A card that is again a
 /// live stack entry is a new cast of it, not this resolution. Permanent spells
 /// (CR 608.3) keep their own paused-entry carrier and are not included.
 pub(super) fn resolving_instant_or_sorcery_on_stack(state: &GameState) -> Option<&StackEntry> {
@@ -2069,9 +2042,9 @@ pub(super) fn finish_deferred_spell_resolution(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
 ) -> DeferredFinalPart {
-    let Some(owed) = owed_final_part(state) else {
+    if owed_final_part(state).is_none() {
         return DeferredFinalPart::NotOwed;
-    };
+    }
     let Some(entry) = spell_awaiting_final_part(state).cloned() else {
         return finish_deferred_resolution_of_departed_spell(state, events);
     };
@@ -2110,17 +2083,8 @@ pub(super) fn finish_deferred_spell_resolution(
         clear_deferred_final_part(state);
         return DeferredFinalPart::Parked;
     };
-    // CR 724.1b / CR 724.2b: the phase the resolution BEGAN in, latched by
-    // `resolve_top` when it deferred this final part — not the phase now, which
-    // the paused instructions may have moved on.
-    let dest = resolved_spell_destination(
-        state,
-        entry.id,
-        ability.as_ref(),
-        casting_variant,
-        arming,
-        owed.resolution_start_phase,
-    );
+    let dest =
+        resolved_spell_destination(state, entry.id, ability.as_ref(), casting_variant, arming);
     // `spell_awaiting_final_part` admits only a spell still on the stack, so
     // the inline path's stack-residency guard holds here by construction.
     match deliver_resolved_spell_off_stack(state, entry.id, entry.controller, dest, events) {
@@ -2590,7 +2554,6 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
     {
         state.announced_source_x = activated.chosen_x.map(|x| (*source_id, x));
     }
-    let resolution_start_phase = state.phase;
 
     // Only run targeting validation and effect execution when an ability exists.
     // Permanent spells with no spell ability (ability is None) skip straight to
@@ -2712,23 +2675,13 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // discards, and Doomsday into the graveyard its own search then exiles
     // "the rest" of.
     //
-    // The owed final part, with the phase the resolution began in (CR 724.2b:
-    // "end the combat phase" exiles the resolving object only during combat),
-    // is latched on the resolution carrier (`GameState::resolving_spell_final_part`),
-    // never on the spell's ability, so a copy cannot inherit it (CR 707.10).
+    // The owed final part is latched on the resolution carrier
+    // (`GameState::resolving_spell_final_part`), never on the spell's ability,
+    // so a copy cannot inherit it (CR 707.10).
     //
     // Permanent spells are CR 608.3, not CR 608.2n: their entry is its own
     // pipeline below, with its own paused-entry carrier (`PendingSpellResolution`).
-    //
-    // CR 724.1b / CR 724.2b + CR 608.2m: a spell whose own end procedure exiles
-    // the resolving object is exiled at that step, before its later
-    // instructions and the prompts its turn transition raises, and finishes
-    // resolving from exile, so it owes no final part.
-    if is_spell
-        && !is_permanent_spell(state, entry.id)
-        && resolution_is_paused(state)
-        && !end_procedure_exiles_resolving_object(ability.as_deref(), resolution_start_phase)
-    {
+    if is_spell && !is_permanent_spell(state, entry.id) && resolution_is_paused(state) {
         let carrier_is_this_spell = state
             .resolving_stack_entry
             .as_ref()
@@ -2740,10 +2693,7 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
         // Latched whatever the shape of the spell's ability (a spell with no
         // ability owes its final part too); only the carrier's identity gates it.
         if carrier_is_this_spell {
-            state.resolving_spell_final_part = Some(OwedSpellFinalPart {
-                spell: entry.id,
-                resolution_start_phase,
-            });
+            state.resolving_spell_final_part = Some(OwedSpellFinalPart { spell: entry.id });
         }
         state.current_trigger_event = None;
         state.current_trigger_events.clear();
@@ -2791,7 +2741,6 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
             ability.as_deref(),
             casting_variant,
             arming,
-            resolution_start_phase,
         );
         if dest == Zone::Battlefield {
             // CR 707.10f + CR 608.3f: A copy of a permanent spell becomes a token
@@ -6673,10 +6622,7 @@ mod tests {
             Zone::Stack,
         );
         state.resolving_stack_entry = Some(pending_spell_entry(spell));
-        state.resolving_spell_final_part = Some(OwedSpellFinalPart {
-            spell,
-            resolution_start_phase: state.phase,
-        });
+        state.resolving_spell_final_part = Some(OwedSpellFinalPart { spell });
         state.waiting_for = WaitingFor::Priority {
             player: PlayerId(0),
         };
@@ -6720,10 +6666,7 @@ mod tests {
                 zone,
             );
             state.resolving_stack_entry = Some(pending_spell_entry(spell));
-            state.resolving_spell_final_part = Some(OwedSpellFinalPart {
-                spell,
-                resolution_start_phase: state.phase,
-            });
+            state.resolving_spell_final_part = Some(OwedSpellFinalPart { spell });
             state.waiting_for = WaitingFor::Priority {
                 player: PlayerId(0),
             };
@@ -6783,10 +6726,7 @@ mod tests {
             Zone::Stack,
         );
         state.resolving_stack_entry = Some(pending_spell_entry(spell));
-        state.resolving_spell_final_part = Some(OwedSpellFinalPart {
-            spell,
-            resolution_start_phase: state.phase,
-        });
+        state.resolving_spell_final_part = Some(OwedSpellFinalPart { spell });
         state.waiting_for = WaitingFor::Priority {
             player: PlayerId(0),
         };
@@ -6907,7 +6847,6 @@ mod tests {
         state.stack.push_back(pending_spell_entry(spell));
         state.resolving_spell_final_part = Some(OwedSpellFinalPart {
             spell: ObjectId(spell.0 + 100),
-            resolution_start_phase: state.phase,
         });
 
         assert_eq!(
