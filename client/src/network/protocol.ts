@@ -106,10 +106,14 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
- *  130 — GameState.deferred_spell_delivery is removed and GameState.resolving_spell_final_part
- *       ({ spell }) marks the CR 608.2n final part a paused instant or
- *       sorcery still owes, in game_setup and state_update; a v129 peer drops the key and would
- *       move the spell too early. Bumped with full-game protocol 148.
+ *  131 — GameState.deferred_spell_delivery is removed and GameState.resolving_spell_final_part
+ *       ({ spell }) marks the CR 608.2n final part a paused instant or sorcery still owes,
+ *       in game_setup and state_update; a v130 peer drops the key and would move the spell
+ *       too early. Bumped with full-game protocol 149.
+ *  130 — game_setup and state_update carry GameState whose abilities may hold
+ *       Effect::ExileTopCardContest (Timesifter) and whose resolution frames may
+ *       park BatchCompletion::TopCardContestRoundComplete; a v129 peer cannot
+ *       parse either tag. Bumped in lockstep with full-game protocol 148.
  *  129 — game_setup and state_update carry GameState whose waiting_for may be
  *       WaitingFor::PhysicalContest (Eye to Eye / Mouth to Mouth) and whose
  *       abilities may hold Effect::PhysicalContest; a v128 peer cannot parse
@@ -700,7 +704,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 130 as const;
+export const WIRE_PROTOCOL_VERSION = 131 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

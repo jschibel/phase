@@ -9128,6 +9128,9 @@ fn resolve_guards_in_effect(effect: &mut Effect) {
                 resolve_guards_in_ability(outcome_template, None);
             }
         }
+        Effect::ExileTopCardContest { winner_effect } => {
+            resolve_guards_in_ability(winner_effect, None);
+        }
         Effect::SeparateIntoPiles {
             chosen_pile_effect,
             unchosen_pile_effect,
@@ -10239,6 +10242,7 @@ fn demote_lifetimes_in_effect(effect: &mut Effect) {
                 demote_lifetimes_in_ability(outcome_template);
             }
         }
+        Effect::ExileTopCardContest { winner_effect } => demote_lifetimes_in_ability(winner_effect),
         Effect::SeparateIntoPiles {
             chosen_pile_effect,
             unchosen_pile_effect,
@@ -11150,6 +11154,9 @@ fn render_effect_descriptions(effect: &mut Effect, card_name: &str) {
             for branch in results.iter_mut() {
                 render_ability_descriptions(&mut branch.effect, card_name);
             }
+        }
+        Effect::ExileTopCardContest { winner_effect } => {
+            render_ability_descriptions(winner_effect, card_name);
         }
         Effect::SeparateIntoPiles {
             chosen_pile_effect,

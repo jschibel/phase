@@ -3051,6 +3051,7 @@ impl ReflexiveGateParent {
             | Effect::EndTheTurn
             | Effect::EndCombatPhase
             | Effect::Vote { .. }
+            | Effect::ExileTopCardContest { .. }
             | Effect::SeparateIntoPiles { .. }
             | Effect::SwitchPT { .. }
             | Effect::CopySpell { .. }
