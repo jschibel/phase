@@ -20,6 +20,7 @@ use engine::parser::parse_oracle_text;
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::counter::CounterType;
+use engine::types::events::GameEvent;
 use engine::types::game_state::{
     AutoMayChoice, GameState, MayTriggerAutoChoiceKey, MayTriggerAutoChoiceScope, MayTriggerOrigin,
     PersistedGameState, PersistedRestoreFinalization, WaitingFor,
@@ -948,6 +949,133 @@ fn crusher_real_upkeep_repeats_and_publishes_counters() {
         );
         assert_repeat_idle(&runner);
     }
+}
+
+#[test]
+fn crusher_real_upkeep_sources_do_not_borrow_prior_revealed_lands() {
+    let db = shared_card_db().expect("production repeat fixtures must load");
+    assert_eq!(
+        db.get_face_by_name("Countryside Crusher")
+            .unwrap()
+            .oracle_text
+            .as_deref(),
+        Some(CRUSHER)
+    );
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::Untap);
+    let crushers = [
+        scenario.add_real_card(P0, "Countryside Crusher", Zone::Battlefield, db),
+        scenario.add_real_card(P0, "Countryside Crusher", Zone::Battlefield, db),
+    ];
+    let library: Vec<_> = ["Forest", "Island", "Shock", "Lightning Bolt"]
+        .iter()
+        .map(|name| scenario.add_real_card(P0, name, Zone::Library, db))
+        .collect();
+    let mut runner = scenario.build();
+    engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
+    runner.advance_to_upkeep();
+    // CR 603.2b + CR 603.3b: both real upkeep triggers reach the stack;
+    // answer an ordering prompt if their order is not automatically settled.
+    assert_eq!(runner.state().phase, Phase::Upkeep);
+    if let WaitingFor::OrderTriggers { player, triggers } = &runner.state().waiting_for {
+        assert_eq!(*player, P0);
+        assert_eq!(triggers.len(), 2);
+        for source in crushers {
+            assert_eq!(triggers.iter().filter(|t| t.source_id == source).count(), 1);
+        }
+        let order = (0..triggers.len()).rev().collect();
+        runner.act(GameAction::OrderTriggers { order }).unwrap();
+    }
+    assert_eq!(runner.state().stack.len(), 2);
+    let first = runner.state().stack[1].source_id;
+    let second = runner.state().stack[0].source_id;
+    assert_ne!(first, second);
+    assert!(crushers.contains(&first) && crushers.contains(&second));
+    runner.act(GameAction::PassPriority).unwrap();
+    let first_result = runner.act(GameAction::PassPriority).unwrap();
+    // CR 608.2c: this source's process reveals and moves only its two lands,
+    // then stops on the nonland before the other source's upkeep resolves.
+    let revealed: Vec<_> = first_result
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            GameEvent::CardsRevealed { card_ids, .. } => Some(card_ids.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        revealed,
+        vec![vec![library[0]], vec![library[1]], vec![library[2]]]
+    );
+    assert_eq!(runner.state().players[0].graveyard.len(), 2);
+    assert_eq!(runner.state().objects[&library[0]].zone, Zone::Graveyard);
+    assert_eq!(runner.state().objects[&library[1]].zone, Zone::Graveyard);
+    assert_eq!(runner.state().players[0].library[0], library[2]);
+
+    // CR 603.2c + CR 603.3b: each source observes both graveyard events.
+    if let WaitingFor::OrderTriggers { player, triggers } = &runner.state().waiting_for {
+        assert_eq!(*player, P0);
+        assert_eq!(triggers.len(), 4);
+        for source in crushers {
+            assert_eq!(triggers.iter().filter(|t| t.source_id == source).count(), 2);
+        }
+        let order = (0..triggers.len()).rev().collect();
+        runner.act(GameAction::OrderTriggers { order }).unwrap();
+    }
+    assert_eq!(runner.state().stack.len(), 5);
+    assert_eq!(runner.state().stack[0].source_id, second);
+    for source in crushers {
+        assert_eq!(
+            runner
+                .state()
+                .stack
+                .iter()
+                .skip(1)
+                .filter(|entry| entry.source_id == source)
+                .count(),
+            2
+        );
+    }
+    for remaining in (1..=4).rev() {
+        assert_eq!(runner.state().stack.len(), remaining + 1);
+        runner.act(GameAction::PassPriority).unwrap();
+        runner.act(GameAction::PassPriority).unwrap();
+    }
+    assert_eq!(runner.state().stack.len(), 1);
+    assert_eq!(runner.state().stack[0].source_id, second);
+    runner.act(GameAction::PassPriority).unwrap();
+    let second_result = runner.act(GameAction::PassPriority).unwrap();
+    // CR 608.2c + CR 701.20b: the second source really reveals the nonland;
+    // the first source's earlier lands cannot satisfy this source's gate.
+    let revealed: Vec<_> = second_result
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            GameEvent::CardsRevealed { card_ids, .. } => Some(card_ids.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(revealed, vec![vec![library[2]]]);
+    assert_eq!(runner.state().players[0].graveyard.len(), 2);
+    assert_eq!(
+        runner.state().players[0]
+            .library
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        library[2..]
+    );
+    for source in crushers {
+        assert_eq!(
+            runner.state().objects[&source]
+                .counters
+                .get(&CounterType::Plus1Plus1)
+                .copied(),
+            Some(2),
+            "both counter observers retain their own source"
+        );
+    }
+    assert_repeat_idle(&runner);
 }
 
 #[test]
