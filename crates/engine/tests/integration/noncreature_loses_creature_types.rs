@@ -9,7 +9,7 @@
 //! Arbor, Idol of False Gods (Kindred), March of the Machines, and the bestow
 //! creatures Springheart Nantuko and Boon Satyr. Overlord of the Mistmoors,
 //! Amoeboid Changeling and One with the Stars use their exact Oracle text with
-//! scenario builders because they are absent from the fixture.
+//! scenario builders.
 //!
 //! Scenario tests run with an EMPTY `GameState::all_creature_types`, where the old
 //! registry-keeps-creature-types clause is inert; every row that asserts a removal
@@ -33,8 +33,8 @@ use engine::types::zones::Zone;
 
 use crate::support::shared_card_db as load_db;
 
-/// Verbatim Oracle text (Scryfall), Overlord of the Mistmoors {5}{W}{W}. Not in
-/// the integration fixture, so its sibling row is built from the text.
+/// Verbatim Oracle text (Scryfall), Overlord of the Mistmoors {5}{W}{W}.
+/// Its sibling row is built from this text.
 const MISTMOORS_ORACLE: &str = "Impending 4\u{2014}{2}{W}{W} (If you cast this spell for its impending cost, it enters with four time counters and isn't a creature until the last is removed. At the beginning of your end step, remove a time counter from it.)\nWhenever this permanent enters or attacks, create two 2/1 white Insect creature tokens with flying.";
 
 /// A registry shaped like `deck_loading.rs`'s output: creature-face subtypes minus
@@ -201,9 +201,8 @@ fn balemurk_regains_avatar_horror_when_last_time_counter_is_removed() {
     assert_eq!(subtypes(&runner, id), strings(&["Avatar", "Horror"]));
 }
 
-/// The one synthetic-Oracle sibling of the Balemurk row (Mistmoors is not in the
-/// fixture): acceptable only because the real-card version of the same behaviour
-/// is `impending_balemurk_has_no_creature_types_while_it_has_time_counters`.
+/// The inline-Oracle sibling of the Balemurk row exercises the same behavior as
+/// `impending_balemurk_has_no_creature_types_while_it_has_time_counters`.
 #[test]
 fn impending_mistmoors_has_no_creature_types_while_it_has_time_counters() {
     let mut scenario = GameScenario::new();
@@ -490,7 +489,7 @@ fn kindred_artifact_keeps_creature_types_when_its_creature_type_is_removed() {
 
 #[test]
 fn changeling_one_with_stars_does_not_regain_creature_types() {
-    // Verbatim MTGJSON Oracle; neither card is in the integration fixture.
+    // Verbatim MTGJSON Oracle for both inline scenario cards.
     const AMOEBOID: &str = "Changeling (This card is every creature type.)\n{T}: Target creature gains all creature types until end of turn.\n{T}: Target creature loses all creature types until end of turn.";
     const STARS: &str = "Enchant creature or enchantment\nEnchanted permanent is an enchantment and loses all other card types. (It still has its abilities, but it's no longer a creature.)";
     let mut scenario = GameScenario::new();
