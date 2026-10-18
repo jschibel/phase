@@ -230,6 +230,30 @@ fn definition_grants_flashback(def: &AbilityDefinition) -> bool {
             .is_some_and(definition_grants_flashback)
 }
 
+pub(crate) fn parse_attack_exert_header(input: &str) -> OracleResult<'_, Option<StaticCondition>> {
+    let (input, condition) = opt(preceded(
+        tag("if "),
+        terminated(parse_inner_condition, tag(", ")),
+    ))
+    .parse(input)?;
+    let (input, _) = tag("you may exert ").parse(input)?;
+    let (input, _) = take_until(" as ").parse(input)?;
+    let (input, _) = tag(" as ").parse(input)?;
+    let (input, _) = alt((tag("it"), tag("he"), tag("she"), tag("they"))).parse(input)?;
+    let (input, _) = tag(" attacks").parse(input)?;
+    Ok((input, condition))
+}
+
+pub(crate) fn parse_unknown_conditioned_attack_exert_header(input: &str) -> OracleResult<'_, ()> {
+    let (input, _) = tag("if ").parse(input)?;
+    let (input, _) = take_until(", you may exert ").parse(input)?;
+    let (input, _) = tag(", you may exert ").parse(input)?;
+    let (input, _) = take_until(" as ").parse(input)?;
+    let (input, _) = tag(" as ").parse(input)?;
+    let (input, _) = alt((tag("it"), tag("he"), tag("she"), tag("they"))).parse(input)?;
+    value((), tag(" attacks")).parse(input)
+}
+
 fn parse_commander_permission_sentence(input: &str) -> nom::IResult<&str, (), OracleError<'_>> {
     let (input, subject) = take_until(" can be your commander").parse(input)?;
     if subject.trim().is_empty() {
@@ -6781,19 +6805,9 @@ fn parse_normalized_oracle_ir(
         // CR 701.43d + CR 607.2h: Keep the optional attack cost and its
         // linked payoff together, intercepting before static P/T dispatch.
         // CR 603.4: A leading condition gates payment, not trigger resolution.
-        if let Some((attack_cost_condition, rest_original)) = nom_on_lower(&line, &lower, |input| {
-            let (input, condition) = opt(preceded(
-                tag("if "),
-                terminated(parse_inner_condition, tag(", ")),
-            ))
-            .parse(input)?;
-            let (input, _) = tag("you may exert ").parse(input)?;
-            let (input, _) = take_until(" as ").parse(input)?;
-            let (input, _) = tag(" as ").parse(input)?;
-            let (input, _) = alt((tag("it"), tag("he"), tag("she"), tag("they"))).parse(input)?;
-            let (input, _) = tag(" attacks").parse(input)?;
-            Ok((input, condition))
-        }) {
+        if let Some((attack_cost_condition, rest_original)) =
+            nom_on_lower(&line, &lower, parse_attack_exert_header)
+        {
             let mut trigger = TriggerDefinition::new(TriggerMode::Exerted)
                 .valid_card(TargetFilter::SelfRef)
                 .trigger_zones(vec![Zone::Battlefield])
@@ -6832,17 +6846,7 @@ fn parse_normalized_oracle_ir(
         }
         // A syntactically attack-exert paragraph with an unknown leading gate
         // must remain unsupported rather than silently losing its restriction.
-        if nom_on_lower(&line, &lower, |input| {
-            let (input, _) = tag("if ").parse(input)?;
-            let (input, _) = take_until(", you may exert ").parse(input)?;
-            let (input, _) = tag(", you may exert ").parse(input)?;
-            let (input, _) = take_until(" as ").parse(input)?;
-            let (input, _) = tag(" as ").parse(input)?;
-            let (input, _) = alt((tag("it"), tag("he"), tag("she"), tag("they"))).parse(input)?;
-            value((), tag(" attacks")).parse(input)
-        })
-        .is_some()
-        {
+        if nom_on_lower(&line, &lower, parse_unknown_conditioned_attack_exert_header).is_some() {
             emitter.ability_at(
                 item_line,
                 AbilityDefinition::new(

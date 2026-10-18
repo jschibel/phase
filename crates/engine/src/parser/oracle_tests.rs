@@ -23444,6 +23444,64 @@ fn exert_with_card_name() {
 }
 
 #[test]
+fn attack_exert_shared_headers_preserve_conditions_and_original_remainders() {
+    // SHAPE: synthetic grammar fixtures cover the existing subject/pronoun axes.
+    let gate = StaticCondition::Not {
+        condition: Box::new(StaticCondition::SourceExertedThisTurn),
+    };
+    for condition in [
+        "If ~ hasn't been exerted this turn, ",
+        "If this creature hasn't been exerted this turn, ",
+    ] {
+        for (subject, pronoun) in [
+            ("~", "it"),
+            ("this creature", "he"),
+            ("it", "she"),
+            ("them", "they"),
+        ] {
+            let text = format!("{condition}you may exert {subject} as {pronoun} attacks. When you do, Draw a card.");
+            let (actual, rest) =
+                nom_on_lower(&text, &text.to_lowercase(), parse_attack_exert_header)
+                    .expect("existing conditional header");
+            assert_eq!(actual, Some(gate.clone()));
+            assert_eq!(rest, ". When you do, Draw a card.");
+        }
+    }
+    for (text, expected_rest) in [
+        ("You may exert this creature as it attacks.", "."),
+        (
+            "You may exert ~ as they attacks. When you do, Draw a card.",
+            ". When you do, Draw a card.",
+        ),
+    ] {
+        let (condition, rest) = nom_on_lower(text, &text.to_lowercase(), parse_attack_exert_header)
+            .expect("existing unconditional header");
+        assert_eq!(condition, None);
+        assert_eq!(rest, expected_rest);
+    }
+    let unknown = "If this creature has danced this turn, you may exert it as it attacks. When you do, Draw a card.";
+    assert!(nom_on_lower(unknown, &unknown.to_lowercase(), parse_attack_exert_header).is_none());
+    let ((), rest) = nom_on_lower(
+        unknown,
+        &unknown.to_lowercase(),
+        parse_unknown_conditioned_attack_exert_header,
+    )
+    .expect("recognized but unsupported conditional header");
+    assert_eq!(rest, ". When you do, Draw a card.");
+    let standalone = parse(
+        "If this creature hasn't been exerted this turn, you may exert it as it attacks.",
+        "Conditional grammar fixture",
+        &[],
+        &["Creature"],
+        &[],
+    );
+    assert_eq!(standalone.triggers.len(), 1);
+    assert!(standalone.triggers[0].is_standalone_attack_exert_permission());
+    assert_eq!(standalone.triggers[0].attack_cost_condition, Some(gate));
+    assert!(standalone.abilities.is_empty());
+}
+
+#[test]
 fn exert_conditional() {
     let r = parse(
             "If this creature hasn't been exerted this turn, you may exert it as it attacks. When you do, untap all other creatures you control and after this phase, there is an additional combat phase.",

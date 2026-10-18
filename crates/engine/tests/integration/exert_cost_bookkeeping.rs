@@ -18,24 +18,37 @@
 //! creature, so the observer tests pair Resolute Survivors (observer) with a
 //! cost-exerter (Arena of Glory, Fervent Paincaster, Oasis Ritualist).
 
+use std::sync::Arc;
+
+use crate::support::shared_card_db;
+use engine::database::card_db::CardDatabase;
 use engine::game::combat::AttackTarget;
+use engine::game::functioning_abilities::active_trigger_definitions;
+use engine::game::printed_cards::{
+    install_card_db, rehydrate_game_from_card_db_with_finalization, CardDbRehydrationFinalization,
+};
 use engine::game::scenario::{CastOutcome, GameRunner, GameScenario, P0, P1};
+use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::ability::{
-    AbilityCost, ChosenAttribute, ContinuousModification, TargetFilter,
-    TriggerDefinitionOccurrenceRef, TriggerDefinitionRef,
+    AbilityCost, ChosenAttribute, ContinuousModification, StaticCondition, TargetFilter,
+    TriggerDefinition, TriggerDefinitionOccurrenceRef, TriggerDefinitionRef,
 };
 use engine::types::actions::GameAction;
 use engine::types::events::{ExertOrigin, GameEvent};
 use engine::types::game_state::{
-    CastPaymentMode, ExileLink, ExileLinkKind, ManaChoice, PersistedGameState,
+    CastPaymentMode, ExileLink, ExileLinkKind, GameState, ManaChoice, PersistedGameState,
     PersistedRestoreFinalization, WaitingFor,
 };
 use engine::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use engine::types::keywords::Keyword;
-use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType};
+use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::{Phase, PhaseGroup, TurnSegment};
 use engine::types::player::PlayerId;
-use engine::types::resolved_commands::{ResolvedObjectStatus, ResolvedRulesCommand};
+use engine::types::proposed_event::ProposedEvent;
+use engine::types::resolution::{ResolutionFrame, ResolutionStateWire};
+use engine::types::resolved_commands::{
+    ResolvedObjectStatus, ResolvedRulesCommand, ResolvedTokenBody,
+};
 use engine::types::statics::StaticMode;
 use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
@@ -1009,6 +1022,861 @@ fn push_pending_attack_event(json: &mut serde_json::Value, event: serde_json::Va
         .as_array_mut()
         .expect("pending_attack_trigger_events is an array")
         .push(event);
+}
+
+// Fixed historical producer output, extracted from f185's stale lowered golden.
+// Never regenerate this fixture from the corrected parser or the current golden.
+fn historical_attack_permission() -> TriggerDefinition {
+    serde_json::from_str(include_str!(
+        "../fixtures/legacy_attack_exert_permission.json"
+    ))
+    .expect("the complete historical trigger decodes")
+}
+
+fn null_historical_fixture_gates(value: &mut serde_json::Value, old: &serde_json::Value) -> usize {
+    if value == old {
+        value["attack_cost_condition"] = serde_json::Value::Null;
+        return 1;
+    }
+    match value {
+        serde_json::Value::Object(object) => object
+            .values_mut()
+            .map(|child| null_historical_fixture_gates(child, old))
+            .sum(),
+        serde_json::Value::Array(values) => values
+            .iter_mut()
+            .map(|child| null_historical_fixture_gates(child, old))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn copied_permission(runner: &GameRunner, source: ObjectId) -> TriggerDefinitionRef {
+    let object = &runner.state().objects[&source];
+    object
+        .validate_trigger_definitions()
+        .expect("coherent copied base/live definitions");
+    let permissions: Vec<_> = active_trigger_definitions(runner.state(), object)
+        .filter(|entry| entry.definition.is_attack_exert_permission())
+        .collect();
+    assert_eq!(permissions.len(), 1);
+    permissions[0].definition_ref.clone()
+}
+
+fn assert_copied_gate(runner: &GameRunner, source: ObjectId, recovered: bool) {
+    let object = &runner.state().objects[&source];
+    let permission = copied_permission(runner, source);
+    assert_eq!(permission.source, ObjectIncarnationRef::from_object(object));
+    let live = active_trigger_definitions(runner.state(), object)
+        .find(|entry| entry.definition_ref == permission)
+        .unwrap()
+        .definition
+        .clone();
+    let base = object
+        .base_trigger_definitions
+        .iter()
+        .find(|entry| entry.is_attack_exert_permission())
+        .unwrap();
+    assert_eq!(&live, base);
+    let mut expected = historical_attack_permission();
+    if recovered {
+        expected.attack_cost_condition = Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::SourceExertedThisTurn),
+        });
+    }
+    assert_eq!(live, expected, "only the historical predicate may change");
+}
+
+/// Current printed definitions stay authoritative through the same real restore.
+#[test]
+fn current_copied_celebrant_permission_survives_real_db_restore() {
+    let db = shared_card_db().expect("real card fixture is required");
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario.add_real_card(P0, "Combat Celebrant", Zone::Battlefield, db);
+    let shimmer = scenario.add_real_card(P0, "Heat Shimmer", Zone::Hand, db);
+    let vitalize = scenario.add_real_card(P0, "Vitalize", Zone::Hand, db);
+    for _ in 0..3 {
+        scenario.add_basic_land(P0, ManaColor::Red);
+    }
+    scenario.add_basic_land(P0, ManaColor::Green);
+    let mut runner = scenario.build();
+    let outcome = runner.cast(shimmer).target_object(source).resolve();
+    outcome.assert_zone(&[shimmer], Zone::Graveyard);
+    let tokens: Vec<_> = outcome
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            GameEvent::TokenCreated {
+                object_id,
+                source_id,
+                ..
+            } if *source_id == shimmer => Some(*object_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tokens.len(), 1);
+    let token = tokens[0];
+    assert_copied_gate(&runner, token, true);
+    for trusted in [false, true] {
+        let mut restored = restore_copy_with_real_db(runner.state(), trusted);
+        assert_copied_gate(&restored, token, true);
+        exert_copy_then_vitalize(&mut restored, token, vitalize);
+        let mut restored = restore_copy_with_real_db(restored.state(), trusted);
+        assert_copied_gate(&restored, token, true);
+        assert_no_second_copy_exert(&mut restored, token);
+    }
+}
+
+/// CR 701.43b: the genuinely unconditional copied permission can be paid again.
+#[test]
+fn unconditional_copied_warrior_can_exert_again_after_real_db_restore() {
+    let db = shared_card_db().expect("real card fixture is required");
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario.add_real_card(P0, "Bitterblade Warrior", Zone::Battlefield, db);
+    let celebrant = scenario.add_real_card(P0, "Combat Celebrant", Zone::Battlefield, db);
+    let shimmer = scenario.add_real_card(P0, "Heat Shimmer", Zone::Hand, db);
+    let vitalize = scenario.add_real_card(P0, "Vitalize", Zone::Hand, db);
+    for _ in 0..3 {
+        scenario.add_basic_land(P0, ManaColor::Red);
+    }
+    scenario.add_basic_land(P0, ManaColor::Green);
+    let mut runner = scenario.build();
+    let outcome = runner.cast(shimmer).target_object(source).resolve();
+    outcome.assert_zone(&[shimmer], Zone::Graveyard);
+    let tokens: Vec<_> = outcome
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            GameEvent::TokenCreated {
+                object_id,
+                source_id,
+                ..
+            } if *source_id == shimmer => Some(*object_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tokens.len(), 1);
+    let token = tokens[0];
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[
+            (token, AttackTarget::Player(P1)),
+            (celebrant, AttackTarget::Player(P1)),
+        ])
+        .expect("both attack legally");
+    for attacker in [token, celebrant] {
+        pay_copy_attack(&mut runner, attacker);
+    }
+    runner.advance_until_stack_empty();
+    assert_exert_priority(&runner, 0);
+    assert_eq!(
+        runner.state().extra_phases.len(),
+        1,
+        "real companion Celebrant earns later combat"
+    );
+    assert_eq!(runner.state().objects[&token].power, Some(3));
+    assert!(runner.state().objects[&token]
+        .keywords
+        .contains(&Keyword::Deathtouch));
+    runner
+        .cast(vitalize)
+        .resolve()
+        .assert_zone(&[vitalize], Zone::Graveyard);
+    assert!(runner.state().exerted_this_turn.contains(&token));
+    assert!(!runner.state().objects[&token].tapped);
+    assert_eq!(cant_untap_markers(&runner, token), 1);
+    for trusted in [false, true] {
+        let mut restored = restore_copy_with_real_db(runner.state(), trusted);
+        let reference = copied_permission(&restored, token);
+        assert_eq!(reference, copied_permission(&runner, token));
+        assert!(
+            active_trigger_definitions(restored.state(), &restored.state().objects[&token])
+                .find(|entry| entry.definition_ref == reference)
+                .unwrap()
+                .definition
+                .attack_cost_condition
+                .is_none()
+        );
+        reach_earned_later_combat(&mut restored);
+        restored
+            .declare_attackers(&[(token, AttackTarget::Player(P1))])
+            .expect("legal second attack");
+        pay_copy_attack(&mut restored, token);
+        assert_exert_priority(&restored, 1);
+        restored.advance_until_stack_empty();
+        assert_exert_priority(&restored, 0);
+        assert_eq!(restored.state().objects[&token].power, Some(4));
+        assert!(restored.state().objects[&token]
+            .keywords
+            .contains(&Keyword::Deathtouch));
+        assert_eq!(cant_untap_markers(&restored, token), 2);
+        assert!(restored.state().extra_phases.is_empty());
+    }
+}
+
+/// CR 707.9b: rehydration preserves the spell's actual copy exceptions.
+#[test]
+fn croaking_counterpart_copy_exceptions_survive_real_db_restore() {
+    let db = shared_card_db().expect("real card fixture is required");
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.state.all_creature_types = db.creature_type_vocabulary().to_vec();
+    assert!(!scenario.state.all_creature_types.is_empty());
+    for subtype in ["Human", "Warrior", "Frog"] {
+        assert!(scenario
+            .state
+            .all_creature_types
+            .iter()
+            .any(|known| known == subtype));
+    }
+    let source = scenario.add_real_card(P0, "Combat Celebrant", Zone::Battlefield, db);
+    scenario.add_real_card(P0, "Fervor", Zone::Battlefield, db);
+    let counterpart = scenario.add_real_card(P0, "Croaking Counterpart", Zone::Hand, db);
+    for color in [ManaColor::Green, ManaColor::Blue, ManaColor::Green] {
+        scenario.add_basic_land(P0, color);
+    }
+    let mut runner = scenario.build();
+    assert_eq!(runner.state().objects[&source].power, Some(4));
+    assert_eq!(runner.state().objects[&source].color, vec![ManaColor::Red]);
+    let outcome = runner.cast(counterpart).target_object(source).resolve();
+    outcome.assert_zone(&[counterpart], Zone::Graveyard);
+    let tokens: Vec<_> = outcome
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            GameEvent::TokenCreated {
+                object_id,
+                source_id,
+                ..
+            } if *source_id == counterpart => Some(*object_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tokens.len(),
+        1,
+        "actual Counterpart cast must create its copy"
+    );
+    let token = tokens[0];
+    let created = &runner.state().objects[&token];
+    assert!(created.is_token);
+    assert_eq!((created.power, created.toughness), (Some(1), Some(1)));
+    assert_eq!(created.color, vec![ManaColor::Green]);
+    assert_eq!(created.card_types.subtypes, vec!["Frog".to_string()]);
+    for trusted in [false, true] {
+        let mut restored = restore_copy_with_real_db(runner.state(), trusted);
+        let object = &restored.state().objects[&token];
+        assert!(object.is_token);
+        assert_eq!((object.power, object.toughness), (Some(1), Some(1)));
+        assert_eq!(object.color, vec![ManaColor::Green]);
+        assert_eq!(object.card_types.subtypes, vec!["Frog".to_string()]);
+        assert!(object.keywords.contains(&Keyword::Haste));
+        assert_copied_gate(&restored, token, true);
+        assert_eq!(
+            copied_permission(&restored, token),
+            copied_permission(&runner, token)
+        );
+        declare_exert_attacker(&mut restored, token);
+        pay_copy_attack(&mut restored, token);
+        restored.advance_until_stack_empty();
+        assert_exert_priority(&restored, 0);
+        assert_eq!(restored.state().extra_phases.len(), 1);
+    }
+}
+
+fn install_historical_permission(runner: &mut GameRunner, source: ObjectId) {
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&source)
+        .unwrap()
+        .install_trigger_base_definitions(Arc::new(vec![historical_attack_permission()]))
+        .expect("install the old producer's complete base");
+    engine::game::layers::evaluate_layers(runner.state_mut());
+    engine::game::trigger_index::reindex_object_triggers(runner.state_mut(), source);
+    assert_copied_gate(runner, source, false);
+}
+
+fn restore_copy_with_real_db(state: &GameState, trusted: bool) -> GameRunner {
+    let json = if trusted {
+        serde_json::to_value(PersistedGameState::capture(state.clone())).unwrap()
+    } else {
+        serde_json::to_value(state).unwrap()
+    };
+    restore_copy_json_with_real_db(json)
+}
+
+fn restore_copy_json_with_real_db(json: serde_json::Value) -> GameRunner {
+    shared_card_db().expect("real integration fixture is required");
+    let db = Arc::new(
+        CardDatabase::from_export_reader(flate2::read::GzDecoder::new(
+            &include_bytes!("../fixtures/integration_cards.json.gz")[..],
+        ))
+        .expect("load the actual integration CardDatabase"),
+    );
+    let restored = serde_json::from_value::<PersistedGameState>(json)
+        .expect("decode saved copy")
+        .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+        .expect("prepare saved copy")
+        .finalize_after_rehydration(|state| {
+            rehydrate_game_from_card_db_with_finalization(
+                state,
+                &db,
+                CardDbRehydrationFinalization::Defer,
+            );
+            install_card_db(state, Arc::clone(&db));
+            engine::game::combat::refresh_combat_declaration_waiting_for(state);
+            Ok(())
+        })
+        .expect("finalize actual DB-backed restore");
+    assert!(restored.card_db.is_some());
+    GameRunner::from_state(restored)
+}
+
+fn actual_parked_copy_wire_families(state: &GameState) -> Vec<serde_json::Value> {
+    // Explicit test-local V1 mapping of the ACTUALLY present frame population.
+    // An unrepresentable frame is a failing reference, never silently discarded.
+    let mut v1 = serde_json::to_value(state).unwrap();
+    let stack = v1
+        .as_object_mut()
+        .unwrap()
+        .remove("resolution_stack")
+        .expect("real parked stack");
+    let frames = stack["frames"].as_array().expect("serialized frame list");
+    let mut seen_copy = false;
+    let mut seen_continuation = false;
+    for frame in frames {
+        match frame["type"].as_str().unwrap() {
+            "AbilityContinuation" => {
+                assert!(
+                    !seen_continuation && !seen_copy,
+                    "V1 order must represent actual parent before child"
+                );
+                seen_continuation = true;
+                v1["pending_continuation"] = frame["data"]["pending"].clone();
+                if let Some(context) = frame["data"].get("choose_zone_trigger_context") {
+                    v1["pending_choose_zone_trigger_context"] = context.clone();
+                }
+            }
+            "CopyToken" => {
+                assert!(!seen_copy, "one actual copy owner");
+                seen_copy = true;
+                v1["pending_copy_token_resolution"] = frame["data"].clone();
+            }
+            kind => panic!("actual parked {kind} has no approved V1 mapping"),
+        }
+    }
+    assert!(seen_copy);
+    v1["resolution_state_version"] = 1.into();
+    let mut families = vec![v1];
+    let current =
+        serde_json::to_value(ResolutionStateWire::from_game_state(state.clone())).unwrap();
+    assert!(
+        state
+            .resolution_stack
+            .iter()
+            .all(|frame| !matches!(frame, ResolutionFrame::MultiDraw(_))),
+        "no draw-family differences apply"
+    );
+    for version in 2..=5 {
+        let mut wire = current.clone();
+        wire["resolution_state_version"] = version.into();
+        families.push(wire);
+    }
+    families.push(serde_json::to_value(state).unwrap());
+    families
+}
+
+fn pay_copy_attack(runner: &mut GameRunner, source: ObjectId) {
+    let permission = current_permission(runner);
+    assert_eq!(permission, copied_permission(runner, source));
+    let result = runner
+        .act(GameAction::ChooseExert { exert: true })
+        .expect("pay selected cost");
+    assert_eq!(attack_receipts(&result.events), vec![permission]);
+    assert_eq!(exerted_events(&result.events), vec![(source, P0)]);
+    assert!(runner.state().exerted_this_turn.contains(&source));
+}
+
+fn exert_copy_then_vitalize(runner: &mut GameRunner, source: ObjectId, vitalize: ObjectId) {
+    declare_exert_attacker(runner, source);
+    pay_copy_attack(runner, source);
+    assert_exert_priority(runner, 1);
+    runner.advance_until_stack_empty();
+    assert_exert_priority(runner, 0);
+    assert_eq!(
+        runner.state().extra_phases.len(),
+        1,
+        "the paid linked ability earned combat"
+    );
+    assert_eq!(cant_untap_markers(runner, source), 1);
+    cast_vitalize_after_activation(runner, source, vitalize);
+    assert_exert_priority(runner, 0);
+}
+
+fn reach_earned_later_combat(runner: &mut GameRunner) {
+    let turn = runner.state().turn_number;
+    assert_eq!(runner.state().phase, Phase::DeclareAttackers);
+    assert_exert_priority(runner, 0);
+    assert_eq!(runner.state().extra_phases.len(), 1);
+    let mut left_first_declaration = false;
+    for _ in 0..40 {
+        if runner.state().phase != Phase::DeclareAttackers {
+            left_first_declaration = true;
+        }
+        if left_first_declaration
+            && matches!(
+                runner.state().waiting_for,
+                WaitingFor::DeclareAttackers { .. }
+            )
+        {
+            assert_eq!(runner.state().turn_number, turn);
+            assert!(
+                runner.state().extra_phases.is_empty(),
+                "the actually earned combat was consumed"
+            );
+            return;
+        }
+        let result = match &runner.state().waiting_for {
+            WaitingFor::Priority { .. } => runner
+                .act(GameAction::PassPriority)
+                .expect("pass combat priority"),
+            WaitingFor::DeclareBlockers { .. } => {
+                runner.declare_blockers(&[]).expect("declare no blockers")
+            }
+            waiting => panic!("unexpected prompt while leaving first combat: {waiting:?}"),
+        };
+        left_first_declaration |= result.events.iter().any(|event| matches!(event, GameEvent::PhaseChanged { phase } if *phase != Phase::DeclareAttackers));
+        assert_eq!(
+            runner.state().turn_number,
+            turn,
+            "must reach the earned combat this turn"
+        );
+    }
+    panic!("did not reach the actually earned later combat");
+}
+
+fn assert_no_second_copy_exert(runner: &mut GameRunner, source: ObjectId) {
+    let incarnation = ObjectIncarnationRef::from_object(&runner.state().objects[&source]);
+    let permission = copied_permission(runner, source);
+    let markers = cant_untap_markers(runner, source);
+    assert_eq!(markers, 1);
+    assert!(!runner.state().objects[&source].tapped);
+    assert!(runner.state().exerted_this_turn.contains(&source));
+    reach_earned_later_combat(runner);
+    let result = runner
+        .declare_attackers(&[(source, AttackTarget::Player(P1))])
+        .expect("legal later attack");
+    assert!(runner
+        .state()
+        .combat
+        .as_ref()
+        .unwrap()
+        .attackers
+        .iter()
+        .any(|a| a.object_id == source));
+    assert_exert_priority(runner, 0);
+    assert!(attack_receipts(&result.events).is_empty());
+    assert!(exerted_events(&result.events).is_empty());
+    assert_eq!(cant_untap_markers(runner, source), markers);
+    assert_eq!(
+        ObjectIncarnationRef::from_object(&runner.state().objects[&source]),
+        incarnation
+    );
+    assert_eq!(copied_permission(runner, source), permission);
+    assert!(runner.state().extra_phases.is_empty());
+}
+
+/// CR 707.2 / CR 701.43b: a saved copy retains its paragraph and its exert history.
+#[test]
+fn historical_copied_celebrant_permission_recovers_through_real_db_restore() {
+    for trusted in [false, true] {
+        let db = shared_card_db().expect("real card fixture is required");
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let source = scenario.add_real_card(P0, "Combat Celebrant", Zone::Battlefield, db);
+        let shimmer = scenario.add_real_card(P0, "Heat Shimmer", Zone::Hand, db);
+        let vitalize = scenario.add_real_card(P0, "Vitalize", Zone::Hand, db);
+        for _ in 0..3 {
+            scenario.add_basic_land(P0, ManaColor::Red);
+        }
+        scenario.add_basic_land(P0, ManaColor::Green);
+        let mut runner = scenario.build();
+        install_historical_permission(&mut runner, source);
+        let outcome = runner.cast(shimmer).target_object(source).resolve();
+        outcome.assert_zone(&[shimmer], Zone::Graveyard);
+        let tokens: Vec<_> = outcome
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                GameEvent::TokenCreated {
+                    object_id,
+                    source_id,
+                    ..
+                } if *source_id == shimmer => Some(*object_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tokens.len(), 1, "real Heat Shimmer creates one copy");
+        let token = tokens[0];
+        assert!(runner.state().objects[&token].is_token);
+        assert!(outcome.events().iter().any(|event| matches!(event, GameEvent::ZoneChanged { object_id, to: Zone::Battlefield, .. } if *object_id == token)), "actual copy enters through a battlefield zone event");
+        assert!(runner.state().objects[&token]
+            .keywords
+            .contains(&Keyword::Haste));
+        assert_copied_gate(&runner, token, false);
+        let creation = runner
+            .state()
+            .resolved_rules_journal
+            .entries()
+            .iter()
+            .find_map(|entry| match &entry.command {
+                Some(ResolvedRulesCommand::TokenCreation(command))
+                    if command.object.object_id == token =>
+                {
+                    Some(command)
+                }
+                _ => None,
+            })
+            .expect("real copy creation is journaled");
+        let ResolvedTokenBody::Copy { copy, .. } = &creation.body else {
+            panic!("journal must retain copied values")
+        };
+        assert_eq!(
+            copy.values.trigger_definitions.as_ref(),
+            &vec![historical_attack_permission()]
+        );
+        let creation_before = serde_json::to_value(creation).unwrap();
+        let incarnation = ObjectIncarnationRef::from_object(&runner.state().objects[&token]);
+        let permission = copied_permission(&runner, token);
+        exert_copy_then_vitalize(&mut runner, token, vitalize);
+        for null_gate in [false, true] {
+            let mut saved = if trusted {
+                serde_json::to_value(PersistedGameState::capture(runner.state().clone())).unwrap()
+            } else {
+                serde_json::to_value(runner.state()).unwrap()
+            };
+            if null_gate {
+                let old = serde_json::to_value(historical_attack_permission()).unwrap();
+                assert!(
+                    null_historical_fixture_gates(&mut saved, &old) >= 5,
+                    "positive source/token live+base and creation-journal old leaves"
+                );
+            }
+            let mut restored = restore_copy_json_with_real_db(saved);
+            assert_copied_gate(&restored, token, true);
+            assert_eq!(copied_permission(&restored, token), permission);
+            assert_eq!(
+                ObjectIncarnationRef::from_object(&restored.state().objects[&token]),
+                incarnation
+            );
+            let mut expected_creation = creation_before.clone();
+            expected_creation["body"]["Copy"]["copy"]["values"]["trigger_definitions"][0]
+                ["attack_cost_condition"] =
+                serde_json::json!({"type":"Not","condition":{"type":"SourceExertedThisTurn"}});
+            let restored_creation = restored
+                .state()
+                .resolved_rules_journal
+                .entries()
+                .iter()
+                .find_map(|entry| match &entry.command {
+                    Some(ResolvedRulesCommand::TokenCreation(command))
+                        if command.object.object_id == token =>
+                    {
+                        Some(command)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(restored_creation).unwrap(),
+                expected_creation
+            );
+            assert_no_second_copy_exert(&mut restored, token);
+        }
+    }
+}
+
+/// CR 614.1a / CR 616.1: Jinnie's optional replacement parks the first batch.
+#[test]
+fn historical_parked_copy_permission_restores_before_resolution_extraction() {
+    let db = shared_card_db().expect("real card fixture is required");
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let warrior = scenario.add_real_card(P0, "Bitterblade Warrior", Zone::Battlefield, db);
+    let celebrant = scenario.add_real_card(P0, "Combat Celebrant", Zone::Battlefield, db);
+    let jinnie = scenario.add_real_card(P0, "Jinnie Fay, Jetmir's Second", Zone::Battlefield, db);
+    let twinflame = scenario.add_real_card(P0, "Twinflame", Zone::Hand, db);
+    let vitalize = scenario.add_real_card(P0, "Vitalize", Zone::Hand, db);
+    scenario.with_mana_pool(
+        P0,
+        [
+            ManaType::Red,
+            ManaType::Red,
+            ManaType::Colorless,
+            ManaType::Colorless,
+            ManaType::Colorless,
+        ]
+        .into_iter()
+        .map(|color| ManaUnit::new(color, twinflame, false, vec![]))
+        .collect(),
+    );
+    scenario.add_basic_land(P0, ManaColor::Green);
+    let mut runner = scenario.build();
+    install_historical_permission(&mut runner, celebrant);
+    let outcome = runner
+        .cast(twinflame)
+        .target_objects(&[warrior, celebrant])
+        .resolve();
+    assert!(matches!(
+        outcome.final_waiting_for(),
+        WaitingFor::ReplacementChoice { .. }
+    ));
+    let original = runner
+        .state()
+        .pending_replacement
+        .as_ref()
+        .expect("real token replacement");
+    let ProposedEvent::CreateToken {
+        copy: Some(copy),
+        count,
+        owner,
+        ..
+    } = &original.proposed
+    else {
+        panic!("first pending event must copy Warrior")
+    };
+    assert_eq!(copy.values.name, "Bitterblade Warrior");
+    assert_eq!((*count, *owner, copy.source_id), (1, P0, twinflame));
+    assert!(copy
+        .values
+        .trigger_definitions
+        .iter()
+        .any(|t| t.is_attack_exert_permission() && t.attack_cost_condition.is_none()));
+    let parked = runner
+        .state()
+        .resolution_stack
+        .iter()
+        .find_map(|frame| match frame {
+            ResolutionFrame::CopyToken(pending) => Some(pending),
+            _ => None,
+        })
+        .expect("real CopyToken frame is present");
+    assert!(parked.created_ids.is_empty());
+    assert_eq!(
+        parked.remaining.len(),
+        1,
+        "the second copied source must still be parked"
+    );
+    let remaining = &parked.remaining[0];
+    assert_eq!(
+        (remaining.count, remaining.owner, remaining.copy.source_id),
+        (1, P0, twinflame)
+    );
+    assert_eq!(remaining.copy.values.name, "Combat Celebrant");
+    assert!(remaining.copy.extra_keywords.contains(&Keyword::Haste));
+    assert_eq!(
+        remaining.copy.values.trigger_definitions.as_ref(),
+        &vec![historical_attack_permission()]
+    );
+    let parked_before = serde_json::to_value(parked).unwrap();
+    let frames_before: Vec<_> = runner
+        .state()
+        .resolution_stack
+        .iter()
+        .map(|frame| serde_json::to_value(frame).unwrap())
+        .collect();
+    let next_object_before = runner.state().next_object_id;
+    let resolving_before = serde_json::to_value(&runner.state().resolving_stack_entry).unwrap();
+    let replacement_before = serde_json::to_value(original).unwrap();
+    let waiting_before = runner.state().waiting_for.clone();
+    let battlefield_before = runner.state().battlefield.clone();
+    let direct: GameState = serde_json::from_value(serde_json::to_value(runner.state()).unwrap())
+        .expect("actual direct pause decode");
+    let direct_pending = direct
+        .resolution_stack
+        .iter()
+        .find_map(|frame| match frame {
+            ResolutionFrame::CopyToken(pending) => Some(pending),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        direct_pending.remaining[0].copy.values.trigger_definitions[0]
+            .attack_cost_condition
+            .is_some(),
+        "direct decode migrates the actual remaining payload"
+    );
+    for wire in actual_parked_copy_wire_families(runner.state()) {
+        if wire.get("resolution_state_version").is_some() {
+            let public: ResolutionStateWire =
+                serde_json::from_value(wire.clone()).expect("actual pause public wire");
+            let pending = public
+                .game_state()
+                .resolution_stack
+                .iter()
+                .find_map(|frame| match frame {
+                    ResolutionFrame::CopyToken(pending) => Some(pending),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(pending.remaining[0].copy.values.trigger_definitions[0]
+                .attack_cost_condition
+                .is_some());
+        }
+        for trusted in [false, true] {
+            let json = if trusted {
+                let mut envelope =
+                    serde_json::to_value(PersistedGameState::capture(runner.state().clone()))
+                        .unwrap();
+                if wire.get("resolution_state_version").is_some() {
+                    envelope["state"] = wire.clone();
+                } else {
+                    // Unversioned input is a Raw contract. Trusted capture
+                    // writes a declared wire without interpreting its leaves.
+                    assert!(envelope["state"]["resolution_state_version"]
+                        .as_u64()
+                        .is_some());
+                    assert_eq!(
+                        envelope["state"]["resolution_frames"], wire["resolution_stack"],
+                        "the public writer preserves the complete old remaining carrier"
+                    );
+                }
+                envelope
+            } else {
+                wire.clone()
+            };
+            let mut restored = restore_copy_json_with_real_db(json);
+            assert_eq!(
+                restored.state().battlefield,
+                battlefield_before,
+                "restore must not create a token"
+            );
+            assert_eq!(restored.state().waiting_for, waiting_before);
+            assert_eq!(
+                restored.state().next_object_id,
+                next_object_before,
+                "restore allocates no token identity"
+            );
+            assert_eq!(
+                serde_json::to_value(&restored.state().resolving_stack_entry).unwrap(),
+                resolving_before
+            );
+            assert_eq!(
+                serde_json::to_value(&restored.state().pending_replacement).unwrap(),
+                replacement_before
+            );
+            let restored_parked = restored
+                .state()
+                .resolution_stack
+                .iter()
+                .find_map(|frame| match frame {
+                    ResolutionFrame::CopyToken(pending) => Some(pending),
+                    _ => None,
+                })
+                .unwrap();
+            let mut expected = parked_before.clone();
+            expected["remaining"][0]["copy"]["values"]["trigger_definitions"][0]
+                ["attack_cost_condition"] =
+                serde_json::json!({"type":"Not","condition":{"type":"SourceExertedThisTurn"}});
+            assert_eq!(
+                serde_json::to_value(restored_parked).unwrap(),
+                expected,
+                "migration must precede extraction"
+            );
+            let mut expected_frames = frames_before.clone();
+            for frame in &mut expected_frames {
+                if frame["type"] == "CopyToken" {
+                    frame["data"] = expected.clone();
+                }
+            }
+            assert_eq!(
+                restored
+                    .state()
+                    .resolution_stack
+                    .iter()
+                    .map(|frame| serde_json::to_value(frame).unwrap())
+                    .collect::<Vec<_>>(),
+                expected_frames,
+                "every original continuation/copy/cause field survives"
+            );
+            let mut events = Vec::new();
+            for name in ["Bitterblade Warrior", "Combat Celebrant"] {
+                let pending = restored
+                    .state()
+                    .pending_replacement
+                    .as_ref()
+                    .expect("each batch reaches Jinnie");
+                let ProposedEvent::CreateToken {
+                    copy: Some(copy),
+                    count,
+                    ..
+                } = &pending.proposed
+                else {
+                    panic!("actual copied event")
+                };
+                assert_eq!(copy.values.name, name);
+                assert_eq!(*count, 1);
+                let WaitingFor::ReplacementChoice { candidates, .. } =
+                    &restored.state().waiting_for
+                else {
+                    panic!("replacement prompt")
+                };
+                assert!(candidates
+                    .iter()
+                    .any(|candidate| candidate.source_id == jinnie));
+                let decline = candidates
+                    .iter()
+                    .position(|candidate| candidate.description == "Decline")
+                    .expect("actual optional decline candidate");
+                act_collect(
+                    &mut restored,
+                    GameAction::ChooseReplacement { index: decline },
+                    &mut events,
+                );
+            }
+            assert_exert_priority(&restored, 0);
+            assert!(restored.state().resolution_stack.iter().next().is_none());
+            assert!(restored.state().pending_replacement.is_none());
+            assert_eq!(restored.state().objects[&twinflame].zone, Zone::Graveyard);
+            let tokens: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    GameEvent::TokenCreated {
+                        object_id,
+                        source_id,
+                        ..
+                    } if *source_id == twinflame => Some(*object_id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(tokens.len(), 2);
+            assert_ne!(tokens[0], tokens[1]);
+            for id in &tokens {
+                assert!(restored.state().objects[id].is_token);
+                assert_eq!(events.iter().filter(|event| matches!(event, GameEvent::ZoneChanged { object_id, to: Zone::Battlefield, .. } if object_id == id)).count(), 1, "each real copied token has one battlefield entry");
+                assert!(restored.state().objects[id]
+                    .keywords
+                    .contains(&Keyword::Haste));
+            }
+            for id in [warrior, celebrant, jinnie] {
+                assert_eq!(restored.state().objects[&id].zone, Zone::Battlefield);
+            }
+            let token = *tokens
+                .iter()
+                .find(|id| restored.state().objects[id].name == "Combat Celebrant")
+                .expect("second real copy");
+            assert_copied_gate(&restored, token, true);
+            assert_ne!(
+                copied_permission(&restored, token).source,
+                copied_permission(&restored, celebrant).source
+            );
+            exert_copy_then_vitalize(&mut restored, token, vitalize);
+            assert_no_second_copy_exert(&mut restored, token);
+        }
+    }
 }
 
 /// A save written before `CreatureExerted` carried an actor and an origin holds
