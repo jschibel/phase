@@ -510,11 +510,18 @@ fn changeling_one_with_stars_does_not_regain_creature_types() {
         .as_enchantment()
         .with_subtypes(vec!["Aura"])
         .with_mana_cost(cost(3, vec![ManaCostShard::Blue]))
-        .from_oracle_text_with_keywords(&["Enchant"], STARS)
+        .from_oracle_text_with_keywords(&["enchant"], STARS)
         .id();
     let mut runner = scenario.build();
     install_registry(&mut runner, &["Bear", "Elf"]);
     refresh(&mut runner);
+    // CR 303.4a: the parsed enchant union supplies the Aura spell's required target.
+    assert!(
+        runner.state().objects[&aura].keywords.iter().any(|keyword| {
+            matches!(keyword, Keyword::Enchant(TargetFilter::Or { filters }) if filters.len() == 2)
+        }),
+        "reach guard: the Aura must retain its parsed creature-or-enchantment restriction"
+    );
     for id in [changeling, sibling] {
         assert!(runner.state().objects[&id].has_keyword(&Keyword::Changeling));
         assert!(subtypes(&runner, id).contains(&"Bear".to_string()));

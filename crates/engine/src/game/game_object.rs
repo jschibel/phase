@@ -89,7 +89,7 @@ pub struct BestowFormState {
 
 /// CR 702.140a-c: Mutate form marker — `Some(_)` while this object is a
 /// mutating creature spell on the stack (cast for its mutate cost). Parallels
-/// `BestowFormState`: an empty typed marker (not a bool) set when the mutate
+/// `PreparedState`: an empty typed marker (not a bool) set when the mutate
 /// cost is paid (`apply_mutate_form`) and cleared by `revert_mutate_form` when
 /// the spell's target is illegal at resolution (CR 702.140b) so the spell
 /// resolves as a plain creature spell. It does NOT persist onto the merged
@@ -219,14 +219,12 @@ pub struct SignatureSpellState {}
 /// cleave text-changing effect is live (the spell was cast for its cleave cost
 /// and the bracket-removed ability set is currently installed on the object).
 ///
-/// Unlike `BestowFormState` (an empty marker whose revert is formulaic — re-add
-/// Creature, drop the synthesized Aura subtype/keyword), a cleave revert cannot
-/// be recomputed: the text-changing effect swaps in a separately parsed ability
-/// set, so restoring the printed form requires the captured snapshot of the four
-/// ability classes as they were before the swap. This struct carries that
-/// snapshot so `apply_zone_exit_cleanup` can restore it when the spell leaves
-/// the stack (CR 702.148a: the abilities function only while the spell is on the
-/// stack). Parallels `BestowFormState` — a typed `Option` marker, never a bool.
+/// A cleave revert restores the captured snapshot of the four ability classes
+/// as they were before the text-changing effect installed a separately parsed
+/// ability set. This struct carries that snapshot so `apply_zone_exit_cleanup`
+/// can restore it when the spell leaves the stack (CR 702.148a: the abilities
+/// function only while the spell is on the stack). Like `BestowFormState`, it
+/// stores the restoration payload in a typed `Option`, never a bool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CleaveFormState {
     pub abilities: Arc<Vec<AbilityDefinition>>,
