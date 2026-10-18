@@ -2045,6 +2045,7 @@ pub fn derive_colors_from_mana_cost(mana_cost: &ManaCost) -> Vec<ManaColor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ability::ChooseOneOfKind;
     use crate::types::format::FormatConfig;
 
     /// CR 611.2c + CR 613.1 (issue #8485, round-5 HIGH-1): a transform ROUND TRIP
@@ -4418,6 +4419,11 @@ mod tests {
         };
         walk_effect(&until_lose, &mut names);
 
+        let contest = Effect::ExileTopCardContest {
+            winner_effect: Box::new(conjure_ability("contest_winner", Zone::Hand)),
+        };
+        walk_effect(&contest, &mut names);
+
         let roll = Effect::RollDie {
             count: QuantityExpr::Fixed { value: 1 },
             sides: 6,
@@ -4433,6 +4439,7 @@ mod tests {
         let choose_one = Effect::ChooseOneOf {
             chooser: PlayerFilter::Controller,
             branches: vec![conjure_ability("choose_one", Zone::Hand)],
+            kind: ChooseOneOfKind::Ordinary,
         };
         walk_effect(&choose_one, &mut names);
 
@@ -4628,6 +4635,7 @@ mod tests {
             "flip_win",
             "flip_lose",
             "until_lose",
+            "contest_winner",
             "roll",
             "choose_one",
             "trigger",

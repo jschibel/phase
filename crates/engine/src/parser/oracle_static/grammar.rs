@@ -1292,8 +1292,34 @@ fn next_nested_ability_quote_span(body: &str, search_from: usize) -> Option<(usi
     }
     let open_quote = next_open?;
     let content_start = open_quote + 1;
-    let rel_close = body[content_start..].find('\'')?;
-    let close_quote = content_start + rel_close;
+    // Digital-only Alchemy (no CR entry): the closer is the next `'` that is
+    // NOT a mid-word apostrophe. A naive first-quote close breaks on
+    // contractions inside the granted ability (Bloodrage Alpha's boon: "…
+    // you don't control.'" closed at "don", corrupting the granted trigger
+    // and stranding "t control.'"). A `'` with word characters on BOTH sides
+    // is always an apostrophe, never a delimiter; the genuine closer follows
+    // sentence punctuation (`.'`) or whitespace.
+    let bytes = body.as_bytes();
+    let mut rel_close = None;
+    for (i, ch) in body[content_start..].char_indices() {
+        if ch != '\'' {
+            continue;
+        }
+        let abs = content_start + i;
+        let prev_word = abs
+            .checked_sub(1)
+            .and_then(|p| bytes.get(p))
+            .is_some_and(|b| b.is_ascii_alphanumeric());
+        let next_word = bytes
+            .get(abs + 1)
+            .is_some_and(|b| b.is_ascii_alphanumeric());
+        if prev_word && next_word {
+            continue;
+        }
+        rel_close = Some(i);
+        break;
+    }
+    let close_quote = content_start + rel_close?;
     Some((open_quote, close_quote))
 }
 
@@ -1604,7 +1630,7 @@ pub(crate) fn parse_quoted_rule_static_modifications(
     // activated ability, not the outer static line — mask quoted spans before
     // testing so the static grant path is not skipped (Roar of the Fifth People
     // chapter II, #5978).
-    if find_cost_separator(&strip_quoted_segments(text)).is_some() {
+    if unquoted_cost_separator(text).is_some() {
         return None;
     }
 
@@ -1794,6 +1820,25 @@ pub(crate) fn find_cost_separator(text: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// CR 602.1: Activated abilities have a cost and an effect and are written as
+/// "[Cost]: [Effect]"; CR 602.1a puts the whole activation cost before the colon.
+/// CR 604.1: a static ability is written as a statement — never in that shape.
+/// So text carrying a cost separator OUTSIDE any quoted granted ability is an
+/// activated ability, not a static one.
+///
+/// Quoted spans are masked first (CR 602.1: inside a granted ability the colon
+/// belongs to the INNER ability, e.g. `Creatures you control have "{T}: Add
+/// {R}."`), so masking keeps that line a static grant.
+/// This is the single authority for the rule; `parse_static_line_inner` and
+/// `parse_quoted_rule_static_modifications` both consult it.
+///
+/// The returned offset is an index into the QUOTE-MASKED text, not into `text`
+/// (masking also trims a trailing ` and`/` or` connector, so the masked string is
+/// shorter); every caller uses `.is_some()`.
+pub(crate) fn unquoted_cost_separator(text: &str) -> Option<usize> {
+    find_cost_separator(&strip_quoted_segments(text))
 }
 
 /// Check if a prefix string looks like a text-based activated ability cost.
