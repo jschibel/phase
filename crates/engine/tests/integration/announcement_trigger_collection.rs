@@ -15,20 +15,22 @@
 //! meantime. The N1 and N2 abilities are synthetic (`from_oracle_text`): the class
 //! is a cost shape, not a printed card.
 
+use engine::game::engine::EngineError;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::ability::{
-    AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, Effect, QuantityExpr,
-    ReplacementDefinition, SacrificeCost, TargetFilter, TargetRef, TriggerDefinition, TypeFilter,
-    TypedFilter,
+    AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, DelayedTriggerCondition, Effect,
+    QuantityExpr, ReplacementDefinition, ResolvedAbility, SacrificeCost, TargetFilter, TargetRef,
+    TriggerDefinition, TypeFilter, TypedFilter, WheneverEventExpiry,
 };
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::game_state::{
-    CastPaymentMode, PendingCostMoveResume, StackEntryKind, WaitingFor,
+    CastPaymentMode, DelayedTrigger, PendingCostMoveResume, PersistedGameState,
+    PersistedRestoreFinalization, StackEntry, StackEntryKind, WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
-use engine::types::mana::{ManaType, ManaUnit};
+use engine::types::mana::{ManaCost, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::replacements::ReplacementEvent;
@@ -394,8 +396,9 @@ fn n1_cancel_after_a_paid_discard_is_refused_and_keeps_its_triggers() {
 
         let refused = b.r.act(GameAction::CancelCast);
         assert!(
-            refused.is_err(),
-            "targeted={targeted}: a paid cost is committed, the cancel is refused"
+            matches!(&refused, Err(EngineError::ActionNotAllowed(reason))
+                if reason == "Cannot cancel an activation after a cost is paid"),
+            "targeted={targeted}: expected the paid-cost guard, got {refused:?}"
         );
         assert_eq!(
             b.r.state().waiting_for,
@@ -666,9 +669,6 @@ fn v21b_delayed_observer_of_a_retained_sacrifice_fragment_triggers_once() {
 }
 
 fn v21b_case(targeted: bool) {
-    use engine::types::ability::{DelayedTriggerCondition, ResolvedAbility};
-    use engine::types::game_state::DelayedTrigger;
-
     let db = shared_card_db().expect("card db");
     let mut scenario = board(2);
     let source = scenario
@@ -740,6 +740,702 @@ fn v21b_case(targeted: bool) {
         r.state().delayed_triggers.is_empty(),
         "the one-shot delayed trigger is consumed"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Typed serialized API conformance supplements: no printed batched Oracle claim.
+// ---------------------------------------------------------------------------
+
+fn delayed_installer_definition(
+    condition: DelayedTriggerCondition,
+    gain: i32,
+) -> AbilityDefinition {
+    let definition = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::CreateDelayedTrigger {
+            condition,
+            effect: Box::new(AbilityDefinition::new(
+                AbilityKind::Database,
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: gain },
+                    player: TargetFilter::Controller,
+                },
+            )),
+            uses_tracked_set: false,
+        },
+    );
+    serde_json::from_str(&serde_json::to_string(&definition).expect("API definition serializes"))
+        .expect("API definition round trips")
+}
+
+fn delayed_leave_condition(batched: bool, filter: TargetFilter) -> DelayedTriggerCondition {
+    let mut trigger = TriggerDefinition::new(TriggerMode::ChangesZoneAll)
+        .origin(Zone::Battlefield)
+        .valid_card(filter);
+    trigger.batched = batched;
+    DelayedTriggerCondition::WheneverEvent {
+        trigger: Box::new(trigger),
+        expiry: WheneverEventExpiry::EndOfTurn,
+    }
+}
+
+fn controlled_creatures() -> TargetFilter {
+    TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You))
+}
+
+fn add_delayed_installer(
+    scenario: &mut GameScenario,
+    condition: DelayedTriggerCondition,
+    gain: i32,
+) -> ObjectId {
+    scenario
+        .add_spell_to_hand(P0, "Typed API delayed installer", true)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![],
+            generic: 0,
+        })
+        .with_ability_definition(delayed_installer_definition(condition, gain))
+        .id()
+}
+
+fn install_delayed(r: &mut GameRunner, installer: ObjectId, one_shot: bool) {
+    let before = r.state().delayed_triggers.len();
+    let outcome = r.cast(installer).resolve();
+    outcome.assert_zone(&[installer], Zone::Graveyard);
+    outcome.assert_life_delta(P0, 0);
+    assert_eq!(outcome.state().delayed_triggers.len(), before + 1);
+    let delayed = outcome
+        .state()
+        .delayed_triggers
+        .iter()
+        .find(|trigger| trigger.source_id == installer)
+        .expect("the public effect installed this source");
+    assert_eq!(delayed.controller, P0);
+    assert_eq!(delayed.one_shot, one_shot);
+    // CR 603.7d: source/controller are captured from this resolving installer.
+    let context = delayed
+        .ability
+        .trigger_source
+        .as_ref()
+        .expect("captured source context");
+    assert_eq!(context.identity.reference.object_id, installer);
+    assert_eq!(context.lki.controller, P0);
+}
+
+struct ApiSacrificeBoard {
+    r: GameRunner,
+    source: ObjectId,
+    target: ObjectId,
+    pairs: [(ObjectId, ObjectId); 2],
+    discards: Vec<ObjectId>,
+    observer: ObjectId,
+    installer: ObjectId,
+    targeted: bool,
+}
+
+fn api_sacrifice_board(
+    targeted: bool,
+    discard: bool,
+    redirects: bool,
+    batched: bool,
+) -> ApiSacrificeBoard {
+    api_sacrifice_board_with(targeted, discard, redirects, batched, |_, _, _| vec![]).0
+}
+
+fn api_sacrifice_board_with(
+    targeted: bool,
+    discard: bool,
+    redirects: bool,
+    batched: bool,
+    extras: impl FnOnce(&mut GameScenario, ObjectId, [(ObjectId, ObjectId); 2]) -> Vec<ObjectId>,
+) -> (ApiSacrificeBoard, Vec<ObjectId>) {
+    let mut scenario = board(2);
+    let source = if discard {
+        scenario
+            .add_creature(P0, "API cost source", 1, 1)
+            .from_oracle_text(if targeted {
+                "Discard a card, Sacrifice two creatures: This creature deals 1 damage to any target."
+            } else {
+                "Discard a card, Sacrifice two creatures: You gain 1 life."
+            })
+            .id()
+    } else {
+        sacrifice_two_source(&mut scenario, targeted)
+    };
+    let (first, second, observer) = sacrifice_pair(&mut scenario, redirects);
+    let (later_first, later_second, _) = sacrifice_pair(&mut scenario, redirects);
+    let target = scenario.add_creature(P1, "API target", 4, 4).id();
+    let discards = if discard {
+        (0..2)
+            .map(|_| scenario.add_spell_to_hand(P0, "Discard payment", true).id())
+            .collect()
+    } else {
+        vec![]
+    };
+    let installer = add_delayed_installer(
+        &mut scenario,
+        delayed_leave_condition(batched, controlled_creatures()),
+        1,
+    );
+    let pairs = [(first, second), (later_first, later_second)];
+    let extra_ids = extras(&mut scenario, source, pairs);
+    let mut r = scenario.build();
+    install_observer(&mut r, observer);
+    install_delayed(&mut r, installer, false);
+    (
+        ApiSacrificeBoard {
+            r,
+            source,
+            target,
+            pairs,
+            discards,
+            observer,
+            installer,
+            targeted,
+        },
+        extra_ids,
+    )
+}
+
+fn begin_api_sacrifice(b: &mut ApiSacrificeBoard, group: usize, paused: bool) {
+    activate(&mut b.r, b.source);
+    if b.targeted {
+        act(
+            &mut b.r,
+            GameAction::SelectTargets {
+                targets: vec![TargetRef::Object(b.target)],
+            },
+        );
+    }
+    if let Some(card) = b.discards.get(group).copied() {
+        assert!(matches!(
+            b.r.state().waiting_for,
+            WaitingFor::PayCost { .. }
+        ));
+        select_cards(&mut b.r, vec![card]);
+        assert_eq!(b.r.state().objects[&card].zone, Zone::Graveyard);
+    }
+    let (first, second) = b.pairs[group];
+    let WaitingFor::PayCost { choices, count, .. } = &b.r.state().waiting_for else {
+        panic!("expected sacrifice payment: {:?}", b.r.state().waiting_for);
+    };
+    assert_eq!(*count, 2);
+    assert!(choices.contains(&first) && choices.contains(&second));
+    select_cards(&mut b.r, vec![first, second]);
+    assert_eq!(b.r.state().objects[&first].zone, Zone::Graveyard);
+    if paused {
+        assert!(matches!(
+            b.r.state().waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ));
+        let Some(PendingCostMoveResume::SacrificeForCost {
+            paused_at_index,
+            deferred_cost_events,
+            chosen,
+            pending,
+            ..
+        }) = &b.r.state().pending_cost_move_resume
+        else {
+            panic!("expected typed sacrifice resume");
+        };
+        assert_eq!(*paused_at_index, 1);
+        assert_eq!(chosen, &[first, second]);
+        assert!(deferred_cost_events.iter().any(|event| matches!(event,
+            GameEvent::ZoneChanged { object_id, .. } if *object_id == first)));
+        assert_eq!(b.r.state().objects[&second].zone, Zone::Battlefield);
+        assert!(b.r.state().pending_replacement.is_some());
+        assert!(b.r.state().stack.is_empty());
+        assert!(
+            pending.is_some(),
+            "the activation continuation remains owned"
+        );
+        let serialized = serde_json::to_value(pending).expect("pending serializes");
+        if !b.targeted && b.discards.is_empty() {
+            // Sacrifice-only untargeted roots never begin a carrier: staging
+            // excludes the typed cursor's retained events before creating one.
+            assert!(serialized
+                .get("activation_trigger_collection")
+                .is_none_or(|value| value.is_null()));
+        } else {
+            assert!(
+                serialized
+                    .get("activation_trigger_collection")
+                    .is_some_and(|value| value.is_object()),
+                "targeted or earlier-paid-discard announcement owns a carrier"
+            );
+        }
+    }
+}
+
+fn finish_api_sacrifice(b: &mut ApiSacrificeBoard, paused: bool) {
+    if paused {
+        act(&mut b.r, GameAction::ChooseReplacement { index: 0 });
+    }
+    if matches!(b.r.state().waiting_for, WaitingFor::OrderTriggers { .. }) {
+        order_in_listed_order(&mut b.r);
+    }
+    assert!(matches!(
+        b.r.state().waiting_for,
+        WaitingFor::Priority { .. }
+    ));
+    assert_eq!(stack(&b.r)[0], (Kind::Activated, b.source, P0));
+}
+
+fn stack_trigger_events<'a>(r: &'a GameRunner, entry: &'a StackEntry) -> &'a [GameEvent] {
+    // Stack placement stores multi-event groups in the side table and single
+    // events on the entry itself. Require an actual event in either form.
+    r.state()
+        .stack_trigger_event_batches
+        .get(&entry.id)
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| match &entry.kind {
+            StackEntryKind::TriggeredAbility { trigger_event, .. } => {
+                std::slice::from_ref(trigger_event.as_ref().expect("raw trigger event retained"))
+            }
+            _ => panic!("expected a triggered stack entry"),
+        })
+}
+
+fn assert_raw_departure_batch(
+    r: &GameRunner,
+    source: ObjectId,
+    expected: &[ObjectId],
+    batched: bool,
+) {
+    let entries: Vec<_> = r
+        .state()
+        .stack
+        .iter()
+        .filter(|entry| {
+            entry.source_id == source
+                && matches!(entry.kind, StackEntryKind::TriggeredAbility { .. })
+        })
+        .collect();
+    // CR 603.2c: one firing for this complete batched event, not one per fragment.
+    assert_eq!(
+        entries.len(),
+        if batched { 1 } else { expected.len() },
+        "complete delayed group must fire exactly once when batched; source={source:?}"
+    );
+    let mut members = vec![];
+    let mut identities = vec![];
+    for entry in entries {
+        let StackEntryKind::TriggeredAbility {
+            subject_match_count,
+            ..
+        } = &entry.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            *subject_match_count,
+            batched.then_some(expected.len() as u32)
+        );
+        assert_eq!(entry.controller, P0);
+        let batch = stack_trigger_events(r, entry);
+        assert_eq!(batch.len(), if batched { expected.len() } else { 1 });
+        for event in batch {
+            let GameEvent::ZoneChanged {
+                object_id,
+                from: Some(Zone::Battlefield),
+                record,
+                ..
+            } = event
+            else {
+                panic!("unexpected batch member {event:?}");
+            };
+            assert!(expected.contains(object_id));
+            assert_eq!(record.co_departed.len(), 1);
+            assert_ne!(record.co_departed[0], *object_id);
+            if expected.len() == 2 {
+                assert_eq!(
+                    record.co_departed,
+                    expected
+                        .iter()
+                        .copied()
+                        .filter(|id| id != object_id)
+                        .collect::<Vec<_>>()
+                );
+            }
+            members.push(*object_id);
+            identities.push((record.recorded_turn_number, record.turn_zone_change_index));
+        }
+    }
+    assert_eq!(sorted(members), sorted(expected.to_vec()));
+    identities.sort();
+    identities.dedup();
+    assert_eq!(
+        identities.len(),
+        expected.len(),
+        "distinct raw departure identities"
+    );
+}
+
+fn assert_api_group(b: &ApiSacrificeBoard, group: usize, batched: bool) {
+    let (first, second) = b.pairs[group];
+    assert_raw_departure_batch(&b.r, b.observer, &[first, second], true);
+    assert_observer_batch(&b.r, b.observer, first, second);
+    assert_raw_departure_batch(&b.r, b.installer, &[first, second], batched);
+}
+
+fn resolve_api_group(b: &mut ApiSacrificeBoard, batched: bool) {
+    let life = b.r.state().players[0].life;
+    let count = if batched { 1 } else { 2 };
+    // CR 603.7b: the stated duration keeps this generator installed after firing.
+    assert!(b
+        .r
+        .state()
+        .delayed_triggers
+        .iter()
+        .any(|trigger| trigger.source_id == b.installer && !trigger.one_shot));
+    b.r.advance_until_stack_empty();
+    assert!(b.r.state().stack.is_empty());
+    assert_eq!(
+        b.r.state().players[0].life - life,
+        count + 1 + i32::from(!b.targeted)
+    );
+}
+
+#[test]
+fn api_batched_delayed_sacrifice_group_is_one_firing() {
+    api_batched_delayed_sacrifice_case(false);
+}
+
+#[test]
+fn api_batched_delayed_sacrifice_group_is_one_firing_targeted() {
+    api_batched_delayed_sacrifice_case(true);
+}
+
+fn api_batched_delayed_sacrifice_case(targeted: bool) {
+    let mut b = api_sacrifice_board(targeted, true, true, true);
+    for group in 0..2 {
+        begin_api_sacrifice(&mut b, group, true);
+        finish_api_sacrifice(&mut b, true);
+        assert_api_group(&b, group, true);
+        resolve_api_group(&mut b, true);
+    }
+}
+
+#[test]
+fn api_delayed_sacrifice_batch_controls() {
+    for (targeted, discard, paused, batched) in [
+        (false, true, false, true),
+        (true, true, false, true),
+        (false, true, true, false),
+        (true, true, true, false),
+        (false, false, false, true),
+        (false, false, true, true),
+    ] {
+        let mut b = api_sacrifice_board(targeted, discard, paused, batched);
+        for group in 0..2 {
+            begin_api_sacrifice(&mut b, group, paused);
+            finish_api_sacrifice(&mut b, paused);
+            assert_api_group(&b, group, batched);
+            resolve_api_group(&mut b, batched);
+        }
+    }
+}
+
+#[test]
+fn api_one_shot_delayed_filters_keep_retained_current_and_unmatched_authority() {
+    for targeted in [false, true] {
+        let (mut b, markers) =
+            api_sacrifice_board_with(targeted, true, true, true, |scenario, _, pairs| {
+                let mut installers: Vec<_> = [pairs[0].0, pairs[0].1, pairs[1].0]
+                    .into_iter()
+                    .map(|id| {
+                        add_delayed_installer(
+                            scenario,
+                            DelayedTriggerCondition::WhenDiesOrExiled {
+                                filter: TargetFilter::SpecificObject { id },
+                            },
+                            0,
+                        )
+                    })
+                    .collect();
+                installers.push(add_delayed_installer(
+                    scenario,
+                    DelayedTriggerCondition::WhenDiesOrExiled {
+                        filter: controlled_creatures(),
+                    },
+                    0,
+                ));
+                installers
+            });
+        for marker in &markers {
+            install_delayed(&mut b.r, *marker, true);
+        }
+        begin_api_sacrifice(&mut b, 0, true);
+        finish_api_sacrifice(&mut b, true);
+        assert_api_group(&b, 0, true);
+        assert_eq!(b.r.state().objects[&b.pairs[0].1].zone, Zone::Exile);
+        assert_raw_departure_batch(&b.r, markers[0], &[b.pairs[0].0], false);
+        assert_raw_departure_batch(&b.r, markers[1], &[b.pairs[0].1], false);
+        // CR 603.7b: only the selected matching occurrence consumes a one-shot.
+        for marker in [markers[0], markers[1], markers[3]] {
+            assert_eq!(stack_triggers_from(&b.r, marker), 1);
+            assert!(!b
+                .r
+                .state()
+                .delayed_triggers
+                .iter()
+                .any(|t| t.source_id == marker));
+        }
+        assert_eq!(stack_triggers_from(&b.r, markers[2]), 0);
+        assert!(b
+            .r
+            .state()
+            .delayed_triggers
+            .iter()
+            .any(|t| t.source_id == markers[2]));
+        resolve_api_group(&mut b, true);
+        begin_api_sacrifice(&mut b, 1, true);
+        finish_api_sacrifice(&mut b, true);
+        assert_api_group(&b, 1, true);
+        assert_eq!(stack_triggers_from(&b.r, markers[2]), 1);
+        assert_raw_departure_batch(&b.r, markers[2], &[b.pairs[1].0], false);
+        for marker in [markers[0], markers[1], markers[3]] {
+            assert_eq!(stack_triggers_from(&b.r, marker), 0);
+        }
+        assert!(!b
+            .r
+            .state()
+            .delayed_triggers
+            .iter()
+            .any(|t| markers.contains(&t.source_id)));
+        resolve_api_group(&mut b, true);
+    }
+}
+
+#[test]
+fn api_delayed_group_keeps_source_and_member_authority() {
+    let (mut b, markers) =
+        api_sacrifice_board_with(false, true, true, true, |scenario, _, pairs| {
+            vec![add_delayed_installer(
+                scenario,
+                delayed_leave_condition(true, TargetFilter::SpecificObject { id: pairs[0].0 }),
+                0,
+            )]
+        });
+    install_delayed(&mut b.r, markers[0], false);
+    assert_ne!(b.installer, markers[0]);
+    assert_eq!(b.r.state().objects[&markers[0]].zone, Zone::Graveyard);
+    begin_api_sacrifice(&mut b, 0, true);
+    finish_api_sacrifice(&mut b, true);
+    assert_api_group(&b, 0, true);
+    assert_raw_departure_batch(&b.r, markers[0], &[b.pairs[0].0], true);
+    resolve_api_group(&mut b, true);
+    begin_api_sacrifice(&mut b, 1, true);
+    finish_api_sacrifice(&mut b, true);
+    assert_api_group(&b, 1, true);
+    assert_eq!(stack_triggers_from(&b.r, markers[0]), 0);
+    assert!(b
+        .r
+        .state()
+        .delayed_triggers
+        .iter()
+        .any(|t| t.source_id == markers[0]));
+    resolve_api_group(&mut b, true);
+}
+
+#[test]
+fn api_delayed_group_uses_creating_controller_despite_different_source_owner() {
+    let (mut b, extra) = api_sacrifice_board_with(false, false, true, true, |scenario, _, _| {
+        let mut ability =
+            delayed_installer_definition(delayed_leave_condition(true, controlled_creatures()), 3);
+        ability.kind = AbilityKind::Activated;
+        let producer = scenario
+            .add_creature(P1, "P1 owned P0 controlled installer", 1, 1)
+            .controlled_by(P0)
+            .with_ability_definition(ability)
+            .id();
+        let opponent_source = scenario
+            .add_creature(P1, "Opponent sacrifice source", 1, 1)
+            .with_ability_definition(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 0 },
+                        player: TargetFilter::Controller,
+                    },
+                )
+                .cost(AbilityCost::Sacrifice(SacrificeCost::count(
+                    controlled_creatures(),
+                    2,
+                ))),
+            )
+            .id();
+        let first = scenario.add_creature(P1, "Opponent first", 1, 1).id();
+        let second = scenario.add_creature(P1, "Opponent second", 1, 1).id();
+        vec![producer, opponent_source, first, second]
+    });
+    let producer = extra[0];
+    assert_eq!(b.r.state().objects[&producer].owner, P1);
+    assert_eq!(b.r.state().objects[&producer].controller, P0);
+    activate(&mut b.r, producer);
+    assert_eq!(stack(&b.r)[0], (Kind::Activated, producer, P0));
+    b.r.resolve_top();
+    let delayed =
+        b.r.state()
+            .delayed_triggers
+            .iter()
+            .find(|t| t.source_id == producer)
+            .expect("ability installed delayed source");
+    assert_eq!(delayed.controller, P0);
+    // CR 603.7e: the creating ability's controller remains the delayed controller.
+    let context = delayed
+        .ability
+        .trigger_source
+        .as_ref()
+        .expect("activated creator snapshot");
+    assert_eq!(context.lki.controller, P0);
+    assert_eq!(context.lki.owner, P1);
+    begin_api_sacrifice(&mut b, 0, true);
+    finish_api_sacrifice(&mut b, true);
+    assert_api_group(&b, 0, true);
+    assert_raw_departure_batch(&b.r, producer, &[b.pairs[0].0, b.pairs[0].1], true);
+    let before = [b.r.state().players[0].life, b.r.state().players[1].life];
+    b.r.advance_until_stack_empty();
+    assert!(b.r.state().stack.is_empty());
+    assert_eq!(
+        [b.r.state().players[0].life, b.r.state().players[1].life],
+        [before[0] + 6, before[1]]
+    );
+
+    let life = [b.r.state().players[0].life, b.r.state().players[1].life];
+    if matches!(b.r.state().waiting_for, WaitingFor::Priority { player: P0 }) {
+        act(&mut b.r, GameAction::PassPriority);
+    }
+    assert!(matches!(
+        b.r.state().waiting_for,
+        WaitingFor::Priority { player: P1 }
+    ));
+    activate(&mut b.r, extra[1]);
+    select_cards(&mut b.r, vec![extra[2], extra[3]]);
+    assert_eq!(b.r.state().objects[&extra[2]].zone, Zone::Graveyard);
+    assert_eq!(b.r.state().objects[&extra[3]].zone, Zone::Graveyard);
+    assert_eq!(stack_triggers_from(&b.r, producer), 0);
+    assert_eq!(stack_triggers_from(&b.r, b.installer), 0);
+    assert_eq!(stack(&b.r), vec![(Kind::Activated, extra[1], P1)]);
+    b.r.advance_until_stack_empty();
+    assert_eq!(
+        [b.r.state().players[0].life, b.r.state().players[1].life],
+        life
+    );
+    if matches!(b.r.state().waiting_for, WaitingFor::Priority { player: P1 }) {
+        act(&mut b.r, GameAction::PassPriority);
+    }
+    begin_api_sacrifice(&mut b, 1, true);
+    finish_api_sacrifice(&mut b, true);
+    assert_api_group(&b, 1, true);
+    assert_raw_departure_batch(&b.r, producer, &[b.pairs[1].0, b.pairs[1].1], true);
+    let before = [b.r.state().players[0].life, b.r.state().players[1].life];
+    b.r.advance_until_stack_empty();
+    assert!(b.r.state().stack.is_empty());
+    assert_eq!(
+        [b.r.state().players[0].life, b.r.state().players[1].life],
+        [before[0] + 6, before[1]]
+    );
+}
+
+#[test]
+fn api_delayed_sacrifice_group_survives_raw_and_trusted_restore() {
+    for trusted in [false, true] {
+        let (mut b, markers) =
+            api_sacrifice_board_with(false, true, true, true, |scenario, _, pairs| {
+                vec![add_delayed_installer(
+                    scenario,
+                    delayed_leave_condition(true, TargetFilter::SpecificObject { id: pairs[0].0 }),
+                    0,
+                )]
+            });
+        install_delayed(&mut b.r, markers[0], false);
+        begin_api_sacrifice(&mut b, 0, true);
+        let persisted = if trusted {
+            PersistedGameState::capture(b.r.state().clone())
+        } else {
+            PersistedGameState::Raw(Box::new(b.r.state().clone()))
+        };
+        let json = serde_json::to_string(&persisted).expect("paused snapshot serializes");
+        let db = shared_card_db().expect("card db");
+        let state = serde_json::from_str::<PersistedGameState>(&json)
+            .expect("persisted snapshot decodes")
+            .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+            .expect("paused snapshot is admissible")
+            .finalize_after_rehydration(|state| {
+                engine::game::rehydrate_game_from_card_db(state, db);
+                Ok(())
+            })
+            .expect("rehydrated paused snapshot is publishable");
+        b.r = GameRunner::from_state(state);
+        assert!(matches!(
+            b.r.state().waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ));
+        assert!(matches!(&b.r.state().pending_cost_move_resume,
+            Some(PendingCostMoveResume::SacrificeForCost { paused_at_index: 1, deferred_cost_events, .. }) if !deferred_cost_events.is_empty()));
+        assert_eq!(b.r.state().delayed_triggers.len(), 2);
+        for source in [b.installer, markers[0]] {
+            let delayed =
+                b.r.state()
+                    .delayed_triggers
+                    .iter()
+                    .find(|t| t.source_id == source)
+                    .expect("restored source");
+            assert!(delayed.ability.trigger_source.is_some());
+        }
+        finish_api_sacrifice(&mut b, true);
+        assert_api_group(&b, 0, true);
+        assert_raw_departure_batch(&b.r, markers[0], &[b.pairs[0].0], true);
+        resolve_api_group(&mut b, true);
+        begin_api_sacrifice(&mut b, 1, true);
+        finish_api_sacrifice(&mut b, true);
+        assert_api_group(&b, 1, true);
+        assert_eq!(stack_triggers_from(&b.r, markers[0]), 0);
+        resolve_api_group(&mut b, true);
+    }
+}
+
+#[test]
+fn api_delayed_group_claims_do_not_hide_activation_or_later_occurrences() {
+    let db = shared_card_db().expect("card db");
+    let (mut b, extra) =
+        api_sacrifice_board_with(false, true, true, true, |scenario, source, _| {
+            let marker = add_delayed_installer(
+                scenario,
+                DelayedTriggerCondition::WheneverEvent {
+                    trigger: Box::new(
+                        TriggerDefinition::new(TriggerMode::AbilityActivated)
+                            .valid_card(TargetFilter::SpecificObject { id: source }),
+                    ),
+                    expiry: WheneverEventExpiry::EndOfTurn,
+                },
+                0,
+            );
+            let construct =
+                scenario.add_real_card(P0, "Crackdown Construct", Zone::Battlefield, db);
+            vec![marker, construct]
+        });
+    install_delayed(&mut b.r, extra[0], false);
+    for group in 0..2 {
+        begin_api_sacrifice(&mut b, group, true);
+        finish_api_sacrifice(&mut b, true);
+        assert_api_group(&b, group, true);
+        assert_eq!(stack_triggers_from(&b.r, extra[0]), 1);
+        assert_eq!(stack_triggers_from(&b.r, extra[1]), 1);
+        let entry =
+            b.r.state()
+                .stack
+                .iter()
+                .find(|entry| entry.source_id == extra[0])
+                .unwrap();
+        let batch = stack_trigger_events(&b.r, entry);
+        assert_eq!(batch.len(), 1);
+        assert!(
+            matches!(&batch[0], GameEvent::AbilityActivated { source_id, .. } if *source_id == b.source)
+        );
+        resolve_api_group(&mut b, true);
+    }
 }
 
 // ---------------------------------------------------------------------------

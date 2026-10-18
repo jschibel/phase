@@ -3744,7 +3744,7 @@ fn pause_sacrifice_for_cost(
     state.waiting_for.clone()
 }
 
-/// CR 603.2 + CR 603.3b: The typed sacrifice root owns every cost event that
+/// CR 603.2c + CR 603.3b: The typed sacrifice root owns every cost event that
 /// crossed a replacement-choice action boundary. Collect the full stamped set
 /// once, and claim the current action occurrences so its normal Priority
 /// pipeline cannot collect the same events again.
@@ -3756,65 +3756,6 @@ pub(crate) fn settle_sacrifice_for_cost_events(
     current_start: usize,
     current_end: usize,
 ) {
-    if let Some(collection) =
-        pending.and_then(|pending| pending.activation_trigger_collection.as_mut())
-    {
-        // Two occurrence bases, filtered separately and never rebased into each
-        // other (see below): the carried fragments carry no ordinal in THIS
-        // buffer, so the consumed journal — whose ordinals are absolute within
-        // the current action — must not be applied to them. The queued-context
-        // witness is occurrence-exact independently of any buffer;
-        // `turn_zone_change_index` separates distinct occurrences within a turn.
-        let carried_cost_events =
-            crate::game::triggers::filter_already_collected_trigger_events_from(
-                state,
-                &deferred_cost_events,
-                0,
-                &[],
-            );
-        // CR 602.2b + CR 603.2c + CR 603.10a: the carried fragments and the
-        // current one are ONE simultaneous sacrifice group, so they are
-        // collected in a single call (as the carrier-less path below does):
-        // collected separately, a batched leave trigger would fire once per
-        // call. The current fragment is claimed for the ordinary collector so
-        // the stack push does not collect it a second time.
-        let current_cost_events = super::announcement_triggers::unclaimed_events(
-            state,
-            &events[..current_end],
-            current_start,
-        );
-        // CR 603.7b: the retained fragment's delayed observers are scanned here,
-        // once, because no later scan can reach it: the stack push scans only the
-        // current action buffer, and the ordinary claim below is
-        // `OrdinaryCollectorsOnly`, so the CURRENT fragment's delayed scan is
-        // left to that push (scanning it here too would double-fire a
-        // repeating delayed trigger; for the same reason a repeating batched
-        // delayed trigger sees the two fragments as separate batches, while
-        // ordinary triggers merge them). The context joins the deferred queue
-        // the push commits the collection into, so it is one batch (CR 603.3b).
-        let carried_for_delayed = carried_cost_events.clone();
-        let group: Vec<GameEvent> = carried_cost_events
-            .into_iter()
-            .chain(current_cost_events)
-            .collect();
-        if !group.is_empty() {
-            collection.collect(state, &group);
-        }
-        if !carried_for_delayed.is_empty() {
-            crate::game::triggers::collect_delayed_trigger_contexts_into_deferred(
-                state,
-                &carried_for_delayed,
-            );
-        }
-        super::announcement_triggers::claim_ordinary_collected_span(
-            state,
-            events,
-            current_start,
-            current_end,
-        );
-        return;
-    }
-
     // Two occurrence bases, filtered separately and never rebased into each
     // other: the carried fragments against the buffer-independent queued-context
     // witness, the current fragment against this action's buffer with its
@@ -3832,13 +3773,38 @@ pub(crate) fn settle_sacrifice_for_cost_events(
         current_start,
         &state.consumed_before_priority_trigger_events,
     );
-    let deferred_cost_events: Vec<GameEvent> = carried_cost_events
+    let ordinary_group: Vec<GameEvent> = carried_cost_events
         .into_iter()
         .chain(current_cost_events)
         .collect();
-    if !deferred_cost_events.is_empty() {
-        crate::game::triggers::collect_triggers_into_deferred(state, &deferred_cost_events);
-        crate::game::triggers::collect_delayed_triggers_into_deferred(state, &deferred_cost_events);
+    // CR 603.2c + CR 603.7b + CR 603.10a: delayed observers must see the same
+    // complete simultaneous departure group. Ordinary queued contexts are not
+    // evidence that delayed observers scanned it, and the retained fragments
+    // have no occurrence ordinal in this action's buffer.
+    let delayed_group: Vec<GameEvent> = deferred_cost_events
+        .into_iter()
+        .chain(crate::game::triggers::filter_consumed_trigger_events_from(
+            &events[..current_end],
+            current_start,
+            crate::game::triggers::TriggerCollectionRequester::Delayed,
+            &state.consumed_before_priority_trigger_events,
+        ))
+        .collect();
+    if !ordinary_group.is_empty() {
+        if let Some(collection) =
+            pending.and_then(|pending| pending.activation_trigger_collection.as_mut())
+        {
+            collection.collect(state, &ordinary_group);
+        } else {
+            crate::game::triggers::collect_triggers_into_deferred(state, &ordinary_group);
+        }
+    }
+    if !delayed_group.is_empty() {
+        // Claims below use the original full buffer, never this combined slice.
+        crate::game::triggers::collect_delayed_trigger_contexts_into_deferred(
+            state,
+            &delayed_group,
+        );
     }
     // The journal claims the whole current fragment, not just what survived the
     // filter: an occurrence the filter dropped is one an earlier collector
@@ -7292,12 +7258,20 @@ pub(super) fn push_ability_entry(
         let mut deferred_contexts = std::mem::take(&mut state.deferred_triggers);
         collection.commit_into(state, &mut deferred_contexts);
         state.deferred_triggers = deferred_contexts;
-        // CR 602.2b + CR 603.3b + CR 603.7c: Cost-payment events are claimed
-        // below because the activation transaction owns their trigger batch.
-        // Collect delayed triggers before that claim too; otherwise a one-shot
-        // delayed trigger such as Earthbend's dies-or-exiled return is hidden
-        // from the later priority scan and never reaches the stack.
-        super::triggers::collect_delayed_triggers_into_deferred(state, events);
+        // CR 603.2c + CR 603.7b: terminal cost groups already claimed for both
+        // collectors must not fire again. Keep ordinary-only claims and new
+        // finishing events visible, with their original full-buffer positions.
+        let delayed_input = super::triggers::unclaimed_trigger_events_from(
+            events,
+            0,
+            super::triggers::TriggerCollectionRequester::Delayed,
+            &state.consumed_before_priority_trigger_events,
+        );
+        super::triggers::collect_unclaimed_delayed_triggers_into_deferred(
+            state,
+            events,
+            &delayed_input,
+        );
         state
             .consumed_before_priority_trigger_events
             .extend(events.iter().enumerate().map(|(index, event)| {
@@ -12173,6 +12147,7 @@ fn finalize_cast_with_phyrexian_choices_inner(
     let mut ability = ability;
     ability.context.cast_from_zone = Some(source_zone);
     ability.context.cast_controller = Some(player);
+    ability.context.cast_active_player = Some(state.active_player);
     ability.context.cast_phase = Some(state.phase);
     // CR 601.2c + CR 608.2c: latch the declared object targets so a nested
     // sub-ability — whose own `targets` may hold a resolution-chosen recipient
@@ -17556,18 +17531,8 @@ mod tests {
     use crate::types::statics::StaticMode;
     use crate::types::triggers::TriggerMode;
 
-    fn install_receipt_eligible_sacrifice_cursor(
-        state: &mut GameState,
-        source_id: ObjectId,
-        chosen: Vec<ObjectId>,
-        paused_at_index: usize,
-        origin: DelayedTriggerOrigin,
-    ) {
-        let selected = chosen
-            .iter()
-            .map(|id| ObjectIncarnationRef::from_object(&state.objects[id]))
-            .collect();
-        let ability = ResolvedAbility::new(
+    fn optional_sacrifice_payment(source_id: ObjectId) -> ResolvedAbility {
+        ResolvedAbility::new(
             Effect::PayCost {
                 cost: AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::Any, 1)),
                 scale: None,
@@ -17576,28 +17541,43 @@ mod tests {
             Vec::new(),
             source_id,
             PlayerId(0),
-        );
-        stack::begin_resolving_stack_entry(
-            state,
-            StackEntry {
-                id: ObjectId(99_000),
-                source_id,
-                controller: PlayerId(0),
-                kind: StackEntryKind::TriggeredAbility {
-                    source_id,
-                    ability: Box::new(ability.clone()),
-                    condition: None,
-                    trigger_event: None,
-                    description: Some("receipt stale sacrifice".to_string()),
-                    source_name: "Receipt source".to_string(),
-                    subject_match_count: None,
-                    die_result: None,
-                    provenance: None,
-                },
-            },
-            Some(TriggerFiring::ReceiptEligible(origin)),
         )
-        .expect("the fixture begins with no carrier installed");
+    }
+
+    fn receipt_trigger_carrier(source_id: ObjectId) -> StackEntry {
+        StackEntry {
+            id: ObjectId(99_000),
+            source_id,
+            controller: PlayerId(0),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id,
+                ability: Box::new(optional_sacrifice_payment(source_id)),
+                condition: None,
+                trigger_event: None,
+                description: Some("receipt stale sacrifice".to_string()),
+                source_name: "Receipt source".to_string(),
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            },
+        }
+    }
+
+    fn install_receipt_eligible_sacrifice_cursor(
+        state: &mut GameState,
+        carrier: StackEntry,
+        firing: Option<TriggerFiring>,
+        chosen: Vec<ObjectId>,
+        paused_at_index: usize,
+    ) {
+        let source_id = carrier.source_id;
+        let selected = chosen
+            .iter()
+            .map(|id| ObjectIncarnationRef::from_object(&state.objects[id]))
+            .collect();
+        let ability = optional_sacrifice_payment(source_id);
+        stack::begin_resolving_stack_entry(state, carrier, firing)
+            .expect("the fixture begins with no carrier installed");
         state.park_ability_continuation(PendingContinuation::new(
             Box::new(ResolvedAbility::new(
                 Effect::NoOp,
@@ -17654,7 +17634,13 @@ mod tests {
             Zone::Battlefield,
         );
         let origin = receipt_origin(source, 70_001);
-        install_receipt_eligible_sacrifice_cursor(&mut state, source, vec![stale], 0, origin);
+        install_receipt_eligible_sacrifice_cursor(
+            &mut state,
+            receipt_trigger_carrier(source),
+            Some(TriggerFiring::ReceiptEligible(origin)),
+            vec![stale],
+            0,
+        );
         state.objects.get_mut(&stale).unwrap().incarnation += 1;
 
         let lifecycle = crate::game::lifecycle::enter_action_frame();
@@ -17700,10 +17686,10 @@ mod tests {
         let origin = receipt_origin(source, 70_003);
         install_receipt_eligible_sacrifice_cursor(
             &mut state,
-            source,
+            receipt_trigger_carrier(source),
+            Some(TriggerFiring::ReceiptEligible(origin)),
             vec![completed, stale],
             0,
-            origin,
         );
         state.objects.get_mut(&stale).unwrap().incarnation += 1;
 
@@ -17721,6 +17707,87 @@ mod tests {
         assert!(state.active_ability_continuation().is_none());
         assert!(state.resolving_stack_entry.is_none());
         assert!(state.resolving_trigger_firing.is_none());
+    }
+
+    /// CR 608.2n: a stale suffix abandons a sorcery's paused sacrifice, but the
+    /// spell still owes its final part, which then puts it into the graveyard.
+    #[test]
+    fn stale_resolution_sacrifice_resume_keeps_the_spells_final_part() {
+        let mut state = GameState::new_two_player(42);
+        let spell = create_object(
+            &mut state,
+            CardId(70_006),
+            PlayerId(0),
+            "Paused sorcery".to_string(),
+            Zone::Stack,
+        );
+        state.objects.get_mut(&spell).unwrap().card_types.core_types = vec![CoreType::Sorcery];
+        let completed = create_object(
+            &mut state,
+            CardId(70_007),
+            PlayerId(0),
+            "Completed fodder".to_string(),
+            Zone::Graveyard,
+        );
+        let stale = create_object(
+            &mut state,
+            CardId(70_008),
+            PlayerId(0),
+            "Stale suffix".to_string(),
+            Zone::Battlefield,
+        );
+        let carrier = StackEntry {
+            id: spell,
+            source_id: spell,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(70_006),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        };
+        install_receipt_eligible_sacrifice_cursor(
+            &mut state,
+            carrier,
+            None,
+            vec![completed, stale],
+            0,
+        );
+        state.resolving_spell_final_part =
+            Some(crate::types::game_state::OwedSpellFinalPart { spell });
+        state.objects.get_mut(&stale).unwrap().incarnation += 1;
+
+        let mut events = Vec::new();
+        resume_sacrifice_for_cost(&mut state, &mut events, 0).unwrap();
+        assert_eq!(
+            state.resolving_stack_entry.as_ref().map(|entry| entry.id),
+            Some(spell)
+        );
+        assert!(state.resolving_spell_final_part.is_some());
+        assert!(state.active_ability_continuation().is_none());
+        assert!(state.pending_cost_move_resume.is_none());
+
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        let mut events = Vec::new();
+        assert!(super::super::engine::run_spell_final_part_if_due(
+            &mut state,
+            &mut events
+        ));
+        assert_eq!(state.objects[&spell].zone, Zone::Graveyard);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GameEvent::StackResolved { object_id } if *object_id == spell
+                ))
+                .count(),
+            1
+        );
+        assert!(state.resolving_stack_entry.is_none());
     }
 
     fn choice_bearing_offer_test_mana_ability() -> AbilityDefinition {
@@ -29322,7 +29389,7 @@ its replicate cost was paid.)\nDraw a card.";
                 let (mut state, source, targets, fodder, tapper, cost, mut resolved) =
                     defensive_x_target_fixture(target_count, mixed);
                 match route {
-                    Route::Assigned => resolved.targets.push(TargetRef::Object(targets[0])),
+                    Route::Assigned => resolved.push_chosen_target(TargetRef::Object(targets[0])),
                     Route::Random => {
                         resolved.target_selection_mode =
                             crate::types::ability::TargetSelectionMode::Random;

@@ -3577,6 +3577,7 @@ mod tests {
                     alt_ability_cost: Some(AbilityCost::Mana {
                         cost: ManaCost::NoCost,
                     }),
+                    without_paying_mana_cost: false,
                     land_enter_tapped: engine::types::zones::EtbTapState::Unspecified,
                 });
         }

@@ -529,8 +529,8 @@ mod tests {
     use engine::ai_support::{ActionMetadata, AiDecisionContext, CandidateAction, TacticalClass};
     use engine::game::zones::create_object;
     use engine::types::ability::{
-        AbilityCondition, CommanderOwnership, Comparator, ContinuousModification, Duration,
-        FilterProp, ModalChoice, ModalSelectionCondition, ModalSelectionConstraint,
+        AbilityCondition, ChooseOneOfKind, CommanderOwnership, Comparator, ContinuousModification,
+        Duration, FilterProp, ModalChoice, ModalSelectionCondition, ModalSelectionConstraint,
         OpponentMayScope, QuantityExpr, QuantityRef, ReplacementDefinition, StaticCondition,
         StaticDefinition, TargetFilter, TypedFilter,
     };
@@ -1537,6 +1537,7 @@ mod tests {
                     count: x_expr(),
                     target: TargetFilter::Controller,
                 })],
+                kind: ChooseOneOfKind::Ordinary,
             })],
         );
         assert_not_reject(&verdict_for_cast(&state, choice_object, choice_card));

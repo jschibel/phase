@@ -1449,6 +1449,7 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::parser::oracle::parse_oracle_text;
+    use crate::types::ability::ChooseOneOfKind;
     use crate::types::card::{CardFace, CardMetadata};
     use crate::types::keywords::Keyword;
 
@@ -1934,6 +1935,7 @@ mod tests {
         let container = Effect::ChooseOneOf {
             chooser: PlayerFilter::Controller,
             branches: vec![confined_branch.clone(), confined_branch],
+            kind: ChooseOneOfKind::Ordinary,
         };
         assert_eq!(
             effect_window_reach(&container),
