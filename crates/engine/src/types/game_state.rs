@@ -49002,6 +49002,7 @@ mod restored_exact_attack_authority_tests {
     use super::*;
     use crate::game::combat::{AttackTarget, CombatParticipation};
     use crate::game::scenario::{GameScenario, P0, P1};
+    use crate::types::ability::Effect;
     use crate::types::resolution::{AbilityContinuationFrame, OptionalEffectFrame};
 
     fn queued() -> (GameState, ObjectId, ObjectId) {
@@ -49446,6 +49447,7 @@ mod restored_exact_attack_authority_tests {
                 1 => ResolutionFrame::RepeatUntil(PendingRepeatUntil {
                     ability: node.clone(),
                     stop_progress: None,
+                    iteration_progress: None,
                 }),
                 2 => ResolutionFrame::PerPlayerZoneChoice(PendingPerPlayerZoneChoice {
                     ability: node.clone(),
@@ -49470,6 +49472,7 @@ mod restored_exact_attack_authority_tests {
                     continuation: Some(node.clone()),
                     replacement_applied: Default::default(),
                     remaining_players: vec![P1],
+                    trigger_context: ResolvingTriggerContext::capture(&state),
                 }),
                 5 => ResolutionFrame::RepeatedOptionalPayment(RepeatedOptionalPaymentFrame {
                     pending: Some(Box::new(PendingRepeatedOptionalPayment {

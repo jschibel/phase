@@ -3098,7 +3098,9 @@ fn armor_of_thorns() {
 // ---------------------------------------------------------------------------
 
 mod diagnostic_snapshots {
+    use super::{ability_has_unimplemented, parse_two_layer};
     use crate::parser::oracle::parse_oracle_ir;
+    use crate::types::ability::{Effect, TargetFilter};
 
     /// Parse Oracle text and return only the diagnostics vec from the IR.
     fn parse_diagnostics(

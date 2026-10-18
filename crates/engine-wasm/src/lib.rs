@@ -3865,8 +3865,7 @@ mod exact_attack_authority_restore_tests {
                 .unwrap()
                 .remove("attacked_permanents");
             let error = decode_restored_game_state(&value.to_string())
-                .err()
-                .expect("unproven authority is refused");
+                .expect_err("unproven authority is refused");
             assert!(error.contains("exact attack authority"));
             assert!(
                 decode_restored_game_state(&wire(&state, trusted)).is_ok(),

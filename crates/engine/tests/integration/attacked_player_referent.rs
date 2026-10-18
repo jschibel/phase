@@ -1241,12 +1241,9 @@ fn reach_blocked_priority(b: &mut AuthorityBoard) {
         }
         match b.r.state().waiting_for.clone() {
             WaitingFor::DeclareBlockers { player, .. } => {
-                b.r.declare_blockers(if player == P1 {
-                    &[(b.blocker, b.attacker)]
-                } else {
-                    &[]
-                })
-                .unwrap();
+                let blockers = [(b.blocker, b.attacker)];
+                b.r.declare_blockers(if player == P1 { &blockers } else { &[] })
+                    .unwrap();
             }
             WaitingFor::Priority { .. } => {
                 b.r.act(GameAction::PassPriority).unwrap();
