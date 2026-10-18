@@ -1577,10 +1577,10 @@ pub(super) fn handle_unless_payment(
             // "Then either the entire set of costs is paid, or none of them
             // is paid. Partial payments aren't allowed."
             //
-            // Mixed `Composite` (e.g., `Composite[Mana, PayLife]`) is
-            // **explicitly out of scope** here — no current MTG card
-            // produces a mixed unless-payment composite. Extend with a
-            // sequenced sub-cost payer when one ships.
+            // Mixed Composite costs are unsupported by this unless-payment
+            // adapter. Printed mana-and-life conjunctions exist; rejecting
+            // this shape is an implementation limit, not proof that no card
+            // produces it.
             AbilityCost::Composite { costs }
                 if costs.iter().all(|c| matches!(c, AbilityCost::Mana { .. })) =>
             {
@@ -1610,13 +1610,9 @@ pub(super) fn handle_unless_payment(
                 }
             }
             AbilityCost::Composite { .. } => {
-                // CR 702.24a + CR 118.12: A non-all-Mana `Composite`
-                // unless-cost is not yet supported. No current MTG card
-                // produces this shape (cumulative upkeep with mixed
-                // disjunctive sub-costs is empirically Mana-only). Falling
-                // through to `payment_failed = true` makes the unless-effect
-                // happen, which is the rules-correct fallback for an
-                // unpayable cost (CR 118.12: declining is equivalent).
+                // Mixed Composite costs are unsupported by this unless-payment
+                // adapter. The current handler falls through to the unpaid
+                // effect without spending resources.
                 payment_failed = true;
             }
             // CR 701.17a + CR 118.12: "you mill N cards" as an unless-cost
@@ -3692,14 +3688,116 @@ mod tests {
     }
 
     #[test]
-    fn successful_resume_deferred_mana_life_and_suffix_carries_same_chosen_outcome() {
+    fn successful_resume_deferred_mana_life_carries_same_chosen_outcome() {
         use crate::game::scenario::{GameScenario, P0};
         use crate::types::ability::{
             ChooseOneOfKind, PlayerFilter, QuantityModification, ReplacementDefinition,
         };
         use crate::types::mana::{ManaColor, ManaCostShard};
         use crate::types::replacements::ReplacementEvent;
-        for suffix in [false, true] {
+        let mut scenario = GameScenario::new();
+        let replacement = ReplacementDefinition::new(ReplacementEvent::LoseLife)
+            .quantity_modification(QuantityModification::Plus { value: 0 })
+            .execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::ChooseOneOf {
+                    chooser: PlayerFilter::Controller,
+                    branches: vec![AbilityDefinition::new(AbilityKind::Spell, gain_life(1))],
+                    kind: ChooseOneOfKind::Ordinary,
+                },
+            ));
+        let source = scenario
+            .add_creature(P0, "Life replacement witness", 1, 1)
+            .with_replacement_definition(replacement)
+            .id();
+        let land = scenario.add_basic_land(P0, ManaColor::White);
+        let mut state = scenario.build().state().clone();
+        state.players[0].energy = 2;
+        state.waiting_for = WaitingFor::UnlessPayment {
+            player: P0,
+            cost: AbilityCost::Mana {
+                cost: ManaCost::Cost {
+                    shards: vec![ManaCostShard::PhyrexianBlack],
+                    generic: 1,
+                },
+            },
+            pending_effect: Box::new(resumed_payment_root(source)),
+            trigger_event: None,
+            effect_description: None,
+            remaining: vec![],
+        };
+        let mut events = payment_action(&mut state, true).events;
+        assert!(
+            matches!(
+                state.waiting_for,
+                WaitingFor::ChooseOneOfBranch { player: P0, .. }
+            ),
+            "life replacement post-effect owns a real choice: waiting={:?}, events={events:?}",
+            state.waiting_for,
+        );
+        assert!(state.pending_deferred_life_cost_resume.is_some());
+        assert_eq!(
+            state.players[0].life, 18,
+            "Phyrexian life already paid, no rider yet"
+        );
+        assert!(state.objects[&land].tapped);
+        assert_eq!(state.players[0].mana_pool.total(), 0);
+        assert_eq!(state.players[0].energy, 2);
+        for amount in [100, 1, 3, 7, 11] {
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                GameEvent::LifeChanged { player_id: P0, amount: actual, .. } if *actual == amount
+            )), "no root, replacement branch or rider before the choice: {amount}");
+        }
+        events.extend(
+            crate::game::engine::apply_as_current(
+                &mut state,
+                GameAction::ChooseBranch { index: 0 },
+            )
+            .expect("finish replacement, then the paid unless outcome")
+            .events,
+        );
+        // CR 118.12: The chosen payment outcome owns the conditional riders.
+        assert_eq!(
+            state.players[0].life, 33,
+            "-2 life, replacement +1, paid child +3, independent tail +11 exactly once"
+        );
+        assert_eq!(state.players[0].energy, 2);
+        for amount in [-2, 1, 3, 11] {
+            assert_eq!(
+                events.iter().filter(|event| matches!(
+                    event,
+                    GameEvent::LifeChanged { player_id: P0, amount: actual, .. } if *actual == amount
+                )).count(),
+                1,
+                "payment, replacement and riders occur exactly once: {amount}"
+            );
+        }
+        for amount in [100, 7] {
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                GameEvent::LifeChanged { player_id: P0, amount: actual, .. } if *actual == amount
+            )), "paid unless suppresses the root and unpaid rider: {amount}");
+        }
+        assert!(state.pending_deferred_life_cost_resume.is_none());
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::Priority { player: P0 }
+        ));
+    }
+
+    #[test]
+    fn mixed_unless_payment_is_rejected_without_spending_resources() {
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::types::ability::{
+            ChooseOneOfKind, PlayerFilter, QuantityModification, ReplacementDefinition,
+        };
+        use crate::types::mana::{ManaColor, ManaCostShard};
+        use crate::types::replacements::ReplacementEvent;
+
+        // Synthetic unsupported-adapter boundary, not printed-card semantics.
+        // The supported Mana sister above positively reaches this replacement.
+        for pay in [true, false] {
             let mut scenario = GameScenario::new();
             let replacement = ReplacementDefinition::new(ReplacementEvent::LoseLife)
                 .quantity_modification(QuantityModification::Plus { value: 0 })
@@ -3718,92 +3816,211 @@ mod tests {
             let land = scenario.add_basic_land(P0, ManaColor::White);
             let mut state = scenario.build().state().clone();
             state.players[0].energy = 2;
-            let mana = AbilityCost::Mana {
-                cost: ManaCost::Cost {
-                    shards: vec![ManaCostShard::PhyrexianBlack],
-                    generic: 1,
-                },
-            };
-            let cost = if suffix {
-                AbilityCost::Composite {
-                    costs: vec![
-                        mana,
-                        AbilityCost::PayEnergy {
-                            amount: QuantityExpr::Fixed { value: 1 },
+            let cost = AbilityCost::Composite {
+                costs: vec![
+                    AbilityCost::Mana {
+                        cost: ManaCost::Cost {
+                            shards: vec![ManaCostShard::PhyrexianBlack],
+                            generic: 1,
                         },
-                    ],
-                }
-            } else {
-                mana
+                    },
+                    AbilityCost::PayEnergy {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                    },
+                ],
             };
             state.waiting_for = WaitingFor::UnlessPayment {
                 player: P0,
-                cost,
+                cost: cost.clone(),
                 pending_effect: Box::new(resumed_payment_root(source)),
                 trigger_event: None,
                 effect_description: None,
                 remaining: vec![],
             };
-            let mut events = payment_action(&mut state, true).events;
-            assert!(
-                matches!(
-                    state.waiting_for,
-                    WaitingFor::ChooseOneOfBranch { player: P0, .. }
-                ),
-                "life replacement post-effect owns a real choice: suffix={suffix}, \
-                 waiting={:?}, life={}, land_tapped={}, pool={}, energy={}, \
-                 deferred_life={:?}, events={events:?}",
-                state.waiting_for,
-                state.players[0].life,
-                state.objects[&land].tapped,
-                state.players[0].mana_pool.total(),
-                state.players[0].energy,
-                state.pending_deferred_life_cost_resume
-            );
-            assert!(state.pending_deferred_life_cost_resume.is_some());
-            assert_eq!(
-                state.players[0].life, 18,
-                "Phyrexian life already paid, no rider yet"
-            );
-            assert!(state.objects[&land].tapped);
+            assert!(matches!(
+                &state.waiting_for,
+                WaitingFor::UnlessPayment { player: P0, cost: actual, pending_effect, .. }
+                    if actual == &cost && pending_effect.source_id == source
+            ));
+            assert_eq!(state.players[0].life, 20);
+            assert!(!state.objects[&land].tapped);
             assert_eq!(state.players[0].mana_pool.total(), 0);
-            assert_eq!(state.players[0].energy, 2, "suffix has not been paid early");
-            events.extend(
-                crate::game::engine::apply_as_current(
-                    &mut state,
-                    GameAction::ChooseBranch { index: 0 },
-                )
-                .expect("finish replacement, then exact unpaid suffix")
-                .events,
-            );
-            assert_eq!(
-                state.players[0].life, 33,
-                "-2 life, replacement +1, paid child +3, independent tail +11 exactly once"
-            );
-            assert_eq!(state.players[0].energy, if suffix { 1 } else { 2 });
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| matches!(event, GameEvent::LifeChanged { amount: -2, .. }))
-                    .count(),
-                1
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| matches!(event, GameEvent::LifeChanged { amount: 3, .. }))
-                    .count(),
-                1
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| matches!(event, GameEvent::LifeChanged { amount: 11, .. }))
-                    .count(),
-                1
-            );
+            assert_eq!(state.players[0].energy, 2);
+            let events = payment_action(&mut state, pay).events;
+            assert_eq!(state.players[0].life, 138, "unpaid root +100/+7/+11");
+            assert!(!state.objects[&land].tapped);
+            assert_eq!(state.players[0].mana_pool.total(), 0);
+            assert_eq!(state.players[0].energy, 2);
+            for amount in [100, 7, 11] {
+                assert_eq!(events.iter().filter(|event| matches!(
+                    event,
+                    GameEvent::LifeChanged { player_id: P0, amount: actual, .. } if *actual == amount
+                )).count(), 1, "unpaid route executes once: {amount}");
+            }
+            for amount in [-2, 1, 3] {
+                assert!(!events.iter().any(|event| matches!(
+                    event,
+                    GameEvent::LifeChanged { player_id: P0, amount: actual, .. } if *actual == amount
+                )), "unsupported entry spends no life or paid/replacement gain: {amount}");
+            }
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, GameEvent::EnergyChanged { .. })));
             assert!(state.pending_deferred_life_cost_resume.is_none());
-            assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+            assert!(state.payment_transaction.is_none());
+            assert!(matches!(
+                state.waiting_for,
+                WaitingFor::Priority { player: P0 }
+            ));
+        }
+    }
+
+    #[test]
+    fn supported_pay_cost_deferred_mana_suffix_preserves_outcome_and_staging() {
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::types::ability::{
+            ChooseOneOfKind, PlayerFilter, QuantityModification, ReplacementDefinition,
+        };
+        use crate::types::mana::{ManaColor, ManaCostShard};
+        use crate::types::replacements::ReplacementEvent;
+
+        // Synthetic supported PayCost authority, reached by normal activation.
+        for energy in [2, 0] {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
+            let replacement = ReplacementDefinition::new(ReplacementEvent::LoseLife)
+                .quantity_modification(QuantityModification::Plus { value: 0 })
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::ChooseOneOf {
+                        chooser: PlayerFilter::Controller,
+                        branches: vec![AbilityDefinition::new(AbilityKind::Spell, gain_life(1))],
+                        kind: ChooseOneOfKind::Ordinary,
+                    },
+                ));
+            let mut paid = AbilityDefinition::new(AbilityKind::Spell, gain_life(3)).condition(
+                AbilityCondition::And {
+                    conditions: vec![
+                        AbilityCondition::effect_performed(),
+                        AbilityCondition::effect_performed(),
+                    ],
+                },
+            );
+            paid.sub_link = SubAbilityLink::SequentialSibling;
+            let mut unpaid = AbilityDefinition::new(AbilityKind::Spell, gain_life(7))
+                .condition(payment_condition(false));
+            unpaid.sub_link = SubAbilityLink::SequentialSibling;
+            let mut independent = AbilityDefinition::new(AbilityKind::Spell, gain_life(11));
+            independent.sub_link = SubAbilityLink::SequentialSibling;
+            let ability = AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::PayCost {
+                    cost: AbilityCost::Composite {
+                        costs: vec![
+                            AbilityCost::Mana {
+                                cost: ManaCost::Cost {
+                                    shards: vec![ManaCostShard::PhyrexianBlack],
+                                    generic: 1,
+                                },
+                            },
+                            AbilityCost::PayEnergy {
+                                amount: QuantityExpr::Fixed { value: 1 },
+                            },
+                        ],
+                    },
+                    scale: None,
+                    payer: TargetFilter::Controller,
+                },
+            )
+            .sub_ability(paid.sub_ability(unpaid.sub_ability(independent)));
+            let source = scenario
+                .add_creature(P0, "Life replacement witness", 1, 1)
+                .with_replacement_definition(replacement)
+                .with_ability_definition(ability)
+                .id();
+            let land = scenario.add_basic_land(P0, ManaColor::White);
+            let mut runner = scenario.build();
+            runner.state_mut().players[0].energy = energy;
+            let outcome = runner.activate(source, 0).resolve();
+            assert!(matches!(
+                outcome.final_waiting_for(),
+                WaitingFor::ChooseOneOfBranch { player: P0, .. }
+            ));
+            let state = outcome.state();
+            // CR 118.3: The full composite cost commits atomically; the live
+            // transaction retains the untouched canonical base during choice.
+            assert!(state.payment_transaction.is_some());
+            assert_eq!(state.players[0].life, 20);
+            assert!(!state.objects[&land].tapped);
+            assert_eq!(state.players[0].mana_pool.total(), 0);
+            assert_eq!(state.players[0].energy, energy);
+            assert!(state.pending_deferred_life_cost_resume.is_none());
+            assert!(!outcome.events().iter().any(|event| matches!(
+                event,
+                GameEvent::LifeChanged { player_id: P0, .. } | GameEvent::EnergyChanged { .. }
+            )));
+            let projected = crate::game::payment_transaction::project(state);
+            assert!(projected.pending_deferred_life_cost_resume.is_some());
+            assert_eq!(projected.players[0].life, 18);
+            assert!(projected.objects[&land].tapped);
+            assert_eq!(projected.players[0].mana_pool.total(), 0);
+            assert_eq!(
+                projected.players[0].energy, energy,
+                "suffix waits for replacement"
+            );
+            let mut events = outcome.events().to_vec();
+            events.extend(
+                runner
+                    .act(GameAction::ChooseBranch { index: 0 })
+                    .expect("settle replacement, then pay or abort the energy suffix")
+                    .events,
+            );
+            let state = runner.state();
+            // CR 118.12: The committed payment result selects paid/unpaid
+            // riders, and the independent instruction follows either result.
+            assert_eq!(state.players[0].life, if energy == 2 { 33 } else { 38 });
+            assert_eq!(state.objects[&land].tapped, energy == 2);
+            assert_eq!(state.players[0].mana_pool.total(), 0);
+            assert_eq!(state.players[0].energy, if energy == 2 { 1 } else { 0 });
+            for amount in [-2, 1, 3] {
+                assert_eq!(events.iter().filter(|event| matches!(
+                    event,
+                    GameEvent::LifeChanged { player_id: P0, amount: actual, .. } if *actual == amount
+                )).count(), if energy == 2 { 1 } else { 0 },
+                "only the fully paid transaction publishes its payment/replacement/paid rider: {amount}");
+            }
+            for (amount, count) in [(100, 0), (7, if energy == 2 { 0 } else { 1 }), (11, 1)] {
+                assert_eq!(events.iter().filter(|event| matches!(
+                    event,
+                    GameEvent::LifeChanged { player_id: P0, amount: actual, .. } if *actual == amount
+                )).count(), count, "exact ordinary rider result: {amount}");
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, GameEvent::EnergyChanged { .. }))
+                    .count(),
+                if energy == 2 { 1 } else { 0 }
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        GameEvent::EnergyChanged {
+                            player: P0,
+                            delta: -1
+                        }
+                    ))
+                    .count(),
+                if energy == 2 { 1 } else { 0 }
+            );
+            assert!(state.payment_transaction.is_none());
+            assert!(state.pending_deferred_life_cost_resume.is_none());
+            assert!(matches!(
+                state.waiting_for,
+                WaitingFor::Priority { player: P0 }
+            ));
         }
     }
 
