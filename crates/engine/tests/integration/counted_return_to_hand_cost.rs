@@ -1329,11 +1329,10 @@ fn assert_mount_pause(board: &MountCostBoard) {
     assert_eq!(chosen, &vec![board.borrowed, board.land, board.ashaya]);
     assert_eq!(*paused_at_index, 2);
     assert_eq!(departure_record_indices.len(), 2);
-    assert!(pending
-        .as_ref()
-        .unwrap()
-        .activation_trigger_collection
-        .is_some());
+    assert!(serde_json::to_value(pending.as_ref().unwrap())
+        .expect("serialize actual pending activation")
+        .get("activation_trigger_collection")
+        .is_some_and(|value| value.is_object()));
     assert_eq!(departures(deferred_cost_events, board.borrowed).len(), 1);
     assert_eq!(departures(deferred_cost_events, board.land).len(), 1);
     assert!(departures(deferred_cost_events, board.ashaya).is_empty());
@@ -1521,7 +1520,7 @@ fn mount_cost_board(
     ) {
         runner
             .act(GameAction::ChooseTarget {
-                target: TargetRef::Object(victim),
+                target: Some(TargetRef::Object(victim)),
             })
             .expect("choose announced victim by intent");
     }
@@ -2047,7 +2046,10 @@ fn delayed_two_land_sibling(
                 min_count: 2,
                 resume: CostResume::Spell { spell: pending },
                 ..
-            } if pending.activation_trigger_collection.is_some()
+            } if serde_json::to_value(pending)
+                .expect("serialize actual primed activation")
+                .get("activation_trigger_collection")
+                .is_some_and(|value| value.is_object())
         ));
     }
     assert!(matches!(
@@ -2096,7 +2098,10 @@ fn delayed_two_land_sibling(
     assert_eq!(pending.activation_ability_index.is_none(), spell);
     if !spell {
         assert_eq!(
-            pending.activation_trigger_collection.is_some(),
+            serde_json::to_value(pending)
+                .expect("serialize actual paused activation")
+                .get("activation_trigger_collection")
+                .is_some_and(|value| value.is_object()),
             prime_carrier,
             "the earlier completed return leg supplies the no-target carrier"
         );
