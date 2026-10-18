@@ -3750,8 +3750,15 @@ mod tests {
                     state.waiting_for,
                     WaitingFor::ChooseOneOfBranch { player: P0, .. }
                 ),
-                "life replacement post-effect owns a real choice: {:?}",
-                state.waiting_for
+                "life replacement post-effect owns a real choice: suffix={suffix}, \
+                 waiting={:?}, life={}, land_tapped={}, pool={}, energy={}, \
+                 deferred_life={:?}, events={events:?}",
+                state.waiting_for,
+                state.players[0].life,
+                state.objects[&land].tapped,
+                state.players[0].mana_pool.total(),
+                state.players[0].energy,
+                state.pending_deferred_life_cost_resume
             );
             assert!(state.pending_deferred_life_cost_resume.is_some());
             assert_eq!(

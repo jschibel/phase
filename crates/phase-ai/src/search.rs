@@ -6927,7 +6927,7 @@ mod tests {
                 .with_mana_cost(ManaCost::Cost { shards: vec![ManaCostShard::Black], generic: 1 }).id();
             let flux = scenario.add_spell_to_hand(P1, "Pendrell Flux", false)
                 .as_enchantment().with_subtypes(vec!["Aura"])
-                .from_oracle_text("Enchant creature\nEnchanted creature has \"At the beginning of your upkeep, sacrifice this creature unless you pay its mana cost.\"")
+                .from_oracle_text_with_keywords(&["Enchant"], "Enchant creature\nEnchanted creature has \"At the beginning of your upkeep, sacrifice this creature unless you pay its mana cost.\"")
                 .with_mana_cost(ManaCost::Cost { shards: vec![ManaCostShard::Blue], generic: 1 }).id();
             let lands = [
                 scenario.add_basic_land(P1, ManaColor::Blue),
@@ -6937,7 +6937,27 @@ mod tests {
             runner.state_mut().active_player = P1;
             runner.state_mut().priority_player = P1;
             runner.state_mut().waiting_for = WaitingFor::Priority { player: P1 };
-            let cast = runner.cast(flux).target_object(host).resolve();
+            // CR 303.4a: MTGJSON's Enchant hint supplies the Aura's target filter.
+            assert_eq!(
+                runner.state().objects[&flux].card_types.core_types,
+                vec![CoreType::Enchantment]
+            );
+            assert!(runner.state().objects[&flux]
+                .keywords
+                .iter()
+                .any(|keyword| matches!(keyword, Keyword::Enchant(_))));
+            let committed = runner.cast(flux).target_object(host).commit();
+            let ability = committed
+                .state()
+                .stack
+                .back()
+                .and_then(|entry| entry.ability())
+                .expect("Flux committed with its Aura target");
+            assert_eq!(
+                engine::game::ability_utils::flatten_targets_in_chain(ability),
+                vec![TargetRef::Object(host)]
+            );
+            let cast = committed.resolve();
             cast.assert_zone(&[flux, host, artist], Zone::Battlefield);
             assert_eq!(
                 cast.state().objects[&flux].attached_to,
