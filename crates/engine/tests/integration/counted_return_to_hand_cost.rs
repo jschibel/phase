@@ -17,17 +17,21 @@
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::parser::oracle_cost::parse_oracle_cost;
 use engine::types::ability::{
-    AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, CostObjectCount, Effect,
-    FilterProp, QuantityExpr, ReplacementDefinition, SpellCastingOption, TargetFilter,
-    TriggerDefinition, TypeFilter, TypedFilter,
+    AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, CostObjectCount,
+    DelayedTriggerCondition, Effect, FilterProp, QuantityExpr, ReplacementDefinition,
+    SpellCastingOption, TargetFilter, TargetRef, TriggerDefinition, TypeFilter, TypedFilter,
+    WheneverEventExpiry,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::Supertype;
 use engine::types::events::GameEvent;
-use engine::types::game_state::{CastPaymentMode, PayCostKind, WaitingFor};
+use engine::types::format::FormatConfig;
+use engine::types::game_state::{CastPaymentMode, PayCostKind, PendingCostMoveResume, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
+use engine::types::player::PlayerId;
+use engine::types::proposed_event::ProposedEvent;
 use engine::types::replacements::ReplacementEvent;
 use engine::types::triggers::TriggerMode;
 use engine::types::zones::{EtbTapState, Zone};
@@ -36,6 +40,7 @@ use std::sync::Arc;
 const ENSNARE: &str = "You may return two Islands you control to their owner's hand rather than pay this spell's mana cost.\nTap all creatures.";
 const THWART: &str = "You may return three Islands you control to their owner's hand rather than pay this spell's mana cost.\nCounter target spell.";
 const DAZE: &str = "You may return an Island you control to its owner's hand rather than pay this spell's mana cost.\nCounter target spell unless its controller pays {1}.";
+const P2: PlayerId = PlayerId(2);
 
 fn ensnare_mana_cost() -> ManaCost {
     ManaCost::Cost {
@@ -83,17 +88,34 @@ fn land_you_control() -> TargetFilter {
 /// group, so it sees its co-departed siblings only through the CR 603.10a
 /// look-back stamp.
 fn attach_land_departure_observer(runner: &mut GameRunner, host: ObjectId) {
-    let trigger = TriggerDefinition::new(TriggerMode::ChangesZone)
-        .valid_card(TargetFilter::Typed(TypedFilter::new(TypeFilter::Land)))
+    attach_departure_observer(
+        runner,
+        host,
+        TargetFilter::Typed(TypedFilter::new(TypeFilter::Land)),
+        1,
+        None,
+    );
+}
+
+fn attach_departure_observer(
+    runner: &mut GameRunner,
+    host: ObjectId,
+    subject: TargetFilter,
+    amount: i32,
+    destination: Option<Zone>,
+) {
+    let mut trigger = TriggerDefinition::new(TriggerMode::ChangesZone)
+        .valid_card(subject)
         .origin(Zone::Battlefield)
         .trigger_zones(vec![Zone::Battlefield])
         .execute(AbilityDefinition::new(
             AbilityKind::Spell,
             Effect::GainLife {
-                amount: QuantityExpr::Fixed { value: 1 },
+                amount: QuantityExpr::Fixed { value: amount },
                 player: TargetFilter::Controller,
             },
         ));
+    trigger.destination = destination;
     let obj = runner
         .state_mut()
         .objects
@@ -995,11 +1017,11 @@ fn targeted_counted_return_activation_group_survives_a_replacement_pause() {
 
 /// A three-player board: P0 activates the target-bearing counted-return
 /// ability, the second land carries two competing replacements (the pause),
-/// and P1's observer gains life whenever any land leaves the battlefield.
+/// and P1's observer watches only the first land's departure.
 /// Pauses on the second land, optionally round-trips the paused state through
 /// serde, then P0 concedes. Returns (P1 life gained, stack depth after the
-/// triggers settle, the first land's zone, the second land's zone).
-fn concede_during_counted_return_pause(round_trip: bool) -> (i32, usize, Zone, Zone) {
+/// triggers settle, first-land hand deliveries, second-land hand deliveries).
+fn concede_during_counted_return_pause(round_trip: bool) -> (i32, usize, usize, usize) {
     let mut scenario = GameScenario::new_n_player(3, 7);
     scenario.at_phase(Phase::PreCombatMain);
     let source = scenario
@@ -1033,7 +1055,19 @@ fn concede_during_counted_return_pause(round_trip: bool) -> (i32, usize, Zone, Z
             .with_replacement_definition(redirect_land_to_exile(lands[1]));
     }
     let mut runner = scenario.build();
-    attach_land_departure_observer(&mut runner, observer_host);
+    attach_departure_observer(
+        &mut runner,
+        observer_host,
+        TargetFilter::SpecificObject { id: lands[0] },
+        1,
+        Some(Zone::Hand),
+    );
+    assert_eq!(
+        runner.state().objects[&observer_host].trigger_definitions[0]
+            .definition
+            .valid_card,
+        Some(TargetFilter::SpecificObject { id: lands[0] })
+    );
     let life0 = runner.life(P1);
 
     runner
@@ -1052,11 +1086,12 @@ fn concede_during_counted_return_pause(round_trip: bool) -> (i32, usize, Zone, Z
             })
             .expect("announce the target");
     }
-    runner
+    let paid_events = runner
         .act(GameAction::SelectCards {
             cards: lands.clone(),
         })
-        .expect("select both lands");
+        .expect("select both lands")
+        .events;
     assert!(
         matches!(
             runner.state().waiting_for,
@@ -1070,6 +1105,14 @@ fn concede_during_counted_return_pause(round_trip: bool) -> (i32, usize, Zone, Z
         Zone::Hand,
         "reach guard: the first land already left"
     );
+    assert_eq!(departures(&paid_events, lands[0]).len(), 1);
+    assert_eq!(runner.state().objects[&lands[1]].zone, Zone::Battlefield);
+    assert!(matches!(
+        runner.state().pending_replacement.as_ref().map(|p| &p.proposed),
+        Some(engine::types::proposed_event::ProposedEvent::ZoneChange {
+            object_id, from: Zone::Battlefield, to: Zone::Hand, ..
+        }) if *object_id == lands[1]
+    ));
     if round_trip {
         let json = serde_json::to_string(runner.state()).expect("serialize the paused state");
         assert!(
@@ -1081,26 +1124,53 @@ fn concede_during_counted_return_pause(round_trip: bool) -> (i32, usize, Zone, Z
         );
     }
 
-    runner
+    let conceded_events = runner
         .act(GameAction::Concede { player_id: P0 })
-        .expect("P0 concedes during the replacement choice");
+        .expect("P0 concedes during the replacement choice")
+        .events;
     assert!(runner.state().players[0].is_eliminated);
+    assert!(!runner.state().players[1].is_eliminated);
+    assert!(!runner.state().players[2].is_eliminated);
+    assert!(runner.state().pending_cost_move_resume.is_none());
+    assert!(runner.state().pending_replacement.is_none());
+    assert_eq!(runner.state().objects[&victim].zone, Zone::Battlefield);
+    let action_events: Vec<_> = paid_events.into_iter().chain(conceded_events).collect();
+    let hand_moves = |id| {
+        departures(&action_events, id)
+            .iter()
+            .filter(|(to, _)| *to == Zone::Hand)
+            .count()
+    };
+    assert_eq!(hand_moves(lands[0]), 1);
+    assert_eq!(hand_moves(lands[1]), 0);
+    assert!(
+        departures(&action_events, lands[1])
+            .iter()
+            .any(|(to, _)| *to == Zone::Exile),
+        "the actual cleanup event identifies the unpaid land's destination"
+    );
+    let recorded_hand_moves = |id| {
+        runner
+            .state()
+            .zone_changes_this_turn
+            .iter()
+            .filter(|r| {
+                r.object_id == id
+                    && r.from_zone == Some(Zone::Battlefield)
+                    && r.to_zone == Zone::Hand
+            })
+            .count()
+    };
+    let first_hand_moves = recorded_hand_moves(lands[0]);
+    let second_hand_moves = recorded_hand_moves(lands[1]);
+    assert_eq!(first_hand_moves, 1);
+    assert_eq!(second_hand_moves, 0);
     runner.advance_until_stack_empty();
     (
         runner.life(P1) - life0,
         runner.state().stack.len(),
-        // The conceding player's objects have left the game with them; zone
-        // reads fall back to the recorded zone.
-        runner
-            .state()
-            .objects
-            .get(&lands[0])
-            .map_or(Zone::Exile, |o| o.zone),
-        runner
-            .state()
-            .objects
-            .get(&lands[1])
-            .map_or(Zone::Exile, |o| o.zone),
+        first_hand_moves,
+        second_hand_moves,
     )
 }
 
@@ -1110,12 +1180,979 @@ fn conceding_during_a_counted_return_pause_publishes_the_completed_prefix_once()
     // surviving player's leaves-the-battlefield observer triggers for it once,
     // although the payer then leaves and the paused move is abandoned.
     for round_trip in [false, true] {
-        let (gained, stack, _, _) = concede_during_counted_return_pause(round_trip);
+        let (gained, stack, first, second) = concede_during_counted_return_pause(round_trip);
+        assert_eq!(first, 1);
+        assert_eq!(second, 0);
         assert_eq!(
             gained, 1,
             "round_trip={round_trip}: P1's observer triggers exactly once"
         );
         assert_eq!(stack, 0, "round_trip={round_trip}: the stack settled");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Delayed prefix/current ownership through real announcement boundaries.
+// ---------------------------------------------------------------------------
+
+const MOUNT: &str = "Flying\n{T}: Target creature you control with toughness 2 or less gets +1/+1 and gains flying until end of turn. When this creature leaves the battlefield this turn, sacrifice that creature. When the creature leaves the battlefield this turn, sacrifice this creature.";
+const ASHAYA: &str = "Ashaya's power and toughness are each equal to the number of lands you control.\nNontoken creatures you control are Forest lands in addition to their other types. (They're still affected by summoning sickness.)";
+const MIRROR_MAGE: &str = "Flying\n{3}, Return three lands you control to their owner's hand: Return target creature to its owner's hand.";
+const ACT_OF_TREASON: &str = "Gain control of target creature until end of turn. Untap that creature. It gains haste until end of turn. (It can attack and {T} this turn.)";
+
+fn gain_life_definition(amount: i32) -> AbilityDefinition {
+    AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: amount },
+            player: TargetFilter::Controller,
+        },
+    )
+}
+
+/// Typed mechanism fixture: installation still happens by resolving a real
+/// activated ability, rather than injecting a delayed registration or queue.
+fn recurring_observer(
+    scenario: &mut GameScenario,
+    player: PlayerId,
+    name: &str,
+    trigger: TriggerDefinition,
+    amount: i32,
+) -> ObjectId {
+    scenario
+        .add_creature(player, name, 1, 1)
+        .with_ability_definition(AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::CreateDelayedTrigger {
+                condition: DelayedTriggerCondition::WheneverEvent {
+                    trigger: Box::new(trigger),
+                    expiry: WheneverEventExpiry::EndOfTurn,
+                },
+                effect: Box::new(gain_life_definition(amount)),
+                uses_tracked_set: false,
+            },
+        ))
+        .id()
+}
+
+fn departure_trigger(subject: ObjectId) -> TriggerDefinition {
+    TriggerDefinition::new(TriggerMode::ChangesZone)
+        .valid_card(TargetFilter::SpecificObject { id: subject })
+        .origin(Zone::Battlefield)
+        .trigger_zones(vec![Zone::Battlefield])
+}
+
+fn pass_to(runner: &mut GameRunner, player: PlayerId) {
+    for _ in 0..3 {
+        assert!(
+            runner.state().stack.is_empty(),
+            "setup priority must not resolve work"
+        );
+        if matches!(runner.state().waiting_for, WaitingFor::Priority { player: p } if p == player) {
+            return;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("pass setup priority");
+    }
+    panic!("requested setup player never received priority");
+}
+
+fn round_trip_paused(runner: GameRunner, round_trip: bool) -> GameRunner {
+    if round_trip {
+        GameRunner::from_state(
+            serde_json::from_str(
+                &serde_json::to_string(runner.state()).expect("serialize entire paused game"),
+            )
+            .expect("deserialize entire paused game"),
+        )
+    } else {
+        runner
+    }
+}
+
+struct MountCostBoard {
+    runner: GameRunner,
+    mage: ObjectId,
+    mount: ObjectId,
+    borrowed: ObjectId,
+    land: ObjectId,
+    ashaya: ObjectId,
+    victim: ObjectId,
+    ordinary_current: ObjectId,
+    ordinary_prefix: ObjectId,
+    delayed_current: ObjectId,
+    decoy: ObjectId,
+    finishing: Option<ObjectId>,
+    paid_events: Vec<GameEvent>,
+    life_before: [i32; 3],
+}
+
+fn assert_mount_pause(board: &MountCostBoard) {
+    let state = board.runner.state();
+    assert_eq!(state.active_player, P0);
+    assert_eq!(state.seat_order, vec![P0, P1, P2]);
+    assert!(state.format_config.command_zone);
+    assert!(state.objects[&board.ashaya].is_commander);
+    assert_eq!(state.objects[&board.ashaya].owner, P0);
+    assert_eq!(state.objects[&board.ashaya].zone, Zone::Battlefield);
+    assert_eq!(state.objects[&board.borrowed].owner, P1);
+    assert_eq!(state.objects[&board.borrowed].zone, Zone::Hand);
+    assert!(state.players[1].hand.contains(&board.borrowed));
+    assert!(matches!(
+        state.waiting_for,
+        WaitingFor::ReplacementChoice { player: P0, .. }
+    ));
+    let replacement = state
+        .pending_replacement
+        .as_ref()
+        .expect("real commander proposal");
+    assert!(replacement.is_optional);
+    assert_eq!(replacement.choice_player, Some(P0));
+    assert_eq!(replacement.candidates.len(), 1);
+    assert!(matches!(replacement.proposed,
+        ProposedEvent::ZoneChange { object_id, from: Zone::Battlefield, to: Zone::Hand, .. }
+        if object_id == board.ashaya));
+    let Some(PendingCostMoveResume::Cast {
+        chosen,
+        paused_at_index,
+        deferred_cost_events,
+        departure_record_indices,
+        pending,
+        ..
+    }) = &state.pending_cost_move_resume
+    else {
+        panic!("actual counted Cast root");
+    };
+    assert_eq!(chosen, &vec![board.borrowed, board.land, board.ashaya]);
+    assert_eq!(*paused_at_index, 2);
+    assert_eq!(departure_record_indices.len(), 2);
+    assert!(pending
+        .as_ref()
+        .unwrap()
+        .activation_trigger_collection
+        .is_some());
+    assert_eq!(departures(deferred_cost_events, board.borrowed).len(), 1);
+    assert_eq!(departures(deferred_cost_events, board.land).len(), 1);
+    assert!(departures(deferred_cost_events, board.ashaya).is_empty());
+    let record = state
+        .zone_changes_this_turn
+        .iter()
+        .find(|r| r.object_id == board.borrowed && r.from_zone == Some(Zone::Battlefield))
+        .expect("paid borrowed departure");
+    assert_eq!(record.controller, P0);
+    assert_eq!(record.owner, P1);
+    assert_eq!(
+        record
+            .trigger_source_context
+            .as_ref()
+            .unwrap()
+            .lki
+            .controller,
+        P0
+    );
+    assert!(record
+        .trigger_definitions
+        .iter()
+        .any(|t| t.definition.valid_card
+            == Some(TargetFilter::SpecificObject { id: board.borrowed })));
+    // CR 603.7c + CR 603.7e: the chosen creature and creating P1 authority
+    // survive Act of Treason and the whole-state serialization boundary.
+    let bindings: Vec<_> = state
+        .delayed_triggers
+        .iter()
+        .filter(|d| {
+            d.source_id == board.mount
+                && d.controller == P1
+                && matches!(
+            &d.condition, DelayedTriggerCondition::WhenLeavesPlayFiltered {
+                filter: TargetFilter::SpecificObject { id }
+            } if *id == board.borrowed)
+        })
+        .collect();
+    assert_eq!(
+        bindings.len(),
+        1,
+        "the final Mount clause names the borrowed creature"
+    );
+    assert!(
+        state
+            .delayed_triggers
+            .iter()
+            .any(|d| d.source_id == board.mount
+                && d.controller == P1
+                && matches!(
+                    d.condition,
+                    DelayedTriggerCondition::WhenLeavesPlayFiltered {
+                        filter: TargetFilter::SelfRef
+                    }
+                )),
+        "the reverse Mount clause watches Mount itself"
+    );
+    assert!(state
+        .delayed_triggers
+        .iter()
+        .any(|d| d.source_id == board.delayed_current
+            && d.controller == P2
+            && !d.one_shot
+            && matches!(&d.condition,
+        DelayedTriggerCondition::WheneverEvent { trigger, .. }
+        if trigger.valid_card == Some(TargetFilter::SpecificObject { id: board.ashaya }))));
+}
+
+fn mount_cost_board(
+    round_trip: bool,
+    finishing_observer: bool,
+    current_destination: Zone,
+) -> MountCostBoard {
+    let mut scenario = GameScenario::new_with_format(FormatConfig::commander(), 3, 9937);
+    scenario.at_phase(Phase::PreCombatMain);
+    let mount = scenario
+        .add_creature(P1, "Phantasmal Mount", 1, 1)
+        .from_oracle_text_with_keywords(&["Flying"], MOUNT)
+        .id();
+    let borrowed = scenario
+        .add_creature(P1, "Borrowed paid creature", 1, 1)
+        .id();
+    let ashaya = scenario
+        .add_creature_from_oracle(P0, "Ashaya, Soul of the Wild", 0, 0, ASHAYA)
+        .as_legendary()
+        .commander()
+        .id();
+    let mage = scenario
+        .add_creature(P0, "Soratami Mirror-Mage", 2, 1)
+        .from_oracle_text_with_keywords(&["Flying"], MIRROR_MAGE)
+        .id();
+    let land = scenario.add_basic_land(P0, ManaColor::Green);
+    let victim = scenario.add_creature(P2, "Unpaid target", 2, 2).id();
+    let ordinary_current = scenario.add_creature(P1, "O1 current", 1, 1).id();
+    let ordinary_prefix = scenario.add_creature(P2, "O2 prefix", 1, 1).id();
+    let delayed_current = recurring_observer(
+        &mut scenario,
+        P2,
+        "D2 current",
+        departure_trigger(ashaya).destination(current_destination),
+        19,
+    );
+    let decoy_subject = scenario
+        .add_creature(P1, "Unselected decoy subject", 1, 1)
+        .id();
+    let decoy = recurring_observer(
+        &mut scenario,
+        P1,
+        "Decoy delayed",
+        departure_trigger(decoy_subject),
+        23,
+    );
+    let finishing = finishing_observer.then(|| {
+        recurring_observer(
+            &mut scenario,
+            P2,
+            "Unclaimed finishing activation",
+            TriggerDefinition::new(TriggerMode::AbilityActivated)
+                .valid_card(TargetFilter::SpecificObject { id: mage }),
+            29,
+        )
+    });
+    let act = scenario
+        .add_spell_to_hand_from_oracle(P0, "Act of Treason", false, ACT_OF_TREASON)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Red],
+            generic: 2,
+        })
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        (0..12)
+            .map(|_| ManaUnit::new(ManaType::Red, ObjectId(0), false, vec![]))
+            .collect(),
+    );
+    let mut runner = scenario.build();
+    for source in [Some(delayed_current), Some(decoy), finishing]
+        .into_iter()
+        .flatten()
+    {
+        let player = runner.state().objects[&source].controller;
+        pass_to(&mut runner, player);
+        runner.activate(source, 0).resolve();
+    }
+    pass_to(&mut runner, P1);
+    runner.activate(mount, 0).target_object(borrowed).resolve();
+    assert_eq!(runner.state().objects[&borrowed].controller, P1);
+    pass_to(&mut runner, P0);
+    let outcome = runner.cast(act).target_object(borrowed).resolve();
+    outcome.assert_zone(&[act], Zone::Graveyard);
+    assert_eq!(outcome.state().objects[&borrowed].controller, P0);
+    assert_eq!(outcome.state().objects[&borrowed].owner, P1);
+    attach_departure_observer(
+        &mut runner,
+        borrowed,
+        TargetFilter::SpecificObject { id: borrowed },
+        11,
+        Some(Zone::Hand),
+    );
+    attach_departure_observer(
+        &mut runner,
+        ordinary_current,
+        TargetFilter::SpecificObject { id: ashaya },
+        13,
+        Some(current_destination),
+    );
+    attach_departure_observer(
+        &mut runner,
+        ordinary_prefix,
+        TargetFilter::SpecificObject { id: borrowed },
+        17,
+        Some(Zone::Hand),
+    );
+    let life_before = [runner.life(P0), runner.life(P1), runner.life(P2)];
+    pass_to(&mut runner, P0);
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: mage,
+            ability_index: 0,
+        })
+        .expect("announce printed Mirror-Mage");
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::TargetSelection { .. }
+    ) {
+        runner
+            .act(GameAction::ChooseTarget {
+                target: TargetRef::Object(victim),
+            })
+            .expect("choose announced victim by intent");
+    }
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::PayCost {
+            kind: PayCostKind::ReturnToHand,
+            count: 3,
+            min_count: 3,
+            ..
+        }
+    ));
+    let paid_events = runner
+        .act(GameAction::SelectCards {
+            cards: vec![borrowed, land, ashaya],
+        })
+        .expect("pay two departures then reach commander choice")
+        .events;
+    let mut board = MountCostBoard {
+        runner,
+        mage,
+        mount,
+        borrowed,
+        land,
+        ashaya,
+        victim,
+        ordinary_current,
+        ordinary_prefix,
+        delayed_current,
+        decoy,
+        finishing,
+        paid_events,
+        life_before,
+    };
+    assert_mount_pause(&board);
+    board.runner = round_trip_paused(board.runner, round_trip);
+    assert_mount_pause(&board);
+    board
+}
+
+/// Inspect the real returned ordering boundary before answering any prompt.
+/// CR 603.3b: all controllers share this batch; life totals cannot prove order.
+fn order_mount_boundary(board: &mut MountCostBoard, abandoned: bool) -> Vec<ObjectId> {
+    let mut expected = if abandoned {
+        vec![(board.mount, P1), (board.ordinary_prefix, P2)]
+    } else {
+        vec![
+            (board.borrowed, P0),
+            (board.mount, P1),
+            (board.ordinary_current, P1),
+            (board.ordinary_prefix, P2),
+            (board.delayed_current, P2),
+        ]
+    };
+    if !abandoned {
+        if let Some(id) = board.finishing {
+            expected.push((id, P2));
+        }
+    }
+    let state = board.runner.state();
+    let mut observed: Vec<_> = state
+        .deferred_triggers
+        .iter()
+        .map(|c| (c.pending.source_id, c.pending.controller))
+        .collect();
+    if let Some(order) = &state.pending_trigger_order {
+        observed.extend(
+            order
+                .groups
+                .iter()
+                .flat_map(|g| g.triggers.iter())
+                .map(|c| (c.pending.source_id, c.pending.controller)),
+        );
+    }
+    observed.extend(state.stack.iter().filter_map(|s| match s.kind {
+        engine::types::game_state::StackEntryKind::TriggeredAbility { .. } => {
+            Some((s.source_id, s.controller))
+        }
+        _ => None,
+    }));
+    observed.sort();
+    expected.sort();
+    assert_eq!(
+        observed, expected,
+        "exact source/controller batch before payload resolution"
+    );
+    for (source, controller) in &expected {
+        let context = state
+            .pending_trigger_order
+            .iter()
+            .flat_map(|o| &o.groups)
+            .flat_map(|g| &g.triggers)
+            .chain(state.deferred_triggers.iter())
+            .find(|c| c.pending.source_id == *source && c.pending.controller == *controller);
+        if let Some(context) = context {
+            let subject = if *source == board.ordinary_current || *source == board.delayed_current {
+                board.ashaya
+            } else {
+                board.borrowed
+            };
+            if Some(*source) != board.finishing {
+                assert!(context.trigger_events.iter().any(|e|
+                    matches!(e, GameEvent::ZoneChanged { object_id, from: Some(Zone::Battlefield), .. }
+                    if *object_id == subject)));
+            }
+        }
+    }
+    assert_eq!(board.runner.life(P1), board.life_before[1]);
+    assert_eq!(board.runner.life(P2), board.life_before[2]);
+    assert_eq!(state.objects[&board.mount].zone, Zone::Battlefield);
+    if !abandoned {
+        assert_eq!(board.runner.life(P0), board.life_before[0]);
+        assert_eq!(state.objects[&board.victim].zone, Zone::Battlefield);
+        assert_eq!(state.stack[0].source_id, board.mage);
+    }
+    // Choose a deliberate source-based permutation for each controller.
+    for _ in 0..3 {
+        let WaitingFor::OrderTriggers { triggers, .. } = &board.runner.state().waiting_for else {
+            break;
+        };
+        let mut order: Vec<_> = (0..triggers.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(triggers[i].source_id));
+        board
+            .runner
+            .act(GameAction::OrderTriggers { order })
+            .expect("controller orders own sources");
+    }
+    assert!(matches!(
+        board.runner.state().waiting_for,
+        WaitingFor::Priority { .. }
+    ));
+    let actual: Vec<_> = board
+        .runner
+        .state()
+        .stack
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.kind,
+                engine::types::game_state::StackEntryKind::TriggeredAbility { .. }
+            )
+        })
+        .map(|s| (s.source_id, s.controller))
+        .collect();
+    // Index zero chooses the bottom of this controller's stack slot.
+    let mut placement = expected;
+    placement.sort_by_key(|(source, controller)| (*controller, std::cmp::Reverse(*source)));
+    assert_eq!(actual, placement, "AP then P1 then P2, bottom to top");
+    actual.into_iter().rev().map(|(source, _)| source).collect()
+}
+
+fn resolve_mount_batch(board: &mut MountCostBoard, expected_resolution: &[ObjectId]) {
+    for source in expected_resolution {
+        // Mount's reverse clause can now observe Mount's sacrifice. It names
+        // the already-returned creature and cannot move that new hand object.
+        if board.runner.state().stack.last().unwrap().source_id != *source {
+            assert_eq!(
+                board.runner.state().stack.last().unwrap().source_id,
+                board.mount
+            );
+            board.runner.resolve_top();
+            assert_eq!(
+                board.runner.state().objects[&board.borrowed].zone,
+                Zone::Hand
+            );
+        }
+        assert_eq!(
+            board.runner.state().stack.last().unwrap().source_id,
+            *source
+        );
+        board.runner.resolve_top();
+    }
+    board.runner.advance_until_stack_empty();
+    assert!(board.runner.state().stack.is_empty());
+}
+
+fn mount_completion(round_trip: bool, command: bool, finishing: bool) {
+    let mut board = mount_cost_board(
+        round_trip,
+        finishing,
+        if command { Zone::Command } else { Zone::Hand },
+    );
+    let result = board
+        .runner
+        .act(GameAction::ChooseReplacement {
+            index: usize::from(!command),
+        })
+        .expect("accept or decline real commander replacement");
+    assert_eq!(
+        board.runner.state().objects[&board.ashaya].zone,
+        if command { Zone::Command } else { Zone::Hand }
+    );
+    assert_eq!(departures(&result.events, board.ashaya).len(), 1);
+    for id in [board.borrowed, board.land, board.ashaya] {
+        let record = board
+            .runner
+            .state()
+            .zone_changes_this_turn
+            .iter()
+            .find(|r| r.object_id == id && r.from_zone == Some(Zone::Battlefield))
+            .unwrap();
+        let mut group = vec![board.borrowed, board.land, board.ashaya];
+        group.retain(|other| *other != id);
+        group.sort();
+        let mut actual = record.co_departed.clone();
+        actual.sort();
+        assert_eq!(actual, group);
+    }
+    let resolution = order_mount_boundary(&mut board, false);
+    resolve_mount_batch(&mut board, &resolution);
+    assert_eq!(
+        board.runner.state().objects[&board.mount].zone,
+        Zone::Graveyard,
+        "retained paid creature departure sacrifices its bound Mount once"
+    );
+    assert_eq!(board.runner.state().objects[&board.victim].zone, Zone::Hand);
+    assert_eq!(board.runner.life(P0) - board.life_before[0], 11);
+    assert_eq!(board.runner.life(P1) - board.life_before[1], 13);
+    assert_eq!(
+        board.runner.life(P2) - board.life_before[2],
+        36 + if finishing { 29 } else { 0 }
+    );
+    assert_eq!(
+        board
+            .runner
+            .state()
+            .zone_changes_this_turn
+            .iter()
+            .filter(|r| r.object_id == board.mount
+                && r.from_zone == Some(Zone::Battlefield)
+                && r.to_zone == Zone::Graveyard)
+            .count(),
+        1
+    );
+    assert!(board
+        .runner
+        .state()
+        .delayed_triggers
+        .iter()
+        .any(|d| d.source_id == board.decoy));
+}
+
+#[test]
+fn counted_return_delayed_mount_survives_commander_pause_completion() {
+    for round_trip in [false, true] {
+        for command in [false, true] {
+            mount_completion(round_trip, command, false);
+        }
+    }
+}
+
+#[test]
+fn counted_return_current_delayed_fragment_is_collected_once() {
+    for round_trip in [false, true] {
+        for command in [false, true] {
+            mount_completion(round_trip, command, true);
+        }
+        // A tap paid before the pause creates an ordinary announcement
+        // carrier even though this activation needs no target selection.
+        delayed_two_land_sibling(false, false, false, round_trip, true);
+    }
+}
+
+#[test]
+fn counted_return_mixed_controller_prefix_and_current_share_apnap_batch() {
+    for round_trip in [false, true] {
+        for command in [false, true] {
+            mount_completion(round_trip, command, false);
+        }
+    }
+}
+
+fn mount_concession(round_trip: bool) {
+    let mut board = mount_cost_board(round_trip, false, Zone::Hand);
+    let result = board
+        .runner
+        .act(GameAction::Concede { player_id: P0 })
+        .expect("payer leaves");
+    assert!(board.runner.state().players[0].is_eliminated);
+    assert!(!board.runner.state().players[1].is_eliminated);
+    assert!(!board.runner.state().players[2].is_eliminated);
+    assert!(board.runner.state().pending_cost_move_resume.is_none());
+    assert!(board.runner.state().pending_replacement.is_none());
+    let all: Vec<_> = board
+        .paid_events
+        .iter()
+        .chain(result.events.iter())
+        .cloned()
+        .collect();
+    assert_eq!(
+        departures(&all, board.borrowed)
+            .iter()
+            .filter(|(to, _)| *to == Zone::Hand)
+            .count(),
+        1
+    );
+    assert_eq!(
+        departures(&all, board.ashaya)
+            .iter()
+            .filter(|(to, _)| *to == Zone::Hand)
+            .count(),
+        0
+    );
+    assert!(!result.events.iter().any(|e| matches!(
+        e,
+        GameEvent::LifeChanged {
+            player_id: P0,
+            amount: 11,
+            ..
+        }
+    )));
+    let resolution = order_mount_boundary(&mut board, true);
+    resolve_mount_batch(&mut board, &resolution);
+    assert_eq!(
+        board.runner.state().objects[&board.mount].zone,
+        Zone::Graveyard
+    );
+    assert_eq!(
+        board.runner.state().objects[&board.victim].zone,
+        Zone::Battlefield
+    );
+    assert_eq!(board.runner.life(P1) - board.life_before[1], 0);
+    assert_eq!(board.runner.life(P2) - board.life_before[2], 17);
+    assert_eq!(board.runner.life(P0), board.life_before[0]);
+    assert_eq!(
+        board
+            .runner
+            .state()
+            .zone_changes_this_turn
+            .iter()
+            .filter(|r| r.object_id == board.mount
+                && r.from_zone == Some(Zone::Battlefield)
+                && r.to_zone == Zone::Graveyard)
+            .count(),
+        1
+    );
+    assert_eq!(
+        board
+            .runner
+            .state()
+            .zone_changes_this_turn
+            .iter()
+            .filter(|r| r.object_id == board.ashaya
+                && r.from_zone == Some(Zone::Battlefield)
+                && r.to_zone == Zone::Hand)
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn counted_return_delayed_mount_survives_commander_pause_concession() {
+    for round_trip in [false, true] {
+        mount_concession(round_trip);
+    }
+}
+
+#[test]
+fn counted_return_concession_retires_matching_payer_observer_and_publishes_survivors() {
+    // O0's actual positive match is asserted by the companion completion row.
+    for round_trip in [false, true] {
+        mount_concession(round_trip);
+    }
+}
+
+/// Shared None-carrier and spell-announcement sibling. Both delayed observers
+/// are executable mechanism definitions installed by activation/resolution.
+fn delayed_two_land_sibling(
+    spell: bool,
+    abandon: bool,
+    empty_prefix: bool,
+    round_trip: bool,
+    tap: bool,
+) {
+    let mut scenario = GameScenario::new_n_player(3, 9938);
+    scenario.at_phase(Phase::PreCombatMain);
+    let lands = [
+        scenario.add_basic_land(P0, ManaColor::Blue),
+        scenario.add_basic_land(P0, ManaColor::Blue),
+    ];
+    let source = if spell {
+        scenario
+            .add_spell_to_hand_from_oracle(P0, "Ensnare", true, ENSNARE)
+            .with_mana_cost(ensnare_mana_cost())
+            .id()
+    } else {
+        scenario
+            .add_creature(P0, "Untargeted counted cost", 1, 1)
+            .with_ability_definition(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        player: TargetFilter::Controller,
+                    },
+                )
+                .cost(parse_oracle_cost(if tap {
+                    "{T}, Return two lands you control to their owner's hand"
+                } else {
+                    "Return two lands you control to their owner's hand"
+                })),
+            )
+            .id()
+    };
+    let victim = scenario
+        .add_creature(P2, "Ensnare resolution witness", 2, 2)
+        .id();
+    let prefix = recurring_observer(
+        &mut scenario,
+        P1,
+        "Retained sibling observer",
+        departure_trigger(lands[0]).destination(Zone::Hand),
+        5,
+    );
+    let current = recurring_observer(
+        &mut scenario,
+        P2,
+        "Current sibling observer",
+        departure_trigger(lands[1]),
+        7,
+    );
+    let finishing = (!spell).then(|| {
+        recurring_observer(
+            &mut scenario,
+            P2,
+            "Untargeted finishing observer",
+            TriggerDefinition::new(TriggerMode::AbilityActivated)
+                .valid_card(TargetFilter::SpecificObject { id: source }),
+            29,
+        )
+    });
+    for name in ["First redirect", "Second redirect"] {
+        scenario
+            .add_creature(P0, name, 0, 0)
+            .as_enchantment()
+            .with_replacement_definition(redirect_land_to_exile(lands[usize::from(!empty_prefix)]));
+    }
+    let mut runner = scenario.build();
+    for id in [Some(prefix), Some(current), finishing]
+        .into_iter()
+        .flatten()
+    {
+        let player = runner.state().objects[&id].controller;
+        pass_to(&mut runner, player);
+        runner.activate(id, 0).resolve();
+    }
+    assert!(runner
+        .state()
+        .delayed_triggers
+        .iter()
+        .any(|d| d.source_id == prefix && d.controller == P1));
+    assert!(runner
+        .state()
+        .delayed_triggers
+        .iter()
+        .any(|d| d.source_id == current && d.controller == P2));
+    pass_to(&mut runner, P0);
+    let life1 = runner.life(P1);
+    let life2 = runner.life(P2);
+    let life0 = runner.life(P0);
+    if spell {
+        let card_id = runner.state().objects[&source].card_id;
+        // A manual announcement is needed to stop at the actual payment pause;
+        // Ensnare has no targets to assemble outside the standard intent driver.
+        runner
+            .act(GameAction::CastSpell {
+                object_id: source,
+                card_id,
+                targets: vec![],
+                payment_mode: CastPaymentMode::Auto,
+            })
+            .expect("announce actual Ensnare");
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::OptionalCostChoice { .. }
+        ));
+        runner
+            .act(GameAction::DecideOptionalCost { pay: true })
+            .expect("select counted alternate cost");
+    } else {
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            })
+            .expect("announce no-target counted activation");
+    }
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::PayCost {
+            kind: PayCostKind::ReturnToHand,
+            count: 2,
+            min_count: 2,
+            ..
+        }
+    ));
+    let paid = runner
+        .act(GameAction::SelectCards {
+            cards: lands.to_vec(),
+        })
+        .expect("pay until actual replacement pause");
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::ReplacementChoice { .. }
+    ));
+    assert_eq!(
+        departures(&paid.events, lands[0]).len(),
+        usize::from(!empty_prefix)
+    );
+    let Some(PendingCostMoveResume::Cast {
+        pending: Some(pending),
+        deferred_cost_events,
+        ..
+    }) = &runner.state().pending_cost_move_resume
+    else {
+        panic!("actual retained Cast root");
+    };
+    assert_eq!(
+        deferred_cost_events
+            .iter()
+            .filter(|e| matches!(
+                e,
+                GameEvent::ZoneChanged {
+                    from: Some(Zone::Battlefield),
+                    ..
+                }
+            ))
+            .count(),
+        usize::from(!empty_prefix)
+    );
+    assert_eq!(pending.activation_ability_index.is_none(), spell);
+    if !spell {
+        assert!(
+            pending.activation_trigger_collection.is_some() == tap,
+            "tap announcement alone supplies the no-target carrier"
+        );
+    }
+    let unpaid = lands[usize::from(!empty_prefix)];
+    assert_eq!(runner.state().objects[&unpaid].zone, Zone::Battlefield);
+    assert!(
+        matches!(&runner.state().pending_replacement.as_ref().unwrap().proposed,
+        ProposedEvent::ZoneChange { object_id, from: Zone::Battlefield, to: Zone::Hand, .. }
+        if *object_id == unpaid)
+    );
+    runner = round_trip_paused(runner, round_trip);
+    let terminal = if abandon {
+        runner
+            .act(GameAction::Concede { player_id: P0 })
+            .expect("abandon spell cost")
+    } else {
+        runner
+            .act(GameAction::ChooseReplacement { index: 0 })
+            .expect("finish no-carrier cost")
+    };
+    if abandon {
+        assert!(runner.state().players[0].is_eliminated);
+        assert!(!runner.state().players[1].is_eliminated);
+        assert!(!runner.state().players[2].is_eliminated);
+        for (index, land) in lands.iter().enumerate() {
+            assert_eq!(
+                runner
+                    .state()
+                    .zone_changes_this_turn
+                    .iter()
+                    .filter(|r| r.object_id == *land
+                        && r.from_zone == Some(Zone::Battlefield)
+                        && r.to_zone == Zone::Hand)
+                    .count(),
+                usize::from(index == 0 && !empty_prefix)
+            );
+        }
+        assert_eq!(
+            departures(&terminal.events, unpaid)
+                .iter()
+                .filter(|(to, _)| *to == Zone::Hand)
+                .count(),
+            0
+        );
+        assert_eq!(
+            runner
+                .state()
+                .zone_changes_this_turn
+                .iter()
+                .filter(|r| r.object_id == unpaid
+                    && r.from_zone == Some(Zone::Battlefield)
+                    && r.to_zone == Zone::Hand)
+                .count(),
+            0
+        );
+    } else {
+        assert_eq!(runner.state().objects[&lands[0]].zone, Zone::Hand);
+        assert_eq!(runner.state().objects[&lands[1]].zone, Zone::Exile);
+        assert_eq!(departures(&terminal.events, lands[1]).len(), 1);
+    }
+    runner.advance_until_stack_empty();
+    assert!(runner.state().stack.is_empty());
+    assert!(runner.state().pending_cost_move_resume.is_none());
+    assert!(runner.state().pending_replacement.is_none());
+    // CR 603.2c: retained and current observations each occur once. On
+    // abandonment only the paid prefix's hand delivery can trigger.
+    assert_eq!(runner.life(P1) - life1, if empty_prefix { 0 } else { 5 });
+    if !abandon {
+        assert_eq!(runner.life(P2) - life2, 7 + if spell { 0 } else { 29 });
+        if spell {
+            assert_eq!(runner.state().objects[&source].zone, Zone::Graveyard);
+            assert!(runner.state().objects[&victim].tapped);
+        } else {
+            assert_eq!(runner.life(P0) - life0, 1);
+        }
+    } else {
+        // The surviving prefix observer watches hand delivery; leave-game
+        // cleanup cannot stand in for that paid cost occurrence.
+        assert_eq!(runner.state().objects[&victim].zone, Zone::Battlefield);
+        assert!(!runner.state().objects[&victim].tapped);
+    }
+}
+
+#[test]
+fn counted_return_delayed_noncarrier_completion() {
+    // Preservation controls, with no independent red-at-base claim.
+    for round_trip in [false, true] {
+        for spell in [false, true] {
+            delayed_two_land_sibling(spell, false, false, round_trip, false);
+        }
+    }
+}
+
+#[test]
+fn counted_return_spell_abandonment_keeps_delayed_prefix() {
+    for round_trip in [false, true] {
+        for empty_prefix in [false, true] {
+            delayed_two_land_sibling(true, true, empty_prefix, round_trip, false);
+        }
     }
 }
 

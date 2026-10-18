@@ -3924,42 +3924,48 @@ pub(crate) fn settle_sacrifice_for_cost_events(
         if !group.is_empty() {
             collection.collect(state, &group);
         }
-        // CR 603.2c: the current fragment is collected; neither the stack
-        // commit nor the next announcement staging pass collects it again.
-        super::announcement_triggers::claim_ordinary_collected_span(
-            state,
-            events,
-            current_start,
-            current_end,
-        );
-        return;
+    } else {
+        // Two occurrence bases, filtered separately and never rebased into each
+        // other: the carried fragments against the buffer-independent queued-context
+        // witness, the current fragment against this action's buffer with its
+        // absolute `current_start` offset — the basis `filter_consumed_trigger_events_from`
+        // requires, and the same one the journal below records.
+        let carried_cost_events =
+            crate::game::triggers::filter_already_collected_trigger_events_from(
+                state,
+                &deferred_cost_events,
+                0,
+                &[],
+            );
+        let current_cost_events =
+            crate::game::triggers::filter_already_collected_trigger_events_from(
+                state,
+                &events[..current_end],
+                current_start,
+                &state.consumed_before_priority_trigger_events,
+            );
+        let ordinary_events: Vec<GameEvent> = carried_cost_events
+            .into_iter()
+            .chain(current_cost_events)
+            .collect();
+        if !ordinary_events.is_empty() {
+            crate::game::triggers::collect_triggers_into_deferred(state, &ordinary_events);
+        }
     }
-
-    // Two occurrence bases, filtered separately and never rebased into each
-    // other: the carried fragments against the buffer-independent queued-context
-    // witness, the current fragment against this action's buffer with its
-    // absolute `current_start` offset — the basis `filter_consumed_trigger_events_from`
-    // requires, and the same one the journal below records.
-    let carried_cost_events = crate::game::triggers::filter_already_collected_trigger_events_from(
-        state,
-        &deferred_cost_events,
-        0,
-        &[],
-    );
-    let current_cost_events = crate::game::triggers::filter_already_collected_trigger_events_from(
-        state,
+    // CR 603.2c + CR 603.7: an ordinary collector's queued witness is not
+    // delayed discovery. Retained events keep their own custody; only the
+    // current fragment uses this action's occurrence journal and absolute base.
+    let delayed_current = crate::game::triggers::filter_consumed_trigger_events_from(
         &events[..current_end],
         current_start,
+        crate::game::triggers::TriggerCollectionRequester::Delayed,
         &state.consumed_before_priority_trigger_events,
     );
-    let deferred_cost_events: Vec<GameEvent> = carried_cost_events
+    let delayed_events: Vec<GameEvent> = deferred_cost_events
         .into_iter()
-        .chain(current_cost_events)
+        .chain(delayed_current)
         .collect();
-    if !deferred_cost_events.is_empty() {
-        crate::game::triggers::collect_triggers_into_deferred(state, &deferred_cost_events);
-        crate::game::triggers::collect_delayed_triggers_into_deferred(state, &deferred_cost_events);
-    }
+    crate::game::triggers::collect_delayed_trigger_contexts_into_deferred(state, &delayed_events);
     // The journal claims the whole current fragment, not just what survived the
     // filter: an occurrence the filter dropped is one an earlier collector
     // already took, so the Priority pipeline must not reach it either.
@@ -7409,7 +7415,13 @@ pub(super) fn push_ability_entry(
         // Collect delayed triggers before that claim too; otherwise a one-shot
         // delayed trigger such as Earthbend's dies-or-exiled return is hidden
         // from the later priority scan and never reaches the stack.
-        super::triggers::collect_delayed_triggers_into_deferred(state, events);
+        let delayed_events = super::triggers::filter_consumed_trigger_events_from(
+            events,
+            0,
+            super::triggers::TriggerCollectionRequester::Delayed,
+            &state.consumed_before_priority_trigger_events,
+        );
+        super::triggers::collect_delayed_trigger_contexts_into_deferred(state, &delayed_events);
         state
             .consumed_before_priority_trigger_events
             .extend(events.iter().enumerate().map(|(index, event)| {

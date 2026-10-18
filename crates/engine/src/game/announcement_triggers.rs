@@ -369,9 +369,13 @@ pub(crate) fn publish_abandoned_announcement(state: &mut GameState, owner: Pendi
     // staging (they wait for the group to finish), and abandoning the unpaid
     // current move retires that root, so they are drained and collected here,
     // once, before it goes.
-    let completed_prefix = take_completed_cast_prefix(state, owner);
-    let completed_prefix =
-        triggers::filter_already_collected_trigger_events_from(state, &completed_prefix, 0, &[]);
+    let raw_completed_prefix = take_completed_cast_prefix(state, owner);
+    let completed_prefix = triggers::filter_already_collected_trigger_events_from(
+        state,
+        &raw_completed_prefix,
+        0,
+        &[],
+    );
     let Some(pending) = state.pending_cast_at_mut(owner) else {
         return;
     };
@@ -389,6 +393,10 @@ pub(crate) fn publish_abandoned_announcement(state: &mut GameState, owner: Pendi
             collection = Some(Box::new(PendingActivationTriggerCollection::for_spell()));
         }
     }
+    // CR 603.2 + CR 603.7 + CR 800.4d: completed events also belong to
+    // surviving delayed observers, independently of the ordinary projection
+    // or carrier. The old prefix has no occurrence ordinal in this action.
+    triggers::collect_delayed_trigger_contexts_into_deferred(state, &raw_completed_prefix);
     let Some(mut collection) = collection else {
         return;
     };
@@ -411,6 +419,19 @@ fn take_completed_cast_prefix(state: &mut GameState, owner: PendingCastOwner) ->
             deferred_cost_events,
             ..
         }) => std::mem::take(deferred_cost_events),
-        _ => Vec::new(),
+        Some(
+            PendingCostMoveResume::SacrificeForCost { .. }
+            | PendingCostMoveResume::WardSacrificePayment { .. }
+            | PendingCostMoveResume::ReplacementMayCost { .. }
+            | PendingCostMoveResume::Foretell { .. }
+            | PendingCostMoveResume::CollectEvidencePayment { .. }
+            | PendingCostMoveResume::UnlessBouncePayment { .. }
+            | PendingCostMoveResume::ManaAbilityPayment { .. }
+            | PendingCostMoveResume::ActivationMillPayment { .. }
+            | PendingCostMoveResume::LoyaltyActivation { .. }
+            | PendingCostMoveResume::CounterAdditionUnlessPayment { .. }
+            | PendingCostMoveResume::RandomDiscardUnlessPayment(_),
+        )
+        | None => Vec::new(),
     }
 }
