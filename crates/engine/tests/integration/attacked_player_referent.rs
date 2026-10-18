@@ -60,8 +60,15 @@ fn scenario() -> GameScenario {
 
 /// A planeswalker owned by P2.
 fn add_karn(sc: &mut GameScenario, loyalty: u32) -> ObjectId {
-    sc.add_planeswalker_from_oracle(P2, "Karn Stand-in", "Karn", loyalty, "+1: You gain 1 life.")
-        .id()
+    let id = sc
+        .add_planeswalker_from_oracle(P2, "Karn Stand-in", "Karn", loyalty, "+1: You gain 1 life.")
+        .as_planeswalker_with_loyalty("Karn", loyalty)
+        .id();
+    let object = &sc.state.objects[&id];
+    assert_eq!(object.base_loyalty, Some(loyalty));
+    assert_eq!(object.loyalty, Some(loyalty));
+    assert_eq!(object.counters[&CounterType::Loyalty], loyalty);
+    id
 }
 
 /// Owner P2, controller P1: the controller (the defending player CR 508.5 collapses to) differs
@@ -772,9 +779,13 @@ fn damage_authority_board(observer: bool, thrasta: bool, loyalty: u32) -> Author
         .id();
     let blocker = sc.add_creature(P1, "Blocking creature", 1, 4).id();
     let unrelated = sc.add_creature(P0, "Unrelated attacker", 1, 1).id();
-    let rancor = sc.add_enchantment_from_oracle(P0, "Rancor", RANCOR).id();
+    let rancor = sc
+        .add_spell_to_hand(P0, "Rancor", false)
+        .as_enchantment()
+        .with_subtypes(vec!["Aura"])
+        .from_oracle_text(RANCOR)
+        .id();
     let mut r = sc.build();
-    zones::move_to_zone(r.state_mut(), rancor, Zone::Hand, &mut Vec::new());
     control_by_p1(&mut r, walker);
     AuthorityBoard {
         r,
@@ -991,6 +1002,12 @@ fn printed_recipient_mutations_respect_live_and_departure_timing() {
                 assert_eq!(object.zone, Zone::Battlefield);
                 assert_eq!(object.incarnation != pin.incarnation, blink);
                 assert_eq!(object.controller, if blink { P2 } else { P0 });
+                if blink {
+                    // CR 306.5b + CR 306.5c: the returned incarnation has fresh printed loyalty.
+                    assert_eq!(object.base_loyalty, Some(5));
+                    assert_eq!(object.loyalty, Some(5));
+                    assert_eq!(object.counters[&CounterType::Loyalty], 5);
+                }
                 assert!(!b
                     .r
                     .state()
@@ -1059,7 +1076,16 @@ fn recipient_retirement_ends_every_incoming_attack_but_keeps_a_player_attack() {
                 .len(),
             2
         );
+        let pin = b.r.state().combat.as_ref().unwrap().attacked_permanents[&b.attacker];
         resolve_response(&mut b.r, if blink { b.flicker } else { b.word }, b.walker);
+        let object = &b.r.state().objects[&b.walker];
+        assert_eq!(object.zone, Zone::Battlefield);
+        assert_eq!(object.incarnation != pin.incarnation, blink);
+        if blink {
+            assert_eq!(object.base_loyalty, Some(5));
+            assert_eq!(object.loyalty, Some(5));
+            assert_eq!(object.counters[&CounterType::Loyalty], 5);
+        }
         assert!(b
             .r
             .state()
@@ -1185,13 +1211,21 @@ fn departed_player_is_no_recipient_and_cannot_supply_lifelink() {
             .from_oracle_text_with_keywords(&["Haste"], FULL_HELLRIDER)
             .id();
         let aura = sc
-            .add_enchantment_from_oracle(P0, "Lifelink", LIFELINK)
+            .add_spell_to_hand(P0, "Lifelink", false)
+            .as_enchantment()
+            .with_subtypes(vec!["Aura"])
+            .from_oracle_text(LIFELINK)
             .id();
         sc.add_enchantment_from_oracle(P1, "Leyline of Sanctity",
             "If this card is in your opening hand, you may begin the game with it on the battlefield.\nYou have hexproof. (You can't be the target of spells or abilities your opponents control.)");
         let mut r = sc.build();
-        zones::move_to_zone(r.state_mut(), aura, Zone::Hand, &mut Vec::new());
-        r.cast(aura).target_object(rider).resolve();
+        let outcome = r.cast(aura).target_object(rider).resolve();
+        outcome.assert_zone(&[aura], Zone::Battlefield);
+        assert_eq!(
+            outcome.state().objects[&aura].attached_to,
+            Some(AttachTarget::Object(rider))
+        );
+        assert!(outcome.state().objects[&rider].attachments.contains(&aura));
         assert!(r.state().objects[&rider].has_keyword(&engine::types::keywords::Keyword::Lifelink));
         assert!(engine::game::static_abilities::player_has_hexproof(
             r.state(),
@@ -1240,12 +1274,22 @@ fn hellrider_observers_offer_both_orders_when_the_first_removes_the_recipient() 
         let goblin = sc.add_creature(P0, "Goblin", 1, 1).id();
         let walker = add_karn(&mut sc, 1);
         let aura = sc
-            .add_enchantment_from_oracle(P0, "Lifelink", LIFELINK)
+            .add_spell_to_hand(P0, "Lifelink", false)
+            .as_enchantment()
+            .with_subtypes(vec!["Aura"])
+            .from_oracle_text(LIFELINK)
             .id();
         let mut r = sc.build();
         control_by_p1(&mut r, walker);
-        zones::move_to_zone(r.state_mut(), aura, Zone::Hand, &mut Vec::new());
-        r.cast(aura).target_object(riders[0]).resolve();
+        let outcome = r.cast(aura).target_object(riders[0]).resolve();
+        outcome.assert_zone(&[aura], Zone::Battlefield);
+        assert_eq!(
+            outcome.state().objects[&aura].attached_to,
+            Some(AttachTarget::Object(riders[0]))
+        );
+        assert!(outcome.state().objects[&riders[0]]
+            .attachments
+            .contains(&aura));
         assert!(
             r.state().objects[&riders[0]].has_keyword(&engine::types::keywords::Keyword::Lifelink)
         );
@@ -1354,7 +1398,15 @@ fn interactive_excess_and_candidates_use_the_current_exact_recipient() {
             for all_blocker in [false, true] {
                 let mut b = damage_authority_board(false, over_pw, if over_pw { 1 } else { 10 });
                 if !over_pw {
-                    b.r.cast(b.rancor).target_object(b.attacker).resolve();
+                    let outcome = b.r.cast(b.rancor).target_object(b.attacker).resolve();
+                    outcome.assert_zone(&[b.rancor], Zone::Battlefield);
+                    assert_eq!(
+                        outcome.state().objects[&b.rancor].attached_to,
+                        Some(AttachTarget::Object(b.attacker))
+                    );
+                    assert!(outcome.state().objects[&b.attacker]
+                        .attachments
+                        .contains(&b.rancor));
                     assert_eq!(b.r.state().objects[&b.attacker].power, Some(6));
                     assert!(b.r.state().objects[&b.attacker]
                         .has_keyword(&engine::types::keywords::Keyword::Trample));

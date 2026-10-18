@@ -3675,8 +3675,15 @@ mod exact_attack_authority_restore_tests {
             .collect();
         let walker = sc
             .add_planeswalker_from_oracle(P1, "Test Walker", "Test", 5, "+1: You gain 1 life.")
+            .as_planeswalker_with_loyalty("Test", 5)
             .id();
         let mut r = sc.build();
+        assert_eq!(r.state().objects[&walker].base_loyalty, Some(5));
+        assert_eq!(r.state().objects[&walker].loyalty, Some(5));
+        assert_eq!(
+            r.state().objects[&walker].counters[&CounterType::Loyalty],
+            5
+        );
         r.advance_to_combat();
         r.declare_attackers(&[(sphere, AttackTarget::Planeswalker(walker))])
             .unwrap();
@@ -3688,6 +3695,12 @@ mod exact_attack_authority_restore_tests {
             zones::move_to_zone(r.state_mut(), walker, Zone::Exile, &mut Vec::new());
             zones::move_to_zone(r.state_mut(), walker, Zone::Battlefield, &mut Vec::new());
             assert_ne!(r.state().objects[&walker].incarnation, pin.incarnation);
+            assert_eq!(r.state().objects[&walker].base_loyalty, Some(5));
+            assert_eq!(r.state().objects[&walker].loyalty, Some(5));
+            assert_eq!(
+                r.state().objects[&walker].counters[&CounterType::Loyalty],
+                5
+            );
             assert!(r
                 .state()
                 .combat
@@ -3902,6 +3915,13 @@ mod exact_attack_authority_restore_tests {
                 if timing == 1 {
                     zones::move_to_zone(&mut state, walker, Zone::Exile, &mut Vec::new());
                     zones::move_to_zone(&mut state, walker, Zone::Battlefield, &mut Vec::new());
+                    assert_ne!(
+                        state.objects[&walker].incarnation,
+                        departure.attack_target_identity.unwrap().incarnation
+                    );
+                    assert_eq!(state.objects[&walker].base_loyalty, Some(5));
+                    assert_eq!(state.objects[&walker].loyalty, Some(5));
+                    assert_eq!(state.objects[&walker].counters[&CounterType::Loyalty], 5);
                 } else if timing == 3 {
                     let object = state.objects.get_mut(&walker).unwrap();
                     object.controller = P0;

@@ -1684,6 +1684,7 @@ fn mishra_production_meld_entry_attack_destination_matrix() {
     use crate::parser::oracle::parse_oracle_text;
     use crate::types::ability::{ChosenAttribute, EntryAttackDestination, PermanentEntryMode};
     use crate::types::actions::GameAction;
+    use crate::types::counter::CounterType;
 
     const MISHRA: &str = "Whenever you attack, each opponent loses X life and you gain X life, \
         where X is the number of attacking creatures. If Mishra, Claimed by Gix and a creature \
@@ -1732,25 +1733,25 @@ fn mishra_production_meld_entry_attack_destination_matrix() {
         let mut sc = GameScenario::new();
         let mishra = sc.add_creature(P0, "Mishra, Claimed by Gix", 3, 5).id();
         let engine = sc.add_creature(P0, "Phyrexian Dragon Engine", 2, 2).id();
-        let planeswalker = sc.add_creature(P1, "Defending Planeswalker", 1, 1).id();
+        let planeswalker = sc
+            .add_creature(P1, "Defending Planeswalker", 1, 1)
+            .as_planeswalker_with_loyalty("Test", 5)
+            .id();
         let battle = sc.add_creature(P0, "Protected Battle", 1, 1).id();
 
-        {
-            let object = sc.state.objects.get_mut(&planeswalker).unwrap();
-            object.card_types.core_types.clear();
-            object.card_types.core_types.push(CoreType::Planeswalker);
-            object.base_card_types.core_types.clear();
-            object
-                .base_card_types
-                .core_types
-                .push(CoreType::Planeswalker);
-        }
         {
             let object = sc.state.objects.get_mut(&battle).unwrap();
             object.card_types.core_types.clear();
             object.card_types.core_types.push(CoreType::Battle);
             object.base_card_types.core_types.clear();
             object.base_card_types.core_types.push(CoreType::Battle);
+            object.power = None;
+            object.toughness = None;
+            object.base_power = None;
+            object.base_toughness = None;
+            object.defense = Some(5);
+            object.base_defense = Some(5);
+            object.counters.insert(CounterType::Defense, 5);
         }
         sc.state
             .objects
@@ -1807,6 +1808,11 @@ fn mishra_production_meld_entry_attack_destination_matrix() {
             AttackTarget::Battle(_) => AttackTarget::Battle(battle),
             player => player,
         };
+        let expected_pin = crate::game::combat::bind_attack_target(runner.state(), destination);
+        assert_eq!(
+            expected_pin.is_some(),
+            !matches!(destination, AttackTarget::Player(_))
+        );
         let result = runner
             .act(GameAction::ChooseEntryAttackTarget {
                 target: destination,
@@ -1851,7 +1857,29 @@ fn mishra_production_meld_entry_attack_destination_matrix() {
             Some(destination),
             "the entry snapshot latches the chosen destination kind"
         );
-        let expected_pin = crate::game::combat::bind_attack_target(runner.state(), destination);
+        if let Some(pin) = expected_pin {
+            let object = &runner.state().objects[&pin.object_id];
+            assert_eq!(object.zone, Zone::Battlefield);
+            assert_eq!(object.incarnation, pin.incarnation);
+            assert!(!object.is_phased_out());
+            match destination {
+                AttackTarget::Planeswalker(_) => {
+                    assert_eq!(object.base_loyalty, Some(5));
+                    assert_eq!(object.loyalty, Some(5));
+                    assert_eq!(object.counters[&CounterType::Loyalty], 5);
+                }
+                AttackTarget::Battle(_) => {
+                    assert_eq!(object.base_defense, Some(5));
+                    assert_eq!(object.defense, Some(5));
+                    assert_eq!(object.counters[&CounterType::Defense], 5);
+                }
+                AttackTarget::Player(_) => unreachable!("players have no permanent pin"),
+            }
+            assert_eq!(
+                crate::game::combat::bind_attack_target(runner.state(), destination),
+                Some(pin)
+            );
+        }
         assert_eq!(
             entry_record.combat_status.attack_target_identity,
             expected_pin
