@@ -12138,6 +12138,7 @@ fn drive_repeat_for_outermost(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
     depth: u32,
+    mut payment_choice: Option<AutoMayChoice>,
 ) -> Result<(), EffectError> {
     let hydrated = hydrate_event_context_targets(state, ability);
     let effective = hydrated.as_ref();
@@ -12155,7 +12156,7 @@ fn drive_repeat_for_outermost(
         iter_ability.repeat_for = None;
         let stack_depth_before_iteration = state.resolution_stack.capture_child_boundary();
         with_iteration_return_result_occurrence(state, &iter_ability, |state| {
-            resolve_chain_body(state, &iter_ability, events, depth)
+            resolve_chain_body(state, &iter_ability, events, depth, payment_choice.take())
         })?;
         if state.waiting_for != initial_waiting_for
             || (!initial_continuation_present && state.active_ability_continuation().is_some())
@@ -14902,6 +14903,33 @@ pub fn resolve_ability_chain(
     events: &mut Vec<GameEvent>,
     depth: u32,
 ) -> Result<(), EffectError> {
+    resolve_ability_chain_with_payment_choice(state, ability, events, depth, None)
+}
+
+/// CR 118.12a + CR 608.2c: the unpaid root still reads its predecessor's
+/// context at admission. Its known payment choice owns only its outgoing result.
+pub(crate) fn resolve_unpaid_unless_ability_chain(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+    depth: u32,
+) -> Result<(), EffectError> {
+    resolve_ability_chain_with_payment_choice(
+        state,
+        ability,
+        events,
+        depth,
+        Some(AutoMayChoice::Decline),
+    )
+}
+
+fn resolve_ability_chain_with_payment_choice(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+    depth: u32,
+    mut payment_choice: Option<AutoMayChoice>,
+) -> Result<(), EffectError> {
     // CR 608.2c: A forwarded result belongs to one resolution chain. A root
     // ability can be resumed from serialized state, so discard any stale value
     // before it begins a new resolution; nested producers replace the context
@@ -15007,12 +15035,12 @@ pub fn resolve_ability_chain(
             "repeat_for (count) and repeat_until (predicate) are mutually exclusive"
         );
         match ability.repeat_until.clone() {
-            None => resolve_chain_body(state, ability, events, depth),
+            None => resolve_chain_body(state, ability, events, depth, payment_choice),
             Some(RepeatContinuation::ControllerChoice) => {
                 let initial_waiting_for = state.waiting_for.clone();
                 let stack_depth_before_iteration = state.resolution_stack.capture_child_boundary();
                 with_iteration_return_result_occurrence(state, ability, |state| {
-                    resolve_chain_body(state, ability, events, depth)
+                    resolve_chain_body(state, ability, events, depth, payment_choice.take())
                 })?;
                 if state.waiting_for != initial_waiting_for {
                     // Inner pause: stash so the drain re-sets the repeat prompt
@@ -15052,7 +15080,7 @@ pub fn resolve_ability_chain(
                 let initial_waiting_for = state.waiting_for.clone();
                 let stack_depth_before_iteration = state.resolution_stack.capture_child_boundary();
                 with_iteration_return_result_occurrence(state, ability, |state| {
-                    resolve_chain_body(state, ability, events, depth)
+                    resolve_chain_body(state, ability, events, depth, payment_choice.take())
                 })?;
                 if state.waiting_for != initial_waiting_for {
                     park_repeat_until_after_inner_pause(
@@ -15114,7 +15142,7 @@ pub fn resolve_ability_chain(
                     let stack_depth_before_iteration =
                         state.resolution_stack.capture_child_boundary();
                     with_iteration_return_result_occurrence(state, ability, |state| {
-                        resolve_chain_body(state, ability, events, depth)
+                        resolve_chain_body(state, ability, events, depth, payment_choice.take())
                     })?;
                     if state.waiting_for != initial_waiting_for {
                         // Inner pause: stash the loop ability with its remaining cap
@@ -15497,6 +15525,7 @@ fn resolve_chain_body(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
     depth: u32,
+    payment_choice: Option<AutoMayChoice>,
 ) -> Result<(), EffectError> {
     // CR 115.10a + CR 301.5f + CR 303.4b: an untargeted "enchanted/equipped X"
     // recipient is bound to the source's host as this instruction begins to
@@ -15851,7 +15880,7 @@ fn resolve_chain_body(
     if repeat_for_outermost_with_scope_or_unless(ability)
         && !has_member_driven_repeat_after_hydration(state, ability)
     {
-        return drive_repeat_for_outermost(state, ability, events, depth);
+        return drive_repeat_for_outermost(state, ability, events, depth, payment_choice);
     }
 
     // CR 608.2: player_scope iteration — when an ability has player_scope set,
@@ -16287,7 +16316,13 @@ fn resolve_chain_body(
                         1 => {
                             let mut bound = ability.clone();
                             bound.set_unpinned_targets(legal);
-                            return resolve_ability_chain(state, &bound, events, depth);
+                            return resolve_ability_chain_with_payment_choice(
+                                state,
+                                &bound,
+                                events,
+                                depth,
+                                payment_choice,
+                            );
                         }
                         _ => {
                             // CR 608.2d: the chosen player picks one object.
@@ -16979,7 +17014,13 @@ fn resolve_chain_body(
                         } else {
                             bound.set_unpinned_targets(vec![TargetRef::Object(legal[0])]);
                         }
-                        return resolve_ability_chain(state, &bound, events, depth);
+                        return resolve_ability_chain_with_payment_choice(
+                            state,
+                            &bound,
+                            events,
+                            depth,
+                            payment_choice,
+                        );
                     }
                     _ => {
                         let mut cont = ability.clone();
@@ -17683,15 +17724,24 @@ fn resolve_chain_body(
     //     `apply_parent_chain_context`, which re-clones the parent's whole
     //     context onto each child at every hand-off.
     let performed_outcome_owned;
-    let ability =
-        if let Some(performed) = resolver_performed_outcome(ability, &events[events_before..]) {
-            let mut owned = ability.clone();
-            owned.set_optional_effect_performed_recursive(performed);
-            performed_outcome_owned = owned;
-            &performed_outcome_owned
+    let ability = if let Some(performed) = payment_choice
+        .map(|choice| choice == AutoMayChoice::Accept)
+        .or_else(|| resolver_performed_outcome(ability, &events[events_before..]))
+    {
+        let mut owned = ability.clone();
+        if payment_choice.is_some() {
+            // CR 118.12 + CR 118.12a: Counter delivery is not payment, and
+            // declining payment cannot undo Flash's preceding optional put.
+            // Publish only after this root's incoming gate and effect.
+            owned.context.optional_effect_performed = performed;
         } else {
-            ability
-        };
+            owned.set_optional_effect_performed_recursive(performed);
+        }
+        performed_outcome_owned = owned;
+        &performed_outcome_owned
+    } else {
+        ability
+    };
 
     // CR 608.2c: Record the objects affected by this effect as a tracked set so
     // downstream sub-abilities can resolve "this way" references (pronouns,
@@ -17868,7 +17918,8 @@ fn resolve_chain_body(
     // `!cost_payment_failed_flag` (not this flag), and that guard already requires
     // `!cost_payment_failed_flag` — the same condition gating this seed.
     let mandatory_rider_owned;
-    let ability = if !ability.optional
+    let ability = if payment_choice.is_none()
+        && !ability.optional
         && !ability.context.optional_effect_performed
         && !compound_run_unperformed(ability)
         && !state.cost_payment_failed_flag

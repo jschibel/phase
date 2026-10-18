@@ -36,6 +36,10 @@ use engine::types::zones::Zone;
 const OVERRIDE: &str =
     "Counter target spell unless its controller pays {1} for each artifact you control.";
 const CLASH_OF_WILLS: &str = "Counter target spell unless its controller pays {X}.";
+const POWER_SINK: &str = "Counter target spell unless its controller pays {X}. If that player doesn't, they tap all lands with mana abilities they control and lose all unspent mana.";
+const CONDESCEND: &str = "Counter target spell unless its controller pays {X}. Scry 2. (Look at the top two cards of your library, then put any number of them on the bottom and the rest on top in any order.)";
+const DONT_MAKE_A_SOUND: &str = "Counter target spell unless its controller pays {2}. If they do, surveil 2. (Look at the top two cards of your library, then put any number of them into your graveyard and the rest on top of your library in any order.)";
+const FLASH: &str = "You may put a creature card from your hand onto the battlefield. If you do, sacrifice it unless you pay its mana cost reduced by {2}.";
 
 struct Board {
     runner: GameRunner,
@@ -472,5 +476,552 @@ fn ward_zero_asks_the_targeting_player() {
             );
             assert_eq!(zone(&runner, murder), Zone::Graveyard);
         }
+    }
+}
+
+struct PrintedCounter {
+    runner: GameRunner,
+    bear: ObjectId,
+    spare: ObjectId,
+    payment_lands: Vec<ObjectId>,
+    looked: Vec<ObjectId>,
+}
+
+/// Real response-cast pipeline. The payer's casting, payment and rider-witness
+/// lands are distinct; the responder has exactly the casting resources needed.
+fn printed_counter_prompt(name: &str, oracle: &str, x: Option<u32>) -> PrintedCounter {
+    printed_counter_prompt_with_redirects(name, oracle, x, false)
+}
+
+fn printed_counter_prompt_with_redirects(
+    name: &str,
+    oracle: &str,
+    x: Option<u32>,
+    redirects: bool,
+) -> PrintedCounter {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bear = scenario
+        .add_creature_to_hand(P0, "Grizzly Bears", 2, 2)
+        .with_subtypes(vec!["Bear"])
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Green],
+            generic: 1,
+        })
+        .id();
+    let casting_lands = [
+        scenario.add_basic_land(P0, ManaColor::Green),
+        scenario.add_basic_land(P0, ManaColor::Green),
+    ];
+    let payment_lands = (0..2)
+        .map(|_| scenario.add_basic_land(P0, ManaColor::Green))
+        .collect::<Vec<_>>();
+    let spare = scenario.add_basic_land(P0, ManaColor::Green);
+    if redirects {
+        use engine::types::ability::{AbilityDefinition, AbilityKind, ReplacementDefinition};
+        use engine::types::replacements::ReplacementEvent;
+        for destination in [Zone::Exile, Zone::Hand] {
+            let redirect = ReplacementDefinition::new(ReplacementEvent::Moved)
+                .destination_zone(Zone::Graveyard)
+                .valid_card(TargetFilter::SpecificObject { id: bear })
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::ChangeZone {
+                        origin: None,
+                        destination,
+                        target: TargetFilter::SelfRef,
+                        owner_library: false,
+                        enter_transformed: false,
+                        enters_under: None,
+                        enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+                        enters_attacking: false,
+                        up_to: false,
+                        enter_with_counters: vec![],
+                        conditional_enter_with_counters: vec![],
+                        enters_modified_if: None,
+                        face_down_profile: None,
+                    },
+                ));
+            scenario
+                .add_creature(P1, &format!("Counter destination {destination:?}"), 1, 1)
+                .with_replacement_definition(redirect);
+        }
+    }
+    let cost = ManaCost::Cost {
+        shards: if x.is_some() {
+            vec![ManaCostShard::X, ManaCostShard::Blue]
+        } else {
+            vec![ManaCostShard::Blue]
+        },
+        generic: if x.is_some() { 0 } else { 1 },
+    };
+    let counter = scenario
+        .add_spell_to_hand_from_oracle(P1, name, true, oracle)
+        .with_mana_cost(cost)
+        .id();
+    let caster_lands = (0..(x.unwrap_or(1) + 1))
+        .map(|_| scenario.add_basic_land(P1, ManaColor::Blue))
+        .collect::<Vec<_>>();
+    let second = scenario.add_card_to_library_top(P1, "Second known card");
+    let first = scenario.add_card_to_library_top(P1, "First known card");
+    let mut runner = scenario.build();
+    let mut bear_cast = runner.cast(bear).commit();
+    assert!(matches!(
+        bear_cast.state().stack.back().unwrap().kind,
+        StackEntryKind::Spell {
+            actual_mana_spent: 2,
+            ..
+        }
+    ));
+    assert!(casting_lands
+        .iter()
+        .all(|land| bear_cast.state().objects[land].tapped));
+    bear_cast
+        .act(GameAction::PassPriority)
+        .expect("Bears caster passes to responder");
+    let response = bear_cast.cast(counter).target_object(bear);
+    let response = match x {
+        Some(x) => response.x(x),
+        None => response,
+    };
+    let committed = response.commit();
+    let entry = committed.state().stack.back().expect("response on stack");
+    match &entry.kind {
+        StackEntryKind::Spell {
+            ability: Some(ability),
+            actual_mana_spent,
+            ..
+        } => {
+            assert_eq!(*actual_mana_spent, x.unwrap_or(1) + 1);
+            if let Some(x) = x {
+                assert_eq!(ability.chosen_x, Some(x));
+            }
+        }
+        other => panic!("real parsed response must be paid and committed: {other:?}"),
+    }
+    let outcome = committed.resolve();
+    outcome.assert_zone(&[bear], Zone::Stack);
+    assert!(matches!(
+        outcome.final_waiting_for(),
+        WaitingFor::UnlessPayment { player: P0, .. }
+    ));
+    assert!(caster_lands
+        .iter()
+        .all(|land| outcome.state().objects[land].tapped));
+    assert!(outcome.state().players[1].mana_pool.is_empty());
+    assert!(payment_lands
+        .iter()
+        .all(|land| !outcome.state().objects[land].tapped));
+    assert!(!outcome.state().objects[&spare].tapped);
+    assert!(
+        !outcome.state().objects[&spare].abilities.is_empty(),
+        "spare Forest has a working mana ability"
+    );
+    drop(bear_cast);
+    PrintedCounter {
+        runner,
+        bear,
+        spare,
+        payment_lands,
+        looked: vec![first, second],
+    }
+}
+
+#[test]
+fn power_sink_acknowledged_and_declined_zero_and_nonzero() {
+    for x in [0, 1] {
+        for pay in [false, true] {
+            let mut board = printed_counter_prompt("Power Sink", POWER_SINK, Some(x));
+            assert_eq!(
+                unless_cost(&board.runner),
+                Some((
+                    P0,
+                    AbilityCost::Mana {
+                        cost: ManaCost::generic(x)
+                    }
+                ))
+            );
+            if pay && x == 1 {
+                let (_, _, grouped) = engine::ai_support::legal_actions_full(board.runner.state());
+                let selection = grouped
+                    .get(&board.payment_lands[0])
+                    .into_iter()
+                    .flatten()
+                    .find_map(|action| {
+                        if let GameAction::TapLandForMana { selection } = action {
+                            Some(selection.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .expect("engine-authored payment-land capability");
+                board
+                    .runner
+                    .act(GameAction::TapLandForMana { selection })
+                    .expect("payer activates the named payment Forest");
+                assert!(board.runner.state().objects[&board.payment_lands[0]].tapped);
+                assert!(!board.runner.state().objects[&board.spare].tapped);
+            }
+            let answer = board
+                .runner
+                .act(GameAction::PayUnlessCost { pay })
+                .expect("answer the actual X payment");
+            if pay {
+                assert_eq!(zone(&board.runner, board.bear), Zone::Stack);
+                assert!(
+                    !board.runner.state().objects[&board.spare].tapped,
+                    "paid X={x} suppresses the unpaid rider"
+                );
+                if x == 0 {
+                    assert!(board
+                        .payment_lands
+                        .iter()
+                        .all(|land| !board.runner.state().objects[land].tapped));
+                }
+                assert!(board.runner.state().players[0].mana_pool.is_empty());
+                board.runner.resolve_top();
+                assert_eq!(zone(&board.runner, board.bear), Zone::Battlefield);
+            } else {
+                assert_eq!(zone(&board.runner, board.bear), Zone::Graveyard);
+                assert!(
+                    board.runner.state().objects[&board.spare].tapped,
+                    "unpaid X={x} must deliver its tap rider even after Counter happened"
+                );
+                assert_eq!(answer.events.iter().filter(|event| matches!(event, engine::types::events::GameEvent::SpellCountered { object_id, .. } if *object_id == board.bear)).count(), 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn power_sink_unpaid_outcome_survives_counter_destination_replacement_pause() {
+    use engine::types::events::GameEvent;
+    for pay in [false, true] {
+        let mut board =
+            printed_counter_prompt_with_redirects("Power Sink", POWER_SINK, Some(0), true);
+        assert_eq!(unless_cost(&board.runner), Some((P0, zero_cost())));
+        let answer = board
+            .runner
+            .act(GameAction::PayUnlessCost { pay })
+            .expect("real zero payment with counter destination replacements");
+        if pay {
+            assert_eq!(zone(&board.runner, board.bear), Zone::Stack);
+            assert!(!board.runner.state().objects[&board.spare].tapped);
+            assert!(matches!(
+                board.runner.state().waiting_for,
+                WaitingFor::Priority { .. }
+            ));
+            assert!(!answer.events.iter().any(|event| matches!(event, GameEvent::SpellCountered { object_id, .. } if *object_id == board.bear)));
+            board.runner.resolve_top();
+            assert_eq!(zone(&board.runner, board.bear), Zone::Battlefield);
+            continue;
+        }
+        match &board.runner.state().waiting_for {
+            WaitingFor::ReplacementChoice { candidates, .. } => assert_eq!(candidates.len(), 2),
+            other => {
+                panic!("competing counter-destination replacements must really pause: {other:?}")
+            }
+        }
+        assert!(answer.events.iter().any(|event| matches!(event, GameEvent::SpellCountered { object_id, .. } if *object_id == board.bear)));
+        assert!(!board
+            .runner
+            .state()
+            .stack
+            .iter()
+            .any(|entry| entry.id == board.bear));
+        assert!(
+            !board.runner.state().objects[&board.spare].tapped,
+            "rider waits for the counter's destination move"
+        );
+        let resumed = board
+            .runner
+            .act(GameAction::ChooseReplacement { index: 0 })
+            .expect("choose actual destination replacement");
+        assert!(matches!(
+            zone(&board.runner, board.bear),
+            Zone::Exile | Zone::Hand
+        ));
+        assert!(board.runner.state().objects[&board.spare].tapped);
+        assert_eq!(answer.events.iter().chain(resumed.events.iter()).filter(|event| matches!(event, GameEvent::PermanentTapped { object_id, .. } if *object_id == board.spare)).count(), 1);
+        assert!(matches!(
+            board.runner.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+    }
+}
+
+#[test]
+fn paid_outcome_preserves_affirmative_and_independent_printed_riders() {
+    for pay in [false, true] {
+        let mut board = printed_counter_prompt("Don't Make a Sound", DONT_MAKE_A_SOUND, None);
+        assert_eq!(
+            unless_cost(&board.runner),
+            Some((
+                P0,
+                AbilityCost::Mana {
+                    cost: ManaCost::generic(2)
+                }
+            ))
+        );
+        board
+            .runner
+            .act(GameAction::PayUnlessCost { pay })
+            .expect("sound payment");
+        if pay {
+            assert_eq!(zone(&board.runner, board.bear), Zone::Stack);
+            match &board.runner.state().waiting_for {
+                WaitingFor::SurveilChoice { player, cards, .. } => {
+                    assert_eq!(*player, P1);
+                    assert_eq!(*cards, board.looked);
+                }
+                other => panic!("paid caster surveils exactly the known two cards: {other:?}"),
+            }
+            board
+                .runner
+                .act(GameAction::SelectCards {
+                    cards: board.looked.clone(),
+                })
+                .expect("keep surveilled cards");
+        } else {
+            assert_eq!(zone(&board.runner, board.bear), Zone::Graveyard);
+            assert!(matches!(
+                board.runner.state().waiting_for,
+                WaitingFor::Priority { .. }
+            ));
+        }
+        for x in [0, 1] {
+            let mut board = printed_counter_prompt("Condescend", CONDESCEND, Some(x));
+            assert_eq!(
+                unless_cost(&board.runner),
+                Some((
+                    P0,
+                    AbilityCost::Mana {
+                        cost: ManaCost::generic(x)
+                    }
+                ))
+            );
+            board
+                .runner
+                .act(GameAction::PayUnlessCost { pay })
+                .expect("Condescend payment");
+            assert_eq!(
+                zone(&board.runner, board.bear),
+                if pay { Zone::Stack } else { Zone::Graveyard }
+            );
+            match &board.runner.state().waiting_for {
+                WaitingFor::ScryChoice { player, cards, .. } => {
+                    assert_eq!(*player, P1);
+                    assert_eq!(*cards, board.looked);
+                }
+                other => panic!("independent Scry 2 occurs for X={x}, pay={pay}: {other:?}"),
+            }
+            board
+                .runner
+                .act(GameAction::SelectCards {
+                    cards: board.looked.clone(),
+                })
+                .expect("keep scry cards");
+        }
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let bolt = scenario.add_spell_to_hand_from_oracle(P0, "Rhystic Lightning", true,
+            "Rhystic Lightning deals 4 damage to any target unless that permanent's controller or that player pays {2}. If they do, Rhystic Lightning deals 2 damage to the permanent or player.")
+            .with_mana_cost(ManaCost::Cost { shards: vec![ManaCostShard::Red], generic: 2 }).id();
+        let casting = (0..3)
+            .map(|_| scenario.add_basic_land(P0, ManaColor::Red))
+            .collect::<Vec<_>>();
+        let payment = (0..2)
+            .map(|_| scenario.add_basic_land(P1, ManaColor::Green))
+            .collect::<Vec<_>>();
+        let mut runner = scenario.build();
+        let outcome = runner.cast(bolt).target_player(P1).resolve();
+        outcome.assert_life_delta(P1, 0);
+        assert!(casting
+            .iter()
+            .all(|land| outcome.state().objects[land].tapped));
+        assert_eq!(
+            unless_cost(&runner),
+            Some((
+                P1,
+                AbilityCost::Mana {
+                    cost: ManaCost::generic(2)
+                }
+            ))
+        );
+        runner
+            .act(GameAction::PayUnlessCost { pay })
+            .expect("damage payment");
+        assert_eq!(runner.state().players[1].life, if pay { 18 } else { 16 });
+        assert_eq!(runner.state().players[0].life, 20);
+        assert_eq!(
+            payment
+                .iter()
+                .filter(|land| runner.state().objects[land].tapped)
+                .count(),
+            if pay { 2 } else { 0 }
+        );
+    }
+}
+
+#[test]
+fn flash_preserves_preceding_optional_outcome_through_unless_payment() {
+    for (put, pay) in [(true, true), (true, false), (false, false)] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let flash = scenario
+            .add_spell_to_hand_from_oracle(P0, "Flash", true, FLASH)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 1,
+            })
+            .id();
+        let memnite = scenario
+            .add_creature_to_hand(P0, "Memnite", 1, 1)
+            .as_artifact_creature()
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let decoy = scenario
+            .add_creature_to_hand(P0, "Grizzly Bears", 2, 2)
+            .with_subtypes(vec!["Bear"])
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Green],
+                generic: 1,
+            })
+            .id();
+        let lands = [
+            scenario.add_basic_land(P0, ManaColor::Blue),
+            scenario.add_basic_land(P0, ManaColor::Blue),
+        ];
+        let mut runner = scenario.build();
+        let mut cast = runner.cast(flash).commit();
+        for _ in 0..4 {
+            if !matches!(cast.state().waiting_for, WaitingFor::Priority { .. }) {
+                break;
+            }
+            cast.act(GameAction::PassPriority)
+                .expect("resolve Flash to its actual optional put");
+        }
+        assert!(matches!(
+            cast.state().waiting_for,
+            WaitingFor::OptionalEffectChoice { player: P0, .. }
+        ));
+        assert!(lands.iter().all(|land| cast.state().objects[land].tapped));
+        cast.act(GameAction::DecideOptionalEffect { accept: put })
+            .expect("answer initial optional put");
+        if put {
+            match &cast.state().waiting_for {
+                WaitingFor::EffectZoneChoice { cards, .. } => {
+                    assert!(cards.contains(&memnite));
+                    assert!(cards.contains(&decoy));
+                }
+                other => panic!("choose the real creature from hand: {other:?}"),
+            }
+            cast.act(GameAction::SelectCards {
+                cards: vec![memnite],
+            })
+            .expect("select Memnite, not the decoy");
+        }
+        let outcome = cast.resolve();
+        outcome.assert_zone(&[decoy], Zone::Hand);
+        if !put {
+            outcome.assert_zone(&[memnite], Zone::Hand);
+            assert!(matches!(
+                outcome.final_waiting_for(),
+                WaitingFor::Priority { .. }
+            ));
+            continue;
+        }
+        outcome.assert_zone(&[memnite], Zone::Battlefield);
+        match outcome.final_waiting_for() {
+            WaitingFor::UnlessPayment {
+                player,
+                cost,
+                pending_effect,
+                ..
+            } => {
+                assert_eq!(*player, P0);
+                assert_eq!(*cost, zero_cost());
+                assert!(matches!(pending_effect.effect, Effect::Sacrifice { .. }));
+                assert!(
+                    pending_effect.context.optional_effect_performed,
+                    "preceding put admits this root"
+                );
+                assert_eq!(
+                    pending_effect.targets,
+                    vec![TargetRef::Object(memnite)],
+                    "the pending instruction is bound to the exact selected Memnite"
+                );
+            }
+            other => panic!("real reduced-cost payment: {other:?}"),
+        }
+        let result = runner
+            .act(GameAction::PayUnlessCost { pay })
+            .expect("answer separate payment");
+        assert_eq!(
+            zone(&runner, memnite),
+            if pay {
+                Zone::Battlefield
+            } else {
+                Zone::Graveyard
+            }
+        );
+        assert_eq!(zone(&runner, decoy), Zone::Hand);
+        assert!(runner.state().players[0].mana_pool.is_empty());
+        assert_eq!(result.events.iter().filter(|event| matches!(event, engine::types::events::GameEvent::PermanentSacrificed { object_id, .. } if *object_id == memnite)).count(), usize::from(!pay));
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+    }
+}
+
+#[test]
+fn payment_outcome_independent_sibling_follows_counter_or_paid_suppression() {
+    use engine::types::ability::SubAbilityLink;
+    use engine::types::events::GameEvent;
+    for pay in [false, true] {
+        let (mut runner, spell) = direct_board();
+        let mut root = ResolvedAbility::new(
+            Effect::Counter {
+                target: TargetFilter::Any,
+                source_rider: None,
+                countered_spell_zone: None,
+            },
+            vec![TargetRef::Object(spell)],
+            ObjectId(9000),
+            P1,
+        );
+        root.unless_pay = Some(UnlessPayModifier {
+            cost: zero_cost(),
+            payer: TargetFilter::ParentTargetController,
+        });
+        let mut sibling = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 7 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(9000),
+            P1,
+        );
+        sibling.sub_link = SubAbilityLink::SequentialSibling;
+        root.sub_ability = Some(Box::new(sibling));
+        resolve_ability_chain(runner.state_mut(), &root, &mut Vec::new(), 0)
+            .expect("mechanism root produces payment");
+        assert_eq!(unless_cost(&runner), Some((P0, zero_cost())));
+        assert_eq!(zone(&runner, spell), Zone::Stack);
+        let result = runner
+            .act(GameAction::PayUnlessCost { pay })
+            .expect("apply actual payment action");
+        assert_eq!(
+            zone(&runner, spell),
+            if pay { Zone::Stack } else { Zone::Graveyard }
+        );
+        assert_eq!(
+            runner.state().players[1].life,
+            27,
+            "independent sibling runs exactly once in both outcomes"
+        );
+        assert_eq!(result.events.iter().filter(|event| matches!(event, GameEvent::SpellCountered { object_id, .. } if *object_id == spell)).count(), usize::from(!pay));
     }
 }

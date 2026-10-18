@@ -416,11 +416,9 @@ fn choose_action_with_session_inner(
         }
     }
 
-    // CR 118.5 + CR 118.12a: A {0} unless-cost needs only an acknowledgment and
-    // no resources, and declining only lets the effect happen. Paying it is not
-    // a payment decision, so it is answered ahead of the scored path, where no
-    // difficulty (including the Easy/VeryEasy softmax) can decline it.
-    if free_unless_payment_owed_by(&state.waiting_for, ai_player) {
+    // CR 118.5 + CR 118.12a: acknowledge a free Counter payment to protect
+    // the spell. Other unless effects can make declining strategically useful.
+    if zero_counter_payment_owed_by(&state.waiting_for, ai_player) {
         if let Some(action) = bind_specialist(GameAction::PayUnlessCost { pay: true }) {
             return direct(Some(action));
         }
@@ -1203,20 +1201,18 @@ fn issued_selection(contract: &AiDecisionContract) -> Option<GameAction> {
         .map(|(_, action)| action.clone())
 }
 
-/// Whether `waiting_for` is an unless-payment owed by `payer` whose whole cost
-/// is a payable {0} (`AbilityCost::Mana` carrying `ManaCost::zero()`).
-/// CR 118.5: such a cost is paid by acknowledging it and spends no resources;
-/// CR 118.12a: declining only lets the unless-effect happen. `ManaCost::NoCost`
-/// (CR 118.6, unpayable), a zero `PayLife`, and every other cost shape are not
-/// free payments and keep the scored/fallback path.
-fn free_unless_payment_owed_by(waiting_for: &WaitingFor, payer: PlayerId) -> bool {
+/// CR 118.5 + CR 118.12a: a payable zero Mana cost protecting a spell from
+/// Counter uses the specialist. Other heads/costs retain their scored policy.
+fn zero_counter_payment_owed_by(waiting_for: &WaitingFor, payer: PlayerId) -> bool {
     matches!(
         waiting_for,
         WaitingFor::UnlessPayment {
             player,
             cost: AbilityCost::Mana { cost },
+            pending_effect,
             ..
         } if *player == payer && *cost == ManaCost::zero()
+            && matches!(pending_effect.effect, Effect::Counter { .. })
     )
 }
 
@@ -1676,7 +1672,7 @@ pub fn fallback_action(
         // Unless payment: decline a real cost (let the effect resolve); pay a
         // free {0} (CR 118.5), which spends nothing.
         WaitingFor::UnlessPayment { player, .. } => Some(GameAction::PayUnlessCost {
-            pay: free_unless_payment_owed_by(&state.waiting_for, *player),
+            pay: zero_counter_payment_owed_by(&state.waiting_for, *player),
         }),
 
         // Disjunctive activation costs: default to the first payable branch.
@@ -6558,8 +6554,7 @@ mod tests {
         AiDecisionContract::issue(state, owner)
     }
 
-    /// A bare unless-payment prompt owed by `payer` for `cost`, with a 1-damage
-    /// pending effect (the shape `spell_target_selection_state` builds).
+    /// A mechanism fixture for the Counter specialist's cost/seat boundary.
     fn unless_payment_state(
         cost: AbilityCost,
         payer: PlayerId,
@@ -6568,11 +6563,10 @@ mod tests {
         let mut state = make_state();
         let source = ObjectId(900);
         let pending_effect = ResolvedAbility::new(
-            Effect::DealDamage {
-                amount: QuantityExpr::Fixed { value: 1 },
+            Effect::Counter {
                 target: TargetFilter::Any,
-                damage_source: None,
-                excess: None,
+                source_rider: None,
+                countered_spell_zone: None,
             },
             Vec::new(),
             source,
@@ -6620,7 +6614,7 @@ mod tests {
         tally
     }
 
-    /// CR 118.5: a free {0} unless-payment is answered `pay: true` at VeryEasy through
+    /// CR 118.5: a zero Counter payment is answered `pay: true` at VeryEasy through
     /// VeryHard and every seed (the engine now asks for it instead of auto-paying). The pre-emption precedes every difficulty-keyed
     /// branch, so CEDH takes it too.
     #[test]
@@ -6668,18 +6662,18 @@ mod tests {
         for cost in [no_cost, pay_life_zero] {
             let state = unless_payment_state(cost.clone(), payer, vec![]);
             assert!(
-                !free_unless_payment_owed_by(&state.waiting_for, payer),
+                !zero_counter_payment_owed_by(&state.waiting_for, payer),
                 "{cost:?}"
             );
         }
-        assert!(free_unless_payment_owed_by(&zero.waiting_for, payer));
+        assert!(zero_counter_payment_owed_by(&zero.waiting_for, payer));
         assert!(
-            !free_unless_payment_owed_by(&zero.waiting_for, PlayerId(0)),
+            !zero_counter_payment_owed_by(&zero.waiting_for, PlayerId(0)),
             "the predicate is keyed to the prompted seat"
         );
     }
 
-    /// `fallback_action` pays a free {0} and still declines a real cost.
+    /// `fallback_action` pays a zero Counter payment and declines a nonzero one.
     #[test]
     fn fallback_pays_a_free_unless_payment_and_declines_a_real_one() {
         let payer = PlayerId(1);
@@ -6694,6 +6688,154 @@ mod tests {
                 "{cost:?}"
             );
             assert!(contract.contains_action(&state, &answer.expect("answer")));
+        }
+    }
+
+    #[test]
+    fn ai_zero_counter_specialist_and_fallback_are_narrow() {
+        let config = create_config(AiDifficulty::Easy, Platform::Native);
+        for effect in [
+            Effect::DealDamage {
+                amount: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Any,
+                damage_source: None,
+                excess: None,
+            },
+            Effect::Sacrifice {
+                target: TargetFilter::SelfRef,
+                count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
+            },
+        ] {
+            let mut state = unless_payment_state(mana_unless_cost(ManaCost::zero()), P0, vec![]);
+            if let WaitingFor::UnlessPayment { pending_effect, .. } = &mut state.waiting_for {
+                pending_effect.effect = effect;
+            }
+            let contract = AiDecisionContract::issue(&state, P0);
+            assert!(contract.contains_action(&state, &GameAction::PayUnlessCost { pay: true }));
+            assert!(contract.contains_action(&state, &GameAction::PayUnlessCost { pay: false }));
+            assert!(!zero_counter_payment_owed_by(&state.waiting_for, P0));
+            assert_eq!(
+                fallback_action(&state, &config, &contract),
+                Some(GameAction::PayUnlessCost { pay: false })
+            );
+        }
+    }
+
+    /// Printed producer with independent Aura/host/Artist authorities.
+    #[test]
+    fn flux_memnite_zero_payment_keeps_ranked_choice_and_decline_payoff() {
+        use crate::decision_receipt::AiDecisionReceiptStatus;
+        use engine::game::game_object::AttachTarget;
+
+        for pay in [false, true] {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PostCombatMain).with_life(P1, 1);
+            let host = scenario
+                .add_creature(P0, "Memnite", 1, 1)
+                .as_artifact_creature()
+                .with_mana_cost(ManaCost::zero())
+                .id();
+            let artist = scenario.add_creature_from_oracle(P0, "Blood Artist", 0, 1,
+                "Whenever this creature or another creature dies, target player loses 1 life and you gain 1 life.")
+                .with_subtypes(vec!["Vampire"])
+                .with_mana_cost(ManaCost::Cost { shards: vec![ManaCostShard::Black], generic: 1 }).id();
+            let flux = scenario.add_spell_to_hand(P1, "Pendrell Flux", false)
+                .as_enchantment().with_subtypes(vec!["Aura"])
+                .from_oracle_text("Enchant creature\nEnchanted creature has \"At the beginning of your upkeep, sacrifice this creature unless you pay its mana cost.\"")
+                .with_mana_cost(ManaCost::Cost { shards: vec![ManaCostShard::Blue], generic: 1 }).id();
+            let lands = [
+                scenario.add_basic_land(P1, ManaColor::Blue),
+                scenario.add_basic_land(P1, ManaColor::Blue),
+            ];
+            let mut runner = scenario.build();
+            runner.state_mut().active_player = P1;
+            runner.state_mut().priority_player = P1;
+            runner.state_mut().waiting_for = WaitingFor::Priority { player: P1 };
+            let cast = runner.cast(flux).target_object(host).resolve();
+            cast.assert_zone(&[flux, host, artist], Zone::Battlefield);
+            assert_eq!(
+                cast.state().objects[&flux].attached_to,
+                Some(AttachTarget::Object(host))
+            );
+            assert_eq!(cast.state().objects[&flux].controller, P1);
+            assert!(lands.iter().all(|land| cast.state().objects[land].tapped));
+            runner.advance_to_upkeep();
+            runner.resolve_top();
+            match &runner.state().waiting_for {
+                WaitingFor::UnlessPayment {
+                    player,
+                    cost,
+                    pending_effect,
+                    ..
+                } => {
+                    assert_eq!(*player, P0);
+                    assert_eq!(*cost, mana_unless_cost(ManaCost::zero()));
+                    assert_eq!(pending_effect.source_id, host);
+                    assert_eq!(pending_effect.controller, P0);
+                    assert!(matches!(pending_effect.effect, Effect::Sacrifice { .. }));
+                }
+                other => panic!("real granted trigger must prompt: {other:?}"),
+            }
+            assert_eq!(runner.state().objects[&host].zone, Zone::Battlefield);
+            let contract = AiDecisionContract::issue(runner.state(), P0);
+            for pay in [false, true] {
+                assert!(
+                    contract.contains_action(runner.state(), &GameAction::PayUnlessCost { pay })
+                );
+            }
+            let config = create_config(AiDifficulty::Easy, Platform::Native);
+            let session = AiSession::arc_from_game(runner.state());
+            let selection = choose_action_with_session_diagnostic(
+                runner.state(),
+                P0,
+                &config,
+                &mut SmallRng::seed_from_u64(9943),
+                &session,
+            );
+            let receipt = selection.receipt.expect("scored payment receipt");
+            assert_eq!(receipt.status, AiDecisionReceiptStatus::Ranked);
+            assert!(receipt
+                .candidates
+                .iter()
+                .any(|candidate| candidate.action == GameAction::PayUnlessCost { pay: false }));
+            let fallback = fallback_action(runner.state(), &config, &contract).expect("fallback");
+            assert_eq!(fallback, GameAction::PayUnlessCost { pay: false });
+            runner
+                .act(if pay {
+                    GameAction::PayUnlessCost { pay: true }
+                } else {
+                    fallback
+                })
+                .expect("issued answer applies");
+            if pay {
+                assert_eq!(runner.state().objects[&host].zone, Zone::Battlefield);
+                assert_eq!(runner.state().players[0].life, 20);
+                assert_eq!(runner.state().players[1].life, 1);
+                assert!(matches!(
+                    runner.state().waiting_for,
+                    WaitingFor::Priority { .. }
+                ));
+            } else {
+                assert_eq!(runner.state().objects[&host].zone, Zone::Graveyard);
+                assert_eq!(runner.state().objects[&artist].zone, Zone::Battlefield);
+                assert!(matches!(
+                    runner.state().waiting_for,
+                    WaitingFor::TriggerTargetSelection { .. }
+                ));
+                runner
+                    .act(GameAction::ChooseTarget {
+                        target: Some(TargetRef::Player(P1)),
+                    })
+                    .expect("Artist targets opponent");
+                runner.resolve_top();
+                assert_eq!(runner.state().players[0].life, 21);
+                assert_eq!(runner.state().players[1].life, 0);
+                assert!(matches!(
+                    runner.state().waiting_for,
+                    WaitingFor::GameOver { .. }
+                ));
+            }
         }
     }
 
@@ -6714,13 +6856,17 @@ mod tests {
     /// End to end with a real engine prompt: P1's Override (verbatim text) with
     /// no artifacts raises the {0} prompt for the AI seat P0, which pays it.
     #[test]
-    fn ai_pays_the_free_unless_prompt_the_engine_raises() {
+    fn ai_override_zero_payment_still_protects_own_spell() {
         for artifacts in [0usize, 1] {
             let mut scenario = GameScenario::new();
             scenario.at_phase(Phase::PreCombatMain);
             let bear = scenario
-                .add_creature_to_hand(P0, "Bear", 2, 2)
-                .with_mana_cost(ManaCost::generic(2))
+                .add_creature_to_hand(P0, "Grizzly Bears", 2, 2)
+                .with_subtypes(vec!["Bear"])
+                .with_mana_cost(ManaCost::Cost {
+                    shards: vec![ManaCostShard::Green],
+                    generic: 1,
+                })
                 .id();
             scenario.add_basic_land(P0, ManaColor::Green);
             scenario.add_basic_land(P0, ManaColor::Green);
@@ -6757,8 +6903,18 @@ mod tests {
                 GameAction::PassPriority,
             )
             .expect("P0 passes");
-            runner.cast(counter).target_object(bear_spell).commit();
-            runner.resolve_top();
+            let outcome = runner.cast(counter).target_object(bear_spell).resolve();
+            outcome.assert_zone(&[bear_spell], Zone::Stack);
+            assert!(outcome.state().players[1].mana_pool.is_empty());
+            assert_eq!(
+                outcome
+                    .state()
+                    .objects
+                    .values()
+                    .filter(|o| o.controller == P1 && o.tapped)
+                    .count(),
+                3
+            );
 
             let config = create_config(AiDifficulty::Easy, Platform::Native);
             let mut rng = SmallRng::seed_from_u64(7);
@@ -6773,6 +6929,22 @@ mod tests {
                     0,
                 ) => {
                     assert_eq!(*cost, ManaCost::zero());
+                    for difficulty in UNLESS_LEVELS {
+                        let config = create_config(difficulty, Platform::Native);
+                        let contract = AiDecisionContract::issue(runner.state(), P0);
+                        let answer = choose_action(
+                            runner.state(),
+                            P0,
+                            &config,
+                            &mut SmallRng::seed_from_u64(9943),
+                        );
+                        assert_eq!(answer, Some(GameAction::PayUnlessCost { pay: true }));
+                        assert!(contract.contains_action(runner.state(), &answer.unwrap()));
+                        assert_eq!(
+                            fallback_action(runner.state(), &config, &contract),
+                            Some(GameAction::PayUnlessCost { pay: true })
+                        );
+                    }
                     assert_eq!(answer, Some(GameAction::PayUnlessCost { pay: true }));
                     runner
                         .act(answer.expect("answer"))
@@ -6782,6 +6954,8 @@ mod tests {
                         Zone::Stack,
                         "paying the free {{0}} leaves the spell on the stack"
                     );
+                    runner.resolve_top();
+                    assert_eq!(runner.state().objects[&bear_spell].zone, Zone::Battlefield);
                 }
                 (
                     WaitingFor::UnlessPayment {
@@ -6795,6 +6969,17 @@ mod tests {
                     // pre-empted; the answer is whichever the scored path picked.
                     assert_eq!(*cost, ManaCost::generic(1));
                     assert!(matches!(answer, Some(GameAction::PayUnlessCost { .. })));
+                    let selection = choose_action_with_session_diagnostic(
+                        runner.state(),
+                        P0,
+                        &config,
+                        &mut SmallRng::seed_from_u64(7),
+                        &AiSession::arc_from_game(runner.state()),
+                    );
+                    assert_eq!(
+                        selection.receipt.expect("ordinary scored counter").status,
+                        crate::decision_receipt::AiDecisionReceiptStatus::Ranked
+                    );
                 }
                 (other, _) => panic!("artifacts {artifacts}: expected the prompt, got {other:?}"),
             }
