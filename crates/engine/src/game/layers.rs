@@ -6763,8 +6763,11 @@ fn gather_active_effects_for_layer(state: &GameState, layer: Layer) -> Vec<Activ
 /// CR 718.3b: A prototyped spell and the permanent it becomes have only their
 /// alternative mana cost and P/T characteristics. If that mana cost contains
 /// colored mana symbols, the spell/permanent is those colors. Reapply this after
-/// layer reset so the prototype marker survives normal layer recomputation.
-fn apply_prototype_characteristics(state: &mut GameState, ids: impl IntoIterator<Item = ObjectId>) {
+/// layer reset or ordinary printed-face refresh, using the saved prototype form.
+pub(crate) fn apply_prototype_characteristics(
+    state: &mut GameState,
+    ids: impl IntoIterator<Item = ObjectId>,
+) {
     for id in ids {
         let Some(obj) = state.objects.get_mut(&id) else {
             continue;

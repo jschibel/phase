@@ -1,3 +1,4 @@
+use crate::types::ability::StaticDefinition;
 use crate::types::card_type::CoreType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
@@ -644,6 +645,10 @@ pub(crate) fn apply_zone_exit_cleanup(
         }
     }
 
+    if let Some(object) = state.objects.get_mut(&object_id) {
+        retire_cast_counterprohibition_on_stack_exit(object, from, to);
+    }
+
     if from == Zone::Battlefield {
         // CR 701.54e: A player's Ring-bearer designation applies only while
         // that permanent remains on the battlefield under that player's control.
@@ -1130,6 +1135,20 @@ fn install_rebound_owner(object: &mut crate::game::game_object::GameObject, owne
     object.controller = owner;
 }
 
+/// CR 112.1 + CR 400.7: a cast-bound rules prohibition ends with the spell;
+/// printed intrinsic prohibitions remain part of the new object's base.
+fn retire_cast_counterprohibition_on_stack_exit(object: &mut GameObject, from: Zone, to: Zone) {
+    if from != Zone::Stack || to == Zone::Stack {
+        return;
+    }
+    let canonical = StaticDefinition::new(StaticMode::CantBeCountered);
+    if !object.base_static_definitions.contains(&canonical) {
+        object
+            .static_definitions
+            .retain(|definition| *definition != canonical);
+    }
+}
+
 pub fn apply_resolved_zone_change(
     state: &mut GameState,
     command: &ResolvedZoneChangeCommand,
@@ -1276,6 +1295,8 @@ pub fn apply_resolved_zone_change(
             },
         );
     }
+
+    retire_cast_counterprohibition_on_stack_exit(object, command.from, command.to);
 
     // CR 613.7d: the battlefield entry drew this timestamp during the original
     // execution, so replay installs it rather than drawing a fresh one — and
@@ -3091,6 +3112,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::game::game_object::CleaveFormState;
     use crate::types::ability::{
         ContinuousModification, ControllerRef, FilterProp, StaticDefinition, TargetFilter,
         TypeFilter, TypedFilter,
@@ -3101,6 +3123,228 @@ mod tests {
 
     fn setup() -> GameState {
         GameState::new_two_player(42)
+    }
+
+    fn cast_prohibition_fixture(zone: Zone, intrinsic: bool) -> (GameState, ObjectId) {
+        let mut state = setup();
+        let id = create_object(
+            &mut state,
+            CardId(9968),
+            PlayerId(0),
+            "Lifecycle fixture".to_string(),
+            zone,
+        );
+        let canonical = StaticDefinition::new(StaticMode::CantBeCountered);
+        let unrelated = StaticDefinition::new(StaticMode::CantBeCopied);
+        let object = state.objects.get_mut(&id).unwrap();
+        object.card_types.core_types = vec![CoreType::Creature];
+        object.base_card_types = object.card_types.clone();
+        object.power = Some(4);
+        object.toughness = Some(3);
+        object.base_power = object.power;
+        object.base_toughness = object.toughness;
+        object.base_characteristics_initialized = true;
+        object.base_static_definitions = Arc::new(if intrinsic {
+            vec![canonical.clone(), unrelated.clone()]
+        } else {
+            vec![unrelated.clone()]
+        });
+        object.static_definitions = vec![canonical, unrelated].into();
+        (state, id)
+    }
+
+    fn cast_prohibition_count(state: &GameState, id: ObjectId) -> usize {
+        let canonical = StaticDefinition::new(StaticMode::CantBeCountered);
+        state.objects[&id]
+            .static_definitions
+            .iter_all()
+            .filter(|definition| **definition == canonical)
+            .count()
+    }
+
+    #[test]
+    fn cast_prohibition_restore_live_exit_destinations_and_retained_boundaries() {
+        // Bounded lifecycle fixtures supplement the actual paid public casts.
+        for intrinsic in [false, true] {
+            for destination in [
+                Zone::Hand,
+                Zone::Graveyard,
+                Zone::Exile,
+                Zone::Command,
+                Zone::Battlefield,
+                Zone::Library,
+            ] {
+                let (mut state, id) = cast_prohibition_fixture(Zone::Stack, intrinsic);
+                let occurrence = ObjectIncarnationRef::from_object(&state.objects[&id]);
+                let baseline = state.objects[&id].base_static_definitions.clone();
+                let allocator = state.next_timestamp;
+                assert_eq!(cast_prohibition_count(&state, id), 1);
+                let mut events = Vec::new();
+                if destination == Zone::Library {
+                    move_to_library_position(&mut state, id, true, &mut events);
+                } else {
+                    move_to_zone(&mut state, id, destination, &mut events);
+                }
+                // CR 112.1 + CR 400.7: only the departing spell loses its
+                // nonprinted rules prohibition; the next object has new identity.
+                assert_eq!(state.objects[&id].zone, destination);
+                match destination {
+                    Zone::Hand => assert!(state.players[0].hand.contains(&id)),
+                    Zone::Graveyard => assert!(state.players[0].graveyard.contains(&id)),
+                    Zone::Exile => assert!(state.exile.contains(&id)),
+                    Zone::Command => assert!(state.command_zone.contains(&id)),
+                    Zone::Battlefield => assert!(state.battlefield.contains(&id)),
+                    Zone::Library => assert_eq!(state.players[0].library.front(), Some(&id)),
+                    Zone::Stack => {
+                        unreachable!("not an exit destination fixture")
+                    }
+                }
+                assert_ne!(
+                    ObjectIncarnationRef::from_object(&state.objects[&id]),
+                    occurrence
+                );
+                assert_eq!(cast_prohibition_count(&state, id), usize::from(intrinsic));
+                assert_eq!(state.objects[&id].base_static_definitions, baseline);
+                assert!(state.objects[&id]
+                    .static_definitions
+                    .iter_all()
+                    .any(|definition| definition.mode == StaticMode::CantBeCopied));
+                assert_eq!(
+                    state.next_timestamp,
+                    allocator + u64::from(destination == Zone::Battlefield)
+                );
+                assert!(events.iter().any(|event| matches!(event, GameEvent::ZoneChanged { object_id, from: Some(Zone::Stack), to, .. } if *object_id == id && *to == destination)));
+                if destination != Zone::Library {
+                    assert!(state.resolved_rules_journal.entries().iter().all(|entry| !matches!(entry.command.as_ref(), Some(crate::types::resolved_commands::ResolvedRulesCommand::ZoneChange(command)) if command.object.object_id == id)), "ordinary Stack/Command generic recording exclusion remains intact");
+                }
+            }
+        }
+        for (from, to) in [(Zone::Hand, Zone::Stack), (Zone::Stack, Zone::Stack)] {
+            let (mut state, id) = cast_prohibition_fixture(from, false);
+            let occurrence = ObjectIncarnationRef::from_object(&state.objects[&id]);
+            move_to_zone(&mut state, id, to, &mut Vec::new());
+            assert_eq!(state.objects[&id].zone, to);
+            assert_eq!(cast_prohibition_count(&state, id), 1);
+            assert_eq!(
+                state.objects[&id].incarnation,
+                occurrence.incarnation + u64::from(from != to)
+            );
+        }
+    }
+
+    #[test]
+    fn cast_prohibition_restore_late_cleanup_prevents_cleave_snapshot_resurrection() {
+        let (mut state, id) = cast_prohibition_fixture(Zone::Stack, false);
+        let object = state.objects.get_mut(&id).unwrap();
+        // Bounded snapshot isolation: the existing cleave owner restores its
+        // stored live statics after early Stack metadata cleanup.
+        object.cleave_form = Some(CleaveFormState {
+            abilities: object.abilities.clone(),
+            triggers: object.trigger_definitions.clone(),
+            statics: object.static_definitions.clone(),
+            replacements: object.replacement_definitions.clone(),
+            base_abilities: object.base_abilities.clone(),
+            base_triggers: object.base_trigger_definitions.clone(),
+            base_trigger_printed_origins: object.base_trigger_printed_origins.clone(),
+            trigger_base_set_instance: object.trigger_base_set_instance,
+            next_trigger_base_set_instance: object.next_trigger_base_set_instance,
+            base_statics: object.base_static_definitions.clone(),
+            base_replacements: object.base_replacement_definitions.clone(),
+        });
+        object.static_definitions.clear();
+        assert_eq!(cast_prohibition_count(&state, id), 0);
+        move_to_zone(&mut state, id, Zone::Hand, &mut Vec::new());
+        assert!(
+            state.objects[&id].cleave_form.is_none(),
+            "snapshot restoration branch was reached"
+        );
+        assert!(
+            state.objects[&id]
+                .static_definitions
+                .iter_all()
+                .any(|definition| definition.mode == StaticMode::CantBeCopied),
+            "unrelated snapshot definition was really restored"
+        );
+        assert_eq!(
+            cast_prohibition_count(&state, id),
+            0,
+            "late retirement prevents canonical snapshot resurrection"
+        );
+    }
+
+    #[test]
+    fn cast_prohibition_restore_direct_transition_core_replay_and_refusal() {
+        for intrinsic in [false, true] {
+            for destination in [Zone::Hand, Zone::Graveyard, Zone::Exile, Zone::Battlefield] {
+                let (mut live, id) = cast_prohibition_fixture(Zone::Stack, intrinsic);
+                let mut replay = live.clone();
+                let original = live.clone();
+                assert!(original.resolved_rules_journal.entries().is_empty());
+                let record = crate::types::game_state::ZoneChangeRecord::test_minimal(
+                    id,
+                    Some(Zone::Stack),
+                    destination,
+                );
+                let command = resolve_and_apply_zone_change(
+                    &mut live,
+                    id,
+                    Zone::Stack,
+                    destination,
+                    PlayerId(0),
+                    None,
+                    record,
+                )
+                .expect("supported direct Stack-source transition core");
+                let retained = usize::from(intrinsic);
+                assert_eq!(cast_prohibition_count(&live, id), retained);
+                assert_eq!(live.objects[&id].incarnation, command.resulting_incarnation);
+                assert_eq!(live.objects[&id].zone, destination);
+                // The existing owner begins a proposal (command=None) before
+                // recording the one exact transition command under that node.
+                assert_eq!(live.resolved_rules_journal.entries().len(), 2);
+                let proposal = live.resolved_rules_journal.entries().front().unwrap();
+                assert!(proposal.command.is_none());
+                assert_eq!(proposal.node, command.cause);
+                assert!(
+                    matches!(live.resolved_rules_journal.entries().back().unwrap().command.as_ref(),
+                    Some(crate::types::resolved_commands::ResolvedRulesCommand::ZoneChange(recorded)) if recorded.as_ref() == &command)
+                );
+                apply_resolved_zone_change(&mut replay, &command)
+                    .expect("direct core command replays");
+                assert_eq!(cast_prohibition_count(&replay, id), retained);
+                assert_eq!(
+                    replay.objects[&id].incarnation,
+                    command.resulting_incarnation
+                );
+                assert_eq!(replay.objects[&id].zone, destination);
+                assert_eq!(replay.next_timestamp, live.next_timestamp);
+                assert_eq!(replay.next_object_id, live.next_object_id);
+                assert_eq!(replay.players[0].hand, live.players[0].hand);
+                assert_eq!(replay.players[0].graveyard, live.players[0].graveyard);
+                assert_eq!(replay.battlefield, live.battlefield);
+                assert_eq!(replay.exile, live.exile);
+                assert_eq!(replay.zone_changes_this_turn, live.zone_changes_this_turn);
+                assert!(
+                    replay.resolved_rules_journal.entries().is_empty(),
+                    "the direct applier does not append the caller's journal entry"
+                );
+                for wrong_source in [false, true] {
+                    let mut hostile = original.clone();
+                    if wrong_source {
+                        hostile.objects.get_mut(&id).unwrap().zone = Zone::Hand;
+                    } else {
+                        hostile.objects.get_mut(&id).unwrap().bump_incarnation();
+                    }
+                    let before = serde_json::to_value(&hostile).unwrap();
+                    assert!(apply_resolved_zone_change(&mut hostile, &command).is_err());
+                    assert_eq!(
+                        serde_json::to_value(&hostile).unwrap(),
+                        before,
+                        "hostile source/occurrence refuses before mutation"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
