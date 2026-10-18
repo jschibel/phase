@@ -24469,9 +24469,10 @@ fn validate_restored_attack_authority(
     let check_choice_continuation =
         |node: &ResolvedAbility, context: Option<&ResolvingTriggerContext>| match context {
             // Match the branch resolver's context push: even Some(empty)
-            // replaces ambient events; None leaves the ambient context alone.
+            // replaces ambient events; None reads the ambient singular without
+            // promoting its plural batch.
             Some(context) => check(node, context.event.as_ref(), &context.events),
-            None => check(node, current_event, current_events),
+            None => check(node, current_event, &[]),
         };
     for frame in state.resolution_stack.iter() {
         match frame {
@@ -49262,11 +49263,11 @@ mod restored_exact_attack_authority_tests {
                 true,
             ),
             (
-                "None leaves ambient plural unchanged",
+                "None does not promote ambient plural during no-push resume",
                 None,
                 None,
                 vec![event],
-                true,
+                false,
             ),
             (
                 "None with no ambient event stays empty",
