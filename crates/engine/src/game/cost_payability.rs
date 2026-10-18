@@ -367,6 +367,7 @@ pub(crate) fn discard_legs_jointly_payable(
                     .copied()
                     .filter(|&id| {
                         id != source
+                            && !super::casting::is_spell_being_cast(state, id)
                             && effective_filter
                                 .as_ref()
                                 .is_none_or(|f| matches_target_filter(state, id, f, &ctx))
@@ -762,7 +763,13 @@ fn object_leg_demand_and_candidates(
         // their graveyard.
         ObjectLegKind::CollectEvidence => (
             ObjectLegDemand::Unmodeled,
-            state.graveyard_of(player).iter().copied().collect(),
+            state
+                .graveyard_of(player)
+                .iter()
+                .copied()
+                // CR 601.2a: a spell being cast is on the stack.
+                .filter(|&id| !super::casting::is_spell_being_cast(state, id))
+                .collect(),
         ),
         // CR 702.49a: ninjutsu returns an unblocked attacker the player controls.
         ObjectLegKind::Ninjutsu { variant } => (
@@ -1387,6 +1394,7 @@ impl AbilityCost {
                     .iter()
                     .filter(|&&id| {
                         id != source
+                            && !super::casting::is_spell_being_cast(state, id)
                             && effective_filter
                                 .as_ref()
                                 .is_none_or(|f| matches_target_filter(state, id, f, &ctx))
@@ -1844,7 +1852,8 @@ pub(super) fn exile_cost_effective_zone(zone: Option<Zone>, filter: Option<&Targ
 }
 
 /// CR 117.1 + CR 118.3: Objects in `zone` (`player`'s own for hand/graveyard/library) that
-/// can be exiled to pay a non-self `AbilityCost::Exile`, excluding `source`.
+/// can be exiled to pay a non-self `AbilityCost::Exile`, excluding `source` and,
+/// CR 601.2a, any spell being cast (`casting::is_spell_being_cast`).
 ///
 /// `Zone::Library` is deterministic top-of-library payment, not a choice. Only
 /// the top `count` cards are eligible, and filtered library exile costs are not
@@ -1898,6 +1907,7 @@ pub(super) fn eligible_exile_cost_objects(
     let ctx = FilterContext::from_source(state, source).with_granting_object(granting_object);
     ids.filter(|&id| {
         id != source
+            && !super::casting::is_spell_being_cast(state, id)
             && filter_ref.is_none_or(|f| matches_target_filter_in_owner_zone(state, id, f, &ctx))
     })
     .collect()
@@ -1932,7 +1942,12 @@ pub(crate) fn eligible_exile_with_aggregate_objects(
     };
     zone_ids
         .into_iter()
-        .filter(|&id| id != source && matches_target_filter_in_owner_zone(state, id, filter, &ctx))
+        .filter(|&id| {
+            id != source
+                // CR 601.2a: a spell being cast is on the stack, not in `zone`.
+                && !super::casting::is_spell_being_cast(state, id)
+                && matches_target_filter_in_owner_zone(state, id, filter, &ctx)
+        })
         .collect()
 }
 
