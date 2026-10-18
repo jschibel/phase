@@ -63,6 +63,7 @@ use super::casting_costs::{self, check_additional_cost_or_pay};
 use super::engine::{EngineError, PriorityAnnouncementFacadeAccess, PriorityPrincipal};
 use super::functioning_abilities::{active_static_definitions, static_kind_present};
 use super::game_object::{GameObject, PreparedState, PrototypeFormState};
+use super::layers::remove_core_type;
 use super::mana_payment;
 use super::priority;
 use super::quantity::resolve_quantity;
@@ -14998,7 +14999,6 @@ pub fn handle_prototype_cost_choice_with_payment_mode(
 /// Idempotent: safe to re-run after printed-face rehydration or layer resets
 /// re-anchor `card_types` from a refreshed `base_card_types`.
 pub(crate) fn apply_bestow_aura_form(obj: &mut crate::game::game_object::GameObject) {
-    use crate::game::layers::remove_core_type;
     use crate::types::card_type::CoreType;
     // CR 702.103b + CR 205.1a: Remove the Creature core type while bestowed;
     // the creature types of the printed face go with it, because a bestowed

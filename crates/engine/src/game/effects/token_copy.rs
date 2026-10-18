@@ -2176,6 +2176,18 @@ mod tests {
         for (core_types, subtypes, expected_core, expected_subtypes) in [
             (
                 vec![CoreType::Artifact, CoreType::Creature],
+                vec!["Heartwood", "Bear"],
+                vec![CoreType::Artifact],
+                vec!["Heartwood"],
+            ),
+            (
+                vec![CoreType::Artifact, CoreType::Creature],
+                vec!["Vibranium", "Bear"],
+                vec![CoreType::Artifact],
+                vec!["Vibranium"],
+            ),
+            (
+                vec![CoreType::Artifact, CoreType::Creature],
                 vec!["Equipment", "Bear"],
                 vec![CoreType::Artifact],
                 vec!["Equipment"],
@@ -2247,6 +2259,18 @@ mod tests {
         for (core_types, subtypes, expected_core, expected_subtypes) in [
             (
                 vec![CoreType::Artifact, CoreType::Creature],
+                vec!["Heartwood", "Bear"],
+                vec![CoreType::Artifact],
+                vec!["Heartwood"],
+            ),
+            (
+                vec![CoreType::Artifact, CoreType::Creature],
+                vec!["Vibranium", "Bear"],
+                vec![CoreType::Artifact],
+                vec!["Vibranium"],
+            ),
+            (
+                vec![CoreType::Artifact, CoreType::Creature],
                 vec!["Equipment", "Bear"],
                 vec![CoreType::Artifact],
                 vec!["Equipment"],
@@ -2286,6 +2310,110 @@ mod tests {
             assert_eq!(token.base_card_types.core_types, expected_core);
             assert_eq!(token.card_types.subtypes, expected_subtypes);
             assert_eq!(token.base_card_types.subtypes, expected_subtypes);
+        }
+    }
+
+    #[test]
+    fn copy_token_artifact_subtypes_follow_owner_in_both_baked_paths() {
+        // CR 205.1a/205.3g + CR 707.9b: synthetic copy exceptions test the
+        // shared primitive, without claiming a printed token-animation pair.
+        for subtype in ["Heartwood", "Vibranium"] {
+            for (modification, core, expected_subtype) in [
+                (
+                    ContinuousModification::RemoveType {
+                        core_type: CoreType::Creature,
+                    },
+                    CoreType::Artifact,
+                    subtype,
+                ),
+                (
+                    ContinuousModification::RemoveType {
+                        core_type: CoreType::Artifact,
+                    },
+                    CoreType::Creature,
+                    "Bear",
+                ),
+                (
+                    ContinuousModification::SetCardTypes {
+                        core_types: vec![CoreType::Artifact],
+                    },
+                    CoreType::Artifact,
+                    subtype,
+                ),
+                (
+                    ContinuousModification::SetCardTypes {
+                        core_types: vec![CoreType::Creature],
+                    },
+                    CoreType::Creature,
+                    "Bear",
+                ),
+            ] {
+                let mut state = GameState::new_two_player(42);
+                state.all_creature_types = vec!["Bear".into(), "Elf".into()];
+                let source_id = create_object(
+                    &mut state,
+                    CardId(1),
+                    PlayerId(0),
+                    "Artifact copy source".into(),
+                    Zone::Battlefield,
+                );
+                let source = state.objects.get_mut(&source_id).unwrap();
+                source.base_card_types = CardType {
+                    supertypes: vec![Supertype::Legendary],
+                    core_types: vec![CoreType::Artifact, CoreType::Creature],
+                    subtypes: vec![subtype.into(), "Bear".into()],
+                };
+                source.card_types = source.base_card_types.clone();
+                let mut liminal = source.clone();
+                let ability = ResolvedAbility::new(
+                    Effect::CopyTokenOf {
+                        target: TargetFilter::SelfRef,
+                        owner: TargetFilter::Controller,
+                        source_filter: None,
+                        enters_attacking: false,
+                        tapped: false,
+                        count: QuantityExpr::Fixed { value: 1 },
+                        extra_keywords: vec![],
+                        additional_modifications: vec![modification.clone()],
+                    },
+                    vec![],
+                    source_id,
+                    PlayerId(0),
+                );
+                let mut events = Vec::new();
+                resolve(&mut state, &ability, &mut events).unwrap();
+                let token_id = ObjectId(state.next_object_id - 1);
+                assert_ne!(token_id, source_id);
+                let token = &state.objects[&token_id];
+                assert!(token.is_token, "reach: CopyTokenOf created a token");
+                assert_eq!(token.name, "Artifact copy source");
+                assert_eq!(
+                    state.objects[&source_id].card_types.subtypes,
+                    vec![subtype.to_string(), "Bear".to_string()]
+                );
+                apply_immediate_copy_token_modifications_to_object(
+                    &mut liminal,
+                    &[modification],
+                    &state.all_creature_types,
+                );
+                for object in [token, &liminal] {
+                    assert_eq!(object.card_types.core_types, vec![core]);
+                    assert_eq!(object.base_card_types.core_types, vec![core]);
+                    assert_eq!(
+                        object.card_types.subtypes,
+                        vec![expected_subtype.to_string()]
+                    );
+                    assert_eq!(
+                        object.base_card_types.subtypes,
+                        vec![expected_subtype.to_string()]
+                    );
+                    assert_eq!(object.card_types.supertypes, vec![Supertype::Legendary]);
+                    assert_eq!(
+                        object.base_card_types.supertypes,
+                        vec![Supertype::Legendary]
+                    );
+                }
+            }
         }
     }
 

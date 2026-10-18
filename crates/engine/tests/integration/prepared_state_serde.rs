@@ -303,3 +303,61 @@ fn bestow_form_legacy_and_false_wire_shapes_restore_empty_payload_or_none() {
     let restored = serde_json::from_value::<GameState>(absent).expect("absent field deserializes");
     assert_eq!(bestow_form_of(&restored, ids.bestow), None);
 }
+
+#[test]
+fn populated_bestow_wire_requires_versioned_peer() {
+    let (mut state, ids) = marker_state_fixture();
+    let satyr_id = ObjectId(10_006);
+    let mut satyr = marker_object(satyr_id, "Satyr payload neighbor");
+    satyr.bestow_form = Some(BestowFormState {
+        removed_creature_subtypes: vec!["Satyr".into()],
+    });
+    state.objects.insert(satyr_id, satyr);
+    state.objects.get_mut(&ids.bestow).unwrap().bestow_form = Some(BestowFormState {
+        removed_creature_subtypes: vec!["Insect".into(), "Monk".into()],
+    });
+    let serialized = serde_json::to_value(&state).expect("full GameState serializes");
+    let wire = object_json(&serialized, ids.bestow)["bestow_form"].clone();
+    assert_eq!(
+        wire,
+        serde_json::json!({ "removed_creature_subtypes": ["Insect", "Monk"] })
+    );
+    // The pre-payload production adapter used precisely Option<bool>.
+    assert!(serde_json::from_value::<Option<bool>>(wire).is_err());
+    for (wire, expected) in [
+        (Value::Bool(true), Some(true)),
+        (Value::Bool(false), Some(false)),
+        (Value::Null, None),
+    ] {
+        assert_eq!(
+            serde_json::from_value::<Option<bool>>(wire).unwrap(),
+            expected
+        );
+    }
+    let restored: GameState =
+        serde_json::from_value(serialized.clone()).expect("current populated sibling decodes");
+    assert_fixture_reachable(&restored, ids);
+    assert_marker_isolation(&restored, ids);
+    assert!(restored.objects[&ids.signature].signature_spell.is_some());
+    for (id, expected) in [
+        (ids.bestow, vec!["Insect", "Monk"]),
+        (satyr_id, vec!["Satyr"]),
+    ] {
+        assert_eq!(restored.objects[&id].id, id);
+        assert_eq!(
+            restored.objects[&id]
+                .bestow_form
+                .as_ref()
+                .unwrap()
+                .removed_creature_subtypes,
+            expected
+        );
+    }
+    assert_eq!(restored.objects[&satyr_id].name, "Satyr payload neighbor");
+    let mut invalid = serialized;
+    object_json_mut(&mut invalid, ids.bestow).insert(
+        "bestow_form".into(),
+        Value::String("not-a-bestow-form".into()),
+    );
+    assert!(serde_json::from_value::<GameState>(invalid).is_err());
+}

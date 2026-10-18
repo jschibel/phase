@@ -210,6 +210,9 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 142: Populated GameObject.bestow_form carries the removed creature subtypes
+ *      as an object instead of a boolean. Old native readers cannot decode it.
+ *      Wire 124 moves with it.
  * 141 — ExileLinkKind gains CastCost (CR 607.2q: a card exiled to pay a cost
  *      of casting a permanent spell, linked to the permanent it becomes),
  *      carried in GameState.exile_links — see PROTOCOL_VERSION's own `/// 141`
@@ -860,7 +863,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 141;
+export const PROTOCOL_VERSION = 142;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

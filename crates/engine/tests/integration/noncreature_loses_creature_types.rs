@@ -1,5 +1,5 @@
-//! CR 205.1a (+ CR 205.3c/205.3d): an object that stops being a creature, for any
-//! reason, has no creature types while it isn't one. "If an object's card type is
+//! CR 205.1a (+ CR 205.3c/205.3d): creature types require a surviving Creature,
+//! Kindred or legacy Tribal type. "If an object's card type is
 //! removed, the subtypes correlated with that card type will remain if they are
 //! also the subtypes of a card type the object currently has; otherwise, they are
 //! also removed for the entire time the object's card type is removed."
@@ -7,8 +7,9 @@
 //! Real cards (the committed integration fixture): Overlord of the Balemurk
 //! (impending), Lion Sash (reconfigure), Heliod, Sun-Crowned (devotion), Dryad
 //! Arbor, Idol of False Gods (Kindred), March of the Machines, and the bestow
-//! creatures Springheart Nantuko and Boon Satyr. Overlord of the Mistmoors is not
-//! in the fixture; its sibling row is the one deliberately synthetic test.
+//! creatures Springheart Nantuko and Boon Satyr. Overlord of the Mistmoors,
+//! Amoeboid Changeling and One with the Stars use their exact Oracle text with
+//! scenario builders because they are absent from the fixture.
 //!
 //! Scenario tests run with an EMPTY `GameState::all_creature_types`, where the old
 //! registry-keeps-creature-types clause is inert; every row that asserts a removal
@@ -17,7 +18,7 @@
 use engine::game::effects::attach::attach_to;
 use engine::game::game_object::{AttachTarget, BestowFormState};
 use engine::game::layers::evaluate_layers;
-use engine::game::scenario::{GameRunner, GameScenario, P0};
+use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::ability::{ContinuousModification, Duration, TargetFilter};
 use engine::types::actions::{AlternativeCastDecision, GameAction};
@@ -25,6 +26,7 @@ use engine::types::card_type::CoreType;
 use engine::types::counter::CounterType;
 use engine::types::game_state::{CastingVariant, StackEntryKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
+use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
@@ -483,6 +485,76 @@ fn kindred_artifact_keeps_creature_types_when_its_creature_type_is_removed() {
 }
 
 // ---------------------------------------------------------------------------
+// Changeling (CR 702.73a + CR 205.3d)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn changeling_one_with_stars_does_not_regain_creature_types() {
+    // Verbatim MTGJSON Oracle; neither card is in the integration fixture.
+    const AMOEBOID: &str = "Changeling (This card is every creature type.)\n{T}: Target creature gains all creature types until end of turn.\n{T}: Target creature loses all creature types until end of turn.";
+    const STARS: &str = "Enchant creature or enchantment\nEnchanted permanent is an enchantment and loses all other card types. (It still has its abilities, but it's no longer a creature.)";
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let changeling = scenario
+        .add_creature(P0, "Amoeboid Changeling", 1, 1)
+        .with_subtypes(vec!["Shapeshifter"])
+        .from_oracle_text_with_keywords(&["Changeling"], AMOEBOID)
+        .id();
+    let sibling = scenario
+        .add_creature(P1, "Amoeboid Changeling", 1, 1)
+        .with_subtypes(vec!["Shapeshifter"])
+        .from_oracle_text_with_keywords(&["Changeling"], AMOEBOID)
+        .id();
+    let aura = scenario
+        .add_spell_to_hand_from_oracle(P0, "One with the Stars", false, STARS)
+        .as_enchantment()
+        .with_subtypes(vec!["Aura"])
+        .with_mana_cost(cost(3, vec![ManaCostShard::Blue]))
+        .from_oracle_text_with_keywords(&["Enchant"], STARS)
+        .id();
+    let mut runner = scenario.build();
+    install_registry(&mut runner, &["Bear", "Elf"]);
+    refresh(&mut runner);
+    for id in [changeling, sibling] {
+        assert!(runner.state().objects[&id].has_keyword(&Keyword::Changeling));
+        assert!(subtypes(&runner, id).contains(&"Bear".to_string()));
+        assert!(subtypes(&runner, id).contains(&"Elf".to_string()));
+    }
+    add_mana(&mut runner, ManaType::Blue, 4);
+    let outcome = runner.cast(aura).target_object(changeling).resolve();
+    outcome.assert_zone(&[aura], Zone::Battlefield);
+    assert_eq!(
+        outcome.state().objects[&aura].attached_to,
+        Some(AttachTarget::Object(changeling))
+    );
+    assert_eq!(
+        outcome.state().objects[&changeling].card_types.core_types,
+        vec![CoreType::Enchantment]
+    );
+    assert!(outcome.state().objects[&changeling].has_keyword(&Keyword::Changeling));
+    assert!(outcome.state().objects[&changeling]
+        .card_types
+        .subtypes
+        .is_empty());
+    drop(outcome);
+    assert_eq!(runner.state().objects[&sibling].controller, P1);
+    assert!(has_core(&runner, sibling, CoreType::Creature));
+    for ty in ["Bear", "Elf"] {
+        assert!(subtypes(&runner, sibling).contains(&ty.to_string()));
+    }
+
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(runner.state_mut(), aura, Zone::Graveyard, &mut events);
+    refresh(&mut runner);
+    assert!(has_core(&runner, changeling, CoreType::Creature));
+    for id in [changeling, sibling] {
+        for ty in ["Bear", "Elf"] {
+            assert!(subtypes(&runner, id).contains(&ty.to_string()));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bestow (CR 702.103b/e/f/g + CR 205.1a), real Springheart Nantuko / Boon Satyr
 // ---------------------------------------------------------------------------
 
@@ -518,6 +590,131 @@ fn payload(runner: &GameRunner, id: ObjectId) -> Option<Vec<String>> {
         .bestow_form
         .as_ref()
         .map(|form| form.removed_creature_subtypes.clone())
+}
+
+/// CR 702.103b/f + CR 205.1a: full-state transport retains each real cast's
+/// own restoration list through rehydration and independent unattachment.
+#[test]
+fn bestow_populated_game_state_roundtrip_preserves_independent_restore_payloads() {
+    let db = load_db().expect("integration fixture");
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let springheart = scenario.add_real_card(P0, "Springheart Nantuko", Zone::Hand, db);
+    let satyr = scenario.add_real_card(P0, "Boon Satyr", Zone::Hand, db);
+    let springheart_host = scenario.add_real_card(P0, "Grizzly Bears", Zone::Battlefield, db);
+    let satyr_host = scenario.add_real_card(P0, "Grizzly Bears", Zone::Battlefield, db);
+    let plain = scenario.add_real_card(P1, "Springheart Nantuko", Zone::Library, db);
+    let mut board = BestowBoard {
+        runner: build(scenario),
+        springheart,
+        satyr,
+        springheart_host,
+        satyr_host,
+    };
+    install_registry(&mut board.runner, &["Insect", "Monk", "Satyr"]);
+    add_mana(&mut board.runner, ManaType::Green, 7);
+    for (id, host, expected) in [
+        (
+            board.springheart,
+            board.springheart_host,
+            strings(&["Insect", "Monk"]),
+        ),
+        (board.satyr, board.satyr_host, strings(&["Satyr"])),
+    ] {
+        let outcome = board
+            .runner
+            .cast(id)
+            .alternative_cast(AlternativeCastDecision::Alternative)
+            .target_object(host)
+            .resolve();
+        outcome.assert_zone(&[id], Zone::Battlefield);
+        let obj = &outcome.state().objects[&id];
+        assert_eq!(obj.attached_to, Some(AttachTarget::Object(host)));
+        assert_eq!(obj.card_types.core_types, vec![CoreType::Enchantment]);
+        assert_eq!(obj.card_types.subtypes, strings(&["Aura"]));
+        assert_eq!(
+            obj.bestow_form.as_ref().unwrap().removed_creature_subtypes,
+            expected
+        );
+    }
+    assert_ne!(board.springheart, board.satyr);
+    assert!(
+        board.runner.state().stack.is_empty(),
+        "reach: both casts resolved"
+    );
+    let serialized =
+        serde_json::to_string(board.runner.state()).expect("full GameState serializes");
+    let restored = serde_json::from_str(&serialized).expect("full GameState deserializes");
+    let mut runner = GameRunner::from_state(restored);
+    engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
+    refresh(&mut runner);
+    for (id, host, expected) in [
+        (
+            board.springheart,
+            board.springheart_host,
+            strings(&["Insect", "Monk"]),
+        ),
+        (board.satyr, board.satyr_host, strings(&["Satyr"])),
+    ] {
+        let obj = &runner.state().objects[&id];
+        assert_eq!(obj.id, id);
+        assert_eq!((obj.owner, obj.controller), (P0, P0));
+        assert_eq!(obj.attached_to, Some(AttachTarget::Object(host)));
+        assert_eq!(obj.card_types.core_types, vec![CoreType::Enchantment]);
+        assert_eq!(obj.card_types.subtypes, strings(&["Aura"]));
+        assert_eq!(payload(&runner, id), Some(expected));
+    }
+    let neighbor = &runner.state().objects[&plain];
+    assert_eq!(
+        (neighbor.zone, neighbor.owner, neighbor.controller),
+        (Zone::Library, P1, P1)
+    );
+    assert!(neighbor.bestow_form.is_none());
+    assert_eq!(
+        neighbor.card_types.core_types,
+        vec![CoreType::Enchantment, CoreType::Creature]
+    );
+    assert_eq!(neighbor.card_types.subtypes, strings(&["Insect", "Monk"]));
+    assert!(runner.state().stack.is_empty());
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(
+        runner.state_mut(),
+        board.springheart_host,
+        Zone::Graveyard,
+        &mut events,
+    );
+    engine::game::sba::check_state_based_actions(runner.state_mut(), &mut events);
+    refresh(&mut runner);
+    assert_eq!(payload(&runner, board.springheart), None);
+    assert!(has_core(&runner, board.springheart, CoreType::Enchantment));
+    assert!(has_core(&runner, board.springheart, CoreType::Creature));
+    assert_eq!(
+        subtypes(&runner, board.springheart),
+        strings(&["Insect", "Monk"])
+    );
+    assert_eq!(payload(&runner, board.satyr), Some(strings(&["Satyr"])));
+    assert_eq!(
+        runner.state().objects[&board.satyr].attached_to,
+        Some(AttachTarget::Object(board.satyr_host))
+    );
+    assert_eq!(subtypes(&runner, board.satyr), strings(&["Aura"]));
+    assert!(!has_core(&runner, board.satyr, CoreType::Creature));
+    engine::game::zones::move_to_zone(
+        runner.state_mut(),
+        board.satyr_host,
+        Zone::Graveyard,
+        &mut events,
+    );
+    engine::game::sba::check_state_based_actions(runner.state_mut(), &mut events);
+    refresh(&mut runner);
+    assert_eq!(payload(&runner, board.satyr), None);
+    assert!(has_core(&runner, board.satyr, CoreType::Enchantment));
+    assert!(has_core(&runner, board.satyr, CoreType::Creature));
+    assert_eq!(subtypes(&runner, board.satyr), strings(&["Satyr"]));
+    assert_eq!(
+        subtypes(&runner, board.springheart),
+        strings(&["Insect", "Monk"])
+    );
 }
 
 /// CR 702.103b + CR 205.1a: cast bestowed, Springheart is an Aura enchantment on

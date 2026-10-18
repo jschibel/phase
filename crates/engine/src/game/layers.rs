@@ -3324,10 +3324,13 @@ fn derive_layer_characteristics(state: &mut GameState) -> Vec<ObjectId> {
     // covered by its own CDA static definition.
     if !state.all_creature_types.is_empty() {
         for &id in &bf_ids {
-            let has_changeling = state
-                .objects
-                .get(&id)
-                .is_some_and(|o| o.has_keyword(&Keyword::Changeling));
+            let has_changeling = state.objects.get(&id).is_some_and(|o| {
+                // CR 205.3d/m: the derived types must still own the creature set.
+                o.has_keyword(&Keyword::Changeling)
+                    && o.card_types.core_types.iter().any(|core_type| {
+                        core_type_subtype_set(*core_type) == Some(SubtypeSet::Creature)
+                    })
+            });
             if has_changeling {
                 let all_types = state.all_creature_types.clone();
                 if let Some(obj) = state.objects.get_mut(&id) {
@@ -6531,10 +6534,13 @@ fn apply_layers_incremental(
     // has Changeling but no CDA covered it.
     if !state.all_creature_types.is_empty() {
         for &id in &recipient_ids {
-            let has_changeling = state
-                .objects
-                .get(&id)
-                .is_some_and(|o| o.has_keyword(&Keyword::Changeling));
+            let has_changeling = state.objects.get(&id).is_some_and(|o| {
+                // CR 205.3d/m: the derived types must still own the creature set.
+                o.has_keyword(&Keyword::Changeling)
+                    && o.card_types.core_types.iter().any(|core_type| {
+                        core_type_subtype_set(*core_type) == Some(SubtypeSet::Creature)
+                    })
+            });
             if has_changeling {
                 let all_types = state.all_creature_types.clone();
                 if let Some(obj) = state.objects.get_mut(&id) {
@@ -12177,6 +12183,10 @@ mod tests {
             ("Avatar", vec![CoreType::Tribal, CoreType::Artifact], true),
             ("Equipment", vec![CoreType::Artifact], true),
             ("Equipment", vec![CoreType::Creature], false),
+            ("Heartwood", vec![CoreType::Artifact], true),
+            ("Heartwood", vec![CoreType::Creature], false),
+            ("Vibranium", vec![CoreType::Artifact], true),
+            ("Vibranium", vec![CoreType::Creature], false),
             ("Forest", vec![CoreType::Land, CoreType::Creature], true),
             ("Forest", vec![CoreType::Creature], false),
             ("Siege", vec![CoreType::Battle], true),
@@ -12306,6 +12316,22 @@ mod tests {
         }
 
         // Land Creature - Forest Dryad (Dryad Arbor shape).
+        let empty = removed(&[Artifact, Creature], &[], Creature);
+        assert_eq!(empty.core_types, vec![Artifact]);
+        assert!(empty.subtypes.is_empty());
+        for subtype in ["Heartwood", "Vibranium"] {
+            for (remove, remaining, expected) in [
+                (Creature, Artifact, vec![subtype]),
+                (Artifact, Creature, vec!["Bear"]),
+            ] {
+                let mut actual = card_type(&[Artifact, Creature], &[subtype, "Bear"]);
+                actual.supertypes.push(Supertype::Legendary);
+                remove_core_type(&mut actual, remove);
+                assert_eq!(actual.core_types, vec![remaining]);
+                assert_eq!(actual.subtypes, expected);
+                assert_eq!(actual.supertypes, vec![Supertype::Legendary]);
+            }
+        }
         assert_eq!(
             removed(&[Land, Creature], &["Forest", "Dryad"], Creature),
             card_type(&[Land], &["Forest"])
@@ -12355,6 +12381,131 @@ mod tests {
             removed(&[Artifact, Creature], &["Equipment", "Cat"], Artifact),
             card_type(&[Creature], &["Cat"])
         );
+    }
+
+    /// CR 205.1a/205.3g: canonical artifact types survive exactly their owner.
+    /// Synthetic primitive inputs exercise the ordinary production layer pass.
+    #[test]
+    fn artifact_subtype_correlation_survives_layered_removal_and_replacement() {
+        for subtype in ["Heartwood", "Vibranium"] {
+            for (modification, remaining, expected) in [
+                (
+                    ContinuousModification::RemoveType {
+                        core_type: CoreType::Creature,
+                    },
+                    CoreType::Artifact,
+                    subtype,
+                ),
+                (
+                    ContinuousModification::RemoveType {
+                        core_type: CoreType::Artifact,
+                    },
+                    CoreType::Creature,
+                    "Bear",
+                ),
+                (
+                    ContinuousModification::SetCardTypes {
+                        core_types: vec![CoreType::Artifact],
+                    },
+                    CoreType::Artifact,
+                    subtype,
+                ),
+                (
+                    ContinuousModification::SetCardTypes {
+                        core_types: vec![CoreType::Creature],
+                    },
+                    CoreType::Creature,
+                    "Bear",
+                ),
+            ] {
+                let mut state = setup();
+                state.all_creature_types = vec!["Bear".into(), "Elf".into()];
+                let target = make_creature(&mut state, "Artifact Creature", 2, 2, PlayerId(0));
+                let obj = state.objects.get_mut(&target).unwrap();
+                obj.card_types.core_types = vec![CoreType::Artifact, CoreType::Creature];
+                obj.card_types.subtypes = vec![subtype.into(), "Bear".into()];
+                obj.card_types.supertypes = vec![Supertype::Legendary];
+                obj.base_card_types = obj.card_types.clone();
+                let source = make_creature(&mut state, "Type Setter", 1, 1, PlayerId(0));
+                state
+                    .objects
+                    .get_mut(&source)
+                    .unwrap()
+                    .static_definitions
+                    .push(
+                        StaticDefinition::continuous()
+                            .affected(TargetFilter::SpecificObject { id: target })
+                            .modifications(vec![modification]),
+                    );
+                evaluate_layers(&mut state);
+                let actual = &state.objects[&target].card_types;
+                assert_eq!(actual.core_types, vec![remaining]);
+                assert_eq!(actual.subtypes, vec![expected.to_string()]);
+                assert_eq!(actual.supertypes, vec![Supertype::Legendary]);
+            }
+        }
+    }
+
+    /// CR 205.3d/m + CR 702.73a: both final append sites require a live owner.
+    #[test]
+    fn changeling_postfix_respects_correlated_type_in_full_and_incremental_paths() {
+        for incremental in [false, true] {
+            for registry in [vec!["Bear".to_string(), "Elf".to_string()], vec![]] {
+                let mut state = setup();
+                state.all_creature_types = registry.clone();
+                let mut cases = Vec::new();
+                for (core, changeling, base_subtype, eligible) in [
+                    (CoreType::Creature, true, "Shapeshifter", true),
+                    (CoreType::Kindred, true, "Shapeshifter", true),
+                    (CoreType::Tribal, true, "Shapeshifter", true),
+                    (CoreType::Enchantment, true, "Aura", false),
+                    (CoreType::Artifact, true, "Equipment", false),
+                    (CoreType::Creature, false, "Human", false),
+                ] {
+                    let id = make_creature(&mut state, "Postfix recipient", 2, 2, PlayerId(0));
+                    let obj = state.objects.get_mut(&id).unwrap();
+                    obj.card_types.core_types = vec![core];
+                    obj.card_types.subtypes = vec![base_subtype.into()];
+                    obj.base_card_types = obj.card_types.clone();
+                    obj.keywords = if changeling {
+                        vec![Keyword::Changeling]
+                    } else {
+                        vec![]
+                    };
+                    obj.base_keywords = obj.keywords.clone();
+                    cases.push((id, core, changeling, base_subtype, eligible));
+                }
+                if incremental {
+                    let entered = cases.iter().map(|(id, ..)| *id).collect();
+                    let prepared = prepare_incremental_flush(
+                        &mut state,
+                        &entered,
+                        StaticGateTruth::AssumeChanged,
+                    )
+                    .expect("reach: the actual incremental preparation accepts these entrants");
+                    apply_layers_incremental(
+                        &mut state,
+                        prepared,
+                        StateDurationRetirementOwner::LayerSettlement,
+                    );
+                } else {
+                    evaluate_layers(&mut state);
+                }
+                for (id, core, changeling, base_subtype, eligible) in cases {
+                    let obj = &state.objects[&id];
+                    assert_eq!(obj.card_types.core_types, vec![core]);
+                    assert_eq!(obj.has_keyword(&Keyword::Changeling), changeling);
+                    let mut expected = vec![base_subtype.to_string()];
+                    if eligible {
+                        expected.extend(registry.clone());
+                    }
+                    assert_eq!(
+                        obj.card_types.subtypes, expected,
+                        "incremental={incremental}, core={core:?}"
+                    );
+                }
+            }
+        }
     }
 
     fn make_creature(
