@@ -3694,7 +3694,9 @@ mod tests {
     #[test]
     fn successful_resume_deferred_mana_life_and_suffix_carries_same_chosen_outcome() {
         use crate::game::scenario::{GameScenario, P0};
-        use crate::types::ability::{PlayerFilter, QuantityModification, ReplacementDefinition};
+        use crate::types::ability::{
+            ChooseOneOfKind, PlayerFilter, QuantityModification, ReplacementDefinition,
+        };
         use crate::types::mana::{ManaColor, ManaCostShard};
         use crate::types::replacements::ReplacementEvent;
         for suffix in [false, true] {
@@ -3706,6 +3708,7 @@ mod tests {
                     Effect::ChooseOneOf {
                         chooser: PlayerFilter::Controller,
                         branches: vec![AbilityDefinition::new(AbilityKind::Spell, gain_life(1))],
+                        kind: ChooseOneOfKind::Ordinary,
                     },
                 ));
             let source = scenario
@@ -3723,7 +3726,12 @@ mod tests {
             };
             let cost = if suffix {
                 AbilityCost::Composite {
-                    costs: vec![mana, AbilityCost::PayEnergy { amount: 1 }],
+                    costs: vec![
+                        mana,
+                        AbilityCost::PayEnergy {
+                            amount: QuantityExpr::Fixed { value: 1 },
+                        },
+                    ],
                 }
             } else {
                 mana
