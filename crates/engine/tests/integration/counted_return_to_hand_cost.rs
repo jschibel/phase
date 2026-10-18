@@ -123,8 +123,8 @@ fn attach_departure_observer(
         .objects
         .get_mut(&host)
         .expect("observer host exists");
-    obj.trigger_definitions.push(trigger.clone());
     Arc::make_mut(&mut obj.base_trigger_definitions).push(trigger);
+    obj.materialize_base_trigger_definitions();
 }
 
 /// A no-target instant whose only castable-for-free route is `alt`.
@@ -1901,22 +1901,22 @@ fn delayed_two_land_sibling(
         scenario.add_basic_land(P0, ManaColor::Blue),
         scenario.add_basic_land(P0, ManaColor::Blue),
     ];
-    let priming_land = prime_carrier.then(|| scenario.add_basic_land(P0, ManaColor::Blue));
+    let priming_land = prime_carrier.then(|| scenario.add_basic_land(P0, ManaColor::Green));
     let source = if spell {
         scenario
             .add_spell_to_hand_from_oracle(P0, "Ensnare", true, ENSNARE)
             .with_mana_cost(ensnare_mana_cost())
             .id()
     } else {
-        let counted_cost = parse_oracle_cost("Return two lands you control to their owner's hand");
+        let counted_cost = parse_oracle_cost(if prime_carrier {
+            "Return two Islands you control to their owner's hand"
+        } else {
+            "Return two lands you control to their owner's hand"
+        });
         let cost = if prime_carrier {
             AbilityCost::Composite {
                 costs: vec![
-                    AbilityCost::ReturnToHand {
-                        count: 1,
-                        filter: Some(land_you_control()),
-                        from_zone: None,
-                    },
+                    parse_oracle_cost("Return a Forest you control to its owner's hand"),
                     counted_cost,
                 ],
             }
