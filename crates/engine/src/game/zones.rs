@@ -1543,9 +1543,11 @@ pub(crate) fn move_to_zone_with_entry_flags(
         let defending_player =
             super::combat::entry_attack_target_defender(state, snapshot_object.controller, target);
         ZoneChangeCombatStatus {
-            attacking: true,
+            attacking: defending_player.is_some(),
             defending_player,
             attack_target: defending_player.map(|_| target),
+            attack_target_identity: defending_player
+                .and_then(|_| super::combat::bind_attack_target(state, target)),
             ..ZoneChangeCombatStatus::default()
         }
     } else {
@@ -2342,6 +2344,7 @@ pub(crate) fn capture_combat_status(
         .attackers
         .iter()
         .find(|attacker| attacker.object_id == object_id);
+    let active_target = attacker.and_then(|info| super::combat::active_attack_target(state, info));
 
     ZoneChangeCombatStatus {
         attacking: attacker.is_some(),
@@ -2353,10 +2356,10 @@ pub(crate) fn capture_combat_status(
         attacking_alone: crate::game::combat::attacking_alone(state, object_id),
         blocking_alone: crate::game::combat::blocking_alone(state, object_id),
         defending_player: attacker.map(|attacker| attacker.defending_player),
-        // CR 506.3 + CR 113.7a: the declared target itself, captured with the
-        // collapsed defending player so the two cannot disagree (both come from
-        // the same live `AttackerInfo`).
-        attack_target: attacker.map(|attacker| attacker.attack_target),
+        // CR 506.4c + CR 608.2h: capture the active relation before removal,
+        // including its explicit absence, independently of the original defender.
+        attack_target: active_target.map(|(target, _)| target),
+        attack_target_identity: active_target.and_then(|(_, pin)| pin),
     }
 }
 
@@ -6644,8 +6647,32 @@ mod capture_combat_status_tests {
         let (a_player, a_walker, a_battle) = (attacker(1), attacker(2), attacker(3));
         let bystander = attacker(4);
         let blocker = attacker(5);
-        let walker = ObjectId(900);
-        let battle = ObjectId(901);
+        let walker = create_object(
+            &mut state,
+            CardId(900),
+            P2,
+            "Walker".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&walker)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Planeswalker];
+        let battle = create_object(
+            &mut state,
+            CardId(901),
+            P0,
+            "Battle".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&battle)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Battle];
 
         let mut combat = CombatState::default();
         combat
@@ -6664,6 +6691,15 @@ mod capture_combat_status_tests {
             P1,
         ));
         combat.blocker_to_attacker.insert(blocker, vec![a_player]);
+        combat.attacked_permanents.insert(
+            a_walker,
+            super::super::combat::bind_attack_target(&state, AttackTarget::Planeswalker(walker))
+                .unwrap(),
+        );
+        combat.attacked_permanents.insert(
+            a_battle,
+            super::super::combat::bind_attack_target(&state, AttackTarget::Battle(battle)).unwrap(),
+        );
         state.combat = Some(combat);
 
         for (id, target, defender) in [
@@ -6675,6 +6711,10 @@ mod capture_combat_status_tests {
             assert!(status.attacking, "reach guard: {target:?}");
             assert_eq!(status.defending_player, Some(defender), "{target:?}");
             assert_eq!(status.attack_target, Some(target), "{target:?}");
+            assert_eq!(
+                status.attack_target_identity,
+                super::super::combat::bind_attack_target(&state, target)
+            );
         }
 
         let blocking = capture_combat_status(&state, blocker);

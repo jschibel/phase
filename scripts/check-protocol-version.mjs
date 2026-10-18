@@ -164,7 +164,8 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +71: v142 adds the TargetFilter::AttackedPlayerOrPlaneswalker reference; ZoneChangeCombatStatus
 // gains `attack_target` (Option<AttackTarget>, the attacker's last-known declared
 // attack target) in zone-change records and trigger-source contexts of GameState.
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 71;
+// +72: v143 carries exact attack relations, departure pins and complete removal receipts.
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 72;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
@@ -262,7 +263,8 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 // ZoneChangeCombatStatus gains `attack_target` (Option<AttackTarget>, the attacker's
 // last-known declared attack target) in zone-change records and trigger-source contexts
 // of GameState.
-const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 70;
+// +71: wire 125 moves with full-game v143 for exact attack authority.
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 71;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse

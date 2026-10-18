@@ -151,6 +151,10 @@ fn assert_untargeted_triggers(r: &GameRunner, source: ObjectId, n: usize) {
     assert_eq!(triggers.len(), n, "triggers on the stack from the source");
     for t in triggers {
         assert!(t.targets.is_empty(), "declared targets: {:?}", t.targets);
+        assert!(
+            !serde_json::to_string(t).unwrap().contains("Unimplemented"),
+            "real lowered trigger is functioning"
+        );
     }
 }
 
@@ -219,14 +223,8 @@ fn deal_damage_resolutions(events: &[GameEvent], source: ObjectId) -> usize {
 }
 
 fn gone_from_combat(r: &mut GameRunner, id: ObjectId) {
-    // Synthetic: the attacker is removed from combat by a retain-filter while staying on the
-    // battlefield (CR 506.4).
-    r.state_mut()
-        .combat
-        .as_mut()
-        .unwrap()
-        .attackers
-        .retain(|a| a.object_id != id);
+    // Typed combat contract; printed action-path removal is covered below.
+    engine::game::effects::remove_from_combat::remove_object_from_combat(r.state_mut(), id);
 }
 
 fn sphere_board(sc: &mut GameScenario) -> (ObjectId, Vec<ObjectId>) {
@@ -520,6 +518,16 @@ fn hellrider_trigger_of_an_attacker_removed_from_combat_deals_no_damage() {
         "positive control: Hellrider's own trigger"
     );
     assert_eq!(life(&b.r, P1), 20, "the Goblin is attacking nothing");
+    assert_eq!(
+        (life(&b.r, P0), life(&b.r, P2)),
+        (20, 20),
+        "no controller fallback"
+    );
+    assert_eq!(
+        damage_from(&ev, b.hellrider),
+        vec![(TargetRef::Object(b.karn), 1)],
+        "only Hellrider's own trigger deals damage"
+    );
 }
 
 /// The Goblin is blinked in response. The new Goblin is a different object (CR 400.7); the
@@ -575,6 +583,15 @@ fn hellrider_reads_the_live_attack_target() {
             .find(|a| a.object_id == goblin)
             .unwrap();
     info.attack_target = AttackTarget::Planeswalker(karn);
+    let pin =
+        engine::game::combat::bind_attack_target(b.r.state(), AttackTarget::Planeswalker(karn))
+            .unwrap();
+    b.r.state_mut()
+        .combat
+        .as_mut()
+        .unwrap()
+        .attacked_permanents
+        .insert(goblin, pin);
     let mut ev = Vec::new();
     settle(&mut b.r, &mut ev, true, 0);
     assert_eq!(
@@ -680,6 +697,769 @@ fn swordjack_removed_from_combat_deals_no_damage() {
     settle(&mut r, &mut ev, true, 0);
     assert_eq!(deal_damage_resolutions(&ev, jack), 1);
     assert_eq!(loyalty(&r, karn), 5);
+    assert_eq!(damage_from(&ev, jack), vec![]);
+    assert_eq!((life(&r, P0), life(&r, P1), life(&r, P2)), (20, 20, 20));
+}
+
+const FULL_SWORDJACK: &str = "Whenever this creature attacks, it deals damage to the player or planeswalker it's attacking equal to the number of artifacts you control.\nEncore {5}{R} ({5}{R}, Exile this card from your graveyard: For each opponent, create a token copy that attacks that opponent this turn if able. They gain haste. Sacrifice them at the beginning of the next end step. Activate only as a sorcery.)";
+const FULL_HELLRIDER: &str = "Haste\nWhenever a creature you control attacks, this creature deals 1 damage to the player or planeswalker it's attacking.";
+const RECONNAISSANCE: &str = "{0}: Remove target attacking creature you control from combat and untap it. (If you activate during end of combat, the creature will untap after it deals combat damage.)";
+const FLICKER: &str =
+    "Exile target nontoken permanent, then return it to the battlefield under its owner's control.";
+const WORD: &str = "Split second (As long as this spell is on the stack, players can't cast spells or activate abilities that aren't mana abilities.)\nUntap target permanent and gain control of it until end of turn. It gains haste until end of turn.";
+const LEYLINE: &str = "If this card is in your opening hand, you may begin the game with it on the battlefield.\nYou may cast spells as though they had flash.";
+const LIFELINK: &str = "Enchant creature\nEnchanted creature has lifelink. (Damage dealt by the creature also causes its controller to gain that much life.)";
+const RANCOR: &str = "Enchant creature\nEnchanted creature gets +2/+0 and has trample.\nWhen this Aura is put into a graveyard from the battlefield, return it to its owner's hand.";
+const THRASTA: &str = "This spell costs {3} less to cast for each other spell cast this turn.\nTrample, haste\nTrample over planeswalkers (This creature can deal excess combat damage to the controller of the planeswalker it's attacking.)\nThrasta has hexproof as long as it entered this turn.";
+
+struct AuthorityBoard {
+    r: GameRunner,
+    source: ObjectId,
+    attacker: ObjectId,
+    walker: ObjectId,
+    recon: ObjectId,
+    murder: ObjectId,
+    flicker: ObjectId,
+    word: ObjectId,
+    blocker: ObjectId,
+    rancor: ObjectId,
+    unrelated: ObjectId,
+}
+
+fn authority_board(observer: bool, loyalty: u32) -> AuthorityBoard {
+    damage_authority_board(observer, false, loyalty)
+}
+
+fn damage_authority_board(observer: bool, thrasta: bool, loyalty: u32) -> AuthorityBoard {
+    let mut sc = scenario();
+    let source = if thrasta {
+        sc.add_creature(P0, "Thrasta, Tempest's Roar", 7, 7)
+            .from_oracle_text_with_keywords(
+                &["Trample", "Haste", "Trample over planeswalkers"],
+                THRASTA,
+            )
+            .id()
+    } else if observer {
+        sc.add_creature(P0, "Hellrider", 3, 3)
+            .from_oracle_text_with_keywords(&["Haste"], FULL_HELLRIDER)
+            .id()
+    } else {
+        sc.add_creature_from_oracle(P0, "Fathom Fleet Swordjack", 4, 3, FULL_SWORDJACK)
+            .id()
+    };
+    let attacker = if observer {
+        sc.add_creature(P0, "Goblin", 1, 1).id()
+    } else {
+        source
+    };
+    for i in 0..3 {
+        sc.add_artifact_from_oracle(P0, &format!("Artifact {i}"), "");
+    }
+    let walker = add_karn(&mut sc, loyalty);
+    let recon = sc
+        .add_enchantment_from_oracle(P0, "Reconnaissance", RECONNAISSANCE)
+        .id();
+    sc.add_enchantment_from_oracle(P0, "Leyline of Anticipation", LEYLINE);
+    let murder = sc
+        .add_spell_to_hand_from_oracle(P0, "Murder", true, "Destroy target creature.")
+        .id();
+    let flicker = sc
+        .add_spell_to_hand_from_oracle(P0, "Flicker", false, FLICKER)
+        .id();
+    let word = sc
+        .add_spell_to_hand_from_oracle(P0, "Word of Seizing", true, WORD)
+        .from_oracle_text_with_keywords(&["Split second"], WORD)
+        .id();
+    let blocker = sc.add_creature(P1, "Blocking creature", 1, 4).id();
+    let unrelated = sc.add_creature(P0, "Unrelated attacker", 1, 1).id();
+    let rancor = sc.add_enchantment_from_oracle(P0, "Rancor", RANCOR).id();
+    let mut r = sc.build();
+    zones::move_to_zone(r.state_mut(), rancor, Zone::Hand, &mut Vec::new());
+    control_by_p1(&mut r, walker);
+    AuthorityBoard {
+        r,
+        source,
+        attacker,
+        walker,
+        recon,
+        murder,
+        flicker,
+        word,
+        blocker,
+        rancor,
+        unrelated,
+    }
+}
+
+fn pass_to_p0(r: &mut GameRunner) {
+    for _ in 0..3 {
+        match r.state().waiting_for {
+            WaitingFor::Priority { player: P0 } => return,
+            WaitingFor::Priority { .. } => {
+                r.act(GameAction::PassPriority).unwrap();
+            }
+            ref other => panic!("expected response priority: {other:?}"),
+        }
+    }
+    panic!("P0 did not get response priority");
+}
+
+/// Resolve just this response through CastCommit actions, preserving lower triggers.
+fn resolve_response(r: &mut GameRunner, spell: ObjectId, target: ObjectId) -> Vec<GameEvent> {
+    pass_to_p0(r);
+    let mut cast = r.cast(spell).target_object(target).commit();
+    assert!(cast
+        .state()
+        .stack
+        .iter()
+        .any(|entry| entry.source_id == spell));
+    let mut events = Vec::new();
+    for _ in 0..24 {
+        if !cast
+            .state()
+            .stack
+            .iter()
+            .any(|entry| entry.source_id == spell)
+        {
+            return events;
+        }
+        events.extend(
+            cast.act(GameAction::PassPriority)
+                .expect("response resolves")
+                .events,
+        );
+    }
+    panic!("response remained on stack");
+}
+
+fn remove_with_recon(b: &mut AuthorityBoard) {
+    let predecessor = b.r.state().clone();
+    pass_to_p0(&mut b.r);
+    b.r.act(GameAction::ActivateAbility {
+        source_id: b.recon,
+        ability_index: 0,
+    })
+    .unwrap();
+    if matches!(b.r.state().waiting_for, WaitingFor::TargetSelection { .. }) {
+        b.r.act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(b.attacker)),
+        })
+        .unwrap();
+    }
+    for _ in 0..24 {
+        if !b
+            .r
+            .state()
+            .stack
+            .iter()
+            .any(|entry| entry.source_id == b.recon)
+        {
+            break;
+        }
+        b.r.act(GameAction::PassPriority).unwrap();
+    }
+    assert!(!b
+        .r
+        .state()
+        .combat
+        .as_ref()
+        .unwrap()
+        .attackers
+        .iter()
+        .any(|info| info.object_id == b.attacker));
+    assert_untargeted_triggers(&b.r, b.source, 1);
+    let command = b
+        .r
+        .state()
+        .resolved_rules_journal
+        .entries()
+        .iter()
+        .rev()
+        .find_map(|entry| match entry.command.as_ref() {
+            Some(engine::types::resolved_commands::ResolvedRulesCommand::CombatMembership(
+                command,
+            )) if command.object.object_id == b.attacker
+                && matches!(
+                    command.edit,
+                    engine::types::resolved_commands::ResolvedCombatMembershipEdit::Remove { .. }
+                ) =>
+            {
+                Some(command.clone())
+            }
+            _ => None,
+        })
+        .expect("printed removal journals its complete combat receipt");
+    let engine::types::resolved_commands::ResolvedCombatMembershipEdit::Remove {
+        expected_participation,
+    } = &command.edit
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        *expected_participation,
+        engine::game::combat::CombatParticipation::capture(&predecessor, b.attacker)
+    );
+    assert!(expected_participation
+        .outgoing_attack_target_identity
+        .flatten()
+        .is_some());
+    let mut replay = predecessor;
+    engine::game::combat::apply_resolved_combat_membership(&mut replay, &command).unwrap();
+    assert_eq!(
+        replay.combat.as_ref().unwrap().attackers,
+        b.r.state().combat.as_ref().unwrap().attackers
+    );
+    assert_eq!(
+        replay.combat.as_ref().unwrap().attacked_permanents,
+        b.r.state().combat.as_ref().unwrap().attacked_permanents
+    );
+}
+
+/// CR 506.4 + CR 608.2h: newest exact departure, including no recipient, wins.
+#[test]
+fn exact_departure_after_printed_removal_overrides_self_and_observer_placement() {
+    for observer in [false, true] {
+        for removed in [false, true] {
+            let mut b = authority_board(observer, 5);
+            attack(
+                &mut b.r,
+                &[(b.attacker, AttackTarget::Planeswalker(b.walker))],
+            );
+            assert_untargeted_triggers(&b.r, b.source, 1);
+            let pin = b.r.state().combat.as_ref().unwrap().attacked_permanents[&b.attacker];
+            assert_eq!(pin.object_id, b.walker);
+            if removed {
+                remove_with_recon(&mut b);
+            }
+            resolve_response(&mut b.r, b.murder, b.attacker);
+            assert_eq!(b.r.state().objects[&b.attacker].zone, Zone::Graveyard);
+            assert_untargeted_triggers(&b.r, b.source, 1);
+            let row = b
+                .r
+                .state()
+                .zone_changes_this_turn
+                .iter()
+                .rev()
+                .find(|row| row.object_id == b.attacker && row.from_zone == Some(Zone::Battlefield))
+                .unwrap();
+            assert_eq!(
+                row.combat_status.attack_target_identity,
+                (!removed).then_some(pin)
+            );
+            let mut events = Vec::new();
+            settle(&mut b.r, &mut events, true, 0);
+            let amount = if observer { 1 } else { 3 };
+            assert_eq!(deal_damage_resolutions(&events, b.source), 1);
+            assert_eq!(
+                damage_from(&events, b.source),
+                if removed {
+                    vec![]
+                } else {
+                    vec![(TargetRef::Object(b.walker), amount)]
+                }
+            );
+            assert_eq!(
+                loyalty(&b.r, b.walker),
+                5 - if removed { 0 } else { amount }
+            );
+            assert_eq!(
+                (life(&b.r, P0), life(&b.r, P1), life(&b.r, P2)),
+                (20, 20, 20)
+            );
+        }
+    }
+}
+
+/// CR 400.7 + CR 506.4c + CR 608.2h: live edge lifetime and departure LKI differ.
+#[test]
+fn printed_recipient_mutations_respect_live_and_departure_timing() {
+    for observer in [false, true] {
+        for blink in [false, true] {
+            for timing in 0..3 {
+                let mut b = authority_board(observer, 5);
+                attack(
+                    &mut b.r,
+                    &[(b.attacker, AttackTarget::Planeswalker(b.walker))],
+                );
+                assert_untargeted_triggers(&b.r, b.source, 1);
+                let pin = b.r.state().combat.as_ref().unwrap().attacked_permanents[&b.attacker];
+                if timing == 2 {
+                    resolve_response(&mut b.r, b.murder, b.attacker);
+                }
+                resolve_response(&mut b.r, if blink { b.flicker } else { b.word }, b.walker);
+                let object = &b.r.state().objects[&b.walker];
+                assert_eq!(object.zone, Zone::Battlefield);
+                assert_eq!(object.incarnation != pin.incarnation, blink);
+                assert_eq!(object.controller, if blink { P2 } else { P0 });
+                assert!(!b
+                    .r
+                    .state()
+                    .combat
+                    .as_ref()
+                    .unwrap()
+                    .attacked_permanents
+                    .contains_key(&b.attacker));
+                if timing == 1 {
+                    resolve_response(&mut b.r, b.murder, b.attacker);
+                }
+                if timing == 0 {
+                    assert!(b
+                        .r
+                        .state()
+                        .combat
+                        .as_ref()
+                        .unwrap()
+                        .attackers
+                        .iter()
+                        .any(|info| info.object_id == b.attacker));
+                }
+                assert_untargeted_triggers(&b.r, b.source, 1);
+                let mut events = Vec::new();
+                settle(&mut b.r, &mut events, true, 0);
+                let amount = if observer { 1 } else { 3 };
+                let expected = if timing == 2 && !blink { amount } else { 0 };
+                assert_eq!(deal_damage_resolutions(&events, b.source), 1);
+                assert_eq!(loyalty(&b.r, b.walker), 5 - expected);
+                assert_eq!(
+                    damage_from(&events, b.source),
+                    if expected == 0 {
+                        vec![]
+                    } else {
+                        vec![(TargetRef::Object(b.walker), expected)]
+                    }
+                );
+                assert_eq!(
+                    (life(&b.r, P0), life(&b.r, P1), life(&b.r, P2)),
+                    (20, 20, 20)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn recipient_retirement_ends_every_incoming_attack_but_keeps_a_player_attack() {
+    for blink in [false, true] {
+        let mut b = authority_board(true, 5);
+        attack(
+            &mut b.r,
+            &[
+                (b.source, AttackTarget::Planeswalker(b.walker)),
+                (b.attacker, AttackTarget::Planeswalker(b.walker)),
+                (b.unrelated, AttackTarget::Player(P1)),
+            ],
+        );
+        assert_untargeted_triggers(&b.r, b.source, 3);
+        assert_eq!(
+            b.r.state()
+                .combat
+                .as_ref()
+                .unwrap()
+                .attacked_permanents
+                .len(),
+            2
+        );
+        resolve_response(&mut b.r, if blink { b.flicker } else { b.word }, b.walker);
+        assert!(b
+            .r
+            .state()
+            .combat
+            .as_ref()
+            .unwrap()
+            .attacked_permanents
+            .is_empty());
+        assert_eq!(b.r.state().combat.as_ref().unwrap().attackers.len(), 3);
+        let mut events = Vec::new();
+        settle(&mut b.r, &mut events, true, 0);
+        assert_eq!(deal_damage_resolutions(&events, b.source), 3);
+        assert_eq!(
+            damage_from(&events, b.source),
+            vec![(TargetRef::Player(P1), 1)]
+        );
+        assert_eq!(loyalty(&b.r, b.walker), 5);
+        assert_eq!(
+            (life(&b.r, P0), life(&b.r, P1), life(&b.r, P2)),
+            (20, 19, 20)
+        );
+    }
+}
+
+#[test]
+fn source_return_and_new_departure_cannot_replace_the_original_exact_departure() {
+    for observer in [false, true] {
+        let mut b = authority_board(observer, 5);
+        attack(
+            &mut b.r,
+            &[(b.attacker, AttackTarget::Planeswalker(b.walker))],
+        );
+        assert_untargeted_triggers(&b.r, b.source, 1);
+        let original = b.r.state().objects[&b.attacker].incarnation;
+        resolve_response(&mut b.r, b.flicker, b.attacker);
+        assert_ne!(b.r.state().objects[&b.attacker].incarnation, original);
+        resolve_response(&mut b.r, b.murder, b.attacker);
+        let departures: Vec<_> = b
+            .r
+            .state()
+            .zone_changes_this_turn
+            .iter()
+            .filter(|row| row.object_id == b.attacker && row.from_zone == Some(Zone::Battlefield))
+            .collect();
+        assert_eq!(departures.len(), 2);
+        assert!(departures[0].combat_status.attack_target_identity.is_some());
+        assert_eq!(departures[1].combat_status.attack_target, None);
+        let mut events = Vec::new();
+        settle(&mut b.r, &mut events, true, 0);
+        let amount = if observer { 1 } else { 3 };
+        assert_eq!(deal_damage_resolutions(&events, b.source), 1);
+        assert_eq!(
+            damage_from(&events, b.source),
+            vec![(TargetRef::Object(b.walker), amount)]
+        );
+        assert_eq!(loyalty(&b.r, b.walker), 5 - amount);
+        assert_eq!(
+            (life(&b.r, P0), life(&b.r, P1), life(&b.r, P2)),
+            (20, 20, 20)
+        );
+    }
+}
+
+#[test]
+fn typed_reselection_then_printed_departure_reads_the_new_destination() {
+    for observer in [false, true] {
+        let mut b = authority_board(observer, 5);
+        attack(&mut b.r, &[(b.attacker, AttackTarget::Player(P1))]);
+        assert_untargeted_triggers(&b.r, b.source, 1);
+        // Typed combat-contract setup, not a Portal Mage support assertion.
+        let target = AttackTarget::Planeswalker(b.walker);
+        let pin = engine::game::combat::bind_attack_target(b.r.state(), target).unwrap();
+        let combat = b.r.state_mut().combat.as_mut().unwrap();
+        combat
+            .attackers
+            .iter_mut()
+            .find(|info| info.object_id == b.attacker)
+            .unwrap()
+            .attack_target = target;
+        combat.attacked_permanents.insert(b.attacker, pin);
+        resolve_response(&mut b.r, b.murder, b.attacker);
+        let mut events = Vec::new();
+        settle(&mut b.r, &mut events, true, 0);
+        let amount = if observer { 1 } else { 3 };
+        assert_eq!(deal_damage_resolutions(&events, b.source), 1);
+        assert_eq!(
+            damage_from(&events, b.source),
+            vec![(TargetRef::Object(b.walker), amount)]
+        );
+        assert_eq!(loyalty(&b.r, b.walker), 5 - amount);
+        assert_eq!(
+            (life(&b.r, P0), life(&b.r, P1), life(&b.r, P2)),
+            (20, 20, 20)
+        );
+    }
+}
+
+#[test]
+fn printed_battlesphere_with_no_untapped_myr_reaches_optional_without_damage() {
+    let mut sc = scenario();
+    let sphere = sc.add_creature_from_oracle(P0, "Myr Battlesphere", 4, 7,
+        "When this creature enters, create four 1/1 colorless Myr artifact creature tokens.\nWhenever this creature attacks, you may tap X untapped Myr you control. If you do, this creature gets +X/+0 until end of turn and deals X damage to the player or planeswalker it's attacking.")
+        .with_subtypes(vec!["Myr", "Construct"]).id();
+    let mut r = sc.build();
+    attack(&mut r, &[(sphere, AttackTarget::Player(P1))]);
+    assert_untargeted_triggers(&r, sphere, 1);
+    assert!(r.state().objects[&sphere].tapped);
+    let mut events = Vec::new();
+    let seen = settle(&mut r, &mut events, true, 0);
+    assert!(seen.optional && !seen.tap_prompt);
+    assert_eq!(r.state().objects[&sphere].power, Some(4));
+    assert_eq!(damage_from(&events, sphere), vec![]);
+    assert_eq!((life(&r, P0), life(&r, P1), life(&r, P2)), (20, 20, 20));
+}
+
+/// CR 800.4 + CR 702.15b: no damage, hence no lifelink, to a departed seat.
+#[test]
+fn departed_player_is_no_recipient_and_cannot_supply_lifelink() {
+    for concede in [false, true] {
+        let mut sc = scenario();
+        let rider = sc
+            .add_creature(P0, "Hellrider", 3, 3)
+            .from_oracle_text_with_keywords(&["Haste"], FULL_HELLRIDER)
+            .id();
+        let aura = sc
+            .add_enchantment_from_oracle(P0, "Lifelink", LIFELINK)
+            .id();
+        sc.add_enchantment_from_oracle(P1, "Leyline of Sanctity",
+            "If this card is in your opening hand, you may begin the game with it on the battlefield.\nYou have hexproof. (You can't be the target of spells or abilities your opponents control.)");
+        let mut r = sc.build();
+        zones::move_to_zone(r.state_mut(), aura, Zone::Hand, &mut Vec::new());
+        r.cast(aura).target_object(rider).resolve();
+        assert!(r.state().objects[&rider].has_keyword(&engine::types::keywords::Keyword::Lifelink));
+        assert!(engine::game::static_abilities::player_has_hexproof(
+            r.state(),
+            P1
+        ));
+        assert!(
+            !engine::game::targeting::player_is_legal_target(r.state(), P1, rider, P0),
+            "positive control: P1 really cannot be targeted; the printed recipient is untargeted"
+        );
+        attack(&mut r, &[(rider, AttackTarget::Player(P1))]);
+        assert_untargeted_triggers(&r, rider, 1);
+        if concede {
+            r.act(GameAction::Concede { player_id: P1 }).unwrap();
+        }
+        assert_eq!(engine::game::players::is_alive(r.state(), P1), !concede);
+        assert_untargeted_triggers(&r, rider, 1);
+        let mut events = Vec::new();
+        settle(&mut r, &mut events, true, 0);
+        assert_eq!(deal_damage_resolutions(&events, rider), 1);
+        assert_eq!(
+            damage_from(&events, rider),
+            if concede {
+                vec![]
+            } else {
+                vec![(TargetRef::Player(P1), 1)]
+            }
+        );
+        assert_eq!(
+            (life(&r, P0), life(&r, P1), life(&r, P2)),
+            if concede { (20, 20, 20) } else { (21, 19, 20) }
+        );
+    }
+}
+
+fn reach_blocked_priority(b: &mut AuthorityBoard) {
+    for _ in 0..32 {
+        let blocked =
+            b.r.state()
+                .combat
+                .as_ref()
+                .unwrap()
+                .attackers
+                .iter()
+                .any(|info| info.object_id == b.attacker && info.blocked);
+        if blocked && matches!(b.r.state().waiting_for, WaitingFor::Priority { .. }) {
+            return;
+        }
+        match b.r.state().waiting_for.clone() {
+            WaitingFor::DeclareBlockers { player, .. } => {
+                b.r.declare_blockers(if player == P1 {
+                    &[(b.blocker, b.attacker)]
+                } else {
+                    &[]
+                })
+                .unwrap();
+            }
+            WaitingFor::Priority { .. } => {
+                b.r.act(GameAction::PassPriority).unwrap();
+            }
+            other => panic!("before legal blocking: {other:?}"),
+        }
+    }
+    panic!("did not reach blocked priority");
+}
+
+fn reach_assignment(r: &mut GameRunner) {
+    for _ in 0..24 {
+        if matches!(r.state().waiting_for, WaitingFor::AssignCombatDamage { .. }) {
+            return;
+        }
+        assert!(matches!(r.state().waiting_for, WaitingFor::Priority { .. }));
+        r.act(GameAction::PassPriority).unwrap();
+    }
+    panic!("did not reach real damage assignment");
+}
+
+/// CR 702.19b/c/e + CR 506.4c: real prompt, shared candidate, validation and routing.
+#[test]
+fn interactive_excess_and_candidates_use_the_current_exact_recipient() {
+    use engine::types::game_state::CombatDamageAssignmentMode as Mode;
+    for over_pw in [false, true] {
+        for retirement in 0..3 {
+            for all_blocker in [false, true] {
+                let mut b = damage_authority_board(false, over_pw, if over_pw { 1 } else { 10 });
+                if !over_pw {
+                    b.r.cast(b.rancor).target_object(b.attacker).resolve();
+                    assert_eq!(b.r.state().objects[&b.attacker].power, Some(6));
+                    assert!(b.r.state().objects[&b.attacker]
+                        .has_keyword(&engine::types::keywords::Keyword::Trample));
+                }
+                attack(
+                    &mut b.r,
+                    &[(b.attacker, AttackTarget::Planeswalker(b.walker))],
+                );
+                let pin = b.r.state().combat.as_ref().unwrap().attacked_permanents[&b.attacker];
+                if !over_pw {
+                    assert_untargeted_triggers(&b.r, b.source, 1);
+                    let mut trigger_events = Vec::new();
+                    settle(&mut b.r, &mut trigger_events, true, 0);
+                    assert_eq!(
+                        damage_from(&trigger_events, b.source),
+                        vec![(TargetRef::Object(b.walker), 3)]
+                    );
+                    assert_eq!(loyalty(&b.r, b.walker), 7);
+                }
+                reach_blocked_priority(&mut b);
+                if retirement != 0 {
+                    resolve_response(
+                        &mut b.r,
+                        if retirement == 1 { b.word } else { b.flicker },
+                        b.walker,
+                    );
+                    assert!(!b
+                        .r
+                        .state()
+                        .combat
+                        .as_ref()
+                        .unwrap()
+                        .attacked_permanents
+                        .contains_key(&b.attacker));
+                    assert_eq!(
+                        b.r.state().objects[&b.walker].incarnation != pin.incarnation,
+                        retirement == 2
+                    );
+                    assert!(b.r.state().combat.as_ref().unwrap().attackers[0].blocked);
+                }
+                reach_assignment(&mut b.r);
+                let power = if over_pw { 7 } else { 6 };
+                let (threshold, controller) = match b.r.state().waiting_for {
+                    WaitingFor::AssignCombatDamage {
+                        total_damage,
+                        pw_loyalty,
+                        pw_controller,
+                        ..
+                    } => {
+                        assert_eq!(total_damage, power);
+                        (pw_loyalty, pw_controller)
+                    }
+                    _ => unreachable!(),
+                };
+                if over_pw {
+                    assert_eq!(threshold, if retirement == 0 { Some(1) } else { None });
+                    assert_eq!(controller, Some(P1));
+                }
+                if retirement != 0 && !over_pw {
+                    let before = serde_json::to_value(b.r.state()).unwrap();
+                    let dirty = format!("{:?}", b.r.state().layers_dirty);
+                    let invalid = b.r.act(GameAction::AssignCombatDamage {
+                        mode: Mode::Normal,
+                        assignments: vec![(b.blocker, 4)],
+                        trample_damage: 2,
+                        controller_damage: 0,
+                    });
+                    assert!(matches!(
+                        invalid,
+                        Err(engine::game::engine::EngineError::InvalidAction(_))
+                    ));
+                    assert_eq!(
+                        serde_json::to_value(b.r.state()).unwrap(),
+                        before,
+                        "rejected excess changes no graph, prompt, journal, cursor or damage"
+                    );
+                    assert_eq!(format!("{:?}", b.r.state().layers_dirty), dirty);
+                }
+                let generated = engine::ai_support::legal_actions(b.r.state())
+                    .into_iter()
+                    .find(|action| {
+                        matches!(
+                            action,
+                            GameAction::AssignCombatDamage {
+                                mode: Mode::Normal,
+                                ..
+                            }
+                        )
+                    })
+                    .expect("normal legal response remains available");
+                let expected_generated = if over_pw {
+                    GameAction::AssignCombatDamage {
+                        mode: Mode::Normal,
+                        assignments: vec![(b.blocker, 4)],
+                        trample_damage: if retirement == 0 { 1 } else { 0 },
+                        controller_damage: if retirement == 0 { 2 } else { 3 },
+                    }
+                } else if retirement == 0 {
+                    GameAction::AssignCombatDamage {
+                        mode: Mode::Normal,
+                        assignments: vec![(b.blocker, 4)],
+                        trample_damage: 2,
+                        controller_damage: 0,
+                    }
+                } else {
+                    GameAction::AssignCombatDamage {
+                        mode: Mode::Normal,
+                        assignments: vec![(b.blocker, 6)],
+                        trample_damage: 0,
+                        controller_damage: 0,
+                    }
+                };
+                assert_eq!(generated, expected_generated);
+                let before_loyalty = loyalty(&b.r, b.walker);
+                let result =
+                    b.r.act(if all_blocker {
+                        GameAction::AssignCombatDamage {
+                            mode: Mode::Normal,
+                            assignments: vec![(b.blocker, power)],
+                            trample_damage: 0,
+                            controller_damage: 0,
+                        }
+                    } else {
+                        generated
+                    })
+                    .expect("legal assignment finishes");
+                let expected = if all_blocker {
+                    vec![(TargetRef::Object(b.blocker), power)]
+                } else if !over_pw && retirement != 0 {
+                    vec![(TargetRef::Object(b.blocker), 6)]
+                } else if !over_pw {
+                    vec![
+                        (TargetRef::Object(b.blocker), 4),
+                        (TargetRef::Object(b.walker), 2),
+                    ]
+                } else if retirement == 0 {
+                    vec![
+                        (TargetRef::Object(b.blocker), 4),
+                        (TargetRef::Object(b.walker), 1),
+                        (TargetRef::Player(P1), 2),
+                    ]
+                } else {
+                    vec![
+                        (TargetRef::Object(b.blocker), 4),
+                        (TargetRef::Player(P1), 3),
+                    ]
+                };
+                assert_eq!(damage_from(&result.events, b.attacker), expected);
+                assert_eq!(
+                    loyalty(&b.r, b.walker),
+                    before_loyalty
+                        - if all_blocker || retirement != 0 {
+                            0
+                        } else if over_pw {
+                            1
+                        } else {
+                            2
+                        }
+                );
+                assert_eq!(
+                    (life(&b.r, P0), life(&b.r, P1), life(&b.r, P2)),
+                    (
+                        20,
+                        if over_pw && !all_blocker {
+                            if retirement == 0 {
+                                18
+                            } else {
+                                17
+                            }
+                        } else {
+                            20
+                        },
+                        20
+                    )
+                );
+                assert!(!matches!(
+                    b.r.state().waiting_for,
+                    WaitingFor::AssignCombatDamage { .. }
+                ));
+            }
+        }
+    }
 }
 
 /// Killed in response, still damages what it was attacking (ruling 2020-11-10).

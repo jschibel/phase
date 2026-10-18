@@ -51054,7 +51054,7 @@ mod pending_trigger_pin_reassignment_tests {
 mod attacked_referent_binding_tests {
     use super::*;
 
-    /// CR 506.3 + CR 603.4: the referent also reads live combat and battlefield state,
+    /// CR 506.3 + CR 608.2k: the bound referent also reads live combat and battlefield state,
     /// which can differ between fire time and resolution; "when in doubt, true".
     #[test]
     fn attacked_referent_filter_binding_diverges() {

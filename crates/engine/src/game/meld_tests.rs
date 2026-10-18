@@ -1851,6 +1851,22 @@ fn mishra_production_meld_entry_attack_destination_matrix() {
             Some(destination),
             "the entry snapshot latches the chosen destination kind"
         );
+        let expected_pin = crate::game::combat::bind_attack_target(runner.state(), destination);
+        assert_eq!(
+            entry_record.combat_status.attack_target_identity,
+            expected_pin
+        );
+        assert_eq!(
+            runner
+                .state()
+                .combat
+                .as_ref()
+                .unwrap()
+                .attacked_permanents
+                .get(&mishra)
+                .copied(),
+            expected_pin
+        );
         assert_eq!(
             entry_record.combat_status.attack_target.is_some(),
             entry_record.combat_status.defending_player.is_some(),
@@ -1865,6 +1881,7 @@ fn mishra_production_meld_entry_attack_destination_matrix() {
             .find(|row| row.object_id == mishra && row.to_zone == Zone::Battlefield)
             .expect("the meld entry leaves a zone-change row");
         assert_eq!(row.combat_status.attack_target, Some(destination));
+        assert_eq!(row.combat_status.attack_target_identity, expected_pin);
         assert_eq!(row.combat_status.defending_player, Some(P1));
     }
 
@@ -1914,6 +1931,7 @@ fn mishra_production_meld_entry_attack_destination_matrix() {
     assert!(!stale_record.combat_status.attacking);
     assert_eq!(stale_record.combat_status.defending_player, None);
     assert_eq!(stale_record.combat_status.attack_target, None);
+    assert_eq!(stale_record.combat_status.attack_target_identity, None);
 }
 
 /// CR 508.4 + CR 701.42: when the defending opponent is the only legal

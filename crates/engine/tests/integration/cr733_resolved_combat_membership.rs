@@ -218,6 +218,7 @@ fn enters_attacking_journals_and_replays_its_recorded_defender() {
         ResolvedCombatMembershipEdit::Attack {
             resulting_defending_player: P1,
             resulting_attack_target: AttackTarget::Player(P1),
+            resulting_attack_target_identity: None,
         },
         "the recorded pair is the CR 508.4 choice the authority settled"
     );

@@ -165,11 +165,62 @@ fn stack_ability(runner: &GameRunner, source: ObjectId) -> &ResolvedAbility {
 }
 
 fn stack_latch(runner: &GameRunner, source: ObjectId) -> ZoneChangeCombatStatus {
-    stack_ability(runner, source)
+    let status = stack_ability(runner, source)
         .trigger_source
         .as_ref()
         .expect("a placed trigger carries its source context")
-        .combat_status
+        .combat_status;
+    if let Some(target) = status.attack_target {
+        assert_eq!(
+            status.attack_target_identity,
+            engine::game::combat::bind_attack_target(runner.state(), target)
+        );
+    }
+    status
+}
+
+#[test]
+fn recipient_retirement_captures_an_attacking_creature_with_no_destination() {
+    for kind in [Kind::Planeswalker, Kind::Battle] {
+        let (mut b, _) = board(ATTACKER_TEXT, kind, None);
+        declare(&mut b);
+        let placed = stack_latch(&b.runner, b.attacker);
+        assert!(placed.attack_target_identity.is_some());
+        let destination = match b.target {
+            AttackTarget::Planeswalker(id) | AttackTarget::Battle(id) => id,
+            _ => unreachable!(),
+        };
+        let snapshot = b.runner.state().combat.as_ref().unwrap().attackers.clone();
+        engine::game::effects::remove_from_combat::remove_object_from_combat(
+            b.runner.state_mut(),
+            destination,
+        );
+        assert_eq!(
+            b.runner.state().combat.as_ref().unwrap().attackers,
+            snapshot
+        );
+        let live = trigger_source_context_for_latch(
+            b.runner.state(),
+            &b.runner.state().objects[&b.attacker],
+        );
+        assert!(live.combat_status.attacking);
+        assert_eq!(live.combat_status.defending_player, Some(b.defender));
+        assert_eq!(live.combat_status.attack_target, None);
+        assert_eq!(live.combat_status.attack_target_identity, None);
+        let mut events = Vec::new();
+        zones::move_to_library_position(b.runner.state_mut(), b.attacker, true, &mut events);
+        let row = zone_changed_record(&events, b.attacker, Zone::Library);
+        assert_eq!(row.combat_status, live.combat_status);
+        assert_eq!(
+            stack_ability(&b.runner, b.attacker)
+                .trigger_source
+                .as_ref()
+                .unwrap()
+                .combat_status,
+            placed,
+            "past placement is immutable"
+        );
+    }
 }
 
 /// The `ZoneChanged` record emitted for `object` leaving to `to`.

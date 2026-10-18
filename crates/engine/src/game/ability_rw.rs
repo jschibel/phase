@@ -146,8 +146,8 @@ pub(crate) enum StateKind {
     /// (skip step/turn): game-sequencing writes — extra turns/phases, skipped
     /// steps, combat removal. Idempotent/additive among identical siblings (two
     /// extra turns commute; removing an already-removed creature is a no-op) and
-    /// observed by NO profiled read, so this kind only self-conflicts (a future
-    /// sequencing READ would fail-closed against it) — never the `Other`
+    /// observed by `AttackedPlayerOrPlaneswalker`'s live combat read, so combat
+    /// removal conflicts with that reader — never the `Other`
     /// catch-all, which conflicts with every read.
     TurnStructure,
     /// Unclassifiable — conflicts with everything (fail-closed).

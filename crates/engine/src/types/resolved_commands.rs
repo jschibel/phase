@@ -528,6 +528,8 @@ pub enum ResolvedCombatMembershipEdit {
     Attack {
         resulting_defending_player: PlayerId,
         resulting_attack_target: AttackTarget,
+        #[serde(default)]
+        resulting_attack_target_identity: Option<ObjectIncarnationRef>,
     },
     /// CR 509.1g + CR 506.3e: the object became a blocking creature for the
     /// recorded attacker, which becomes blocked per CR 509.1h.
@@ -3380,6 +3382,30 @@ impl ResolvedRulesJournal {
                     ));
                 }
                 match &command.edit {
+                    ResolvedCombatMembershipEdit::Attack {
+                        resulting_attack_target,
+                        resulting_attack_target_identity: Some(pin),
+                        ..
+                    } if pin.incarnation == LEGACY_INCARNATION
+                        || match resulting_attack_target {
+                            AttackTarget::Planeswalker(id) | AttackTarget::Battle(id) => {
+                                *id != pin.object_id
+                            }
+                            AttackTarget::Player(_) => true,
+                        } =>
+                    {
+                        return Err(ResolvedRulesJournalError::InvalidSerializedAuthority(
+                            "combat-membership attack has incoherent permanent identity"
+                                .to_string(),
+                        ));
+                    }
+                    ResolvedCombatMembershipEdit::Remove {
+                        expected_participation,
+                    } if !expected_participation.is_coherent(command.object.object_id) => {
+                        return Err(ResolvedRulesJournalError::InvalidSerializedAuthority(
+                            "combat-membership removal has incoherent attack authority".to_string(),
+                        ));
+                    }
                     // CR 509.1a: a creature is chosen to block an attacking
                     // creature, which is never itself.
                     ResolvedCombatMembershipEdit::Block {

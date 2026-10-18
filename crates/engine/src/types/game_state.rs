@@ -1936,12 +1936,15 @@ pub struct ZoneChangeCombatStatus {
     /// planeswalker or battle itself, not the player it collapses to in
     /// `defending_player` (CR 508.5). A source whose ability resolves after it
     /// left the battlefield (CR 608.2h) can still be asked what it was
-    /// attacking. Every producer sets this exactly when it sets
-    /// `defending_player`. `None` means no attack target was recorded,
+    /// attacking. CR 506.4c: an attacking creature may attack nothing while
+    /// retaining its original `defending_player`. `None` means no active destination,
     /// including records serialized before the field existed, whose target
     /// kind cannot be reconstructed from `defending_player`.
     #[serde(default)]
     pub attack_target: Option<AttackTarget>,
+    /// CR 400.7: exact permanent recipient at capture; never rebound on reads.
+    #[serde(default)]
+    pub attack_target_identity: Option<ObjectIncarnationRef>,
 }
 
 /// CR 508.1a: Snapshot of a creature's public characteristics when it was
@@ -24062,6 +24065,250 @@ fn migrate_legacy_graveyard_paid_cast_cleanup(value: &mut serde_json::Value) -> 
     visit(value, &receipts)
 }
 
+/// Checked persistence compatibility for unresolved attacked-recipient reads.
+/// Raw and Trusted enter here together; transport/display decoding stays separate.
+fn validate_restored_attack_authority(
+    state: &GameState,
+    map_present: bool,
+    departure_targets_present: &[bool],
+) -> Result<(), String> {
+    const ERROR: &str = "persisted game lacks coherent exact attack authority";
+    if !crate::game::combat::combat_attack_authority_is_coherent(state)
+        || state.combat.as_ref().is_some_and(|combat| {
+            combat.attacked_permanents.keys().any(|id| {
+                combat
+                    .attackers
+                    .iter()
+                    .find(|info| info.object_id == *id)
+                    .and_then(|info| crate::game::combat::active_attack_target(state, info))
+                    .is_none()
+            })
+        })
+        || (!map_present
+            && state.combat.as_ref().is_some_and(|combat| {
+                combat.attackers.iter().any(|info| {
+                    matches!(
+                        info.attack_target,
+                        AttackTarget::Planeswalker(_) | AttackTarget::Battle(_)
+                    )
+                })
+            }))
+    {
+        return Err(ERROR.to_string());
+    }
+    fn ability(
+        state: &GameState,
+        node: &ResolvedAbility,
+        event: Option<&GameEvent>,
+        events: &[GameEvent],
+        presence: &[bool],
+    ) -> Result<(), String> {
+        let mut reads = false;
+        let _ = crate::types::ability_visit::visit_effect(&node.effect, &mut |effect| {
+            reads |= matches!(
+                effect.target_filter(),
+                Some(TargetFilter::AttackedPlayerOrPlaneswalker)
+            );
+            std::ops::ControlFlow::Continue(())
+        });
+        if reads {
+            let event = event.or_else(|| events.first());
+            let (_, _, live) = crate::game::combat::selected_attacked_referent(
+                state,
+                node.source_id,
+                node.trigger_source.as_ref(),
+                event,
+            );
+            if !live {
+                let row = crate::game::combat::attacked_referent_departure_row(
+                    state,
+                    node.source_id,
+                    node.trigger_source.as_ref(),
+                    event,
+                )
+                .ok_or_else(|| ERROR.to_string())?;
+                let status = row.combat_status;
+                let index = state
+                    .zone_changes_this_turn
+                    .iter()
+                    .position(|candidate| std::ptr::eq(candidate, row))
+                    .expect("selected row belongs to departure history");
+                if (!presence.get(index).copied().unwrap_or(false)
+                    && (status.attacking || status.defending_player.is_some()))
+                    || match (status.attack_target, status.attack_target_identity) {
+                        (
+                            Some(AttackTarget::Planeswalker(id) | AttackTarget::Battle(id)),
+                            Some(pin),
+                        ) => {
+                            pin.object_id != id
+                                || pin.incarnation == crate::types::identifiers::LEGACY_INCARNATION
+                        }
+                        (Some(AttackTarget::Planeswalker(_) | AttackTarget::Battle(_)), None) => {
+                            true
+                        }
+                        (Some(AttackTarget::Player(_)) | None, Some(_)) => true,
+                        (Some(AttackTarget::Player(_)) | None, None) => false,
+                    }
+                {
+                    return Err(ERROR.to_string());
+                }
+            }
+        }
+        if let Some(sub) = node.sub_ability.as_deref() {
+            ability(state, sub, event, events, presence)?;
+        }
+        if let Some(otherwise) = node.else_ability.as_deref() {
+            ability(state, otherwise, event, events, presence)?;
+        }
+        Ok(())
+    }
+    let check = |node: &ResolvedAbility, event: Option<&GameEvent>, events: &[GameEvent]| {
+        ability(state, node, event, events, departure_targets_present)
+    };
+    if let Some(pending) = state.pending_trigger.as_deref() {
+        check(
+            &pending.ability,
+            pending.trigger_event.as_ref(),
+            &state.pending_trigger_event_batch,
+        )?;
+    }
+    for pending in &state.deferred_triggers {
+        check(
+            &pending.pending.ability,
+            pending.pending.trigger_event.as_ref(),
+            &pending.trigger_events,
+        )?;
+    }
+    if let Some(order) = &state.pending_trigger_order {
+        for group in &order.groups {
+            for pending in &group.triggers {
+                check(
+                    &pending.pending.ability,
+                    pending.pending.trigger_event.as_ref(),
+                    &pending.trigger_events,
+                )?;
+            }
+        }
+    }
+    for entry in state.stack.iter().chain(state.resolving_stack_entry.iter()) {
+        if let Some(node) = entry.ability() {
+            let event = match &entry.kind {
+                StackEntryKind::TriggeredAbility { trigger_event, .. } => trigger_event.as_ref(),
+                _ => None,
+            };
+            check(
+                node,
+                event,
+                state
+                    .stack_trigger_event_batches
+                    .get(&entry.id)
+                    .map_or(&[], Vec::as_slice),
+            )?;
+        }
+    }
+    let current_event = state.current_trigger_event.as_ref();
+    let current_events = state.current_trigger_events.as_slice();
+    for frame in state.resolution_stack.iter() {
+        match frame {
+            ResolutionFrame::OptionalEffect(frame) => check(
+                &frame.ability,
+                frame.trigger_event.as_ref(),
+                &frame.trigger_events,
+            )?,
+            ResolutionFrame::AbilityContinuation(frame) => {
+                let context = frame
+                    .pending
+                    .trigger_context
+                    .as_ref()
+                    .or(frame.choose_zone_trigger_context.as_ref());
+                check(
+                    &frame.pending.chain,
+                    context.and_then(|context| context.event.as_ref()),
+                    context.map_or(&[], |context| context.events.as_slice()),
+                )?;
+            }
+            ResolutionFrame::RepeatFor(frame) => {
+                check(&frame.ability, current_event, current_events)?
+            }
+            ResolutionFrame::RepeatUntil(frame) => {
+                check(&frame.ability, current_event, current_events)?
+            }
+            ResolutionFrame::RepeatedOptionalPayment(frame) => {
+                if let Some(pending) = &frame.pending {
+                    check(&pending.payment_unit, current_event, current_events)?;
+                    check(&pending.reflexive, current_event, current_events)?;
+                }
+            }
+            ResolutionFrame::PerPlayerZoneChoice(frame) => {
+                check(&frame.ability, current_event, current_events)?
+            }
+            ResolutionFrame::PerCategoryZoneChoice(frame) => {
+                check(&frame.pending.ability, current_event, current_events)?
+            }
+            ResolutionFrame::ChooseOneOf(frame) => {
+                if let Some(node) = &frame.continuation {
+                    check(node, current_event, current_events)?;
+                }
+            }
+            ResolutionFrame::ChangeZone(_)
+            | ResolutionFrame::BatchDelivery(_)
+            | ResolutionFrame::CounterMoves(_)
+            | ResolutionFrame::CounterRemovals(_)
+            | ResolutionFrame::CounterAdditions(_)
+            | ResolutionFrame::CopyToken(_)
+            | ResolutionFrame::DebugCardEntries(_)
+            | ResolutionFrame::EachPlayerCopyChosen(_)
+            | ResolutionFrame::VoteBallot(_)
+            | ResolutionFrame::CoinFlip(_)
+            | ResolutionFrame::DieRoll(_)
+            | ResolutionFrame::Proliferate(_)
+            | ResolutionFrame::MultiDraw(_)
+            | ResolutionFrame::Discard(_)
+            | ResolutionFrame::ConniveReentry(_)
+            | ResolutionFrame::LifeTotalAssignment(_)
+            | ResolutionFrame::SpellResolution(_)
+            | ResolutionFrame::MutateMerge(_)
+            | ResolutionFrame::CipherEncode(_)
+            | ResolutionFrame::PostReplacement(_) => {}
+        }
+    }
+    match &state.waiting_for {
+        WaitingFor::UnlessPayment {
+            pending_effect,
+            trigger_event,
+            ..
+        }
+        | WaitingFor::UnlessPaymentChooseCost {
+            pending_effect,
+            trigger_event,
+            ..
+        } => check(pending_effect, trigger_event.as_ref(), &[])?,
+        WaitingFor::ExploreChoice { pending_effect, .. }
+        | WaitingFor::ReturnAsAuraTarget { pending_effect, .. }
+        | WaitingFor::WardDiscardChoice { pending_effect, .. }
+        | WaitingFor::WardSacrificeChoice { pending_effect, .. }
+        | WaitingFor::UnlessBounceChoice { pending_effect, .. }
+        | WaitingFor::MoveCountersDistribution { pending_effect, .. }
+        | WaitingFor::RemoveCountersChoice { pending_effect, .. } => {
+            check(pending_effect, current_event, current_events)?
+        }
+        WaitingFor::MultiTargetSelection {
+            pending_ability, ..
+        } => check(pending_ability, current_event, current_events)?,
+        WaitingFor::RepeatDecision { ability, .. }
+        | WaitingFor::ClashChooseOpponent { ability, .. }
+        | WaitingFor::ChooseFromZoneOpponentChooser { ability, .. } => {
+            check(ability, current_event, current_events)?
+        }
+        WaitingFor::ChooseOneOfBranch {
+            continuation: Some(node),
+            ..
+        } => check(node, current_event, current_events)?,
+        _ => {}
+    }
+    Ok(())
+}
+
 impl GameStateDecode {
     pub(crate) fn decode_persisted_resolution_state(
         mut value: serde_json::Value,
@@ -24095,9 +24342,26 @@ impl GameStateDecode {
             }
         }
         migrate_legacy_batched_zone_change_trigger_fired(&mut value)?;
+        // Defaults must not turn unknown old attack authority into a recorded
+        // ended relation. Preserve these input-presence facts through decoding.
+        let attack_map_present = value
+            .get("combat")
+            .is_none_or(|combat| combat.is_null() || combat.get("attacked_permanents").is_some());
+        let departure_targets_present: Vec<_> = value
+            .get("zone_changes_this_turn")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|row| {
+                row.get("combat_status")
+                    .and_then(|status| status.get("attack_target"))
+                    .is_some()
+            })
+            .collect();
         let mut state = serde_json::from_value::<ResolutionStateWire>(value)
             .map(ResolutionStateWire::into_game_state)
             .map_err(|error| error.to_string())?;
+        validate_restored_attack_authority(&state, attack_map_present, &departure_targets_present)?;
         validate_restored_zone_change_replay_keys(&state)?;
         normalize_delayed_trigger_allocators(&mut state)?;
         normalize_resolution_cast_offer_allocator(&mut state)?;
@@ -48033,10 +48297,549 @@ mod shared_zone_storage_tests {
 }
 
 #[cfg(test)]
+mod restored_exact_attack_authority_tests {
+    use super::*;
+    use crate::game::combat::{AttackTarget, CombatParticipation};
+    use crate::game::scenario::{GameScenario, P0, P1};
+    use crate::types::resolution::{AbilityContinuationFrame, OptionalEffectFrame};
+
+    fn queued() -> (GameState, ObjectId, ObjectId) {
+        let mut sc = GameScenario::new();
+        sc.at_phase(Phase::PreCombatMain);
+        for _ in 0..10 {
+            sc.add_card_to_library_top(P0, "Plains");
+            sc.add_card_to_library_top(P1, "Plains");
+        }
+        let attacker = sc.add_creature_from_oracle(P0, "Scorch Spitter", 1, 1,
+            "Whenever this creature attacks, it deals 1 damage to the player or planeswalker it's attacking.").id();
+        let walker = sc
+            .add_planeswalker_from_oracle(P1, "Test Walker", "Test", 5, "+1: You gain 1 life.")
+            .id();
+        let mut r = sc.build();
+        r.advance_to_combat();
+        r.declare_attackers(&[(attacker, AttackTarget::Planeswalker(walker))])
+            .unwrap();
+        assert_eq!(r.state().stack.len(), 1);
+        assert!(r
+            .state()
+            .combat
+            .as_ref()
+            .unwrap()
+            .attacked_permanents
+            .contains_key(&attacker));
+        (r.state().clone(), attacker, walker)
+    }
+
+    fn serialized(state: &GameState, trusted: bool) -> serde_json::Value {
+        serde_json::to_value(if trusted {
+            PersistedGameState::capture(state.clone())
+        } else {
+            PersistedGameState::Raw(Box::new(state.clone()))
+        })
+        .unwrap()
+    }
+
+    fn observer_with_two_bound_events() -> (GameState, ObjectId, StackEntry) {
+        let mut sc = GameScenario::new();
+        sc.at_phase(Phase::PreCombatMain);
+        for _ in 0..10 {
+            sc.add_card_to_library_top(P0, "Plains");
+            sc.add_card_to_library_top(P1, "Plains");
+        }
+        let source = sc.add_creature(P0, "Hellrider", 3, 3).from_oracle_text_with_keywords(&["Haste"],
+            "Haste\nWhenever a creature you control attacks, this creature deals 1 damage to the player or planeswalker it's attacking.").id();
+        let attacker = sc.add_creature(P0, "Goblin", 1, 1).id();
+        let walker = sc
+            .add_planeswalker_from_oracle(P1, "Test Walker", "Test", 5, "+1: You gain 1 life.")
+            .id();
+        let mut r = sc.build();
+        r.advance_to_combat();
+        r.declare_attackers(&[
+            (attacker, AttackTarget::Planeswalker(walker)),
+            (source, AttackTarget::Player(P1)),
+        ])
+        .unwrap();
+        while let WaitingFor::OrderTriggers { triggers, .. } = &r.state().waiting_for {
+            let order = (0..triggers.len()).collect();
+            r.act(crate::types::actions::GameAction::OrderTriggers { order })
+                .unwrap();
+        }
+        assert_eq!(r.state().stack.len(), 2);
+        let own = r.state().stack.iter().find(|entry| matches!(&entry.kind,
+            StackEntryKind::TriggeredAbility { trigger_event: Some(GameEvent::AttackersDeclared { attacks, .. }), .. }
+                if attacks.iter().any(|(id, _)| *id == attacker))).unwrap().clone();
+        let ambient = r
+            .state()
+            .stack
+            .iter()
+            .find(|entry| entry.id != own.id)
+            .unwrap();
+        let StackEntryKind::TriggeredAbility { trigger_event, .. } = &ambient.kind else {
+            unreachable!()
+        };
+        let mut state = r.state().clone();
+        state.current_trigger_event = trigger_event.clone();
+        state.stack.clear();
+        state.stack_trigger_firings.clear();
+        state.stack_trigger_event_batches.clear();
+        crate::game::zones::move_to_zone(&mut state, attacker, Zone::Graveyard, &mut Vec::new());
+        (state, attacker, own)
+    }
+
+    #[test]
+    fn pending_deferred_ordered_and_resolving_consumers_keep_their_own_bound_event() {
+        let (state, attacker, entry) = observer_with_two_bound_events();
+        let StackEntryKind::TriggeredAbility {
+            ability,
+            trigger_event,
+            ..
+        } = &entry.kind
+        else {
+            unreachable!()
+        };
+        let mut pending = crate::game::triggers::PendingTrigger::ordinary(
+            entry.source_id,
+            P0,
+            None,
+            ability.clone(),
+            1,
+        );
+        pending.trigger_event = trigger_event.clone();
+        for carrier in 0..4 {
+            let mut state = state.clone();
+            match carrier {
+                0 => {
+                    state.pending_trigger = Some(Box::new(pending.clone()));
+                    state.pending_trigger_firing = Some(TriggerFiring::Ordinary);
+                }
+                1 => state.deferred_triggers.push(
+                    crate::game::triggers::PendingTriggerContext::single(pending.clone()),
+                ),
+                2 => {
+                    state.pending_trigger_order = Some(PendingTriggerOrder {
+                        groups: vec![TriggerOrderGroup {
+                            controller: P0,
+                            triggers: vec![crate::game::triggers::PendingTriggerContext::single(
+                                pending.clone(),
+                            )],
+                            ordered: true,
+                        }],
+                        resume_after_ordering: None,
+                    })
+                }
+                3 => {
+                    state.resolving_stack_entry = Some(entry.clone());
+                    state.resolving_trigger_firing = Some(TriggerFiring::Ordinary);
+                }
+                _ => unreachable!(),
+            }
+            for trusted in [false, true] {
+                let current = serialized(&state, trusted);
+                serde_json::from_value::<PersistedGameState>(current.clone())
+                    .expect("populated selected departure has exact authority");
+                let mut old = current;
+                let rows = payload(&mut old, trusted)["zone_changes_this_turn"]
+                    .as_array_mut()
+                    .unwrap();
+                let row = rows
+                    .iter_mut()
+                    .find(|row| {
+                        row["object_id"] == serde_json::json!(attacker.0)
+                            && row["from_zone"] == serde_json::json!("Battlefield")
+                    })
+                    .unwrap();
+                row["combat_status"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("attack_target_identity");
+                assert!(
+                    serde_json::from_value::<PersistedGameState>(old)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("exact attack authority"),
+                    "carrier {carrier} must read its event, never the ambient other attack"
+                );
+            }
+        }
+    }
+
+    fn payload(value: &mut serde_json::Value, trusted: bool) -> &mut serde_json::Value {
+        if trusted {
+            &mut value["state"]
+        } else {
+            value
+        }
+    }
+
+    fn admitted(value: serde_json::Value) -> GameState {
+        serde_json::from_value::<PersistedGameState>(value)
+            .expect("checked ingress admits proven authority")
+            .prepare_for_restore(PersistedRestoreFinalization::Immediate)
+            .unwrap()
+            .finalize_immediately()
+            .unwrap()
+    }
+
+    #[test]
+    fn raw_and_trusted_distinguish_unknown_map_from_explicit_ended() {
+        let (active, attacker, walker) = queued();
+        let mut ended = active.clone();
+        crate::game::effects::remove_from_combat::remove_object_from_combat(&mut ended, walker);
+        for trusted in [false, true] {
+            let back = admitted(serialized(&active, trusted));
+            assert_eq!(
+                back.combat.as_ref().unwrap().attacked_permanents,
+                active.combat.as_ref().unwrap().attacked_permanents
+            );
+            assert!(admitted(serialized(&ended, trusted))
+                .combat
+                .as_ref()
+                .unwrap()
+                .attacked_permanents
+                .is_empty());
+            for state in [&active, &ended] {
+                let mut old = serialized(state, trusted);
+                payload(&mut old, trusted)["combat"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("attacked_permanents");
+                let error = serde_json::from_value::<PersistedGameState>(old).unwrap_err();
+                assert!(error.to_string().contains("exact attack authority"));
+            }
+            let mut player = active.clone();
+            player.combat.as_mut().unwrap().attackers[0].attack_target = AttackTarget::Player(P1);
+            player.combat.as_mut().unwrap().attacked_permanents.clear();
+            let mut old = serialized(&player, trusted);
+            payload(&mut old, trusted)["combat"]
+                .as_object_mut()
+                .unwrap()
+                .remove("attacked_permanents");
+            assert_eq!(
+                admitted(old).combat.as_ref().unwrap().attackers[0].object_id,
+                attacker
+            );
+            let mut no_combat = serialized(&GameState::new_two_player(42), trusted);
+            payload(&mut no_combat, trusted)
+                .as_object_mut()
+                .unwrap()
+                .remove("combat");
+            assert!(admitted(no_combat).combat.is_none());
+            let mut malformed = serialized(&active, trusted);
+            payload(&mut malformed, trusted)["combat"]["attacked_permanents"]
+                [attacker.0.to_string()]["incarnation"] = serde_json::json!(99999);
+            assert!(serde_json::from_value::<PersistedGameState>(malformed)
+                .unwrap_err()
+                .to_string()
+                .contains("exact attack authority"));
+        }
+    }
+
+    #[test]
+    fn selected_departure_pin_outranks_missing_placement_and_unused_history() {
+        let (mut state, attacker, walker) = queued();
+        crate::game::zones::move_to_zone(&mut state, attacker, Zone::Graveyard, &mut Vec::new());
+        let index = state
+            .zone_changes_this_turn
+            .iter()
+            .rposition(|row| row.object_id == attacker && row.from_zone == Some(Zone::Battlefield))
+            .unwrap();
+        assert!(state.zone_changes_this_turn[index]
+            .combat_status
+            .attack_target_identity
+            .is_some());
+        for trusted in [false, true] {
+            let mut current = serialized(&state, trusted);
+            // The selected departure, rather than this stale placement latch,
+            // carries the authority the unresolved instruction will read.
+            let root = payload(&mut current, trusted);
+            root["stack"][0]["kind"]["data"]["ability"]["trigger_source"]["combat_status"]
+                .as_object_mut()
+                .unwrap()
+                .remove("attack_target_identity");
+            let back = admitted(current.clone());
+            assert_eq!(
+                back.zone_changes_this_turn[index]
+                    .combat_status
+                    .attack_target,
+                Some(AttackTarget::Planeswalker(walker))
+            );
+            let mut old = current.clone();
+            payload(&mut old, trusted)["zone_changes_this_turn"][index]["combat_status"]
+                .as_object_mut()
+                .unwrap()
+                .remove("attack_target_identity");
+            assert!(serde_json::from_value::<PersistedGameState>(old)
+                .unwrap_err()
+                .to_string()
+                .contains("exact attack authority"));
+            let mut old_target = current;
+            payload(&mut old_target, trusted)["zone_changes_this_turn"][index]["combat_status"]
+                .as_object_mut()
+                .unwrap()
+                .remove("attack_target");
+            assert!(serde_json::from_value::<PersistedGameState>(old_target)
+                .unwrap_err()
+                .to_string()
+                .contains("exact attack authority"));
+            let mut unused = state.clone();
+            unused.stack.clear();
+            unused.stack_trigger_firings.clear();
+            unused.stack_trigger_event_batches.clear();
+            unused.resolving_stack_entry = None;
+            unused.zone_changes_this_turn[index]
+                .combat_status
+                .attack_target_identity = None;
+            admitted(serialized(&unused, trusted));
+        }
+    }
+
+    #[test]
+    fn unused_legacy_permanent_removal_history_stays_loadable_without_upgrading_authority() {
+        use crate::types::resolved_commands::{
+            ResolvedCombatMembershipCommand, ResolvedCombatMembershipEdit, ResolvedRulesCommand,
+        };
+        let (mut state, attacker, _) = queued();
+        let mut receipt = CombatParticipation::capture(&state, attacker);
+        assert!(receipt.outgoing_attack_target_identity.flatten().is_some());
+        receipt.outgoing_attack_target_identity = None;
+        let cause = state.current_or_begin_rules_execution_node();
+        state
+            .resolved_rules_journal
+            .record_combat_membership(ResolvedCombatMembershipCommand {
+                object: ObjectIncarnationRef::from_object(&state.objects[&attacker]),
+                edit: ResolvedCombatMembershipEdit::Remove {
+                    expected_participation: receipt,
+                },
+                cause,
+            })
+            .unwrap();
+        for trusted in [false, true] {
+            let back = admitted(serialized(&state, trusted));
+            assert!(back.resolved_rules_journal.entries().iter().any(
+                |entry| matches!(entry.command.as_ref(),
+                Some(ResolvedRulesCommand::CombatMembership(ResolvedCombatMembershipCommand {
+                    edit: ResolvedCombatMembershipEdit::Remove { expected_participation }, ..
+                })) if expected_participation.outgoing_attack_target_identity.is_none())
+            ));
+        }
+    }
+
+    #[test]
+    fn retained_optional_and_outer_continuations_are_checked_with_their_own_event() {
+        let (mut state, attacker, entry) = observer_with_two_bound_events();
+        let StackEntryKind::TriggeredAbility {
+            ability: node,
+            trigger_event,
+            ..
+        } = entry.kind
+        else {
+            unreachable!()
+        };
+        let source_id = node.source_id;
+        state
+            .resolution_stack
+            .push_optional_effect(OptionalEffectFrame {
+                ability: node.clone(),
+                trigger_event: trigger_event.clone(),
+                trigger_events: trigger_event.clone().into_iter().collect(),
+                trigger_match_count: None,
+                return_result_occurrence: None,
+            });
+        state.waiting_for = WaitingFor::OptionalEffectChoice {
+            player: P0,
+            source_id,
+            decision_subject_id: None,
+            description: Some("test".to_string()),
+            may_trigger_key: None,
+            same_card_may_trigger_choice_available: false,
+        };
+        let mut pending = PendingContinuation::new(node, &state);
+        pending.trigger_context = Some(ResolvingTriggerContext {
+            event: trigger_event.clone(),
+            events: trigger_event.into_iter().collect(),
+            match_count: None,
+            die_result: None,
+        });
+        state
+            .resolution_stack
+            .insert_parent_of_active(ResolutionFrame::AbilityContinuation(
+                AbilityContinuationFrame {
+                    pending,
+                    choose_zone_trigger_context: None,
+                },
+            ))
+            .unwrap();
+        // The ambient event deliberately names an unrelated attacker. It must
+        // never replace either retained frame's own captured context.
+        state.current_trigger_event = Some(GameEvent::GameStarted);
+        for trusted in [false, true] {
+            admitted(serialized(&state, trusted));
+            let mut old = serialized(&state, trusted);
+            let rows = payload(&mut old, trusted)["zone_changes_this_turn"]
+                .as_array_mut()
+                .unwrap();
+            let row = rows
+                .iter_mut()
+                .find(|row| {
+                    row["object_id"] == serde_json::json!(attacker.0)
+                        && row["from_zone"] == serde_json::json!("Battlefield")
+                })
+                .unwrap();
+            row["combat_status"]
+                .as_object_mut()
+                .unwrap()
+                .remove("attack_target_identity");
+            assert!(serde_json::from_value::<PersistedGameState>(old)
+                .unwrap_err()
+                .to_string()
+                .contains("exact attack authority"));
+        }
+        // Receipt history alone never becomes unresolved recipient authority.
+        let receipt = CombatParticipation::default();
+        assert_eq!(receipt.outgoing_attack_target_identity, Some(None));
+    }
+
+    #[test]
+    fn retained_repeat_and_choice_frames_validate_unresolved_sub_and_else_chains() {
+        use crate::types::resolution::{
+            PendingRepeatedOptionalPayment, PerCategoryZoneChoiceFrame,
+            RepeatedOptionalPaymentFrame,
+        };
+        let (mut state, attacker, _) = queued();
+        let entry = state.stack.pop_back().unwrap();
+        state.stack_trigger_firings.clear();
+        state.stack_trigger_event_batches.clear();
+        let StackEntryKind::TriggeredAbility {
+            ability: leaf,
+            trigger_event,
+            ..
+        } = entry.kind
+        else {
+            unreachable!()
+        };
+        crate::game::zones::move_to_zone(&mut state, attacker, Zone::Graveyard, &mut Vec::new());
+        state.current_trigger_event = trigger_event.clone();
+        let mut node = leaf.clone();
+        node.effect = Effect::NoOp;
+        node.sub_ability = Some(leaf.clone());
+        node.else_ability = Some(leaf);
+        for carrier in 0..6 {
+            let mut state = state.clone();
+            state.waiting_for = WaitingFor::OptionalEffectChoice {
+                player: P0,
+                source_id: attacker,
+                decision_subject_id: None,
+                description: None,
+                may_trigger_key: None,
+                same_card_may_trigger_choice_available: false,
+            };
+            let frame = match carrier {
+                0 => ResolutionFrame::RepeatFor(PendingRepeatIteration {
+                    ability: node.clone(),
+                    tracked_members: vec![],
+                    iterated_counter_kinds: vec![],
+                    next_iteration: 0,
+                    total_iterations: 1,
+                    copy_order_fixed: None,
+                }),
+                1 => ResolutionFrame::RepeatUntil(PendingRepeatUntil {
+                    ability: node.clone(),
+                    stop_progress: None,
+                }),
+                2 => ResolutionFrame::PerPlayerZoneChoice(PendingPerPlayerZoneChoice {
+                    ability: node.clone(),
+                    remaining_players: vec![P1],
+                    accumulated: false,
+                    current: None,
+                    nominee: None,
+                }),
+                3 => ResolutionFrame::PerCategoryZoneChoice(PerCategoryZoneChoiceFrame {
+                    pending: PendingPerCategoryZoneChoice {
+                        ability: node.clone(),
+                        pool: vec![],
+                        remaining_member_filters: vec![],
+                    },
+                }),
+                4 => ResolutionFrame::ChooseOneOf(PendingChooseOneOf {
+                    controller: P0,
+                    source_id: attacker,
+                    branches: vec![],
+                    parent_occurrences: Default::default(),
+                    context: Default::default(),
+                    continuation: Some(node.clone()),
+                    replacement_applied: Default::default(),
+                    remaining_players: vec![P1],
+                }),
+                5 => ResolutionFrame::RepeatedOptionalPayment(RepeatedOptionalPaymentFrame {
+                    pending: Some(Box::new(PendingRepeatedOptionalPayment {
+                        payment_unit: node.clone(),
+                        reflexive: node.clone(),
+                        remaining: 1,
+                    })),
+                    optional_cost_payments_this_resolution: 0,
+                }),
+                _ => unreachable!(),
+            };
+            if carrier == 5 {
+                let ResolutionFrame::RepeatedOptionalPayment(frame) = frame else {
+                    unreachable!()
+                };
+                state.resolution_stack.push_repeated_optional_payment(frame);
+            } else {
+                let mut harmless = node.clone();
+                harmless.effect = Effect::NoOp;
+                harmless.sub_ability = None;
+                harmless.else_ability = None;
+                state
+                    .resolution_stack
+                    .push_optional_effect(OptionalEffectFrame {
+                        ability: harmless,
+                        trigger_event: trigger_event.clone(),
+                        trigger_events: vec![],
+                        trigger_match_count: None,
+                        return_result_occurrence: None,
+                    });
+                state
+                    .resolution_stack
+                    .insert_parent_of_active(frame)
+                    .unwrap();
+            }
+            for trusted in [false, true] {
+                let current = serialized(&state, trusted);
+                serde_json::from_value::<PersistedGameState>(current.clone())
+                    .expect("typed retained carrier has exact authority");
+                let mut old = current;
+                let rows = payload(&mut old, trusted)["zone_changes_this_turn"]
+                    .as_array_mut()
+                    .unwrap();
+                let row = rows
+                    .iter_mut()
+                    .find(|row| {
+                        row["object_id"] == serde_json::json!(attacker.0)
+                            && row["from_zone"] == serde_json::json!("Battlefield")
+                    })
+                    .unwrap();
+                row["combat_status"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("attack_target_identity");
+                assert!(
+                    serde_json::from_value::<PersistedGameState>(old)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("exact attack authority"),
+                    "retained carrier {carrier} must validate both runtime child links"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod zone_change_combat_status_tests {
     use super::{ZoneChangeCombatStatus, ZoneChangeRecord};
     use crate::game::combat::AttackTarget;
-    use crate::types::identifiers::ObjectId;
+    use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
     use crate::types::player::PlayerId;
     use crate::types::zones::Zone;
 
@@ -48051,6 +48854,12 @@ mod zone_change_combat_status_tests {
             attacking: true,
             defending_player: Some(defender),
             attack_target: Some(target),
+            attack_target_identity: match target {
+                AttackTarget::Player(_) => None,
+                AttackTarget::Planeswalker(id) | AttackTarget::Battle(id) => {
+                    Some(ObjectIncarnationRef::of(id, 9))
+                }
+            },
             ..ZoneChangeCombatStatus::default()
         })
     }

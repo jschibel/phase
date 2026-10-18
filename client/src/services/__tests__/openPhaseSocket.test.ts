@@ -308,10 +308,18 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
-  it("accepts the literal Full v142 attacked-player referent protocol", async () => {
+  it("rejects Full v142 before it can lose exact attack authority", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
     ws.deliverMessage(helloFrame({ protocol_version: 142 }));
+    await expect(promise).rejects.toMatchObject({ kind: "protocol_mismatch" });
+    expect(ws.close).toHaveBeenCalled();
+  });
+
+  it("accepts the literal Full v143 exact attack authority protocol", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: 143 }));
 
     await expect(promise).resolves.toBeDefined();
     expect(ws.close).not.toHaveBeenCalled();

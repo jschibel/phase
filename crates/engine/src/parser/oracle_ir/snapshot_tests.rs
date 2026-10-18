@@ -3156,6 +3156,28 @@ mod diagnostic_snapshots {
 
     #[test]
     fn diagnostic_attacked_referent_leaves_no_remainder() {
+        let (_, lowered) = parse_two_layer(
+            "Whenever this creature attacks, it deals damage to the player or planeswalker it's attacking equal to the number of artifacts you control.\nEncore {5}{R} ({5}{R}, Exile this card from your graveyard: For each opponent, create a token copy that attacks that opponent this turn if able. They gain haste. Sacrifice them at the beginning of the next end step. Activate only as a sorcery.)",
+            "Fathom Fleet Swordjack", &["Creature"], &["Orc", "Pirate"],
+        );
+        let body = lowered
+            .triggers
+            .iter()
+            .find_map(|trigger| trigger.execute.as_deref())
+            .expect("printed attack trigger lowered successfully");
+        assert!(matches!(
+            body.effect.as_ref(),
+            Effect::DealDamage {
+                target: TargetFilter::AttackedPlayerOrPlaneswalker,
+                ..
+            }
+        ));
+        assert!(!lowered.abilities.iter().any(ability_has_unimplemented));
+        assert!(lowered
+            .triggers
+            .iter()
+            .filter_map(|trigger| trigger.execute.as_deref())
+            .all(|body| !ability_has_unimplemented(body)));
         // CR 506.3: the printed Fathom Fleet Swordjack text. "the player or planeswalker
         // it's attacking" is consumed whole by the attacked-referent combinator, leaving
         // no ignored-remainder "it's attacking". Reach guard: the

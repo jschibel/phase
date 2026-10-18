@@ -210,6 +210,8 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 143 — GameState carries exact active attack relations, departure recipient pins and
+ *      complete combat-removal receipts. P2P wire 125 moves with it.
  * 142 — TargetFilter gains AttackedPlayerOrPlaneswalker (the player or planeswalker an
  *      attacking creature is attacking, CR 506.3 + CR 115.10a), serialized in the
  *      ability definitions of GameState. A v141 peer cannot deserialize the tag; the
@@ -867,7 +869,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 142;
+export const PROTOCOL_VERSION = 143;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
