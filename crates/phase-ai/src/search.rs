@@ -1669,8 +1669,8 @@ pub fn fallback_action(
             ..
         } => Some(GameAction::DecideOptionalEffect { accept: false }),
 
-        // Unless payment: decline a real cost (let the effect resolve); pay a
-        // free {0} (CR 118.5), which spends nothing.
+        // Unless payment: pay a zero-Mana Counter cost (CR 118.5);
+        // decline every other unless payment.
         WaitingFor::UnlessPayment { player, .. } => Some(GameAction::PayUnlessCost {
             pay: zero_counter_payment_owed_by(&state.waiting_for, *player),
         }),
