@@ -4626,7 +4626,9 @@ fn life_writes() -> RwProfile {
 /// in the module doc — CR 702.15 / CR 702.2 / CR 704.5a / CR 800.4a).
 fn damage_writes(target: &TargetFilter) -> RwProfile {
     let (player, object) = target_recipient(target);
-    let mut p = RwProfile::empty();
+    // CR 603.3b + CR 608.2h: resolving the recipient can read live state or
+    // a member-bound referent before damage writes it; preserve those reads.
+    let mut p = rw_target_filter(target);
     if player {
         p.merge(life_writes());
     }
@@ -9944,6 +9946,36 @@ mod tests {
 #[cfg(test)]
 mod attacked_referent_classification_tests {
     use super::*;
+
+    #[test]
+    fn fixed_damage_ability_profiles_its_recipient_reads() {
+        let profile = ability_rw_profile(&ResolvedAbility::new(
+            Effect::DealDamage {
+                amount: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::AttackedPlayerOrPlaneswalker,
+                damage_source: None,
+                excess: None,
+            },
+            vec![],
+            crate::types::identifiers::ObjectId(1),
+            crate::types::player::PlayerId(0),
+        ));
+        assert!(profile.reads_event_live);
+        assert!(profile.reads_board.set_membership);
+        assert!(profile.reads_board.turn_structure);
+        assert!(profile.reads_member_bound());
+        assert!(profile.writes_external.player_life);
+        assert!(profile.writes_external.journal_life);
+        assert!(profile.writes_external.set_membership);
+        assert!(!profile.legacy_batch_prompt());
+
+        for target in [TargetFilter::DefendingPlayer, TargetFilter::SelfRef] {
+            let profile = damage_writes(&target);
+            assert!(!profile.reads_event_live);
+            assert!(!profile.reads_board.set_membership);
+            assert!(!profile.reads_member_bound());
+        }
+    }
 
     /// CR 506.3: the attacked player-or-planeswalker is a symbolic, per-member combat
     /// referent that is both a player and a planeswalker permanent.

@@ -1226,6 +1226,86 @@ fn departed_player_is_no_recipient_and_cannot_supply_lifelink() {
     }
 }
 
+/// CR 603.3b + CR 704.5i + CR 702.15b: the controller orders simultaneous
+/// observers; only the first damages the 1-loyalty walker and can gain life.
+#[test]
+fn hellrider_observers_offer_both_orders_when_the_first_removes_the_recipient() {
+    for lifelink_first in [false, true] {
+        let mut sc = scenario();
+        let riders = [0, 1].map(|_| {
+            sc.add_creature(P0, "Hellrider", 3, 3)
+                .from_oracle_text_with_keywords(&["Haste"], FULL_HELLRIDER)
+                .id()
+        });
+        let goblin = sc.add_creature(P0, "Goblin", 1, 1).id();
+        let walker = add_karn(&mut sc, 1);
+        let aura = sc
+            .add_enchantment_from_oracle(P0, "Lifelink", LIFELINK)
+            .id();
+        let mut r = sc.build();
+        control_by_p1(&mut r, walker);
+        zones::move_to_zone(r.state_mut(), aura, Zone::Hand, &mut Vec::new());
+        r.cast(aura).target_object(riders[0]).resolve();
+        assert!(
+            r.state().objects[&riders[0]].has_keyword(&engine::types::keywords::Keyword::Lifelink)
+        );
+        assert!(
+            !r.state().objects[&riders[1]].has_keyword(&engine::types::keywords::Keyword::Lifelink)
+        );
+        r.advance_to_combat();
+        r.declare_attackers(&[(goblin, AttackTarget::Planeswalker(walker))])
+            .unwrap();
+        let WaitingFor::OrderTriggers { player, triggers } = &r.state().waiting_for else {
+            panic!("the live recipient read requires an ordering choice");
+        };
+        assert_eq!(*player, P0);
+        assert_eq!(triggers.len(), 2);
+        let first = if lifelink_first { riders[0] } else { riders[1] };
+        let second = if lifelink_first { riders[1] } else { riders[0] };
+        let first_index = triggers.iter().position(|t| t.source_id == first).unwrap();
+        let second_index = triggers.iter().position(|t| t.source_id == second).unwrap();
+        r.act(GameAction::OrderTriggers {
+            order: vec![second_index, first_index],
+        })
+        .unwrap();
+        assert_eq!(r.state().stack.back().unwrap().source_id, first);
+        for source in riders {
+            assert_untargeted_triggers(&r, source, 1);
+        }
+        let mut normalized = stack_abilities(&r, riders[0])[0].clone();
+        normalized.clear_trigger_identity_recursive();
+        let mut other = stack_abilities(&r, riders[1])[0].clone();
+        other.clear_trigger_identity_recursive();
+        assert_eq!(
+            normalized, other,
+            "granted lifelink is outside the normalized AST"
+        );
+
+        let mut events = Vec::new();
+        let seen = settle(&mut r, &mut events, true, 0);
+        assert!(!seen.target_prompt);
+        assert_eq!(deal_damage_resolutions(&events, first), 1);
+        assert_eq!(deal_damage_resolutions(&events, second), 1);
+        assert_eq!(
+            damage_from(&events, first),
+            vec![(TargetRef::Object(walker), 1)]
+        );
+        assert_eq!(damage_from(&events, second), vec![]);
+        assert_eq!(r.state().objects[&walker].zone, Zone::Graveyard);
+        assert!(!r
+            .state()
+            .combat
+            .as_ref()
+            .unwrap()
+            .attacked_permanents
+            .contains_key(&goblin));
+        assert_eq!(
+            (life(&r, P0), life(&r, P1), life(&r, P2)),
+            (if lifelink_first { 21 } else { 20 }, 20, 20)
+        );
+    }
+}
+
 fn reach_blocked_priority(b: &mut AuthorityBoard) {
     for _ in 0..32 {
         let blocked =

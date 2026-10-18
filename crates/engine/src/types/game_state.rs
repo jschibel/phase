@@ -24466,6 +24466,13 @@ fn validate_restored_attack_authority(
     }
     let current_event = state.current_trigger_event.as_ref();
     let current_events = state.current_trigger_events.as_slice();
+    let check_choice_continuation =
+        |node: &ResolvedAbility, context: Option<&ResolvingTriggerContext>| match context {
+            // Match the branch resolver's context push: even Some(empty)
+            // replaces ambient events; None leaves the ambient context alone.
+            Some(context) => check(node, context.event.as_ref(), &context.events),
+            None => check(node, current_event, current_events),
+        };
     for frame in state.resolution_stack.iter() {
         match frame {
             ResolutionFrame::OptionalEffect(frame) => check(
@@ -24505,7 +24512,7 @@ fn validate_restored_attack_authority(
             }
             ResolutionFrame::ChooseOneOf(frame) => {
                 if let Some(node) = &frame.continuation {
-                    check(node, current_event, current_events)?;
+                    check_choice_continuation(node, frame.trigger_context.as_ref())?;
                 }
             }
             ResolutionFrame::ChangeZone(_)
@@ -24560,8 +24567,9 @@ fn validate_restored_attack_authority(
         }
         WaitingFor::ChooseOneOfBranch {
             continuation: Some(node),
+            trigger_context,
             ..
-        } => check(node, current_event, current_events)?,
+        } => check_choice_continuation(node, trigger_context.as_ref())?,
         _ => {}
     }
     Ok(())
@@ -49161,6 +49169,198 @@ mod restored_exact_attack_authority_tests {
                         .contains("exact attack authority"),
                     "carrier {carrier} must read its event, never the ambient other attack"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn choose_one_of_continuations_validate_the_context_branch_resolution_will_push() {
+        let (state, attacker, entry) = observer_with_two_bound_events();
+        let StackEntryKind::TriggeredAbility {
+            ability,
+            trigger_event,
+            ..
+        } = &entry.kind
+        else {
+            unreachable!()
+        };
+        let event = trigger_event
+            .clone()
+            .expect("observer binds the Goblin attack");
+        assert_eq!(
+            ability.effect.target_filter(),
+            Some(&TargetFilter::AttackedPlayerOrPlaneswalker)
+        );
+        assert_eq!(
+            crate::game::combat::selected_attacked_referent(
+                &state,
+                ability.source_id,
+                ability.trigger_source.as_ref(),
+                Some(&event),
+            ),
+            (attacker, false, false),
+            "the actual observer reads the departed Goblin, not live Hellrider"
+        );
+        let departure = state
+            .zone_changes_this_turn
+            .iter()
+            .rposition(|row| row.object_id == attacker && row.from_zone == Some(Zone::Battlefield))
+            .unwrap();
+        assert!(state.zone_changes_this_turn[departure]
+            .combat_status
+            .attack_target_identity
+            .is_some());
+        let context = |event, events| ResolvingTriggerContext {
+            event,
+            events,
+            match_count: None,
+            die_result: None,
+        };
+        // These are retained-owner contract fixtures around the real observer
+        // continuation; Hellrider itself does not print a branch choice.
+        let cases = [
+            (
+                "stored singular replaces unrelated ambient",
+                Some(context(Some(event.clone()), vec![])),
+                Some(GameEvent::GameStarted),
+                vec![GameEvent::GameStarted],
+                true,
+            ),
+            (
+                "stored plural supplies absent singular",
+                Some(context(None, vec![event.clone()])),
+                None,
+                vec![],
+                true,
+            ),
+            (
+                "stored singular outranks stored plural",
+                Some(context(Some(event.clone()), vec![GameEvent::GameStarted])),
+                None,
+                vec![],
+                true,
+            ),
+            (
+                "stored nonattack singular does not fall through to plural",
+                Some(context(Some(GameEvent::GameStarted), vec![event.clone()])),
+                Some(event.clone()),
+                vec![event.clone()],
+                false,
+            ),
+            (
+                "Some empty clears both ambient event carriers",
+                Some(context(None, vec![])),
+                Some(event.clone()),
+                vec![event.clone()],
+                false,
+            ),
+            (
+                "None leaves ambient singular unchanged",
+                None,
+                Some(event.clone()),
+                vec![],
+                true,
+            ),
+            (
+                "None leaves ambient plural unchanged",
+                None,
+                None,
+                vec![event],
+                true,
+            ),
+            (
+                "None with no ambient event stays empty",
+                None,
+                None,
+                vec![],
+                false,
+            ),
+        ];
+        for (case, stored, ambient_event, ambient_events, requires_pin) in cases {
+            for frame_owner in [false, true] {
+                let mut state = state.clone();
+                state.current_trigger_event = ambient_event.clone();
+                state.current_trigger_events = ambient_events.clone();
+                let branches = vec![AbilityDefinition::new(
+                    crate::types::ability::AbilityKind::Spell,
+                    Effect::NoOp,
+                )];
+                if frame_owner {
+                    state.waiting_for = WaitingFor::OptionalEffectChoice {
+                        player: P0,
+                        source_id: entry.source_id,
+                        decision_subject_id: None,
+                        description: None,
+                        may_trigger_key: None,
+                        same_card_may_trigger_choice_available: false,
+                    };
+                    state
+                        .resolution_stack
+                        .push_optional_effect(OptionalEffectFrame {
+                            ability: Box::new(ResolvedAbility::new(
+                                Effect::NoOp,
+                                vec![],
+                                entry.source_id,
+                                P0,
+                            )),
+                            trigger_event: None,
+                            trigger_events: vec![],
+                            trigger_match_count: None,
+                            return_result_occurrence: None,
+                        });
+                    state
+                        .resolution_stack
+                        .insert_parent_of_active(ResolutionFrame::ChooseOneOf(PendingChooseOneOf {
+                            controller: P0,
+                            source_id: entry.source_id,
+                            branches,
+                            parent_occurrences: Default::default(),
+                            context: Default::default(),
+                            continuation: Some(ability.clone()),
+                            replacement_applied: Default::default(),
+                            remaining_players: vec![P1],
+                            trigger_context: stored.clone(),
+                        }))
+                        .unwrap();
+                } else {
+                    state.waiting_for = WaitingFor::ChooseOneOfBranch {
+                        player: P0,
+                        controller: P0,
+                        source_id: entry.source_id,
+                        branches,
+                        branch_descriptions: vec!["Continue".to_string()],
+                        parent_occurrences: Default::default(),
+                        context: Default::default(),
+                        continuation: Some(ability.clone()),
+                        replacement_applied: Default::default(),
+                        remaining_players: vec![],
+                        trigger_context: stored.clone(),
+                    };
+                }
+                for trusted in [false, true] {
+                    let current = serialized(&state, trusted);
+                    serde_json::from_value::<PersistedGameState>(current.clone())
+                        .expect("selected departure pin admits both retained owners");
+                    let mut missing_pin = current;
+                    payload(&mut missing_pin, trusted)["zone_changes_this_turn"][departure]
+                        ["combat_status"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("attack_target_identity")
+                        .expect("remove only the selected Goblin departure pin");
+                    let restored = serde_json::from_value::<PersistedGameState>(missing_pin);
+                    if requires_pin {
+                        assert!(
+                            restored
+                                .unwrap_err()
+                                .to_string()
+                                .contains("exact attack authority"),
+                            "{case}: frame_owner={frame_owner}, trusted={trusted}"
+                        );
+                    } else {
+                        restored.expect("effective context selects live Hellrider, not Goblin LKI");
+                    }
+                }
             }
         }
     }
