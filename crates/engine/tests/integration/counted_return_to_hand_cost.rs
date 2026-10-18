@@ -26,7 +26,9 @@ use engine::types::actions::GameAction;
 use engine::types::card_type::Supertype;
 use engine::types::events::GameEvent;
 use engine::types::format::FormatConfig;
-use engine::types::game_state::{CastPaymentMode, PayCostKind, PendingCostMoveResume, WaitingFor};
+use engine::types::game_state::{
+    CastPaymentMode, CostResume, PayCostKind, PendingCostMoveResume, WaitingFor,
+};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
@@ -1777,8 +1779,8 @@ fn counted_return_current_delayed_fragment_is_collected_once() {
         for command in [false, true] {
             mount_completion(round_trip, command, true);
         }
-        // A tap paid before the pause creates an ordinary announcement
-        // carrier even though this activation needs no target selection.
+        // A separate completed return leg stages an ordinary announcement
+        // carrier before the observed two-land leg, without target selection.
         delayed_two_land_sibling(false, false, false, round_trip, true);
     }
 }
@@ -1892,7 +1894,7 @@ fn delayed_two_land_sibling(
     abandon: bool,
     empty_prefix: bool,
     round_trip: bool,
-    tap: bool,
+    prime_carrier: bool,
 ) {
     let mut scenario = GameScenario::new_n_player(3, 9938);
     scenario.at_phase(Phase::PreCombatMain);
@@ -1900,12 +1902,28 @@ fn delayed_two_land_sibling(
         scenario.add_basic_land(P0, ManaColor::Blue),
         scenario.add_basic_land(P0, ManaColor::Blue),
     ];
+    let priming_land = prime_carrier.then(|| scenario.add_basic_land(P0, ManaColor::Blue));
     let source = if spell {
         scenario
             .add_spell_to_hand_from_oracle(P0, "Ensnare", true, ENSNARE)
             .with_mana_cost(ensnare_mana_cost())
             .id()
     } else {
+        let counted_cost = parse_oracle_cost("Return two lands you control to their owner's hand");
+        let cost = if prime_carrier {
+            AbilityCost::Composite {
+                costs: vec![
+                    AbilityCost::ReturnToHand {
+                        count: 1,
+                        filter: Some(land_you_control()),
+                        from_zone: None,
+                    },
+                    counted_cost,
+                ],
+            }
+        } else {
+            counted_cost
+        };
         scenario
             .add_creature(P0, "Untargeted counted cost", 1, 1)
             .with_ability_definition(
@@ -1916,11 +1934,7 @@ fn delayed_two_land_sibling(
                         player: TargetFilter::Controller,
                     },
                 )
-                .cost(parse_oracle_cost(if tap {
-                    "{T}, Return two lands you control to their owner's hand"
-                } else {
-                    "Return two lands you control to their owner's hand"
-                })),
+                .cost(cost),
             )
             .id()
     };
@@ -2007,6 +2021,35 @@ fn delayed_two_land_sibling(
             })
             .expect("announce no-target counted activation");
     }
+    if let Some(priming_land) = priming_land {
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::PayCost {
+                kind: PayCostKind::ReturnToHand,
+                count: 1,
+                min_count: 1,
+                ..
+            }
+        ));
+        let primed = runner
+            .act(GameAction::SelectCards {
+                cards: vec![priming_land],
+            })
+            .expect("complete the separate unobserved return leg");
+        assert_eq!(departures(&primed.events, priming_land).len(), 1);
+        assert_eq!(runner.state().objects[&priming_land].zone, Zone::Hand);
+        assert!(runner.state().pending_cost_move_resume.is_none());
+        assert!(matches!(
+            &runner.state().waiting_for,
+            WaitingFor::PayCost {
+                kind: PayCostKind::ReturnToHand,
+                count: 2,
+                min_count: 2,
+                resume: CostResume::Spell { spell: pending },
+                ..
+            } if pending.activation_trigger_collection.is_some()
+        ));
+    }
     assert!(matches!(
         runner.state().waiting_for,
         WaitingFor::PayCost {
@@ -2052,9 +2095,10 @@ fn delayed_two_land_sibling(
     );
     assert_eq!(pending.activation_ability_index.is_none(), spell);
     if !spell {
-        assert!(
-            pending.activation_trigger_collection.is_some() == tap,
-            "tap announcement alone supplies the no-target carrier"
+        assert_eq!(
+            pending.activation_trigger_collection.is_some(),
+            prime_carrier,
+            "the earlier completed return leg supplies the no-target carrier"
         );
     }
     let unpaid = lands[usize::from(!empty_prefix)];
