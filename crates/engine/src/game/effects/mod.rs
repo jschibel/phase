@@ -18890,7 +18890,7 @@ fn resolve_chain_body(
                 // this resolution and must not run twice.
                 let mut bound = ability.clone();
                 bound.set_unpinned_targets(candidates);
-                return resolve_chain_body(state, &bound, events, depth);
+                return resolve_chain_body(state, &bound, events, depth, payment_choice);
             }
             _ => {
                 let mut parked = ability.clone();
