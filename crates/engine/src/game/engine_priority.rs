@@ -269,10 +269,12 @@ fn run_post_action_pipeline_core(
     //
     // CR 603.3b: batch ownership is read from the policy the pass was entered
     // with: `after_spell_final_part` shifts `ResolutionSafe` to `SettledPriority`
-    // for the drain, and a batch of announced casts latched by the resolution
-    // that just finished belongs to the same pass whose final part ran.
+    // for the drain. The caller's exact retired-carrier handoff proves the same
+    // completed boundary for an activated ability, even above an unrelated
+    // unresolved spell. Skip still owns no drain; the shared owner/readiness
+    // gates still refuse unfinished work under either policy.
     let seam_drain_policy = drain_policy;
-    let drain_policy = if final_part_ran {
+    let drain_policy = if final_part_ran || completed_resolution_batch {
         drain_policy.after_spell_final_part()
     } else {
         drain_policy

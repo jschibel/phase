@@ -27121,10 +27121,14 @@ mod resolving_carrier_settle_tests {
     #[test]
     fn paused_nonpayment_resolution_returns_to_active_player() {
         use crate::game::scenario::GameScenario;
-        use crate::types::ability::{AbilityDefinition, AbilityKind, ReplacementDefinition};
+        use crate::types::ability::{
+            AbilityDefinition, AbilityKind, ReplacementDefinition, TriggerDefinition,
+        };
+        use crate::types::counter::CounterType;
         use crate::types::mana::ManaCost;
         use crate::types::replacements::ReplacementEvent;
         use crate::types::zones::EtbTapState;
+        use crate::types::TriggerMode;
         let p2 = PlayerId(2);
         // Ordinary activated choice and unpaused activation are independent
         // siblings of the staged PayCost regression.
@@ -27146,8 +27150,29 @@ mod resolving_carrier_settle_tests {
                 .add_creature(p2, "Ordinary completion", 1, 1)
                 .with_ability_definition(ability)
                 .id();
+            let observer = scenario
+                .add_creature(p2, "Ordinary completion observer", 1, 1)
+                .with_trigger_definition(TriggerDefinition::new(TriggerMode::LifeGained).execute(
+                    AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::PutCounter {
+                            counter_type: CounterType::Plus1Plus1,
+                            count: QuantityExpr::Fixed { value: 1 },
+                            target: TargetFilter::SelfRef,
+                        },
+                    ),
+                ))
+                .id();
+            let lower = scenario
+                .add_spell_to_hand(PlayerId(0), "Unresolved lower instant", true)
+                .with_mana_cost(ManaCost::zero())
+                .with_ability_definition(AbilityDefinition::new(AbilityKind::Spell, Effect::NoOp))
+                .id();
             let mut runner = scenario.build();
             let turn = runner.state().turn_number;
+            runner.cast(lower).commit();
+            assert_eq!(runner.state().objects[&lower].zone, Zone::Stack);
+            assert_eq!(runner.state().stack.len(), 1);
             nonactive_priority_window(&mut runner);
             runner
                 .act(GameAction::ActivateAbility {
@@ -27161,6 +27186,8 @@ mod resolving_carrier_settle_tests {
                     matches!(runner.state().waiting_for, WaitingFor::ChooseOneOfBranch { player, .. } if player == p2)
                 );
                 assert!(runner.state().resolving_stack_entry.is_some());
+                assert_eq!(runner.state().stack.len(), 1);
+                assert_eq!(runner.state().stack[0].id, lower);
                 events.extend(
                     runner
                         .act(GameAction::ChooseBranch { index: 0 })
@@ -27171,6 +27198,61 @@ mod resolving_carrier_settle_tests {
                     assert_eq!(events.iter().filter(|event| matches!(event,
                         GameEvent::LifeChanged { player_id, amount: actual, .. } if *player_id == p2 && *actual == amount)).count(), 1);
                 }
+                assert!(runner.state().resolving_stack_entry.is_none());
+                assert_eq!(runner.state().stack.len(), 1);
+                assert_eq!(runner.state().stack[0].id, lower);
+                assert_eq!(runner.state().objects[&lower].zone, Zone::Stack);
+                // CR 117.5 + CR 603.3b: the whole due group is announced before
+                // priority, above the unrelated spell that has not resolved.
+                assert!(matches!(runner.state().waiting_for,
+                    WaitingFor::OrderTriggers { player, .. } if player == p2));
+                let groups = &runner
+                    .state()
+                    .pending_trigger_order
+                    .as_ref()
+                    .unwrap()
+                    .groups;
+                assert_eq!(groups.len(), 1);
+                assert_eq!(groups[0].triggers.len(), 2, "FIRST whole completed group");
+                for amount in [1, 11] {
+                    assert_eq!(groups[0].triggers.iter().filter(|context| {
+                        context.pending.source_id == observer && matches!(
+                            context.pending.trigger_event.as_ref(),
+                            Some(GameEvent::LifeChanged { player_id, amount: actual, .. })
+                                if *player_id == p2 && *actual == amount
+                        )
+                    }).count(), 1);
+                }
+                let selected: Vec<_> = [1, 0]
+                    .into_iter()
+                    .map(|index| {
+                        groups[0].triggers[index]
+                            .pending
+                            .trigger_event
+                            .clone()
+                            .unwrap()
+                    })
+                    .collect();
+                events.extend(
+                    runner
+                        .act(GameAction::OrderTriggers { order: vec![1, 0] })
+                        .unwrap()
+                        .events,
+                );
+                let announced: Vec<_> = runner
+                    .state()
+                    .stack
+                    .iter()
+                    .skip(1)
+                    .map(|entry| {
+                        let StackEntryKind::TriggeredAbility { trigger_event, .. } = &entry.kind
+                        else {
+                            panic!("expected completed observer: {entry:?}");
+                        };
+                        trigger_event.clone().unwrap()
+                    })
+                    .collect();
+                assert_eq!(announced, selected);
             } else {
                 assert_eq!(
                     events
@@ -27183,6 +27265,30 @@ mod resolving_carrier_settle_tests {
             }
             assert_eq!(runner.state().players[2].life, 32);
             assert!(runner.state().payment_transaction.is_none());
+            let observer_count = if paused { 2 } else { 1 };
+            assert_eq!(runner.state().stack.len(), observer_count + 1);
+            assert_eq!(runner.state().stack[0].id, lower);
+            assert!(matches!(
+                runner.state().stack[0].kind,
+                StackEntryKind::Spell { .. }
+            ));
+            assert!(runner.state().stack.iter().skip(1).all(|entry| {
+                entry.source_id == observer
+                    && matches!(entry.kind, StackEntryKind::TriggeredAbility { .. })
+            }));
+            assert_eq!(runner.state().objects[&lower].zone, Zone::Stack);
+            assert!(!events.iter().any(|event| matches!(event,
+                GameEvent::StackResolved { object_id, .. } if *object_id == lower)));
+            for remaining in (1..=observer_count).rev() {
+                runner.resolve_top();
+                assert_eq!(runner.state().stack.len(), remaining);
+                assert_eq!(runner.state().objects[&lower].zone, Zone::Stack);
+            }
+            assert_eq!(runner.state().stack[0].id, lower);
+            assert_eq!(
+                runner.state().objects[&observer].counters[&CounterType::Plus1Plus1],
+                observer_count as u32
+            );
             assert_nonactive_completion(runner.state(), turn);
         }
         // Synthetic {0} instant: successful final move and a real final-move
@@ -27363,11 +27469,10 @@ mod resolving_carrier_settle_tests {
     fn ripple_terminal_completion_returns_to_active_player_without_stack_growth() {
         use crate::game::scenario::GameScenario;
         use crate::types::ability::{
-            AbilityDefinition, AbilityKind, TriggerDefinition, TypedFilter,
+            AbilityDefinition, AbilityKind, TargetRef, TriggerDefinition, TypedFilter,
         };
         use crate::types::actions::CastChoice;
         use crate::types::counter::CounterType;
-        use crate::types::game_state::TargetRef;
         use crate::types::keywords::Keyword;
         use crate::types::mana::{ManaCost, ManaType, ManaUnit};
         use crate::types::TriggerMode;

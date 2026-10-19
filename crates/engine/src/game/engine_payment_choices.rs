@@ -4315,10 +4315,17 @@ mod tests {
             .collect()
     }
 
-    fn completion_stack_contexts(state: &GameState) -> Vec<(ObjectId, GameEvent)> {
+    fn completion_stack_contexts(state: &GameState, lower: ObjectId) -> Vec<(ObjectId, GameEvent)> {
+        assert_eq!(state.objects[&lower].zone, Zone::Stack);
+        assert_eq!(state.stack[0].id, lower);
+        assert!(matches!(
+            state.stack[0].kind,
+            crate::types::game_state::StackEntryKind::Spell { .. }
+        ));
         state
             .stack
             .iter()
+            .skip(1)
             .map(|entry| {
                 let crate::types::game_state::StackEntryKind::TriggeredAbility {
                     trigger_event,
@@ -4349,9 +4356,17 @@ mod tests {
         for energy in [2, 0] {
             let (mut scenario, source, land) = completion_payment_scenario(true, true, true);
             let observer = add_completion_delayed_observer(&mut scenario, true);
+            let lower = scenario
+                .add_spell_to_hand(PlayerId(0), "Unresolved lower instant", true)
+                .with_mana_cost(ManaCost::zero())
+                .with_ability_definition(AbilityDefinition::new(AbilityKind::Spell, Effect::NoOp))
+                .id();
             let mut runner = scenario.build();
             runner.state_mut().players[2].energy = energy;
             install_completion_delayed_observer(&mut runner, observer);
+            runner.cast(lower).commit();
+            assert_eq!(runner.state().objects[&lower].zone, Zone::Stack);
+            assert_eq!(runner.state().stack.len(), 1);
             let mut events = begin_completion_payment(&mut runner, source);
             let carrier = runner.state().resolving_stack_entry.as_ref().unwrap().id;
             events.extend(
@@ -4379,7 +4394,9 @@ mod tests {
                 crate::game::payment_transaction::project(runner.state()).players[2].life,
                 19
             );
-            assert!(runner.state().stack.is_empty());
+            assert_eq!(runner.state().stack.len(), 1);
+            assert_eq!(runner.state().stack[0].id, lower);
+            assert_eq!(runner.state().objects[&lower].zone, Zone::Stack);
             events.extend(
                 runner
                     .act(GameAction::ChooseBranch { index: 0 })
@@ -4404,7 +4421,9 @@ mod tests {
             assert!(!events
                 .iter()
                 .any(|event| matches!(completion_amount_if_payer(event), Some(5 | 11))));
-            assert!(state.stack.is_empty());
+            assert_eq!(state.stack.len(), 1);
+            assert_eq!(state.stack[0].id, lower);
+            assert_eq!(state.objects[&lower].zone, Zone::Stack);
             let retained: Vec<_> = state
                 .deferred_triggers
                 .iter()
@@ -4422,6 +4441,9 @@ mod tests {
                 if energy == 2 { 40 } else { 43 }
             );
             assert!(runner.state().resolving_stack_entry.is_none());
+            assert_eq!(runner.state().stack.len(), 1);
+            assert_eq!(runner.state().stack[0].id, lower);
+            assert_eq!(runner.state().objects[&lower].zone, Zone::Stack);
             let contexts = completion_order_contexts(runner.state());
             assert!(contexts
                 .iter()
@@ -4458,10 +4480,23 @@ mod tests {
                 vec![1, 0, 2]
             };
             let selected: Vec<_> = order.iter().map(|index| contexts[*index].clone()).collect();
-            runner.act(GameAction::OrderTriggers { order }).unwrap();
-            assert_eq!(completion_stack_contexts(runner.state()), selected);
+            events.extend(
+                runner
+                    .act(GameAction::OrderTriggers { order })
+                    .unwrap()
+                    .events,
+            );
+            assert_eq!(completion_stack_contexts(runner.state(), lower), selected);
+            assert!(!events.iter().any(|event| matches!(event,
+                GameEvent::StackResolved { object_id, .. } if *object_id == lower)));
             let hand = runner.state().players[2].hand.len();
-            runner.advance_until_stack_empty();
+            for remaining in (1..=expected.len()).rev() {
+                assert_eq!(runner.state().stack.len(), remaining + 1);
+                runner.resolve_top();
+                assert_eq!(runner.state().stack.len(), remaining);
+                assert_eq!(runner.state().objects[&lower].zone, Zone::Stack);
+            }
+            assert_eq!(runner.state().stack[0].id, lower);
             assert_eq!(runner.state().players[2].hand.len(), hand + expected.len());
             assert_eq!(runner.state().delayed_triggers.len(), 1);
             assert_completion_entitlement(runner.state());
@@ -4503,12 +4538,16 @@ mod tests {
 
     #[test]
     fn canonical_payment_tail_does_not_recollect_replayed_delayed_occurrences() {
-        use crate::types::ability::Comparator;
+        use crate::types::ability::{Comparator, TargetRef};
         use crate::types::counter::CounterType;
-        use crate::types::game_state::TargetRef;
         for energy in [2, 0] {
             let (mut scenario, source, land) = completion_payment_scenario(false, false, false);
             let delayed = add_completion_delayed_observer(&mut scenario, false);
+            let lower = scenario
+                .add_spell_to_hand(PlayerId(0), "Unresolved lower instant", true)
+                .with_mana_cost(ManaCost::zero())
+                .with_ability_definition(AbilityDefinition::new(AbilityKind::Spell, Effect::NoOp))
+                .id();
             let sentinel = scenario
                 .add_creature(PlayerId(2), "Cost sentinel", 1, 1)
                 .id();
@@ -4543,6 +4582,9 @@ mod tests {
             let mut runner = scenario.build();
             runner.state_mut().players[2].energy = energy;
             install_completion_delayed_observer(&mut runner, delayed);
+            runner.cast(lower).commit();
+            assert_eq!(runner.state().objects[&lower].zone, Zone::Stack);
+            assert_eq!(runner.state().stack.len(), 1);
             let mut events = begin_completion_payment(&mut runner, source);
             assert_eq!(runner.state().players[2].life, 20);
             assert_eq!(
@@ -4594,6 +4636,9 @@ mod tests {
             assert!(runner.state().payment_transaction.is_none());
             assert!(runner.state().pending_deferred_life_cost_resume.is_none());
             assert!(runner.state().resolving_stack_entry.is_none());
+            assert_eq!(runner.state().stack.len(), 1);
+            assert_eq!(runner.state().stack[0].id, lower);
+            assert_eq!(runner.state().objects[&lower].zone, Zone::Stack);
             let contexts = completion_order_contexts(runner.state());
             let expected = if energy == 2 {
                 vec![
@@ -4635,7 +4680,12 @@ mod tests {
                 order = vec![order[3], order[1], order[4], order[0], order[2]];
             }
             let selected: Vec<_> = order.iter().map(|index| contexts[*index].clone()).collect();
-            runner.act(GameAction::OrderTriggers { order }).unwrap();
+            events.extend(
+                runner
+                    .act(GameAction::OrderTriggers { order })
+                    .unwrap()
+                    .events,
+            );
             let mut target_choices = 0;
             for _ in 0..8 {
                 let WaitingFor::TriggerTargetSelection { target_slots, .. } =
@@ -4650,17 +4700,28 @@ mod tests {
                 assert!(target_slots[0]
                     .legal_targets
                     .contains(&TargetRef::Object(decoy)));
-                runner
-                    .act(GameAction::ChooseTarget {
-                        target: Some(TargetRef::Object(sentinel)),
-                    })
-                    .unwrap();
+                events.extend(
+                    runner
+                        .act(GameAction::ChooseTarget {
+                            target: Some(TargetRef::Object(sentinel)),
+                        })
+                        .unwrap()
+                        .events,
+                );
                 target_choices += 1;
             }
             assert_eq!(target_choices, if energy == 2 { 2 } else { 1 });
-            assert_eq!(completion_stack_contexts(runner.state()), selected);
+            assert_eq!(completion_stack_contexts(runner.state(), lower), selected);
+            assert!(!events.iter().any(|event| matches!(event,
+                GameEvent::StackResolved { object_id, .. } if *object_id == lower)));
             let hand = runner.state().players[2].hand.len();
-            runner.advance_until_stack_empty();
+            for remaining in (1..=expected.len()).rev() {
+                assert_eq!(runner.state().stack.len(), remaining + 1);
+                runner.resolve_top();
+                assert_eq!(runner.state().stack.len(), remaining);
+                assert_eq!(runner.state().objects[&lower].zone, Zone::Stack);
+            }
+            assert_eq!(runner.state().stack[0].id, lower);
             let gains = if energy == 2 { 2 } else { 1 };
             assert_eq!(runner.state().players[2].hand.len(), hand + gains);
             assert_eq!(
