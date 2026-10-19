@@ -16407,6 +16407,26 @@ fn apply_non_priority_pass_action(
 
     state.waiting_for = waiting_for.clone();
 
+    // CR 603.2c + CR 603.7b: inside a staged payment, an answer that opens a
+    // further prompt becomes processed replay history, which no later collector
+    // scans. Deliver its still-unclaimed delayed occurrences now, while this
+    // buffer's claims and typed retention owners are live, through the same
+    // collect-only authority as the shared pipeline's non-Priority exit; then end
+    // this buffer's claim coordinates before the next recorded action's buffer.
+    if (state.payment_transaction.is_some() || state.payment_transaction_replay)
+        && state.game_end.is_none()
+    {
+        let delayed_input = engine_priority::unclaimed_delayed_trigger_input(
+            state,
+            &events,
+            0,
+            &mut Vec::new(),
+            None,
+        );
+        triggers::collect_unclaimed_delayed_triggers_into_deferred(state, &events, &delayed_input);
+        state.consumed_before_priority_trigger_events.clear();
+    }
+
     Ok(ActionResult::applied(events, waiting_for))
 }
 
@@ -27122,7 +27142,7 @@ mod resolving_carrier_settle_tests {
     fn paused_nonpayment_resolution_returns_to_active_player() {
         use crate::game::scenario::GameScenario;
         use crate::types::ability::{
-            AbilityDefinition, AbilityKind, ReplacementDefinition, TriggerDefinition,
+            AbilityDefinition, AbilityKind, QuantityRef, ReplacementDefinition, TriggerDefinition,
         };
         use crate::types::counter::CounterType;
         use crate::types::mana::ManaCost;
@@ -27150,6 +27170,10 @@ mod resolving_carrier_settle_tests {
                 .add_creature(p2, "Ordinary completion", 1, 1)
                 .with_ability_definition(ability)
                 .id();
+            // CR 603.3b: each firing puts its own occurrence's amount of
+            // counters, so firings off distinct life gains are distinguishable
+            // and their controller orders them; identical commuting firings
+            // would be announced without a choice.
             let observer = scenario
                 .add_creature(p2, "Ordinary completion observer", 1, 1)
                 .with_trigger_definition(TriggerDefinition::new(TriggerMode::LifeGained).execute(
@@ -27157,7 +27181,9 @@ mod resolving_carrier_settle_tests {
                         AbilityKind::Spell,
                         Effect::PutCounter {
                             counter_type: CounterType::Plus1Plus1,
-                            count: QuantityExpr::Fixed { value: 1 },
+                            count: QuantityExpr::Ref {
+                                qty: QuantityRef::EventContextAmount,
+                            },
                             target: TargetFilter::SelfRef,
                         },
                     ),
@@ -27279,16 +27305,32 @@ mod resolving_carrier_settle_tests {
             assert_eq!(runner.state().objects[&lower].zone, Zone::Stack);
             assert!(!events.iter().any(|event| matches!(event,
                 GameEvent::StackResolved { object_id, .. } if *object_id == lower)));
+            let observer_counters = |state: &GameState| {
+                state.objects[&observer]
+                    .counters
+                    .get(&CounterType::Plus1Plus1)
+                    .copied()
+                    .unwrap_or(0)
+            };
+            let mut placed = 0;
             for remaining in (1..=observer_count).rev() {
+                // Each announced firing resolves once, with its own occurrence.
+                let StackEntryKind::TriggeredAbility {
+                    trigger_event: Some(GameEvent::LifeChanged { amount, .. }),
+                    ..
+                } = &runner.state().stack[remaining].kind
+                else {
+                    panic!("expected the top completed observer");
+                };
+                placed += u32::try_from(*amount).expect("a life gain is positive");
                 runner.resolve_top();
                 assert_eq!(runner.state().stack.len(), remaining);
                 assert_eq!(runner.state().objects[&lower].zone, Zone::Stack);
+                assert_eq!(observer_counters(runner.state()), placed);
             }
             assert_eq!(runner.state().stack[0].id, lower);
-            assert_eq!(
-                runner.state().objects[&observer].counters[&CounterType::Plus1Plus1],
-                observer_count as u32
-            );
+            // Paused +1 and +11, or the synchronous +12, each resolved once.
+            assert_eq!(observer_counters(runner.state()), 12);
             assert_nonactive_completion(runner.state(), turn);
         }
         // Synthetic {0} instant: successful final move and a real final-move
@@ -27384,6 +27426,9 @@ mod resolving_carrier_settle_tests {
             AbilityCost, AbilityDefinition, AbilityKind, ManaProduction, QuantityModification,
             ReplacementDefinition,
         };
+        use crate::types::game_state::{
+            ManaAbilityCostResolutionMode, ManaAbilityResume, PendingCostMoveResume,
+        };
         use crate::types::replacements::ReplacementEvent;
         let p2 = PlayerId(2);
         for paused in [true, false] {
@@ -27433,7 +27478,28 @@ mod resolving_carrier_settle_tests {
                 assert!(
                     matches!(runner.state().waiting_for, WaitingFor::ChooseOneOfBranch { player, .. } if player == p2)
                 );
-                assert!(runner.state().pending_deferred_life_cost_resume.is_some());
+                // CR 605.3b + CR 119.4 + CR 614.1: paying the life is a life
+                // loss its replacement modifies, so the direct activation's
+                // typed cost cursor — not an effect-payment deferred-life root —
+                // owns the unpaid remainder and returns to P2's own window.
+                let Some(PendingCostMoveResume::ManaAbilityPayment { pending, cursor }) =
+                    runner.state().pending_cost_move_resume.as_ref()
+                else {
+                    panic!("direct mana activation owns its paused life payment");
+                };
+                assert_eq!(pending.player, p2);
+                assert_eq!(pending.source_id, source);
+                assert_eq!(pending.ability_index, Some(0));
+                assert!(matches!(pending.resume, ManaAbilityResume::Priority));
+                assert!(pending.cost_move_resume.is_none());
+                assert!(cursor.remaining.is_empty());
+                assert!(cursor.remaining_life_payments.is_empty());
+                assert!(matches!(
+                    cursor.resolution_mode,
+                    ManaAbilityCostResolutionMode::Interactive
+                ));
+                assert!(cursor.parent.is_none());
+                assert!(runner.state().pending_deferred_life_cost_resume.is_none());
                 assert!(runner.state().stack.is_empty());
                 assert!(runner.state().resolving_stack_entry.is_none());
                 events.extend(
@@ -27455,6 +27521,7 @@ mod resolving_carrier_settle_tests {
             );
             assert!(runner.state().resolving_stack_entry.is_none());
             assert!(runner.state().pending_deferred_life_cost_resume.is_none());
+            assert!(runner.state().pending_cost_move_resume.is_none());
             // CR 117.3c + CR 605.3b: this nonstack mana root keeps P2's window.
             assert_eq!(
                 runner.state().waiting_for,
@@ -27594,9 +27661,14 @@ mod resolving_carrier_settle_tests {
                     Some(&1)
                 );
                 assert_eq!(runner.state().stack.len(), 2);
+                // CR 117.3b + CR 117.4: the observer's resolution returned
+                // priority to active P0. P0 and P1 pass, so caster P2's pass
+                // closes this round and resolves the Ripple trigger.
                 nonactive_priority_window(&mut runner);
+                runner.act(GameAction::PassPriority).unwrap();
+            } else {
+                resolve_from_nonactive_window(&mut runner);
             }
-            resolve_from_nonactive_window(&mut runner);
             assert!(
                 matches!(runner.state().waiting_for, WaitingFor::RippleRevealChoice { player, count: 4, .. } if player == p2)
             );

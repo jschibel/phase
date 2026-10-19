@@ -7693,15 +7693,16 @@ fn group_is_order_independent(state: &GameState, group: &[PendingTriggerContext]
 fn group_thisobject_sources(
     group: &[PendingTriggerContext],
 ) -> Vec<crate::types::game_state::YieldTarget> {
-    use crate::types::game_state::YieldTarget;
-    group
-        .iter()
-        .map(|ctx| YieldTarget::ThisObject {
-            source_id: ctx.pending.source_id,
-            incarnation: ctx.pending.ability.trigger_source_incarnation(),
-            trigger_description: None,
-        })
-        .collect()
+    group.iter().map(thisobject_order_source).collect()
+}
+
+/// CR 603.3b: one trigger's ephemeral-tier (`ThisObject`) ordering identity.
+fn thisobject_order_source(ctx: &PendingTriggerContext) -> crate::types::game_state::YieldTarget {
+    crate::types::game_state::YieldTarget::ThisObject {
+        source_id: ctx.pending.source_id,
+        incarnation: ctx.pending.ability.trigger_source_incarnation(),
+        trigger_description: None,
+    }
 }
 
 /// CR 603.3b + CR 704.5d: the persistent-tier (`AllCopies`) source multiset, keyed on
@@ -7899,7 +7900,6 @@ fn build_ephemeral_order_template(
         ChoicePoint, DecisionGroupKey, DecisionKind, DecisionSlot, DecisionTemplate,
         PinnedDecision, ReplayMode,
     };
-    use crate::types::game_state::YieldTarget;
     let sources = group_thisobject_sources(triggers);
     let decisions = triggers
         .iter()
@@ -7907,14 +7907,7 @@ fn build_ephemeral_order_template(
         .map(|(pos, ctx)| PinnedDecision::Order {
             // CR 603.3b: one ordering slot per trigger in this batch, at instance `0` of its
             // own (source, TriggerOrder) class.
-            slot: DecisionSlot::first(
-                YieldTarget::ThisObject {
-                    source_id: ctx.pending.source_id,
-                    incarnation: ctx.pending.ability.trigger_source_incarnation(),
-                    trigger_description: None,
-                },
-                ChoicePoint::TriggerOrder,
-            ),
+            slot: DecisionSlot::first(thisobject_order_source(ctx), ChoicePoint::TriggerOrder),
             pos: pos as u8,
         })
         .collect();
@@ -7924,6 +7917,89 @@ fn build_ephemeral_order_template(
         replay: ReplayMode::Static,
         key: DecisionGroupKey::from_sources(&sources, DecisionKind::TriggerOrdering),
     }
+}
+
+/// CR 603.3b: whether `queued` — one ordering controller's queued trigger
+/// identities, in queue order — is exactly the not-yet-announced end of an order
+/// that controller already chose. `build_ephemeral_order_template` pins a chosen
+/// order's triggers in that order, and a construction pause parks the rest of it
+/// contiguously and in order, so a chosen remainder is the tail of those pins.
+/// Coverage alone is not enough: a fresh observer or a different permutation of
+/// covered sources is not a remainder of the chosen order.
+fn queued_triggers_continue_chosen_order(
+    state: &GameState,
+    controller: PlayerId,
+    queued: &[crate::types::game_state::YieldTarget],
+) -> bool {
+    use crate::analysis::decision_template::{DecisionKind, PinnedDecision};
+    state.decision_templates.iter().any(|template| {
+        if template.owner != controller
+            || template.key.kind != DecisionKind::TriggerOrdering
+            || !template.key.is_ephemeral()
+            || template.decisions.len() < queued.len()
+        {
+            return false;
+        }
+        let remainder = &template.decisions[template.decisions.len() - queued.len()..];
+        remainder
+            .iter()
+            .zip(queued)
+            .all(|(decision, source)| match decision {
+                PinnedDecision::Order { slot, .. } => slot.source == *source,
+                // CR 603.3b (N3 structural guard): only `Order` pins describe a
+                // chosen trigger order; any other pin cannot match a queued trigger.
+                PinnedDecision::Targets { .. }
+                | PinnedDecision::Mode { .. }
+                | PinnedDecision::MayChoice { .. }
+                | PinnedDecision::UnlessBreak { .. }
+                | PinnedDecision::ManaColor { .. }
+                | PinnedDecision::ConvokeTaps { .. } => false,
+            })
+    })
+}
+
+/// CR 603.3b: put a drained deferred queue into placement order before grouping.
+/// Segment and settlement collectors append their contexts as each delivery
+/// completes, so a fresh collection is normalized back to APNAP order
+/// (timestamp within a controller) and every controller orders its complete
+/// batch once before the next player receives priority. The not-yet-announced
+/// remainder of an order a controller already chose keeps that chosen order:
+/// re-sorting it would move triggers the player has already placed.
+fn normalize_deferred_trigger_order(state: &GameState, pending: &mut [PendingTriggerContext]) {
+    let mut controllers: Vec<PlayerId> = Vec::new();
+    for ctx in pending.iter() {
+        let controller = trigger_order_controller(state, ctx.pending.controller);
+        if !controllers.contains(&controller) {
+            controllers.push(controller);
+        }
+    }
+    let chosen_remainders: Vec<PlayerId> = controllers
+        .into_iter()
+        .filter(|controller| {
+            let queued: Vec<_> = pending
+                .iter()
+                .filter(|ctx| {
+                    trigger_order_controller(state, ctx.pending.controller) == *controller
+                })
+                .map(thisobject_order_source)
+                .collect();
+            queued_triggers_continue_chosen_order(state, *controller, &queued)
+        })
+        .collect();
+    // The sort is stable: a chosen remainder carries no timestamp key, so it keeps
+    // its queued order within its controller's APNAP slot.
+    pending.sort_by_key(|ctx| {
+        let controller = trigger_order_controller(state, ctx.pending.controller);
+        let collection_order = if chosen_remainders.contains(&controller) {
+            None
+        } else {
+            Some(ctx.pending.timestamp)
+        };
+        (
+            trigger_apnap_rank(state, ctx.pending.controller),
+            collection_order,
+        )
+    });
 }
 
 /// CR 603.3b gate 3rd arm: try to auto-order `group` from a saved template instead of
@@ -11149,16 +11225,9 @@ fn drain_deferred_trigger_queue_unchecked(
     events_out: &mut Vec<GameEvent>,
 ) -> Option<crate::types::game_state::WaitingFor> {
     let mut pending = std::mem::take(&mut state.deferred_triggers);
-    // CR 603.3b: Segment and settlement collectors intentionally append their
-    // contexts as each delivery completes. Normalize that collection order back
-    // to APNAP before grouping so every controller orders its complete batch
-    // once before the next player receives priority.
-    pending.sort_by_key(|ctx| {
-        (
-            trigger_apnap_rank(state, ctx.pending.controller),
-            ctx.pending.timestamp,
-        )
-    });
+    // CR 603.3b: APNAP placement for fresh collections; an already chosen
+    // order's parked remainder keeps the player's order.
+    normalize_deferred_trigger_order(state, &mut pending);
     match begin_trigger_ordering(state, pending) {
         TriggerOrderingDisposition::PromptForChoice(wf) => {
             // Mid-batch re-order (the `mem::take` above emptied `deferred_triggers`, so
@@ -51987,6 +52056,82 @@ pub mod tests {
              trigger on the stack; stack={:?}",
             sokka_runner.state().stack
         );
+    }
+
+    /// CR 603.3b: the deferred drain's placement normalization keeps the parked
+    /// remainder of an order its controller already chose, and still normalizes
+    /// every queue that is not exactly such a remainder.
+    #[test]
+    fn deferred_drain_keeps_a_chosen_order_remainder_and_normalizes_fresh_queues() {
+        let context = |source: u64, controller: PlayerId, timestamp: u32| {
+            PendingTriggerContext::single(PendingTrigger {
+                source_id: ObjectId(source),
+                controller,
+                condition: None,
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                    Vec::new(),
+                    ObjectId(source),
+                    controller,
+                )),
+                timestamp,
+                target_constraints: Vec::new(),
+                distribute: None,
+                trigger_event: None,
+                modal: None,
+                mode_abilities: Vec::new(),
+                description: None,
+                may_trigger_origin: None,
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            })
+        };
+        let sources = |pending: &[PendingTriggerContext]| -> Vec<u64> {
+            pending.iter().map(|ctx| ctx.pending.source_id.0).collect()
+        };
+        let mut unmarked = setup();
+        unmarked.active_player = PlayerId(0);
+        // The chosen order X, Y, Z deliberately disagrees with timestamp order.
+        let chosen = [
+            context(1, PlayerId(0), 5),
+            context(2, PlayerId(0), 9),
+            context(3, PlayerId(0), 1),
+        ];
+        let mut marked = unmarked.clone();
+        marked.set_trigger_order_template(build_ephemeral_order_template(PlayerId(0), &chosen));
+
+        // The parked remainder Y, Z keeps the chosen order inside its APNAP slot.
+        let mut remainder = vec![
+            context(4, PlayerId(1), 0),
+            chosen[1].clone(),
+            chosen[2].clone(),
+        ];
+        normalize_deferred_trigger_order(&marked, &mut remainder);
+        assert_eq!(sources(&remainder), vec![2, 3, 4]);
+
+        // A fresh observer joining that remainder makes a new, unordered group.
+        let mut mixed = vec![
+            chosen[1].clone(),
+            chosen[2].clone(),
+            context(5, PlayerId(0), 0),
+        ];
+        normalize_deferred_trigger_order(&marked, &mut mixed);
+        assert_eq!(sources(&mixed), vec![5, 3, 2]);
+
+        // Covered sources that are not the end of the chosen order are not a
+        // remainder of it.
+        let mut not_a_remainder = vec![chosen[0].clone(), chosen[2].clone()];
+        normalize_deferred_trigger_order(&marked, &mut not_a_remainder);
+        assert_eq!(sources(&not_a_remainder), vec![3, 1]);
+
+        // Without a chosen order the same queue is normalized.
+        let mut fresh = vec![chosen[1].clone(), chosen[2].clone()];
+        normalize_deferred_trigger_order(&unmarked, &mut fresh);
+        assert_eq!(sources(&fresh), vec![3, 2]);
     }
 }
 

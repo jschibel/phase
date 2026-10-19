@@ -871,7 +871,7 @@ fn run_post_action_pipeline_core(
 /// whatever ordinals the batch's own claims carry. The kept events remember
 /// their buffer positions, so a claim the batch's scan publishes is the
 /// full-buffer occurrence it matched (CR 603.2c).
-fn unclaimed_delayed_trigger_input(
+pub(super) fn unclaimed_delayed_trigger_input(
     state: &mut GameState,
     events: &[GameEvent],
     start: usize,
