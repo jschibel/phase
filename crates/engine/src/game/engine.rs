@@ -9070,12 +9070,14 @@ fn settle_finished_resolving_stack_entry(state: &mut GameState) {
     state.resolution_source_relatch = None;
     // CR 117.3b: completion of this nonmana stack object grants priority to
     // the active player, after settlement. A real prompt retains its owner.
+    // CR 800.4j: once the active player has left the game, the next player in
+    // turn order receives that priority instead.
     if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
         super::priority::reset_priority(state);
         super::public_state::sync_waiting_for(
             state,
             &WaitingFor::Priority {
-                player: state.active_player,
+                player: living_priority_seat(state),
             },
         );
     }
@@ -27998,6 +28000,362 @@ mod resolving_carrier_settle_tests {
             assert!(apply(&mut rejected, wrong, GameAction::PassPriority).is_err());
             assert_eq!(rejected.stack.len(), 1);
         }
+    }
+
+    /// Exact pinned Oracle text of Hymn of the Faller.
+    const HYMN_OF_THE_FALLER: &str = "Surveil 1, then you draw a card and lose 1 life. (To surveil 1, look at the top card of your library. You may put it into your graveyard.)\nVoid \u{2014} If a nonland permanent left the battlefield this turn or a spell was warped this turn, draw another card.";
+
+    /// Stages active P0 at 1 life with a funded Hymn of the Faller in hand and
+    /// a known card on top of its library for the surveil and the draw.
+    /// Returns `(hymn, surveilled)`.
+    fn stage_lethal_hymn(
+        scenario: &mut crate::game::scenario::GameScenario,
+    ) -> (ObjectId, ObjectId) {
+        use crate::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
+        let p0 = PlayerId(0);
+        scenario.with_life(p0, 1);
+        scenario.with_mana_pool(
+            p0,
+            vec![
+                ManaUnit::new(ManaType::Black, ObjectId(0), false, vec![]),
+                ManaUnit::new(ManaType::Black, ObjectId(0), false, vec![]),
+            ],
+        );
+        let hymn = scenario
+            .add_spell_to_hand(p0, "Hymn of the Faller", false)
+            .from_oracle_text_with_keywords(&["Surveil", "Void"], HYMN_OF_THE_FALLER)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Black],
+                generic: 1,
+            })
+            .id();
+        scenario.add_card_to_library_top(p0, "Library filler");
+        let surveilled = scenario.add_card_to_library_top(p0, "Surveilled card");
+        (hymn, surveilled)
+    }
+
+    /// CR 704.5a + CR 800.4a + CR 800.4j: active P0 casts the staged Hymn, every
+    /// player passes, and P0 answers its surveil. The draw and the life loss
+    /// leave P0 at 0 life, so the state-based action removes P0 in its own
+    /// action. The game continues in P0's turn without an active player, and the
+    /// priority P0 would have received goes to P1, the next player in turn
+    /// order.
+    fn resolve_lethal_hymn(
+        runner: &mut crate::game::scenario::GameRunner,
+        hymn: ObjectId,
+        surveilled: ObjectId,
+    ) {
+        let (p0, p1, p2) = (PlayerId(0), PlayerId(1), PlayerId(2));
+        // Turn order runs P0 -> P1 -> P2.
+        assert_eq!(runner.state().seat_order, [p0, p1, p2]);
+        assert_eq!(
+            runner.state().turn_direction,
+            crate::types::phase::TurnDirection::Normal
+        );
+        runner.cast(hymn).commit();
+        for player in [p0, p1, p2] {
+            assert_eq!(runner.state().waiting_for, WaitingFor::Priority { player });
+            runner.act(GameAction::PassPriority).unwrap();
+        }
+        assert!(matches!(
+            &runner.state().waiting_for,
+            WaitingFor::SurveilChoice { player, cards } if *player == p0 && *cards == [surveilled]
+        ));
+        let events = runner
+            .act(GameAction::SelectCards {
+                cards: vec![surveilled],
+            })
+            .unwrap()
+            .events;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+                    GameEvent::CardDrawn { player_id, object_id, .. }
+                        if *player_id == p0 && *object_id == surveilled))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+                    GameEvent::LifeChanged { player_id, amount: -1, .. } if *player_id == p0))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+                    GameEvent::StackResolved { object_id } if *object_id == hymn))
+                .count(),
+            1
+        );
+        assert!(runner.state().stack.is_empty());
+        assert!(runner.state().resolving_stack_entry.is_none());
+        assert!(runner.state().players[0].is_eliminated);
+        assert!(!runner.state().players[1].is_eliminated);
+        assert!(!runner.state().players[2].is_eliminated);
+        assert!(runner.state().game_end.is_none());
+        assert_eq!(runner.state().active_player, p0);
+        assert_eq!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { player: p1 }
+        );
+        assert_eq!(runner.state().priority_player, p1);
+    }
+
+    /// CR 117.3b + CR 800.4j: the departed active player is replaced by the
+    /// next player in turn order still in the game. P1 holds priority, no
+    /// other seat may act, and the turn is unchanged.
+    fn assert_priority_skips_the_departed_active_player(state: &GameState, turn: u32) {
+        let (p0, p1, p2) = (PlayerId(0), PlayerId(1), PlayerId(2));
+        assert!(state.players[0].is_eliminated);
+        assert!(state.game_end.is_none());
+        assert_eq!(state.active_player, p0);
+        assert_eq!(state.waiting_for, WaitingFor::Priority { player: p1 });
+        assert_eq!(state.priority_player, p1);
+        assert!(state.priority_passes.is_empty());
+        assert_eq!(state.phase, Phase::PreCombatMain);
+        assert_eq!(state.turn_number, turn);
+        let mut accepted = state.clone();
+        assert!(apply(&mut accepted, p1, GameAction::PassPriority).is_ok());
+        for wrong in [p0, p2] {
+            let mut rejected = state.clone();
+            assert!(apply(&mut rejected, wrong, GameAction::PassPriority).is_err());
+            assert_eq!(rejected.stack.len(), state.stack.len());
+            assert_eq!(rejected.phase, Phase::PreCombatMain);
+            assert_eq!(rejected.turn_number, turn);
+        }
+    }
+
+    /// CR 117.3b + CR 608.2n + CR 800.4j: the active player left the game in an
+    /// EARLIER action, and the turn continues. A spell another player casts
+    /// later in that turn pauses, and its final part completes it at the pass
+    /// top after the answer, with no state-based action or trigger in that
+    /// pass. The active player would receive priority, so the next player in
+    /// turn order still in the game receives it instead.
+    #[test]
+    fn completion_after_the_active_player_left_gives_priority_to_the_next_living_seat() {
+        use crate::game::scenario::GameScenario;
+        use crate::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
+        // Exact pinned Oracle text.
+        const CONSIDER: &str = "Surveil 1. (Look at the top card of your library. You may put it into your graveyard.)\nDraw a card.";
+        let (p1, p2) = (PlayerId(1), PlayerId(2));
+        let mut scenario = GameScenario::new_n_player(3, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        let (hymn, hymn_surveilled) = stage_lethal_hymn(&mut scenario);
+        scenario.with_mana_pool(
+            p1,
+            vec![ManaUnit::new(ManaType::Blue, ObjectId(0), false, vec![])],
+        );
+        let consider = scenario
+            .add_spell_to_hand(p1, "Consider", true)
+            .from_oracle_text_with_keywords(&["Surveil"], CONSIDER)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 0,
+            })
+            .id();
+        scenario.add_card_to_library_top(p1, "P1 library filler");
+        let surveilled = scenario.add_card_to_library_top(p1, "P1 surveilled card");
+        let mut runner = scenario.build();
+        let turn = runner.state().turn_number;
+        resolve_lethal_hymn(&mut runner, hymn, hymn_surveilled);
+
+        runner.cast(consider).commit();
+        // CR 117.3c: the caster receives priority. P1 and P2 pass in turn
+        // order past the departed seat, so Consider resolves.
+        for player in [p1, p2] {
+            assert_eq!(runner.state().waiting_for, WaitingFor::Priority { player });
+            runner.act(GameAction::PassPriority).unwrap();
+        }
+        // Reach guard: Consider paused on its surveil while still owing its
+        // final part, and no terminal marker is installed, so its completion
+        // comes from the pass-top final part.
+        assert!(matches!(
+            &runner.state().waiting_for,
+            WaitingFor::SurveilChoice { player, cards } if *player == p1 && *cards == [surveilled]
+        ));
+        assert_eq!(
+            runner
+                .state()
+                .resolving_stack_entry
+                .as_ref()
+                .map(|entry| entry.id),
+            Some(consider)
+        );
+        assert!(runner.state().resolving_spell_final_part.is_some());
+        assert!(runner.state().pending_resolution_completion.is_none());
+
+        let events = runner
+            .act(GameAction::SelectCards {
+                cards: vec![surveilled],
+            })
+            .unwrap()
+            .events;
+        // Reach guards: P1 drew the surveilled card once, and Consider
+        // resolved exactly once into its owner's graveyard in this action.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+                    GameEvent::CardDrawn { player_id, object_id, .. }
+                        if *player_id == p1 && *object_id == surveilled))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+                    GameEvent::CardDrawn { player_id, .. } if *player_id == p1))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+                    GameEvent::StackResolved { object_id } if *object_id == consider))
+                .count(),
+            1
+        );
+        assert_eq!(runner.state().objects[&consider].zone, Zone::Graveyard);
+        assert!(runner.state().stack.is_empty());
+        assert!(runner.state().resolving_stack_entry.is_none());
+        assert!(runner.state().resolving_spell_final_part.is_none());
+        assert!(runner.state().pending_resolution_completion.is_none());
+        assert!(runner
+            .state()
+            .pending_trigger_construction_priority_recipient
+            .is_none());
+        assert_priority_skips_the_departed_active_player(runner.state(), turn);
+    }
+
+    /// CR 117.3b + CR 702.60a + CR 800.4j: the same entitlement at the late
+    /// terminal completion site. After the active player left the game in an
+    /// earlier action, P2 casts Surging Flame. Its Ripple trigger reveals no
+    /// hit, and completing the bottom order retires that trigger. The active
+    /// player would receive priority, so the next player in turn order still
+    /// in the game receives it, not the departed seat and not the trigger's
+    /// controller.
+    #[test]
+    fn late_terminal_completion_after_the_active_player_left_gives_priority_to_the_next_living_seat(
+    ) {
+        use crate::game::scenario::GameScenario;
+        use crate::types::ability::TargetRef;
+        use crate::types::actions::CastChoice;
+        use crate::types::keywords::Keyword;
+        use crate::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
+        // Exact pinned Oracle, plus the explicit keyword metadata used in
+        // production.
+        const SURGING_FLAME: &str = "Ripple 4 (When you cast this spell, you may reveal the top four cards of your library. You may cast spells with the same name as this spell from among those cards without paying their mana costs. Put the rest on the bottom of your library.)\nSurging Flame deals 2 damage to any target.";
+        let (p1, p2) = (PlayerId(1), PlayerId(2));
+        let mut scenario = GameScenario::new_n_player(3, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        let (hymn, hymn_surveilled) = stage_lethal_hymn(&mut scenario);
+        scenario.with_mana_pool(
+            p2,
+            vec![
+                ManaUnit::new(ManaType::Red, ObjectId(0), false, vec![]),
+                ManaUnit::new(ManaType::Red, ObjectId(0), false, vec![]),
+            ],
+        );
+        let flame = scenario
+            .add_spell_to_hand_from_oracle(p2, "Surging Flame", true, SURGING_FLAME)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 1,
+            })
+            .with_keyword(Keyword::Ripple(4))
+            .id();
+        let deep = scenario.add_card_to_library_top(p2, "Deep card");
+        let misses: Vec<_> = (0..4)
+            .map(|index| scenario.add_card_to_library_top(p2, &format!("Ripple miss {index}")))
+            .collect();
+        let mut runner = scenario.build();
+        let turn = runner.state().turn_number;
+        resolve_lethal_hymn(&mut runner, hymn, hymn_surveilled);
+
+        // P1 passes on the empty stack, so P2 receives priority and casts.
+        runner.act(GameAction::PassPriority).unwrap();
+        assert_eq!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { player: p2 }
+        );
+        let card_id = runner.state().objects[&flame].card_id;
+        runner
+            .act(GameAction::CastSpell {
+                object_id: flame,
+                card_id,
+                targets: vec![],
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+            })
+            .unwrap();
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ));
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Player(p1)),
+            })
+            .unwrap();
+        assert_eq!(runner.state().players[2].mana_pool.total(), 0);
+        // CR 117.3c: the caster receives priority. P2 and P1 pass past the
+        // departed seat, which resolves only the Ripple trigger.
+        assert_eq!(runner.state().stack.len(), 2);
+        for player in [p2, p1] {
+            assert_eq!(runner.state().waiting_for, WaitingFor::Priority { player });
+            runner.act(GameAction::PassPriority).unwrap();
+        }
+        assert!(
+            matches!(runner.state().waiting_for, WaitingFor::RippleRevealChoice { player, count: 4, .. } if player == p2)
+        );
+        assert_eq!(runner.state().stack.len(), 1);
+        assert_eq!(runner.state().objects[&flame].zone, Zone::Stack);
+        runner
+            .act(GameAction::RippleChoice {
+                choice: CastChoice::Cast,
+            })
+            .unwrap();
+        // Reach guard: the real bottom-order prompt for exactly the misses.
+        let offered = match &runner.state().waiting_for {
+            WaitingFor::RippleBottomOrder { player, cards, .. } => {
+                assert_eq!(*player, p2);
+                let mut actual = cards.clone();
+                actual.sort();
+                let mut expected = misses.clone();
+                expected.sort();
+                assert_eq!(actual, expected);
+                cards.clone()
+            }
+            other => panic!("actual bottom-order prompt required: {other:?}"),
+        };
+        let ordered: Vec<_> = offered.iter().rev().copied().collect();
+        assert_ne!(ordered, offered);
+        runner
+            .act(GameAction::SelectCards {
+                cards: ordered.clone(),
+            })
+            .unwrap();
+        // Reach guards: the pile is on the library bottom in the requested
+        // order, the terminal marker was consumed, the Ripple carrier retired,
+        // and Surging Flame is still on the stack with no stack growth.
+        let library: Vec<_> = runner.state().players[2].library.iter().copied().collect();
+        assert_eq!(library[0], deep);
+        assert_eq!(
+            &library[library.len() - ordered.len()..],
+            ordered.as_slice()
+        );
+        assert!(runner.state().pending_resolution_completion.is_none());
+        assert!(runner.state().resolving_stack_entry.is_none());
+        assert_eq!(runner.state().stack.len(), 1);
+        assert_eq!(runner.state().stack[0].id, flame);
+        assert_eq!(runner.state().objects[&flame].zone, Zone::Stack);
+        assert_priority_skips_the_departed_active_player(runner.state(), turn);
     }
 }
 

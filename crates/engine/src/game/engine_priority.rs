@@ -979,11 +979,11 @@ fn sba_choice_requires_combined_trigger_batch(waiting_for: &WaitingFor) -> bool 
 /// well, so constructing the batch it completes cannot hand priority to the
 /// trigger controller instead. A carried recipient takes precedence.
 ///
-/// CR 800.4a + CR 800.4j: the completion recipient was read before this pass's
-/// state-based actions, and elimination re-points only an already installed
-/// recipient. If that player has since left the game, the next player in turn
-/// order still in the game receives priority instead, so it is the one
-/// persisted.
+/// CR 800.4a + CR 800.4j: the completion recipient can name a player who has
+/// left the game: the early site reads it before this pass's state-based
+/// actions, and elimination re-points only an already installed recipient.
+/// If that player has since left the game, the next player in turn order
+/// still in the game receives priority instead, so it is the one persisted.
 ///
 /// With no recipient — every ordinary wrapper that retired no carrier — this is
 /// a no-op, and the existing active-player/controller fallbacks at each
