@@ -11089,7 +11089,8 @@ pub(crate) fn drain_deferred_triggers_after_trigger_construction(
 ///
 /// The recipient is installed only from the settled-Priority convergence core's
 /// own exhaustively validated `WaitingFor::Priority { player }`, or from the
-/// synchronized wait of an exact carrier that core just retired, before any
+/// synchronized wait of an exact carrier that core just retired (past a player
+/// who has since left the game, CR 800.4j), before any
 /// ordered or singleton construction step can pause. Reinstalling the same
 /// player is idempotent; observing a *different* player while the field is live
 /// is an internal invariant error. The one carved-out rewrite is
@@ -11141,8 +11142,10 @@ pub(super) fn is_trigger_construction_prompt(
 /// Contract:
 ///
 /// 1. With no recipient installed, return `produced` byte-for-byte and perform
-///    no drain. This is the entire ordinary-caller contract — every existing
-///    controller/active-player fallback at the seams stays exactly baseline.
+///    no drain. An ordinary caller has no recipient unless the shared core
+///    retired its exact carrier in the pass that opened this construction
+///    (CR 117.3b + CR 117.5); otherwise every existing controller/active-player
+///    fallback at the seams stays exactly baseline.
 /// 2. With a recipient and one of the six approved construction prompts, return
 ///    the real prompt and leave the recipient installed for the next step.
 /// 3. With a recipient and a `Priority` of any player, run the bounded
@@ -42430,7 +42433,7 @@ pub mod tests {
     /// recipient installed, the finisher returns `produced` byte-for-byte and
     /// performs no drain.
     ///
-    /// This is the entire ordinary-caller contract. Every existing
+    /// This is the whole contract for a caller with no recipient installed. Every existing
     /// controller/active-player fallback at the seven seams depends on it, so
     /// the row includes a terminal `Priority` with a *drainable* queue behind it
     /// — exactly the shape clause 3 would drain — and requires the queue to be

@@ -27812,6 +27812,193 @@ mod resolving_carrier_settle_tests {
             assert_nonactive_completion(runner.state(), turn);
         }
     }
+
+    /// CR 117.3b + CR 117.5 + CR 800.4a + CR 800.4j: the early final-part
+    /// completion recipient is read before this pass's state-based actions. When
+    /// those actions remove the active player, the trigger construction the
+    /// completed batch opens hands priority to the next player in turn order
+    /// still in the game, never to the departed seat.
+    #[test]
+    fn early_final_part_completion_recipient_skips_an_eliminated_active_player() {
+        use crate::game::scenario::GameScenario;
+        use crate::types::ability::TargetRef;
+        use crate::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
+        // Exact pinned Oracle text.
+        const HYMN: &str = "Surveil 1, then you draw a card and lose 1 life. (To surveil 1, look at the top card of your library. You may put it into your graveyard.)\nVoid \u{2014} If a nonland permanent left the battlefield this turn or a spell was warped this turn, draw another card.";
+        const BOWMASTERS: &str = "Flash\nWhen this creature enters and whenever an opponent draws a card except the first one they draw in each of their draw steps, this creature deals 1 damage to any target. Then amass Orcs 1.";
+        let (p0, p1, p2) = (PlayerId(0), PlayerId(1), PlayerId(2));
+        let mut scenario = GameScenario::new_n_player(3, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.with_life(p0, 1);
+        scenario.with_mana_pool(
+            p0,
+            vec![
+                ManaUnit::new(ManaType::Black, ObjectId(0), false, vec![]),
+                ManaUnit::new(ManaType::Black, ObjectId(0), false, vec![]),
+            ],
+        );
+        let hymn = scenario
+            .add_spell_to_hand(p0, "Hymn of the Faller", false)
+            .from_oracle_text_with_keywords(&["Surveil", "Void"], HYMN)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Black],
+                generic: 1,
+            })
+            .id();
+        let bowmasters = scenario
+            .add_creature(p2, "Orcish Bowmasters", 1, 1)
+            .from_oracle_text_with_keywords(&["Amass", "Flash"], BOWMASTERS)
+            .id();
+        scenario.add_card_to_library_top(p0, "Library filler");
+        let surveilled = scenario.add_card_to_library_top(p0, "Surveilled card");
+        let mut runner = scenario.build();
+        let turn = runner.state().turn_number;
+        // CR 101.4: turn order runs P0 -> P1 -> P2.
+        assert_eq!(runner.state().seat_order, [p0, p1, p2]);
+        assert_eq!(
+            runner.state().turn_direction,
+            crate::types::phase::TurnDirection::Normal
+        );
+
+        runner.cast(hymn).commit();
+        for player in [p0, p1, p2] {
+            assert_eq!(runner.state().waiting_for, WaitingFor::Priority { player });
+            runner.act(GameAction::PassPriority).unwrap();
+        }
+        // Reach guard: the sorcery paused on its surveil while still owing its
+        // final part, and no in-resolution cast installed a terminal marker,
+        // so its completion can only come from the pass-top final part.
+        assert!(matches!(
+            &runner.state().waiting_for,
+            WaitingFor::SurveilChoice { player, cards } if *player == p0 && *cards == [surveilled]
+        ));
+        assert_eq!(
+            runner
+                .state()
+                .resolving_stack_entry
+                .as_ref()
+                .map(|entry| entry.id),
+            Some(hymn)
+        );
+        assert!(runner.state().resolving_spell_final_part.is_some());
+        assert!(runner.state().pending_resolution_completion.is_none());
+        assert!(runner
+            .state()
+            .pending_trigger_construction_priority_recipient
+            .is_none());
+
+        let events = runner
+            .act(GameAction::SelectCards {
+                cards: vec![surveilled],
+            })
+            .unwrap()
+            .events;
+        // Reach guards: the draw and the life loss happened once, the final
+        // part ran in this action, and the active player then lost the game to
+        // the state-based action (CR 704.5a) in a game that continues.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+                    GameEvent::CardDrawn { player_id, object_id, .. }
+                        if *player_id == p0 && *object_id == surveilled))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+                    GameEvent::CardDrawn { player_id, .. } if *player_id == p0))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+                    GameEvent::LifeChanged { player_id, amount: -1, .. } if *player_id == p0))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+                    GameEvent::StackResolved { object_id } if *object_id == hymn))
+                .count(),
+            1
+        );
+        assert!(runner.state().resolving_stack_entry.is_none());
+        assert!(runner.state().resolving_spell_final_part.is_none());
+        assert!(runner.state().pending_resolution_completion.is_none());
+        assert!(runner.state().players[0].is_eliminated);
+        assert!(!runner.state().players[1].is_eliminated);
+        assert!(!runner.state().players[2].is_eliminated);
+        assert!(runner.state().game_end.is_none());
+        assert_eq!(runner.state().active_player, p0);
+        // Reach guard: the Bowmasters trigger is under real construction, with
+        // more than one legal target and none of them the departed player.
+        let WaitingFor::TriggerTargetSelection {
+            player,
+            source_id,
+            target_slots,
+            ..
+        } = &runner.state().waiting_for
+        else {
+            panic!(
+                "Bowmasters' trigger must construct its real target: {:?}",
+                runner.state().waiting_for
+            );
+        };
+        assert_eq!(*player, p2);
+        assert_eq!(*source_id, Some(bowmasters));
+        assert!(target_slots[0].legal_targets.len() >= 2);
+        assert!(target_slots[0]
+            .legal_targets
+            .contains(&TargetRef::Player(p1)));
+        assert!(!target_slots[0]
+            .legal_targets
+            .contains(&TargetRef::Player(p0)));
+        // Reach guard: the completed resolution's recipient was persisted
+        // across this construction prompt.
+        assert!(runner
+            .state()
+            .pending_trigger_construction_priority_recipient
+            .is_some());
+
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Player(p1)),
+            })
+            .unwrap();
+        assert_eq!(runner.state().stack.len(), 1);
+        assert_eq!(runner.state().stack[0].source_id, bowmasters);
+        assert!(matches!(
+            runner.state().stack[0].kind,
+            StackEntryKind::TriggeredAbility { .. }
+        ));
+        assert!(runner
+            .state()
+            .pending_trigger_construction_priority_recipient
+            .is_none());
+        // CR 117.3b + CR 800.4j: the departed active player would have received
+        // priority, so the next player in turn order (P0 -> P1) receives it.
+        assert_eq!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { player: p1 }
+        );
+        assert_eq!(runner.state().priority_player, p1);
+        assert_eq!(runner.state().phase, Phase::PreCombatMain);
+        assert_eq!(runner.state().turn_number, turn);
+        let mut accepted = runner.state().clone();
+        assert!(apply(&mut accepted, p1, GameAction::PassPriority).is_ok());
+        for wrong in [p0, p2] {
+            let mut rejected = runner.state().clone();
+            assert!(apply(&mut rejected, wrong, GameAction::PassPriority).is_err());
+            assert_eq!(rejected.stack.len(), 1);
+        }
+    }
 }
 
 #[cfg(test)]

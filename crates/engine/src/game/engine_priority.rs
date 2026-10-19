@@ -190,8 +190,11 @@ pub(super) fn run_post_action_pipeline_after_spell_final_part(
 
 /// The shared post-action settlement core. Every ordinary wrapper reaches it
 /// through the boolean form above, with `carried_priority_recipient == None`,
-/// which preserves their current stack-growth fallback and every current
-/// non-sidecar ordering behavior byte-for-byte.
+/// which preserves their current stack-growth fallback. CR 117.3b + CR 117.5:
+/// the one recipient an ordinary wrapper's pass can persist is the
+/// synchronized active player of an exact carrier this core itself retired
+/// (or, once that player has left the game, the next player in turn order
+/// still in it, CR 800.4j).
 ///
 /// `carried_priority_recipient` is `Some(player)` only for a settled-Priority
 /// convergence whose activator was not the active player (CR 117.3c + CR 117.5).
@@ -584,7 +587,8 @@ fn run_post_action_pipeline_core(
                 }
                 persist_carried_recipient_across_prompt(
                     state,
-                    carried_priority_recipient.or(completion_recipient),
+                    carried_priority_recipient,
+                    completion_recipient,
                 );
                 state.consumed_before_priority_trigger_events.clear();
                 return Ok(waiting_for);
@@ -658,7 +662,8 @@ fn run_post_action_pipeline_core(
                 state.waiting_for = waiting_for.clone();
                 persist_carried_recipient_across_prompt(
                     state,
-                    carried_priority_recipient.or(completion_recipient),
+                    carried_priority_recipient,
+                    completion_recipient,
                 );
                 state.consumed_before_priority_trigger_events.clear();
                 return Ok(waiting_for);
@@ -806,7 +811,8 @@ fn run_post_action_pipeline_core(
         }
         persist_carried_recipient_across_prompt(
             state,
-            carried_priority_recipient.or(completion_recipient),
+            carried_priority_recipient,
+            completion_recipient,
         );
         state.consumed_before_priority_trigger_events.clear();
         return Ok(state.waiting_for.clone());
@@ -845,7 +851,8 @@ fn run_post_action_pipeline_core(
     if matches!(state.waiting_for, WaitingFor::OrderTriggers { .. }) {
         persist_carried_recipient_across_prompt(
             state,
-            carried_priority_recipient.or(completion_recipient),
+            carried_priority_recipient,
+            completion_recipient,
         );
         return Ok(state.waiting_for.clone());
     }
@@ -859,7 +866,8 @@ fn run_post_action_pipeline_core(
         state.waiting_for = waiting_for.clone();
         persist_carried_recipient_across_prompt(
             state,
-            carried_priority_recipient.or(completion_recipient),
+            carried_priority_recipient,
+            completion_recipient,
         );
         return Ok(waiting_for);
     }
@@ -969,7 +977,13 @@ fn sba_choice_requires_combined_trigger_batch(waiting_for: &WaitingFor) -> bool 
 /// CR 117.3b + CR 117.5: a pass that retired its exact resolving carrier
 /// supplies that completion's synchronized active-player recipient here as
 /// well, so constructing the batch it completes cannot hand priority to the
-/// trigger controller instead.
+/// trigger controller instead. A carried recipient takes precedence.
+///
+/// CR 800.4a + CR 800.4j: the completion recipient was read before this pass's
+/// state-based actions, and elimination re-points only an already installed
+/// recipient. If that player has since left the game, the next player in turn
+/// order still in the game receives priority instead, so it is the one
+/// persisted.
 ///
 /// With no recipient — every ordinary wrapper that retired no carrier — this is
 /// a no-op, and the existing active-player/controller fallbacks at each
@@ -981,8 +995,17 @@ fn sba_choice_requires_combined_trigger_batch(waiting_for: &WaitingFor) -> bool 
 fn persist_carried_recipient_across_prompt(
     state: &mut GameState,
     carried_priority_recipient: Option<PlayerId>,
+    completion_recipient: Option<PlayerId>,
 ) {
-    let Some(player) = carried_priority_recipient else {
+    let Some(player) = carried_priority_recipient.or_else(|| {
+        completion_recipient.map(|player| {
+            if players::is_alive(state, player) {
+                player
+            } else {
+                players::next_player_in_turn_order(state, player)
+            }
+        })
+    }) else {
         return;
     };
     if !triggers::is_trigger_construction_prompt(&state.waiting_for) {
