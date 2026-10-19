@@ -60,6 +60,48 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
+/// 155 — `PendingChangeZoneIteration` members carry their pre-event entry
+///      modifications (CR 603.6a + CR 614.12): `remaining` becomes
+///      `ChangeZoneMemberEntry` records and the raw gate fields are removed; old
+///      peers cannot parse a parked ChangeZone frame. `RESOLUTION_STATE_WIRE_VERSION`
+///      moves from 6 to 7 with it: a v154 peer refuses the version-7 resolution
+///      state. Full-game peers and P2P move in lockstep (wire 137); no lobby
+///      carrier names it.
+///
+/// 154 — `PendingCostMoveResume` gains `CounterCostRemovalPayment`, a
+///      counter-removal cost paused while a replacement choice settles its
+///      current removal (CR 616.1; the settled count is credited to the
+///      activation, CR 118.11), with its `PausedCounterCostRemoval` record
+///      (which carries its `replacement_subtree` boundary);
+///      `ManaAbilityCostCursor` gains the optional `counter_removal` record.
+///      Serialized in `GameState.pending_cost_move_resume`: a v153 peer cannot
+///      parse the new tag. The same version carries the activation-owned
+///      removed-counter count (`SpellContext.cost_removed_counter_amount`,
+///      `ManaAbilityCostCursor.cost_removed_counters`,
+///      `PendingManaAbility.cost_removed_counters`; optional, skipped when
+///      unset), which a v153 peer re-encoding state would drop. Full-game
+///      peers and P2P move in lockstep (wire 136); no lobby carrier names it.
+///
+/// 153 — `ContinuousModification::GrantAllActivatedAbilitiesOf` gains the
+///      optional kind selector `kind: Option<ActivatedAbilityKind>`, and the
+///      loyalty-grant sibling variant is removed (Nicol Bolas,
+///      Dragon-God's loyalty grant is `kind: Some(Loyalty)` on the activated
+///      authority — the same parameterization shape as entry 127's FilterProp
+///      merge). The field rides in `GameState`'s transient continuous effects
+///      with `#[serde(default)]`, and the enum has no `deny_unknown_fields`,
+///      so a v152 peer reading kind-bearing Bolas state drops `kind` SILENTLY
+///      and over-grants every activated ability of every other planeswalker —
+///      the silent-skew class entry 129 refuses to tolerate without a
+///      handshake-refusable bump. The removed tag never shipped (no committed
+///      export names it), so no migration shim exists; branch-era saved states
+///      fail loudly on the unknown variant. P2P moves in lockstep (wire 135);
+///      lobby messages are unchanged.
+/// 152 — `ShortcutDecisionSchema` gains `suggested_declaration` (the offer's
+///      eliminating suggestion) and `leading_aims` (published slots a trigger on
+///      the stack already targets), and `ShortcutProposal` gains `leading_aims`.
+///      A v151 peer drops them. Full-game peers and P2P move in lockstep
+///      (wire 134).
+///
 /// 151: Populated `GameObject.bestow_form` carries removed creature subtypes as
 ///      an object instead of the legacy boolean. Old readers cannot decode it;
 ///      full-game and P2P (wire 133) refuse them before state delivery.
@@ -1142,7 +1184,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 151;
+pub const PROTOCOL_VERSION: u32 = 155;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2399,12 +2441,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 151);
+        assert_eq!(PROTOCOL_VERSION, 155);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 150);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 154);
     }
 
     #[test]

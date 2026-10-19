@@ -8574,7 +8574,7 @@ pub(crate) fn take_sba_choice_trigger_batch(
 /// dedicated resolution owners (`copy_spell.rs`).
 pub(crate) fn park_observer_triggers_if_paused(
     state: &mut GameState,
-    events: &[GameEvent],
+    events: &mut Vec<GameEvent>,
     slice_start: usize,
 ) {
     if triggered_mana_sidecar_owns_local_collection(state) {
@@ -8583,8 +8583,11 @@ pub(crate) fn park_observer_triggers_if_paused(
     if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
         return;
     }
+    // CR 601.2h + CR 602.2b + CR 603.3: under a live announcement these events
+    // wait in its carrier; only the span it does not own is parked here.
+    let owned = super::announcement_triggers::take_inline_trigger_span(state, events, slice_start);
     let trigger_events: Vec<GameEvent> = filter_consumed_trigger_events_from(
-        events,
+        &events[..owned.end],
         slice_start,
         TriggerCollectionRequester::Ordinary,
         &state.consumed_before_priority_trigger_events,
@@ -8621,8 +8624,11 @@ pub(crate) fn collect_and_drain_observer_triggers_if_settled(
         park_observer_triggers_if_paused(state, events, slice_start);
         return;
     }
+    // CR 601.2h + CR 602.2b + CR 603.3: under a live announcement these events
+    // wait in its carrier; only the span it does not own is collected here.
+    let owned = super::announcement_triggers::take_inline_trigger_span(state, events, slice_start);
     let trigger_events: Vec<GameEvent> = filter_consumed_trigger_events_from(
-        events,
+        &events[..owned.end],
         slice_start,
         TriggerCollectionRequester::Ordinary,
         &state.consumed_before_priority_trigger_events,
@@ -12429,7 +12435,7 @@ fn player_scope_unbound_at_fire_time(scope: &PlayerScope) -> bool {
         PlayerScope::ScopedPlayer
         | PlayerScope::Target
         | PlayerScope::RecipientController
-        | PlayerScope::ParentObjectTargetController => true,
+        | PlayerScope::ParentObjectTarget { .. } => true,
         PlayerScope::AllPlayers { exclude, .. } => exclude
             .as_deref()
             .is_some_and(player_scope_unbound_at_fire_time),
@@ -42801,7 +42807,7 @@ pub mod tests {
             if settled {
                 collect_and_drain_observer_triggers_if_settled(&mut state, &mut events, 0);
             } else {
-                park_observer_triggers_if_paused(&mut state, &events, 0);
+                park_observer_triggers_if_paused(&mut state, &mut events, 0);
             }
             assert!(
                 !state.deferred_triggers.is_empty() || !state.stack.is_empty(),
@@ -42816,7 +42822,7 @@ pub mod tests {
             if settled {
                 collect_and_drain_observer_triggers_if_settled(&mut state, &mut events, 0);
             } else {
-                park_observer_triggers_if_paused(&mut state, &events, 0);
+                park_observer_triggers_if_paused(&mut state, &mut events, 0);
             }
             assert!(
                 state.deferred_triggers.is_empty() && state.stack.is_empty(),
@@ -42832,7 +42838,7 @@ pub mod tests {
             if settled {
                 collect_and_drain_observer_triggers_if_settled(&mut state, &mut events, 0);
             } else {
-                park_observer_triggers_if_paused(&mut state, &events, 0);
+                park_observer_triggers_if_paused(&mut state, &mut events, 0);
             }
             assert!(
                 state.deferred_triggers.is_empty() && state.stack.is_empty(),
@@ -42865,7 +42871,7 @@ pub mod tests {
             if settled {
                 collect_and_drain_observer_triggers_if_settled(&mut state, &mut events, 0);
             } else {
-                park_observer_triggers_if_paused(&mut state, &events, 0);
+                park_observer_triggers_if_paused(&mut state, &mut events, 0);
             }
 
             let collected = state.deferred_triggers.len() + state.stack.len();

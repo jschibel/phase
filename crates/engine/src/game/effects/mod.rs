@@ -11,18 +11,18 @@ use crate::game::speed::has_max_speed;
 use crate::parser::oracle_effect::publishes_chain_created_referent;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityUseTally, CardPlayMode,
-    CardTypeSetSource, CastFromZoneDriver, ChosenAttribute, CommanderOwnership,
+    CardTypeSetSource, CastFromZoneDriver, ChosenAttribute, ChosenTargetSlots, CommanderOwnership,
     ContinuousModification, ControllerRef, CopyRetargetPermission, CostPaidObjectSnapshot,
     CounterKindDomain, DetachedRemainder, Duration, EachDamageRecipient, Effect, EffectError,
     EffectKind, EffectOutcomeSignal, EffectResolutionResult, EffectScope, ExtraPhaseRecipient,
     FilterProp, ForEachCategoryAction, ForwardedResultContext, ManaProduction,
-    MassLibraryShuffleMode, NameStickerSet, ObjectSelectionCardinality, OpponentMayScope,
-    PlayerFilter, PlayerRelation, PlayerScope, PossessionAxis, PtValue, QuantityExpr, QuantityRef,
-    ReciprocalZoneChoiceRole, RepeatContinuation, ResolvedAbility, RevealUntilDisposition,
-    SacrificeCost, SacrificeRequirement, SharedQuality, SharedQualityRelation, SiblingCondition,
-    StaticDefinition, SubAbilityLink, TapStateChange, TargetChoiceTiming,
-    TargetDamageSourceBinding, TargetFilter, TargetRef, ThisWayCause, TypedFilter,
-    ZoneChoiceCandidateSource, ZoneChoiceChooser,
+    MassLibraryShuffleMode, NameStickerSet, ObjectScope, ObjectSelectionCardinality,
+    OpponentMayScope, PlayerFilter, PlayerRelation, PlayerScope, PossessionAxis, PtValue,
+    QuantityExpr, QuantityRef, ReciprocalZoneChoiceRole, RepeatContinuation, ResolvedAbility,
+    RevealUntilDisposition, SacrificeCost, SacrificeRequirement, SharedQuality,
+    SharedQualityRelation, SiblingCondition, StaticDefinition, SubAbilityLink, TapStateChange,
+    TargetChoiceTiming, TargetDamageSourceBinding, TargetFilter, TargetReadOrigin, TargetRef,
+    ThisWayCause, TrackedAnaphorSource, TypedFilter, ZoneChoiceCandidateSource, ZoneChoiceChooser,
 };
 #[cfg(test)]
 use crate::types::ability::{AttackSubject, CombatHistoryScope};
@@ -1207,6 +1207,12 @@ pub(crate) fn settle_empty_forwarded_zone_result(state: &mut GameState, producer
 }
 
 pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    // CR 601.2h + CR 605.3b + CR 608.2c: a parked counter-cost root whose
+    // replacement subtree has retired resumes before any further resolution
+    // work; every frame left on top of it is outer work.
+    if state.counter_cost_root_is_due() {
+        return;
+    }
     counters::drain_pending_counter_moves(state, events);
     counters::drain_pending_counter_removals(state, events);
     counters::drain_pending_counter_additions(state, events);
@@ -1349,9 +1355,13 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
                     // CR 608.2c: Preserve the completed result when pruning resumes at an independent sibling.
                     remaining.context.forwarded_result_context =
                         chain.context.forwarded_result_context.clone();
+                    // CR 603.10 + CR 608.2c: the choice-driven instruction just completed; its entries are observed before the resumed chain runs.
+                    settle_entries_before_instruction(state, events, &remaining, None);
                     chain_progress = resolve_ability_chain_step(state, &remaining, events, 1).ok();
                 }
             } else {
+                // CR 603.10 + CR 608.2c: the choice-driven instruction just completed; its entries are observed before the resumed chain runs.
+                settle_entries_before_instruction(state, events, &chain, None);
                 chain_progress = resolve_ability_chain_step(state, &chain, events, 1).ok();
             }
         }
@@ -1369,6 +1379,8 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
         {
             if let Some(mut scope) = completed_scope {
                 bind_resolution_exile_batch_paths(&mut scope.after_scope, &scope.batch);
+                // CR 603.10 + CR 608.2c: the choice-driven instruction just completed; its entries are observed before the resumed chain runs.
+                settle_entries_before_instruction(state, events, &scope.after_scope, None);
                 chain_progress =
                     resolve_ability_chain_step(state, &scope.after_scope, events, 1).ok();
             }
@@ -1387,7 +1399,12 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
             drain_pending_continuation(state, events);
             resume_resolution_frames(state, events);
         }
-        if !waits_for_resolution_choice(&state.waiting_for) {
+        // CR 601.2h + CR 605.3b + CR 608.2c: a parked counter-cost root whose
+        // replacement subtree has retired resumes before any further resolution
+        // work; every frame left on top of it is outer work. Once the subtree
+        // retired with the continuation that just ran, the paused dispatch on top
+        // belongs to an outer owner and stays paused.
+        if !waits_for_resolution_choice(&state.waiting_for) && !state.counter_cost_root_is_due() {
             // CR 615.5: a resumed continuation completes its own paused
             // resident drain only after it has not raised another choice.
             state.finish_active_paused_post_replacement_dispatch();
@@ -1400,6 +1417,12 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
                 drain_pending_continuation(state, events);
             }
         }
+    }
+    // CR 601.2h + CR 605.3b + CR 608.2c: a parked counter-cost root whose
+    // replacement subtree has retired resumes before any further resolution
+    // work; every frame left on top of it is outer work.
+    if state.counter_cost_root_is_due() {
+        return;
     }
     // CR 701.38d: Resume per-ballot vote iteration after an interactive
     // choice resolves. Must run after change_zone_iteration (which may be
@@ -1657,6 +1680,12 @@ pub(crate) fn resume_resolution_frames(state: &mut GameState, events: &mut Vec<G
         if waits_for_resolution_choice(&state.waiting_for) {
             state.resolution_stack.note_repeat_until_descendant_choice();
         }
+        return;
+    }
+    // CR 601.2h + CR 605.3b + CR 608.2c: a parked counter-cost root whose
+    // replacement subtree has retired resumes before any further resolution
+    // work; every frame left on top of it is outer work.
+    if state.counter_cost_root_is_due() {
         return;
     }
 
@@ -2174,18 +2203,13 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
             origin,
             destination,
             enter_transformed,
-            enter_tapped,
             enters_under_player,
-            enters_attacking,
-            enter_with_counters,
-            conditional_enter_with_counters,
             duration,
             track_exiled_by_source,
             face_down_in_exile,
             mut moved_count,
             face_down_profile,
             library_placement,
-            enters_modified_if,
             enter_attached_to,
             effect_kind,
         } = pending;
@@ -2239,26 +2263,18 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
         // members moved in this resume join the logical co-departed group and
         // their observer triggers are collected with earlier pause segments.
         let events_before_drain = events.len();
-        for (i, obj_id) in remaining.iter().enumerate() {
-            let per_obj_enter_counters =
-                crate::game::effects::change_zone::enter_with_counters_for_pending_object(
-                    state,
-                    source_id,
-                    *obj_id,
-                    &enter_with_counters,
-                    &conditional_enter_with_counters,
-                );
+        // CR 603.6a + CR 614.12: each member applies the entry modifications
+        // resolved before the event's first member moved; never recompute
+        // against the partly-moved board.
+        for (i, member) in remaining.iter().enumerate() {
+            let obj_id = &member.object_id;
             let ctx = crate::game::effects::change_zone::ChangeZoneIterationCtx {
                 source_id,
                 controller,
                 origin,
                 destination,
                 enter_transformed,
-                enter_tapped,
                 enters_under_player,
-                enters_attacking,
-                enter_with_counters: per_obj_enter_counters,
-                conditional_enter_with_counters: vec![],
                 duration: duration.clone(),
                 track_exiled_by_source,
                 face_down_in_exile,
@@ -2267,13 +2283,9 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
                 // per-permanent replacement-ordering / as-enters choice resumes
                 // FACE DOWN with the same characteristics (Yedora-style return),
                 // instead of exposing the real object face up. Mirrors the
-                // `enter_tapped`/`enter_transformed`/`enters_under_player` carry-through.
+                // `enter_transformed`/`enters_under_player` carry-through.
                 face_down_profile: face_down_profile.clone(),
                 library_placement: library_placement.clone(),
-                // CR 614.12: thread the moved-object type gate into the per-object
-                // resume ctx so a resumed member is still gated on its type
-                // (Summoner's Grimoire), matching the synchronous move path.
-                enters_modified_if: enters_modified_if.clone(),
                 enter_attached_to,
             };
             let before_zone = state.objects.get(obj_id).map(|object| object.zone);
@@ -2299,7 +2311,7 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
             let delivery_start = events.len();
             let stack_depth_before_zone_move = state.resolution_stack.capture_child_boundary();
             match crate::game::effects::change_zone::process_one_zone_move_with_terminal(
-                state, &ctx, *obj_id, events,
+                state, &ctx, member, events,
             ) {
                 crate::game::zone_pipeline::ZoneMoveTerminalResult::Completed(completion) => {
                     logical_zone_change_group
@@ -2353,12 +2365,7 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
                             origin: ctx.origin,
                             destination: ctx.destination,
                             enter_transformed: ctx.enter_transformed,
-                            enter_tapped: ctx.enter_tapped,
                             enters_under_player: ctx.enters_under_player,
-                            enters_attacking: ctx.enters_attacking,
-                            enter_with_counters: enter_with_counters.clone(),
-                            conditional_enter_with_counters: conditional_enter_with_counters
-                                .clone(),
                             duration: ctx.duration.clone(),
                             track_exiled_by_source: ctx.track_exiled_by_source,
                             face_down_in_exile: ctx.face_down_in_exile,
@@ -2367,9 +2374,6 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
                             // across a further pause so resumed members stay face down.
                             face_down_profile: ctx.face_down_profile.clone(),
                             library_placement: ctx.library_placement.clone(),
-                            // CR 614.12: preserve the moved-object type gate
-                            // across a further pause.
-                            enters_modified_if: ctx.enters_modified_if.clone(),
                             enter_attached_to: ctx.enter_attached_to,
                             effect_kind,
                         },
@@ -2414,12 +2418,7 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
                             origin: ctx.origin,
                             destination: ctx.destination,
                             enter_transformed: ctx.enter_transformed,
-                            enter_tapped: ctx.enter_tapped,
                             enters_under_player: ctx.enters_under_player,
-                            enters_attacking: ctx.enters_attacking,
-                            enter_with_counters: enter_with_counters.clone(),
-                            conditional_enter_with_counters: conditional_enter_with_counters
-                                .clone(),
                             duration: ctx.duration.clone(),
                             track_exiled_by_source: ctx.track_exiled_by_source,
                             face_down_in_exile: ctx.face_down_in_exile,
@@ -2429,9 +2428,6 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
                             // across a further pause so resumed members stay face down.
                             face_down_profile: ctx.face_down_profile.clone(),
                             library_placement: ctx.library_placement.clone(),
-                            // CR 614.12: preserve the moved-object type gate
-                            // across a further pause.
-                            enters_modified_if: ctx.enters_modified_if.clone(),
                             enter_attached_to: ctx.enter_attached_to,
                             effect_kind,
                         },
@@ -2508,7 +2504,15 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
         // landed us back at Priority (no further replacement choice), B1-drain the
         // deferred observer triggers parked during earlier pause segments plus the
         // ones this resume produced; otherwise leave them parked for the next drain.
-        let trigger_events: Vec<GameEvent> = events[events_before_drain..]
+        //
+        // CR 601.2h + CR 603.3: a live announcement takes custody of the span it
+        // owns; only the rest is collected here.
+        let owned = crate::game::announcement_triggers::take_inline_trigger_span(
+            state,
+            events,
+            events_before_drain,
+        );
+        let trigger_events: Vec<GameEvent> = events[owned]
             .iter()
             .filter(|ev| {
                 !matches!(
@@ -4536,7 +4540,9 @@ fn has_resolution_owned_zone_choice(sub: &ResolvedAbility) -> bool {
 
 /// Whether a child owns an object-selection slot independent of its parent's
 /// already-bound object. Reflexive continuations retain their context-owned
-/// referent even when their effect is a resolution-time typed zone choice.
+/// referent even when their effect is a resolution-time typed zone choice,
+/// unless that choice reads only parent metadata
+/// (`effect_refs_parent_target_metadata`).
 fn sub_has_independent_object_target_slot(sub: &ResolvedAbility) -> bool {
     (crate::game::triggers::extract_target_filter_from_effect(&sub.effect).is_some()
         && !effect_requires_parent_target_object(&sub.effect)
@@ -4546,8 +4552,15 @@ fn sub_has_independent_object_target_slot(sub: &ResolvedAbility) -> bool {
             .target_filter()
             .is_some_and(TargetFilter::references_exiled_by_source)
             && !effect_requires_parent_target_object(&sub.effect))
+        // CR 608.2c + CR 608.2d + CR 608.2h: "If that spell is countered this
+        // way, its controller may put a creature card from their hand onto the
+        // battlefield" (Fold into Aether). The parent object anchors only the
+        // choosing player, read from its last known information through the
+        // parent referent context; the card is a fresh choice made while the
+        // effect is applied, so the countered spell is not its candidate.
         || (has_resolution_owned_zone_choice(sub)
-            && !sub_ability_target_belongs_to_reflexive_context(sub))
+            && (!sub_ability_target_belongs_to_reflexive_context(sub)
+                || effect_refs_parent_target_metadata(&sub.effect)))
         || choose_one_of_branches_own_object_choice(sub)
 }
 
@@ -4750,6 +4763,349 @@ fn waits_for_resolution_choice(waiting_for: &WaitingFor) -> bool {
     )
 }
 
+/// CR 603.10 + CR 608.2c: `next` is about to run inline. When it begins a later instruction,
+/// every entry an earlier instruction completed is observed now, before `next` can change the
+/// entrant (counters a later instruction puts on it, CR 608.2c; "then attach", CR 702.92a).
+/// Not a boundary when `next` is an entering resolution step of the completed instruction
+/// (`SubAbilityLink::ContinuationStep`; its entrants and the earlier ones are one entry event,
+/// CR 603.6a). Nothing is observed while an entry may still be in progress — a resolution
+/// choice or a parked replacement is pending (CR 614.12a), so `next` is parked and its resume
+/// is its own boundary — or while `entry_observation_deferred` holds (CR 611.2e / CR 303.4f /
+/// CR 603.6a + CR 101.4).
+fn settle_entries_before_instruction(
+    state: &mut GameState,
+    events: &[GameEvent],
+    next: &ResolvedAbility,
+    completed: Option<&ResolvedAbility>,
+) {
+    // CR 603.6a: an entering resolution step of the same instruction is a co-entrant of the
+    // same entry event, so this is not an instruction boundary (B0).
+    if matches!(next.sub_link, SubAbilityLink::ContinuationStep)
+        && effect_enters_battlefield(&next.effect)
+    {
+        return;
+    }
+    // CR 614.12a: an entry may still be in progress while a resolution choice or a parked
+    // replacement is pending (G1).
+    if waits_for_resolution_choice(&state.waiting_for) || state.pending_replacement.is_some() {
+        return;
+    }
+    if entry_observation_deferred(state, next, completed) {
+        return;
+    }
+    crate::game::zones::settle_battlefield_entry_observations(state, events);
+}
+
+/// CR 603.6a: is `effect` one of the battlefield-entering instruction kinds that the generated
+/// card data links to an earlier entry as a same-instruction resolution step
+/// (`SubAbilityLink::ContinuationStep`)? The membership is that measured co-entry set, not every
+/// effect that can put a permanent onto the battlefield (for example `Seek`, `RevealUntil`,
+/// `Myriad` and `Encore` reach no such link today). `ChooseFromZone` selects cards and moves
+/// nothing itself, so it is not a member.
+fn effect_enters_battlefield(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::Token { .. }
+            | Effect::CopyTokenOf { .. }
+            | Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                ..
+            }
+            | Effect::ChangeZoneAll {
+                destination: Zone::Battlefield,
+                ..
+            }
+            | Effect::Dig {
+                destination: Some(Zone::Battlefield),
+                ..
+            }
+            | Effect::Conjure {
+                destination: Zone::Battlefield,
+                ..
+            }
+            | Effect::DraftFromSpellbook {
+                destination: Zone::Battlefield,
+                ..
+            }
+            | Effect::Investigate
+            | Effect::Amass { .. }
+            | Effect::Incubate { .. }
+            | Effect::Populate
+            | Effect::Manifest { .. }
+            | Effect::ManifestDread
+            | Effect::Cloak { .. }
+    )
+}
+
+/// CR 611.2e: a resolving spell or ability that puts a nontoken permanent onto the battlefield
+/// and says it "is" or "has" a characteristic applies that effect as the permanent enters. These
+/// are the instruction kinds that can carry such a rider, as measured over the generated card
+/// data (`GenericEffect`, `Animate`, `ReturnAsAura`, `ApplyPerpetual`). The lowered
+/// AST does not carry the rider's onset ("is/has" vs "gains/becomes"; see the
+/// `parser/oracle_ir/ast.rs` / `parser/oracle_effect/imperative.rs` comments), so every member
+/// is treated as one that may apply with the entry.
+fn effect_may_apply_with_entry(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::GenericEffect { .. }
+            | Effect::Animate { .. }
+            | Effect::ReturnAsAura { .. }
+            | Effect::ApplyPerpetual { .. }
+    )
+}
+
+/// CR 611.2e: does any node of this resolved chain (its `sub_ability` / `else_ability`
+/// subtree) carry an instruction kind that may apply with the entry?
+fn resolved_chain_may_apply_with_entry(root: &ResolvedAbility) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if effect_may_apply_with_entry(&node.effect) {
+            return true;
+        }
+        stack.extend(node.sub_ability.as_deref());
+        stack.extend(node.else_ability.as_deref());
+    }
+    false
+}
+
+/// CR 611.2e: the `AbilityDefinition` form of [`resolved_chain_may_apply_with_entry`], for
+/// frame-held templates that have not been resolved yet.
+fn definition_chain_may_apply_with_entry(root: &AbilityDefinition) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if effect_may_apply_with_entry(&node.effect) {
+            return true;
+        }
+        stack.extend(node.sub_ability.as_deref());
+        stack.extend(node.else_ability.as_deref());
+    }
+    false
+}
+
+/// CR 611.2e: the chain a paused library-search delivery resumes into, if any.
+fn library_search_resume_may_apply_with_entry(
+    resume: &crate::types::game_state::LibrarySearchDeliveryResume,
+) -> bool {
+    use crate::types::game_state::LibrarySearchDeliveryResume;
+    match resume {
+        LibrarySearchDeliveryResume::Standard { .. } => false,
+        LibrarySearchDeliveryResume::Scoped { after_scope, .. } => after_scope
+            .as_deref()
+            .is_some_and(resolved_chain_may_apply_with_entry),
+    }
+}
+
+/// CR 611.2e: the chain a batch delivery's completion resumes into, if any. Exhaustive so a
+/// new completion that carries a chain forces a decision here.
+fn batch_completion_may_apply_with_entry(
+    completion: &crate::types::game_state::BatchCompletion,
+) -> bool {
+    use crate::types::game_state::BatchCompletion;
+    match completion {
+        BatchCompletion::CastFromZoneExileDeliveryComplete { ability, .. }
+        | BatchCompletion::ForEachCategoryExileComplete { ability, .. } => {
+            resolved_chain_may_apply_with_entry(ability)
+        }
+        BatchCompletion::LibrarySearchDeliverySettled { resume }
+        | BatchCompletion::SearchPartitionPrimaryDelivered { resume, .. } => {
+            library_search_resume_may_apply_with_entry(resume)
+        }
+        // CR 608.2c: a settled contest round resumes into the contest ability and, once
+        // decided, the winner's instruction.
+        BatchCompletion::TopCardContestRoundComplete { ability, .. } => {
+            resolved_chain_may_apply_with_entry(ability)
+                || matches!(
+                    &ability.effect,
+                    Effect::ExileTopCardContest { winner_effect }
+                        if definition_chain_may_apply_with_entry(winner_effect)
+                )
+        }
+        BatchCompletion::RecordInstructionZoneResult { .. }
+        | BatchCompletion::ReturnAsAuraNoTargetComplete { .. }
+        | BatchCompletion::ExploreLandDeliveryComplete { .. }
+        | BatchCompletion::CloakExileDeliveryComplete { .. }
+        | BatchCompletion::ExileFaceDownPileDeliveryComplete { .. }
+        | BatchCompletion::ExileFaceDownPileReturnComplete { .. }
+        | BatchCompletion::CascadeExileLoopComplete { .. }
+        | BatchCompletion::CascadeBottomComplete { .. }
+        | BatchCompletion::RippleTerminalComplete { .. }
+        | BatchCompletion::DiscoverBottomComplete { .. }
+        | BatchCompletion::DiscoverPlacementComplete { .. }
+        | BatchCompletion::DiscoverDeclined { .. }
+        | BatchCompletion::ResolutionCastRejectedToHand { .. }
+        | BatchCompletion::DiscoverDeclinedComplete { .. }
+        | BatchCompletion::ResolutionCastRejectionComplete { .. }
+        | BatchCompletion::PutOnTopComplete { .. }
+        | BatchCompletion::TopOrBottomComplete { .. }
+        | BatchCompletion::EffectZonePutAtLibraryPositionComplete { .. }
+        | BatchCompletion::DrawnThisTurnTopdeckComplete { .. }
+        | BatchCompletion::SurveilKeepOnTop { .. }
+        | BatchCompletion::ManifestDreadCleanup { .. }
+        | BatchCompletion::RevealRestPile { .. }
+        | BatchCompletion::DigMassPutAllRestComplete { .. }
+        | BatchCompletion::DigMassPutAllComplete { .. }
+        | BatchCompletion::DigPriorLookRestComplete { .. }
+        | BatchCompletion::RemoveExileLinks { .. }
+        | BatchCompletion::NinjutsuPlacement { .. }
+        | BatchCompletion::AttractionOpenRemainder { .. }
+        | BatchCompletion::ContraptionAssembleRemainder { .. }
+        | BatchCompletion::SearchFoundZoneDelivery { .. }
+        | BatchCompletion::MeldExile { .. }
+        | BatchCompletion::MeldEntry { .. }
+        | BatchCompletion::MeldRedirect { .. }
+        | BatchCompletion::MilledDeliveryComplete { .. } => false,
+    }
+}
+
+/// CR 611.2e: does a frame-held later instruction of this resolution (an outer continuation, a
+/// paused iteration's remainder, or any other parked chain) carry an instruction kind that may
+/// apply with the entry? Exhaustive over `ResolutionFrame` so a new frame kind forces a decision.
+fn frame_may_apply_with_entry(frame: &ResolutionFrame) -> bool {
+    use crate::types::ability::PostReplacementContinuation;
+    match frame {
+        ResolutionFrame::AbilityContinuation(frame) => {
+            let pending = &frame.pending;
+            resolved_chain_may_apply_with_entry(&pending.chain)
+                || pending
+                    .attachment_choice
+                    .as_ref()
+                    .is_some_and(|choice| resolved_chain_may_apply_with_entry(&choice.operation))
+                || pending
+                    .attachment_remainder
+                    .as_ref()
+                    .is_some_and(|remainder| {
+                        resolved_chain_may_apply_with_entry(&remainder.producer)
+                    })
+                || pending
+                    .player_scope_linked_exile
+                    .as_ref()
+                    .is_some_and(|scope| resolved_chain_may_apply_with_entry(&scope.after_scope))
+        }
+        ResolutionFrame::RepeatFor(pending) => {
+            resolved_chain_may_apply_with_entry(&pending.ability)
+        }
+        ResolutionFrame::RepeatUntil(pending) => {
+            resolved_chain_may_apply_with_entry(&pending.ability)
+        }
+        ResolutionFrame::RepeatedOptionalPayment(frame) => {
+            frame.pending.as_deref().is_some_and(|pending| {
+                resolved_chain_may_apply_with_entry(&pending.payment_unit)
+                    || resolved_chain_may_apply_with_entry(&pending.reflexive)
+            })
+        }
+        ResolutionFrame::BatchDelivery(batch) => batch
+            .completion
+            .as_ref()
+            .is_some_and(batch_completion_may_apply_with_entry),
+        ResolutionFrame::ChooseOneOf(pending) => {
+            pending
+                .branches
+                .iter()
+                .any(definition_chain_may_apply_with_entry)
+                || pending
+                    .continuation
+                    .as_deref()
+                    .is_some_and(resolved_chain_may_apply_with_entry)
+        }
+        ResolutionFrame::VoteBallot(pending) => {
+            definition_chain_may_apply_with_entry(&pending.ability_template)
+        }
+        ResolutionFrame::PerPlayerZoneChoice(pending) => {
+            resolved_chain_may_apply_with_entry(&pending.ability)
+        }
+        ResolutionFrame::PerCategoryZoneChoice(frame) => {
+            resolved_chain_may_apply_with_entry(&frame.pending.ability)
+        }
+        ResolutionFrame::OptionalEffect(frame) => {
+            resolved_chain_may_apply_with_entry(&frame.ability)
+        }
+        ResolutionFrame::CoinFlip(pending) => {
+            pending
+                .win_effect
+                .as_deref()
+                .is_some_and(definition_chain_may_apply_with_entry)
+                || pending
+                    .lose_effect
+                    .as_deref()
+                    .is_some_and(definition_chain_may_apply_with_entry)
+        }
+        ResolutionFrame::DieRoll(pending) => pending
+            .results_table
+            .iter()
+            .any(|branch| definition_chain_may_apply_with_entry(&branch.effect)),
+        ResolutionFrame::PostReplacement(stack) => {
+            stack
+                .drains()
+                .any(|drain| match drain.ready_continuation() {
+                    Some(PostReplacementContinuation::Template(definition)) => {
+                        definition_chain_may_apply_with_entry(definition)
+                    }
+                    Some(PostReplacementContinuation::Resolved(resolved)) => {
+                        resolved_chain_may_apply_with_entry(resolved)
+                    }
+                    None => false,
+                })
+        }
+        ResolutionFrame::ChangeZone(_)
+        | ResolutionFrame::CounterMoves(_)
+        | ResolutionFrame::CounterRemovals(_)
+        | ResolutionFrame::CounterAdditions(_)
+        | ResolutionFrame::CopyToken(_)
+        | ResolutionFrame::DebugCardEntries(_)
+        | ResolutionFrame::EachPlayerCopyChosen(_)
+        | ResolutionFrame::Proliferate(_)
+        | ResolutionFrame::MultiDraw(_)
+        | ResolutionFrame::Discard(_)
+        | ResolutionFrame::ConniveReentry(_)
+        | ResolutionFrame::LifeTotalAssignment(_)
+        | ResolutionFrame::SpellResolution(_)
+        | ResolutionFrame::MutateMerge(_)
+        | ResolutionFrame::CipherEncode(_) => false,
+    }
+}
+
+/// The deferral predicate D: at this boundary, is settling the earlier instructions' entries
+/// unsafe because the remaining chain may still change what entered, as part of its entry?
+///
+/// - **D1 (CR 611.2e):** any node of the remaining chain — `next`'s subtree plus every
+///   frame-held later instruction on the resolution stack and a parked library-search resume —
+///   is an instruction kind that may apply with the entry.
+/// - **D2 (CR 303.4f, conservative):** `next` is an `Attach` following a forwarded result, or
+///   following no known completed instruction.
+/// - **D3 (CR 603.6a + CR 101.4):** `next` is a `player_scope` seat leg; the seats may form one
+///   simultaneous entry event.
+///
+/// Carriers held only in chain-driver locals are measured over the generated card data, not
+/// walked: the `after_scope` tail is covered by D3 (every seat leg carries `scoped_player`); a
+/// multi-target-player fan-out's `after_fanout` tail reaches no entering leg; and no entering
+/// `repeat_for` / nested driver carries a later candidate outside its iterated subtree.
+fn entry_observation_deferred(
+    state: &GameState,
+    next: &ResolvedAbility,
+    completed: Option<&ResolvedAbility>,
+) -> bool {
+    // D3 — CR 603.6a + CR 101.4.
+    if next.scoped_player.is_some() {
+        return true;
+    }
+    // D2 — CR 303.4f.
+    if matches!(next.effect, Effect::Attach { .. })
+        && completed.is_none_or(|completed| completed.forward_result)
+    {
+        return true;
+    }
+    // D1 — CR 611.2e.
+    resolved_chain_may_apply_with_entry(next)
+        || state
+            .resolution_stack
+            .iter()
+            .any(frame_may_apply_with_entry)
+        || state
+            .pending_library_search_delivery
+            .as_ref()
+            .is_some_and(library_search_resume_may_apply_with_entry)
+}
+
 pub(super) fn resolve_optional_effect_decision(
     state: &mut GameState,
     ability: ResolvedAbility,
@@ -4800,7 +5156,7 @@ fn resolve_optional_effect_decision_step(
             return Ok(progress);
         }
         AutoMayChoice::Decline => {
-            let decline_branch = optional_decline_branch(&ability);
+            let decline_branch = optional_decline_branch(state, &ability);
             // CR 608.2c: Declining the optional return skips its action, but
             // an independent following instruction can still read its named
             // result. Settle that result as empty before the surviving branch
@@ -4867,17 +5223,18 @@ fn resolve_optional_effect_decision_step(
 /// branch (modelling the reduced gate's condition both ways, a superset of
 /// what resolution runs).
 ///
-/// Invariant: a borrowed branch is a printed decline branch (an `else`, an "if
-/// you don't" clause, or an unconditional next instruction), unchanged. An
-/// owned branch is returned only when no printed decline branch is selected
-/// and `sub` is a plain positive "if you do" gate some later instruction of
-/// which survives the decline: `sub` itself, whose condition reads false once
-/// the decline is recorded, with its sub-chain replaced by exactly the
-/// surviving instructions in printed order
-/// ([`declined_gate_reduced_to_surviving_instructions`]).
-pub(crate) fn optional_decline_branch(
-    ability: &ResolvedAbility,
-) -> Option<Cow<'_, ResolvedAbility>> {
+/// Invariant: borrowed branches are unchanged printed decline alternatives or
+/// surviving instructions. Owned branches may reduce a plain positive "if you
+/// do" gate through [`declined_gate_reduced_to_surviving_instructions`], remove
+/// instructions consuming an ordinary search's unproduced object, or hand off
+/// actual parent targets to the selected search head without removing anything.
+/// Descendant entry views remain temporary and do not change stored metadata.
+/// Independent player work, own targets and fresh producers survive; explicit
+/// decline alternatives keep their own authority.
+pub(crate) fn optional_decline_branch<'a>(
+    state: &GameState,
+    ability: &'a ResolvedAbility,
+) -> Option<Cow<'a, ResolvedAbility>> {
     if let Some(branch) = ability.else_ability.as_deref() {
         return Some(Cow::Borrowed(branch));
     }
@@ -4917,23 +5274,1249 @@ pub(crate) fn optional_decline_branch(
             .is_some()
                 || cast_from_zone::is_enters_with_counter_rider_subability(sub)
                 || cast_from_zone::is_enters_with_modifications_rider_subability(sub))));
-    if !selected {
-        // CR 608.2c: a declined "you may" fails the "if you do" gate `sub`,
-        // and the gate skips only the instructions it governs.
-        return declined_gate_reduced_to_surviving_instructions(sub).map(Cow::Owned);
-    }
-    if sub
-        .condition
-        .as_ref()
-        .is_some_and(|condition| condition.is_optional_effect_performed())
-        && sub.else_ability.is_none()
-    {
-        Some(Cow::Borrowed(
-            nested_optional_decline_clause(sub).unwrap_or(sub),
-        ))
+    let mut branch = if !selected {
+        // CR 608.2c: the positive performed gate retains its existing reduction.
+        Cow::Owned(declined_gate_reduced_to_surviving_instructions(sub)?)
     } else {
-        Some(Cow::Borrowed(sub))
+        if sub
+            .condition
+            .as_ref()
+            .is_some_and(|condition| condition.is_optional_effect_performed())
+            && sub.else_ability.is_none()
+        {
+            if let Some(decline) = nested_optional_decline_clause(sub) {
+                return Some(Cow::Borrowed(decline));
+            }
+        }
+        Cow::Borrowed(sub)
+    };
+    // CR 608.2c + CR 609.3 + CR 701.23a: a declined search produced no found
+    // object. Select surviving instructions before any result gate or fallback
+    // reads the source. Runtime and search-ordering consume this same branch.
+    if matches!(ability.effect, Effect::SearchLibrary { .. })
+        && should_propagate_parent_targets(ability, &branch)
+        && effect_refs_parent_target(&branch.effect)
+    {
+        branch.to_mut().mirror_targets_from(ability);
     }
+    if matches!(ability.effect, Effect::SearchLibrary { .. })
+        && declined_search_branch_requires_reduction(state, &branch)
+    {
+        without_declined_search_object_dependencies(state, &branch).map(Cow::Owned)
+    } else {
+        Some(branch)
+    }
+}
+
+// CR 608.2c: only implicit current-result references name this unperformed
+// search. Explicit prior sets and action-qualified sets retain their authority.
+fn declined_search_reference_available(
+    state: &GameState,
+    filter: &TargetFilter,
+    object_information_available: bool,
+    slot_context: Option<&ResolvedAbility>,
+) -> bool {
+    match filter {
+        TargetFilter::ParentTarget => object_information_available,
+        TargetFilter::ParentTargetSlot { index } => slot_context.is_some_and(|ability| {
+            matches!(
+                crate::game::targeting::resolve_live_parent_slot_from_root(state, ability, *index),
+                Some(TargetRef::Object(_))
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn declined_search_bare_filter_dependency(
+    state: &GameState,
+    filter: &TargetFilter,
+    information: bool,
+    context: Option<&ResolvedAbility>,
+) -> bool {
+    match filter {
+        TargetFilter::ParentTarget | TargetFilter::ParentTargetSlot { .. } => {
+            !declined_search_reference_available(state, filter, information, context)
+        }
+        TargetFilter::LastRevealed => true,
+        TargetFilter::TrackedSet { id } => *id == TrackedSetId(0),
+        TargetFilter::TrackedSetFiltered { id, caused_by, .. } => {
+            *id == TrackedSetId(0) && caused_by.is_none()
+        }
+        _ => false,
+    }
+}
+
+// CR 608.2c + CR 608.2h: inspect required information before predicate binding.
+fn declined_search_scalar_quantity_dependency(
+    state: &GameState,
+    quantity: &QuantityExpr,
+    information: bool,
+    context: Option<&ResolvedAbility>,
+) -> bool {
+    crate::game::filter::quantity_expr_contains_scalar_input(
+        quantity,
+        &|property, information, _| {
+            !information && matches!(property, FilterProp::SameNameAsParentTarget)
+        },
+        &|reference, information, context, candidate_attribute_owner| {
+            declined_search_quantity_ref_dependency(
+                state,
+                reference,
+                information,
+                context,
+                candidate_attribute_owner,
+            )
+        },
+        &|filter, information, context| {
+            declined_search_bare_filter_dependency(state, filter, information, context)
+        },
+        &|source, _, _| {
+            matches!(
+                source,
+                CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::ChainSet,
+                    caused_by: None
+                }
+            )
+        },
+        information,
+        context,
+    )
+}
+
+fn declined_search_scalar_filter_inputs(
+    state: &GameState,
+    filter: &TargetFilter,
+    information: bool,
+    context: Option<&ResolvedAbility>,
+) -> bool {
+    crate::game::filter::filter_contains_scalar_input(
+        filter,
+        &|property, information, _| {
+            !information && matches!(property, FilterProp::SameNameAsParentTarget)
+        },
+        &|reference, information, context, candidate_attribute_owner| {
+            declined_search_quantity_ref_dependency(
+                state,
+                reference,
+                information,
+                context,
+                candidate_attribute_owner,
+            )
+        },
+        &|filter, information, context| {
+            declined_search_bare_filter_dependency(state, filter, information, context)
+        },
+        &|source, _, _| {
+            matches!(
+                source,
+                CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::ChainSet,
+                    caused_by: None
+                }
+            )
+        },
+        information,
+        context,
+    )
+}
+
+fn declined_search_player_dependency(state: &GameState, player: &PlayerFilter) -> bool {
+    crate::game::filter::player_filter_contains_scalar_input(
+        player,
+        &|property, information, _| {
+            !information && matches!(property, FilterProp::SameNameAsParentTarget)
+        },
+        &|reference, information, context, candidate_attribute_owner| {
+            declined_search_quantity_ref_dependency(
+                state,
+                reference,
+                information,
+                context,
+                candidate_attribute_owner,
+            )
+        },
+        &|filter, information, context| {
+            declined_search_bare_filter_dependency(state, filter, information, context)
+        },
+        &|source, _, _| {
+            matches!(
+                source,
+                CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::ChainSet,
+                    caused_by: None
+                }
+            )
+        },
+        false,
+        None,
+    )
+}
+
+fn declined_search_scalar_filter_dependency(
+    state: &GameState,
+    filter: &TargetFilter,
+    information: bool,
+    context: Option<&ResolvedAbility>,
+) -> bool {
+    declined_search_bare_filter_dependency(state, filter, information, context)
+        || declined_search_scalar_filter_inputs(state, filter, information, context)
+}
+
+fn declined_search_filter_dependency(
+    state: &GameState,
+    filter: &TargetFilter,
+    information: bool,
+    context: Option<&ResolvedAbility>,
+) -> bool {
+    declined_search_scalar_filter_dependency(state, filter, information, context)
+        || match filter {
+            TargetFilter::Typed(typed) => typed.properties.iter().any(|property| {
+                declined_search_property_dependency(state, property, information, context)
+            }),
+            TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+                filters.iter().any(|filter| {
+                    declined_search_filter_dependency(state, filter, information, context)
+                })
+            }
+            TargetFilter::Not { filter } => {
+                declined_search_filter_dependency(state, filter, information, context)
+            }
+            _ => false,
+        }
+}
+
+fn declined_search_property_dependency(
+    state: &GameState,
+    property: &FilterProp,
+    information: bool,
+    context: Option<&ResolvedAbility>,
+) -> bool {
+    match property {
+        FilterProp::InTrackedSet { id } => *id == TrackedSetId(0),
+        FilterProp::DistinctFrom { reference } => {
+            declined_search_filter_dependency(state, reference, information, context)
+        }
+        FilterProp::Cmc { value, .. } | FilterProp::PtComparison { value, .. } => {
+            declined_search_quantity_dependency(state, value, information, context)
+        }
+        FilterProp::Counters { count, .. } => {
+            declined_search_quantity_dependency(state, count, information, context)
+        }
+        FilterProp::Not { prop } => {
+            declined_search_property_dependency(state, prop, information, context)
+        }
+        FilterProp::AnyOf { props } => props.iter().any(|property| {
+            declined_search_property_dependency(state, property, information, context)
+        }),
+        _ => false,
+    }
+}
+
+// CR 608.2c: explicit action/event populations keep their own authority.
+fn declined_search_population_dependency(
+    state: &GameState,
+    source: &CardTypeSetSource,
+    information: bool,
+    context: Option<&ResolvedAbility>,
+) -> bool {
+    let mut dependent = false;
+    let complete =
+        source.try_for_each_member(crate::types::ability::UNION_DEPTH_BUDGET, &mut |member| {
+            dependent |= match member {
+                CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::ChainSet,
+                    caused_by: None,
+                } => true,
+                CardTypeSetSource::Objects { filter } => {
+                    declined_search_filter_dependency(state, filter, information, context)
+                }
+                CardTypeSetSource::TurnJournal { filter, .. } => {
+                    filter.as_ref().is_some_and(|filter| {
+                        declined_search_filter_dependency(state, filter, information, context)
+                    })
+                }
+                _ => false,
+            };
+        });
+    dependent || !complete
+}
+
+fn declined_search_quantity_dependency(
+    state: &GameState,
+    quantity: &QuantityExpr,
+    information: bool,
+    context: Option<&ResolvedAbility>,
+) -> bool {
+    (!information
+        && crate::game::filter::quantity_expr_contains_filter_prop(quantity, &|property| {
+            matches!(property, FilterProp::SameNameAsParentTarget)
+        }))
+        || declined_search_scalar_quantity_dependency(state, quantity, information, context)
+        || quantity.any_ref(&mut |reference| match reference {
+            QuantityRef::DistinctCardTypes { source }
+            | QuantityRef::SharedCardTypes { source }
+            | QuantityRef::DistinctSubtypes { source, .. }
+            | QuantityRef::DistinctColorsAmong { source } => {
+                declined_search_population_dependency(state, source, information, context)
+            }
+            QuantityRef::PropertyAggregate(aggregate) => declined_search_population_dependency(
+                state,
+                aggregate.source(),
+                information,
+                context,
+            ),
+            QuantityRef::ObjectCount { filter }
+            | QuantityRef::ObjectCountDistinct { filter, .. }
+            | QuantityRef::ObjectCountBySharedQuality { filter, .. }
+            | QuantityRef::CountersOnObjects { filter, .. }
+            | QuantityRef::DistinctCounterKindsAmong { filter } => {
+                declined_search_filter_dependency(state, filter, information, context)
+            }
+            _ => false,
+        })
+}
+
+// CR 115.1 + CR 608.2c: validate an already present Player value against
+// the actual carrier's legal current-mode declarations; never manufacture a target.
+fn declined_search_inherited_player_available(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    player: PlayerId,
+) -> bool {
+    let carries = |entry: &&crate::types::game_state::StackEntry| {
+        entry.id == ability.source_id || entry.source_id == ability.source_id
+    };
+    let carrier = state
+        .resolving_stack_entry
+        .as_ref()
+        .filter(carries)
+        .or_else(|| state.stack.iter().find(carries));
+    if carrier.and_then(|entry| entry.ability()).is_none() {
+        return false;
+    }
+    let root = crate::game::targeting::resolving_root_ability(state, ability);
+    (0..crate::game::ability_utils::declared_targets_in_chain(root).len()).any(|index| {
+        crate::game::targeting::resolve_live_parent_slot_from_root(state, ability, index)
+            == Some(TargetRef::Player(player))
+    })
+}
+
+// CR 115.1 + CR 608.2c: retain the selected Player or its existing carried value.
+fn declined_search_selected_player(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    position: usize,
+    player: PlayerId,
+) -> bool {
+    declined_search_selected_occurrence(ability, position, &TargetRef::Player(player))
+        || declined_search_inherited_player_available(state, ability, player)
+}
+
+// CR 400.7 + CR 608.2h: both pins belong to this exact selected occurrence.
+fn declined_search_selected_object(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    position: usize,
+    id: ObjectId,
+) -> bool {
+    declined_search_selected_occurrence(ability, position, &TargetRef::Object(id))
+        && ability.target_pin_is_current(id, state)
+        && ability.target_occurrence_is_current(position, state)
+}
+
+// CR 109.4 + CR 608.2h: preserve ordered target/controller and frozen-context authority.
+fn declined_search_parent_controller_available(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> bool {
+    let first = ability
+        .target_occurrences()
+        .into_iter()
+        .enumerate()
+        .find(|(_, (target, _))| match target {
+            TargetRef::Player(_) => true,
+            TargetRef::Object(id) => {
+                crate::game::ability_utils::last_known_permanent_controller(state, *id).is_some()
+            }
+        });
+    match first {
+        Some((position, (TargetRef::Player(player), _))) => {
+            declined_search_selected_player(state, ability, position, player)
+        }
+        Some((position, (TargetRef::Object(id), _))) => {
+            declined_search_selected_object(state, ability, position, id)
+        }
+        None => ability.effect_context_object.is_some(),
+    }
+}
+
+// CR 108.3 + CR 608.2h: mirror `parent_target_owner` — the first object target
+// whose owner is known (live or LKI), else the propagated effect-context object.
+fn declined_search_parent_owner_available(state: &GameState, ability: &ResolvedAbility) -> bool {
+    ability
+        .target_occurrences()
+        .into_iter()
+        .enumerate()
+        .find_map(|(position, (target, _))| match target {
+            TargetRef::Object(id)
+                if state.objects.contains_key(&id) || state.lki_cache.contains_key(&id) =>
+            {
+                Some(declined_search_selected_object(
+                    state, ability, position, id,
+                ))
+            }
+            TargetRef::Object(_) | TargetRef::Player(_) => None,
+        })
+        .unwrap_or_else(|| ability.effect_context_object.is_some())
+}
+
+// CR 608.2c: each scope keeps the identity/fallback its ordinary reader consumes.
+fn declined_search_player_scope_dependency(
+    state: &GameState,
+    scope: &PlayerScope,
+    context: Option<&ResolvedAbility>,
+) -> bool {
+    match scope {
+        PlayerScope::Target => !context.is_some_and(|ability| {
+            ability
+                .target_occurrences()
+                .into_iter()
+                .enumerate()
+                .find_map(|(position, (target, _))| match target {
+                    TargetRef::Player(player) => Some(declined_search_selected_player(
+                        state, ability, position, player,
+                    )),
+                    TargetRef::Object(_) => None,
+                })
+                .unwrap_or(false)
+        }),
+        PlayerScope::ParentObjectTarget { possession } => match possession {
+            PossessionAxis::Controller => !context
+                .is_some_and(|ability| declined_search_parent_controller_available(state, ability)),
+            PossessionAxis::Owner => !context
+                .is_some_and(|ability| declined_search_parent_owner_available(state, ability)),
+        },
+        PlayerScope::RecipientController => context.is_some_and(|ability| {
+            ability
+                .target_occurrences()
+                .into_iter()
+                .enumerate()
+                .find_map(|(position, (target, _))| match target {
+                    TargetRef::Object(id) => Some(
+                        state.objects.contains_key(&id)
+                            && !declined_search_selected_object(state, ability, position, id),
+                    ),
+                    TargetRef::Player(_) => None,
+                })
+                .unwrap_or(false)
+        }),
+        PlayerScope::Controller
+        | PlayerScope::ScopedPlayer
+        | PlayerScope::Opponent { .. }
+        | PlayerScope::AllPlayers { .. }
+        | PlayerScope::DefendingPlayer
+        | PlayerScope::SourceChosenPlayer
+        | PlayerScope::AnyTurn
+        | PlayerScope::SpecificPlayer { .. } => false,
+    }
+}
+
+fn declined_search_quantity_ref_dependency(
+    state: &GameState,
+    reference: &QuantityRef,
+    information: bool,
+    context: Option<&ResolvedAbility>,
+    candidate_attribute_owner: Option<&PlayerFilter>,
+) -> bool {
+    if candidate_attribute_owner.is_none()
+        && reference.player_scope().is_some_and(|scope| {
+            let operative = match scope {
+                PlayerScope::AllPlayers { exclude, .. } => exclude.as_deref(),
+                _ => Some(scope),
+            };
+            operative
+                .is_some_and(|scope| declined_search_player_scope_dependency(state, scope, context))
+        })
+    {
+        return true;
+    }
+    match reference {
+        QuantityRef::CountersOn { scope, .. }
+        | QuantityRef::Power { scope }
+        | QuantityRef::BasePower { scope }
+        | QuantityRef::Intensity { scope }
+        | QuantityRef::Toughness { scope }
+        | QuantityRef::ObjectManaValue { scope }
+        | QuantityRef::ObjectColorCount { scope }
+        | QuantityRef::ObjectNameWordCount { scope }
+        | QuantityRef::ObjectTypelineComponentCount { scope }
+        | QuantityRef::ManaSymbolsInManaCost { scope, .. } => {
+            !information
+                && matches!(
+                    scope,
+                    ObjectScope::Target
+                        | ObjectScope::Recipient
+                        | ObjectScope::Anaphoric
+                        | ObjectScope::Demonstrative
+                )
+        }
+        QuantityRef::TrackedSetSize
+        | QuantityRef::FilteredTrackedSetSize {
+            caused_by: None, ..
+        } => true,
+        QuantityRef::TargetObjectManaValue { filter } => {
+            !information || declined_search_filter_dependency(state, filter, information, context)
+        }
+        QuantityRef::TargetControllerCounter { .. } => !context
+            .is_some_and(|ability| declined_search_parent_controller_available(state, ability)),
+        // CR 123.6d + CR 608.2h: name letters require the actual live sticker subject.
+        QuantityRef::NameStickerLetterCount {
+            stickers:
+                NameStickerSet::OnObject {
+                    scope: ObjectScope::Target | ObjectScope::Recipient,
+                },
+            ..
+        } => {
+            let first_live = context.and_then(|ability| {
+                ability
+                    .target_occurrences()
+                    .into_iter()
+                    .enumerate()
+                    .find_map(|(position, (target, _))| match target {
+                        TargetRef::Object(id) if state.objects.contains_key(&id) => {
+                            Some((ability, position, id))
+                        }
+                        TargetRef::Object(_) | TargetRef::Player(_) => None,
+                    })
+            });
+            match first_live {
+                Some((ability, position, id)) => {
+                    !declined_search_selected_object(state, ability, position, id)
+                }
+                None => matches!(
+                    reference,
+                    QuantityRef::NameStickerLetterCount {
+                        stickers: NameStickerSet::OnObject {
+                            scope: ObjectScope::Target
+                        },
+                        ..
+                    }
+                ),
+            }
+        }
+        // CR 601.2h + CR 608.2h: read the selected cast object's actual payment.
+        QuantityRef::ManaSpentToCast {
+            scope: crate::types::ability::CastManaObjectScope::AbilityTarget,
+            ..
+        } => !information || context.is_none(),
+        _ => false,
+    }
+}
+
+// Player recipients are roles of the effect, even when spelled ParentTarget.
+// A mixed damage slot additionally consults its actual announced/bound role.
+// CR 608.2c: player recipients and object operands retain their distinct roles.
+fn declined_search_object_operands(ability: &ResolvedAbility) -> Vec<&TargetFilter> {
+    match &ability.effect {
+        Effect::Double {
+            target_kind:
+                crate::types::ability::DoubleTarget::LifeTotal
+                | crate::types::ability::DoubleTarget::ManaPool { .. },
+            ..
+        }
+        | Effect::Draw { .. }
+        | Effect::GainLife { .. }
+        | Effect::LoseLife { .. }
+        | Effect::Shuffle { .. }
+        | Effect::Mill { .. }
+        | Effect::DiscardCard { .. }
+        | Effect::RevealTop { .. } => Vec::new(),
+        Effect::Discard {
+            filter,
+            unless_filter,
+            ..
+        } => filter.iter().chain(unless_filter).collect(),
+        Effect::SearchLibrary { filter, .. }
+        | Effect::Dig { filter, .. }
+        | Effect::RevealUntil { filter, .. } => vec![filter],
+        Effect::ExileFromTopUntil { until, .. } => match until {
+            crate::types::ability::UntilCondition::NextMatches { filter, .. } => vec![filter],
+            crate::types::ability::UntilCondition::CumulativeThreshold { .. } => Vec::new(),
+        },
+        Effect::RevealHand { card_filter, .. } => vec![card_filter],
+        Effect::Token { attach_to, .. } => attach_to.iter().collect(),
+        Effect::CopyTokenOf {
+            target,
+            source_filter,
+            ..
+        } => vec![source_filter.as_ref().unwrap_or(target)],
+        Effect::DealDamage { target, .. }
+            if target.is_player_scope()
+                || (!ability.targets.is_empty()
+                    && ability
+                        .targets
+                        .iter()
+                        .all(|target| matches!(target, TargetRef::Player(_)))) =>
+        {
+            Vec::new()
+        }
+        Effect::ChooseFromZone { filter, .. } => filter.iter().collect(),
+        _ => effect_parent_ref_slots(&ability.effect),
+    }
+}
+
+// CR 601.2c + CR 608.2c: declarations, result references and selected
+// occurrences have different authority. The neutral query supplies witnesses,
+// not an exhaustive target-slot vector.
+fn declined_search_announcement_witness(filter: &TargetFilter) -> bool {
+    if filter.is_context_ref() {
+        return false;
+    }
+    match filter {
+        TargetFilter::LastRevealed
+        | TargetFilter::LastZoneChanged
+        | TargetFilter::TrackedSet { .. }
+        | TargetFilter::TrackedSetFiltered { .. }
+        | TargetFilter::ChosenCard
+        | TargetFilter::ChosenDamageSource { .. } => false,
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+            !filters.is_empty() && filters.iter().all(declined_search_announcement_witness)
+        }
+        TargetFilter::Not { filter } => declined_search_announcement_witness(filter),
+        _ => true,
+    }
+}
+
+// Declaration-role Boolean composition does not inspect property predicates.
+fn declined_search_has_player_role(filter: &TargetFilter) -> bool {
+    filter.is_player_scope()
+        || filter.denotes_player_target()
+        || matches!(filter, TargetFilter::Opponent)
+        || match filter {
+            TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+                filters.iter().any(declined_search_has_player_role)
+            }
+            TargetFilter::Not { filter } => declined_search_has_player_role(filter),
+            _ => false,
+        }
+}
+
+fn declined_search_object_witness(filter: &TargetFilter) -> bool {
+    if !declined_search_announcement_witness(filter)
+        || filter.is_player_scope()
+        || filter.denotes_player_target()
+        || matches!(filter, TargetFilter::Opponent)
+    {
+        return false;
+    }
+    match filter {
+        TargetFilter::Or { filters } => {
+            !filters.is_empty() && filters.iter().all(declined_search_object_witness)
+        }
+        TargetFilter::And { filters } => {
+            filters.iter().any(declined_search_object_witness)
+                && !filters.iter().any(declined_search_has_player_role)
+        }
+        TargetFilter::Not { filter } => declined_search_object_witness(filter),
+        TargetFilter::Typed(_) => filter.names_enumerable_population(),
+        TargetFilter::Named { .. }
+        | TargetFilter::HasChosenName
+        | TargetFilter::StackSpell
+        | TargetFilter::StackAbility { .. } => true,
+        _ => false,
+    }
+}
+
+fn declined_search_selected_occurrence(
+    ability: &ResolvedAbility,
+    position: usize,
+    target: &TargetRef,
+) -> bool {
+    if ability.target_reads != TargetReadOrigin::OwnAnnouncement {
+        return false;
+    }
+    match &ability.chosen_target_slots {
+        ChosenTargetSlots::Recorded(positions) => {
+            positions.contains(&position)
+                && crate::game::ability_utils::node_has_stack_target_declaration_matching(
+                    ability,
+                    &declined_search_announcement_witness,
+                )
+        }
+        ChosenTargetSlots::Unrecorded => {
+            crate::game::ability_utils::chain_node_positions(ability).contains(&position)
+                && crate::game::ability_utils::node_has_stack_target_declaration_matching(
+                    ability,
+                    &|filter| match target {
+                        TargetRef::Object(_) => declined_search_object_witness(filter),
+                        TargetRef::Player(_) => {
+                            declined_search_announcement_witness(filter)
+                                && (filter.is_player_scope()
+                                    || filter.denotes_player_target()
+                                    || matches!(filter, TargetFilter::Opponent))
+                        }
+                    },
+                )
+        }
+    }
+}
+
+fn declined_search_owns_target(ability: &ResolvedAbility) -> bool {
+    ability.target_reads == TargetReadOrigin::OwnAnnouncement
+        && (crate::game::ability_utils::node_has_stack_target_declaration_matching(
+            ability,
+            &declined_search_object_witness,
+        ) || ability
+            .target_occurrences()
+            .into_iter()
+            .enumerate()
+            .find(|(_, (target, _))| matches!(target, TargetRef::Object(_)))
+            .is_some_and(|(position, (target, _))| {
+                matches!(ability.chosen_target_slots, ChosenTargetSlots::Recorded(_))
+                    && declined_search_selected_occurrence(ability, position, &target)
+            }))
+}
+
+// CR 400.7 + CR 608.2h: information belongs to the first actual Object
+// occurrence and its own positional/delayed pins, never another chosen slot.
+fn declined_search_object_information(state: &GameState, ability: &ResolvedAbility) -> bool {
+    ability
+        .target_occurrences()
+        .into_iter()
+        .enumerate()
+        .find(|(_, (target, _))| matches!(target, TargetRef::Object(_)))
+        .is_some_and(|(position, (target, _))| match target {
+            TargetRef::Object(id) => {
+                declined_search_selected_occurrence(ability, position, &TargetRef::Object(id))
+                    && ability.target_pin_is_current(id, state)
+                    && ability.target_occurrence_is_current(position, state)
+            }
+            TargetRef::Player(_) => false,
+        })
+}
+
+// CR 608.2c + CR 609.3: one pure preparation serves preflight and retention.
+// Inputs are checked before a new producer can establish a fresh authority.
+#[cfg(test)]
+fn prepare_declined_search_node<'a>(
+    state: &GameState,
+    ability: &'a ResolvedAbility,
+) -> Option<Cow<'a, ResolvedAbility>> {
+    prepare_declined_search_node_with_input(state, ability, ability)
+}
+
+fn prepare_declined_search_node_with_input<'a>(
+    state: &GameState,
+    ability: &'a ResolvedAbility,
+    input: &ResolvedAbility,
+) -> Option<Cow<'a, ResolvedAbility>> {
+    if crosses_modal_boundary(ability)
+        || ability.reads_chosen_group.is_some()
+        || ability.reads_return_result.is_some()
+    {
+        return Some(Cow::Borrowed(ability));
+    }
+    let owns_object = declined_search_owns_target(ability);
+    let information = declined_search_object_information(state, input);
+    let context = Some(input);
+    let retain_reference =
+        |filter: &TargetFilter, information: bool, context: Option<&ResolvedAbility>| {
+            declined_search_reference_available(state, filter, information, context)
+        };
+    // These are current operative player roles. Branch definitions retain
+    // their own later boundary; a missing scope refuses the whole instruction.
+    let raw_player = match &ability.effect {
+        Effect::StartYourEngines { player_scope } | Effect::ChangeSpeed { player_scope, .. } => {
+            Some(player_scope)
+        }
+        Effect::DamageAll { player_filter, .. }
+        | Effect::Conjure {
+            library_players: player_filter,
+            ..
+        } => player_filter.as_ref(),
+        Effect::DamageEachPlayer { player_filter, .. } => Some(player_filter),
+        Effect::RevealChosenNumbers { players, .. } => Some(players),
+        Effect::ChooseOneOf { chooser, .. } => Some(chooser),
+        _ => None,
+    };
+    if raw_player.is_some_and(|player| declined_search_player_dependency(state, player))
+        || ability
+            .player_scope
+            .as_ref()
+            .is_some_and(|player| declined_search_player_dependency(state, player))
+        || ability.effect.target_filter().is_some_and(|filter| {
+            (filter.is_player_scope()
+                || filter.denotes_player_target()
+                || matches!(filter, TargetFilter::Opponent))
+                && declined_search_scalar_filter_inputs(state, filter, information, context)
+        })
+        || matches!(&ability.effect, Effect::SearchLibrary { target_player: Some(player), .. }
+            if declined_search_scalar_filter_inputs(state, player, false, None))
+    {
+        return None;
+    }
+    let mut dependent = false;
+    ability.effect.for_each_quantity_expr(&mut |quantity| {
+        dependent |=
+            declined_search_scalar_quantity_dependency(state, quantity, information, context);
+    });
+    dependent |= ability.repeat_for.as_ref().is_some_and(|quantity| {
+        declined_search_scalar_quantity_dependency(state, quantity, information, context)
+    });
+    if dependent {
+        return None;
+    }
+    let mut prepared = ability.clone();
+    let mut complete = true;
+    prepared.effect.for_each_quantity_expr_mut(&mut |quantity| {
+        complete &= crate::game::filter::bind_absent_search_predicates_in_quantity_with_context(
+            quantity,
+            information,
+            context,
+            &retain_reference,
+        );
+    });
+    if let Some(quantity) = &mut prepared.repeat_for {
+        complete &= crate::game::filter::bind_absent_search_predicates_in_quantity_with_context(
+            quantity,
+            information,
+            context,
+            &retain_reference,
+        );
+    }
+    if !complete {
+        return None;
+    }
+    prepared.effect.for_each_quantity_expr(&mut |quantity| {
+        dependent |= declined_search_quantity_dependency(state, quantity, information, context);
+    });
+    dependent |= prepared.repeat_for.as_ref().is_some_and(|quantity| {
+        declined_search_quantity_dependency(state, quantity, information, context)
+    });
+    if dependent {
+        return None;
+    }
+
+    // CR 115.1 + CR 115.10a: these modes consume matching predicates; the
+    // same variants' announced/direct modes keep their separate authority.
+    let counter_population = ability.effect.is_counter_multiplication()
+        && ability.target_choice_timing == TargetChoiceTiming::Resolution
+        && ability.targets.is_empty()
+        && ability.multi_target.is_none()
+        && !ability.optional_targeting
+        && ability.effect.target_filter().is_some_and(|target| {
+            !target.is_context_ref()
+                && target.names_enumerable_population()
+                && matches!(target.extract_in_zone(), None | Some(Zone::Battlefield))
+        });
+    let described_host = matches!(&ability.effect, Effect::Attach { attachment, target, .. }
+        if ability.target_choice_timing == TargetChoiceTiming::Resolution
+            && ability.attach_host_target().is_none()
+            && attachment.is_context_ref()
+            && crate::game::ability_utils::attach_host_filter_needs_target_slot(target)
+            && target.denotes_battlefield_objects());
+    if let Effect::GenericEffect {
+        target,
+        static_abilities,
+        ..
+    } = &mut prepared.effect
+    {
+        static_abilities.retain_mut(|static_def| {
+            let application = effect::generic_effect_application_filter(
+                target.as_ref(),
+                static_def.affected.as_ref(),
+            );
+            if application.is_some_and(|filter| {
+                declined_search_scalar_filter_inputs(state, filter, information, context)
+            }) {
+                return false;
+            }
+            if application.is_some_and(|filter| {
+                (owns_object && matches!(filter, TargetFilter::ParentTarget))
+                    || (matches!(filter, TargetFilter::ParentTargetSlot { .. })
+                        && declined_search_reference_available(state, filter, information, context))
+            }) {
+                // The inherited application names this instruction's own target.
+                // Secondary quantities and repeats passed their input checks.
+                return true;
+            }
+            let Some(application) = application else {
+                return true;
+            };
+            if target.is_none() && !application.is_context_ref() && !application.is_player_scope() {
+                let Some(affected) = &mut static_def.affected else {
+                    return true;
+                };
+                match crate::game::filter::bind_absent_search_predicate_with_context(
+                    affected,
+                    information,
+                    context,
+                    &retain_reference,
+                ) {
+                    Some(Some(false)) | None => false,
+                    Some(_) => {
+                        !declined_search_filter_dependency(state, affected, information, context)
+                    }
+                }
+            } else {
+                !declined_search_filter_dependency(state, application, information, context)
+            }
+        });
+        if static_abilities.is_empty() {
+            return None;
+        }
+    } else {
+        let mut impossible = false;
+        // CR 608.2f: DamageAll's independently checked player audience shares
+        // the same simultaneous action even when its object population is empty.
+        let has_player_population = matches!(
+            &ability.effect,
+            Effect::DamageAll {
+                player_filter: Some(_),
+                ..
+            }
+        );
+        let mut bind = |filter: &mut TargetFilter| {
+            if declined_search_scalar_filter_dependency(state, filter, information, context) {
+                impossible = true;
+                return;
+            }
+            match crate::game::filter::bind_absent_search_predicate_with_context(
+                filter,
+                information,
+                context,
+                &retain_reference,
+            ) {
+                Some(Some(false)) => impossible |= !has_player_population,
+                None => impossible = true,
+                Some(_) => {
+                    impossible |=
+                        declined_search_filter_dependency(state, filter, information, context)
+                }
+            }
+        };
+        if let Some(population) = mass_population_target_mut(&mut prepared.effect) {
+            bind(population);
+        } else {
+            match &mut prepared.effect {
+                Effect::SetTapState {
+                    scope: EffectScope::All,
+                    target,
+                    ..
+                }
+                | Effect::Transform {
+                    scope: EffectScope::All,
+                    target,
+                    ..
+                }
+                | Effect::ForceAttack {
+                    scope: EffectScope::All,
+                    target,
+                    ..
+                }
+                | Effect::Suspect {
+                    scope: EffectScope::All,
+                    target,
+                }
+                | Effect::Unsuspect {
+                    scope: EffectScope::All,
+                    target,
+                }
+                | Effect::BecomePrepared {
+                    scope: EffectScope::All,
+                    target,
+                }
+                | Effect::BecomeUnprepared {
+                    scope: EffectScope::All,
+                    target,
+                }
+                | Effect::PreventDamage {
+                    recipient_scope: EffectScope::All,
+                    target,
+                    ..
+                }
+                | Effect::GoadAll { target } => bind(target),
+                Effect::ExploreAll { filter }
+                | Effect::SearchLibrary { filter, .. }
+                | Effect::Dig { filter, .. }
+                | Effect::RevealUntil { filter, .. }
+                | Effect::RevealHand {
+                    card_filter: filter,
+                    ..
+                } => bind(filter),
+                Effect::ExileFromTopUntil {
+                    until: crate::types::ability::UntilCondition::NextMatches { filter, .. },
+                    ..
+                } => bind(filter),
+                Effect::ChooseFromZone {
+                    filter: Some(filter),
+                    ..
+                }
+                | Effect::CopyTokenOf {
+                    source_filter: Some(filter),
+                    ..
+                } => bind(filter),
+                Effect::Discard {
+                    filter,
+                    unless_filter,
+                    ..
+                } => {
+                    if let Some(filter) = filter {
+                        bind(filter);
+                    }
+                    // CR 608.2c: this is an alternative to the ordinary discard, not its
+                    // required population. An empty alternative leaves that
+                    // ordinary instruction available.
+                    if let Some(filter) = unless_filter {
+                        impossible |= declined_search_scalar_filter_dependency(
+                            state,
+                            filter,
+                            information,
+                            context,
+                        )
+                            || crate::game::filter::bind_absent_search_predicate_with_context(
+                                filter,
+                                information,
+                                context,
+                                &retain_reference,
+                            )
+                            .is_none()
+                            || declined_search_filter_dependency(
+                                state,
+                                filter,
+                                information,
+                                context,
+                            );
+                    }
+                }
+                Effect::Attach {
+                    attachment, target, ..
+                } if described_host => {
+                    if declined_search_filter_dependency(state, attachment, false, context) {
+                        return None;
+                    }
+                    bind(target);
+                }
+                _ if counter_population => {
+                    if let Some(filter) = prepared.effect.target_filter_mut() {
+                        bind(filter);
+                    }
+                }
+                _ if has_resolution_owned_zone_choice(ability) => {
+                    if let Some(filter) = prepared.effect.target_filter_mut() {
+                        bind(filter);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if impossible {
+            return None;
+        }
+        if declined_search_object_operands(&prepared)
+            .into_iter()
+            .any(|operand| {
+                let owns_operand = owns_object
+                    && (!matches!(operand, TargetFilter::ParentTargetSlot { .. })
+                        || declined_search_reference_available(
+                            state,
+                            operand,
+                            information,
+                            context,
+                        ))
+                    && prepared
+                        .effect
+                        .target_filter()
+                        .is_some_and(|declared| std::ptr::eq(declared, operand));
+                declined_search_scalar_filter_inputs(
+                    state,
+                    operand,
+                    if owns_operand { information } else { false },
+                    context,
+                ) || (!owns_operand
+                    && declined_search_filter_dependency(state, operand, false, context))
+            })
+        {
+            return None;
+        }
+    }
+    if prepared == *ability {
+        Some(Cow::Borrowed(ability))
+    } else {
+        Some(Cow::Owned(prepared))
+    }
+}
+
+// CR 608.2c: a genuine later producer owns its continuation's referent.
+fn declined_search_fresh_authority(ability: &ResolvedAbility) -> bool {
+    declined_search_owns_target(ability)
+        || ability.reads_chosen_group.is_some()
+        || ability.reads_return_result.is_some()
+        || matches!(
+            ability.effect,
+            Effect::SearchLibrary { .. }
+                | Effect::ChooseFromZone { .. }
+                | Effect::ExileFromTopUntil { .. }
+        )
+        || effect_writes_last_revealed_ids(&ability.effect)
+        || reveal_hand::effect_parks_reveal_card_choice(&ability.effect)
+        || publishes_chain_created_referent(&ability.effect)
+        || (ability.forward_result
+            && matches!(
+                ability.effect,
+                Effect::ChangeZone { .. } | Effect::ChangeZoneAll { .. }
+            ))
+}
+
+// CR 608.2c: inspect the same ordinary entry projection used by the dispatcher.
+// The view is temporary: returned payloads retain the stored child's metadata.
+fn declined_search_sub_input<'a>(
+    state: &GameState,
+    parent: &ResolvedAbility,
+    child: &'a ResolvedAbility,
+) -> Cow<'a, ResolvedAbility> {
+    if child.targets.is_empty()
+        && !parent.targets.is_empty()
+        && !parent.forward_result
+        && !bound_result_is_empty(child)
+        && !effect_uses_implicit_tracked_set_targets(&child.effect)
+        && !(matches!(parent.effect, Effect::Draw { .. })
+            && matches!(child.effect, Effect::Reveal { .. })
+            && !state.last_zone_changed_ids.is_empty())
+    {
+        let mut input = child.clone();
+        input.replace_target_occurrences(inherited_parent_occurrences(parent, child));
+        Cow::Owned(input)
+    } else {
+        Cow::Borrowed(child)
+    }
+}
+
+// CR 608.2c: an otherwise entry receives its actual runtime predecessor.
+fn declined_search_else_input<'a>(
+    state: &GameState,
+    predecessor: &ResolvedAbility,
+    child: &'a ResolvedAbility,
+) -> Cow<'a, ResolvedAbility> {
+    // The nested false dispatcher gives actual reveal/exile results precedence.
+    // Those producers stop C6; never substitute an old Player for their result.
+    if !(child.targets.is_empty()
+        && ((!state.last_revealed_ids.is_empty()
+            && effect_writes_last_revealed_ids(&predecessor.effect))
+            || (!state.last_zone_changed_ids.is_empty()
+                && matches!(predecessor.effect, Effect::ExileTop { .. })
+                && !effect_uses_implicit_tracked_set_targets(&child.effect))))
+        && should_propagate_parent_targets(predecessor, child)
+    {
+        let mut input = child.clone();
+        input.mirror_targets_from(predecessor);
+        Cow::Owned(input)
+    } else {
+        Cow::Borrowed(child)
+    }
+}
+
+// CR 608.2c: retain borrowing when no instruction requires the unproduced object.
+fn declined_search_branch_requires_reduction(state: &GameState, ability: &ResolvedAbility) -> bool {
+    fn requires(
+        state: &GameState,
+        stored: &ResolvedAbility,
+        input: &ResolvedAbility,
+        predecessor: Option<&ResolvedAbility>,
+    ) -> bool {
+        if crosses_modal_boundary(stored) {
+            return false;
+        }
+        if !matches!(
+            prepare_declined_search_node_with_input(state, stored, input),
+            Some(Cow::Borrowed(_))
+        ) {
+            return true;
+        }
+        if declined_search_fresh_authority(stored) {
+            return false;
+        }
+        stored.sub_ability.as_deref().is_some_and(|child| {
+            let child_input = declined_search_sub_input(state, input, child);
+            requires(state, child, &child_input, Some(input))
+        }) || stored.else_ability.as_deref().is_some_and(|child| {
+            let child_input =
+                declined_search_else_input(state, predecessor.unwrap_or(input), child);
+            requires(state, child, &child_input, None)
+        })
+    }
+    requires(state, ability, ability, None)
+}
+
+// CR 608.2c + CR 609.3: discard an impossible object instruction WITH its
+// resolution steps and branches, then resume at the next printed instruction.
+// This is local to ordinary search decline, never a general chain optimizer.
+fn without_declined_search_object_dependencies(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> Option<ResolvedAbility> {
+    fn reduce(
+        state: &GameState,
+        ability: &ResolvedAbility,
+        first_input: &ResolvedAbility,
+    ) -> Option<ResolvedAbility> {
+        let mut kept = Vec::new();
+        let mut cursor = Some(ability);
+        let mut previous_input: Option<ResolvedAbility> = None;
+        let mut skipped_instruction = false;
+        while let Some(node) = cursor {
+            cursor = node.sub_ability.as_deref();
+            if crosses_modal_boundary(node) {
+                kept.extend(
+                    std::iter::successors(Some(node), |node| node.sub_ability.as_deref()).cloned(),
+                );
+                break;
+            }
+            if skipped_instruction && !starts_independent_instruction(node) {
+                continue;
+            }
+            let input = if std::ptr::eq(node, ability) {
+                Cow::Borrowed(first_input)
+            } else if let Some(parent) = previous_input.as_ref() {
+                declined_search_sub_input(state, parent, node)
+            } else {
+                Cow::Borrowed(node)
+            };
+            skipped_instruction = false;
+            let Some(prepared) = prepare_declined_search_node_with_input(state, node, &input)
+            else {
+                skipped_instruction = true;
+                previous_input = None;
+                continue;
+            };
+            let mut remaining = prepared.into_owned();
+            if declined_search_fresh_authority(node) {
+                kept.push(remaining);
+                kept.extend(
+                    std::iter::successors(cursor, |node| node.sub_ability.as_deref()).cloned(),
+                );
+                break;
+            }
+            remaining.else_ability = node
+                .else_ability
+                .as_deref()
+                .and_then(|child| {
+                    let child_input = declined_search_else_input(
+                        state,
+                        previous_input.as_ref().unwrap_or(&input),
+                        child,
+                    );
+                    reduce(state, child, &child_input)
+                })
+                .map(Box::new);
+            previous_input = Some(input.into_owned());
+            kept.push(remaining);
+        }
+        relink_in_printed_order(kept.iter().collect()).map(|root| *root)
+    }
+    reduce(state, ability, ability)
 }
 
 /// Whether a sub-ability condition references a per-iteration outcome gate —
@@ -5405,7 +6988,7 @@ fn duration_outlives_declined_gate(duration: &Duration) -> bool {
             }
             | PlayerScope::RecipientController
             | PlayerScope::DefendingPlayer
-            | PlayerScope::ParentObjectTargetController
+            | PlayerScope::ParentObjectTarget { .. }
             | PlayerScope::SourceChosenPlayer
             | PlayerScope::AnyTurn
             | PlayerScope::SpecificPlayer { id: _ } => false,
@@ -11876,6 +13459,18 @@ fn optional_effect_is_infeasible(state: &GameState, ability: &ResolvedAbility) -
             }
             false
         }
+        // CR 115.10a + CR 608.2d: "you may have it deal 2 damage to another
+        // creature you control. If you do, draw a card" names its recipient with
+        // no "target", so it is chosen as the damage is applied — and "The player
+        // can't choose an option that's illegal or impossible". With no creature
+        // or player to choose, accepting would record a performed effect for a
+        // no-op and run the "If you do" rider anyway (Wicked Guardian drawing a
+        // card with no other creature), which the targeted reading never allowed:
+        // with no legal target the ability was not put on the stack at all.
+        Effect::DealDamage { .. } => {
+            deal_damage::awaits_resolution_recipient_choice(ability)
+                && deal_damage::resolution_recipient_candidates(state, ability).is_empty()
+        }
         _ => false,
     }
 }
@@ -15057,9 +16652,17 @@ fn resolve_ability_chain_with_payment_choice(
     // before it begins a new resolution; nested producers replace the context
     // after this node's effect completes.
     let root_context_owned;
-    let ability = if depth == 0 && ability.context.forwarded_result_context.is_some() {
+    let mut cost_removed_seed = None;
+    let ability = if depth == 0
+        && (ability.context.forwarded_result_context.is_some()
+            || ability.context.cost_removed_counter_amount.is_some())
+    {
         let mut owned = ability.clone();
         owned.context.forwarded_result_context = None;
+        // CR 602.2b + CR 601.2h + CR 608.2h: the cost-removed count is a
+        // root-only input; take it off the root so no hand-off or handler-local
+        // context clone carries it into a continuation that could reseed.
+        cost_removed_seed = owned.context.cost_removed_counter_amount.take();
         root_context_owned = owned;
         &root_context_owned
     } else {
@@ -15074,6 +16677,12 @@ fn resolve_ability_chain_with_payment_choice(
     // across unrelated ability resolutions.
     if depth == 0 {
         reset_top_level_resolution_state(state);
+        // CR 602.2b + CR 601.2h + CR 608.2h: counters removed to pay this
+        // activation's cost are the preceding "this way" amount its instructions
+        // read; a later producer re-stamps per CR 608.2c.
+        if let Some(n) = cost_removed_seed {
+            state.last_effect_amount = Some(crate::game::arithmetic::u32_to_i32_saturating(n));
+        }
     }
 
     // CR 700.2 ("each of those options is a mode") + CR 608.2c (instructions in
@@ -17254,6 +18863,51 @@ fn resolve_chain_body(
         }
     }
 
+    // CR 115.10a + CR 608.2d + CR 609.3: an untargeted described damage
+    // recipient ("a creature or player", "another creature you control" — no
+    // literal "target") is chosen while the damage is APPLIED, at THIS
+    // instruction's own resolution, not announced when the ability went on the
+    // stack. `target_choice_timing_for_clause` (parser) marks such a clause
+    // `Resolution` by the same `names_resolution_chosen_recipient` shape
+    // `awaits_resolution_recipient_choice` reads here, so the two cannot drift.
+    // Mirrors the untargeted `PutCounter` block above: zero candidates is a
+    // silent no-op ("The player can't choose an option that's illegal or
+    // impossible"), a single candidate is forced and binds without a prompt, and
+    // several raise the controller's prompt, parking this node as the
+    // continuation the answer binds. The amount is read once, when the damage is
+    // applied after the pick (CR 608.2h), before any later clause of the chain
+    // (CR 608.2c). Candidates are a plain scan of the live population, never
+    // targeting legality — hexproof, shroud and protection restrict neither the
+    // prompt nor the choice (CR 115.10a); protection only prevents the damage
+    // (CR 702.16e).
+    if deal_damage::awaits_resolution_recipient_choice(ability) {
+        let candidates = deal_damage::resolution_recipient_candidates(state, ability);
+        match candidates.len() {
+            0 => {}
+            1 => {
+                // Re-enter the body, not the chain entry: the depth-0 prelude
+                // (the per-ability resolution counter among it) already ran for
+                // this resolution and must not run twice.
+                let mut bound = ability.clone();
+                bound.set_unpinned_targets(candidates);
+                return resolve_chain_body(state, &bound, events, depth);
+            }
+            _ => {
+                let mut parked = ability.clone();
+                deal_damage::bind_recipient_pool(&mut parked, &candidates);
+                state.park_ability_continuation(PendingContinuation::new(Box::new(parked), state));
+                state.waiting_for = WaitingFor::ChooseObjectsSelection {
+                    player: ability.controller,
+                    eligible: candidates,
+                    min: 1,
+                    max: Some(1),
+                    trigger_event: state.current_trigger_event.clone(),
+                };
+                return Ok(ResolutionProgress::Waiting);
+            }
+        }
+    }
+
     // CR 608.2c: Snapshot event count so we can detect objects moved by this effect.
     let events_before = events.len();
     let mut immediate_effect_result = None;
@@ -18306,9 +19960,20 @@ fn resolve_chain_body(
         // chain that is pure metadata resolves nothing.
         let Some(sub) = cast_from_zone::cast_metadata_continuation(ability, sub) else {
             // The consumed metadata run left no next written instruction: the
-            // chain is finished, so surface the parent's own progress.
+            // chain is finished, so surface the parent's own progress. No later
+            // instruction of this chain can change an earlier entrant, so — as at
+            // any chain end — nothing is settled here; an unsettled entry is read
+            // live, and a parked outer instruction's resume is its own boundary.
             return Ok(progress);
         };
+        // CR 603.10 + CR 608.2c: the parent instruction completed; its entries are observed
+        // before the next instruction can change the entrant (S-a). The boundary is the next
+        // WRITTEN instruction, judged after the metadata splice: a consumed rider modifies only
+        // the cast spell's own later entry (the enters-with-counter rider is a CR 614.1c
+        // replacement), never an entrant of this resolution, so the
+        // deferral predicate and the co-entry / attach checks read the instruction that
+        // actually runs next, with the cast parent as the completed instruction.
+        settle_entries_before_instruction(state, events, sub, Some(ability));
         // CR 614.1a + CR 608.2c: CastFromZone consumes the Torrential/Kylox
         // graveyard-redirect rider by stamping the granted casting permission. Do
         // not also execute the parser's structural rider (`ChangeZone` /
@@ -21747,7 +23412,7 @@ fn resolve_grant_next_spell_ability(
     // ("the next spell you cast"). Exhaustive over PlayerScope (no `_`), so any
     // future variant forces a maintainer to re-confirm its next-spell semantics.
     let player = match player_scope {
-        PlayerScope::Target => ability.target_player(),
+        PlayerScope::Target => Some(ability.target_player()),
         // CR 513.1: `AnyTurn` is a duration-timing referent that never reaches a
         // next-spell player-selection position; default to the controller.
         PlayerScope::Controller
@@ -21760,17 +23425,27 @@ fn resolve_grant_next_spell_ability(
         // from a value/quantity/player-selection position.
         | PlayerScope::SpecificPlayer { .. }
         | PlayerScope::DefendingPlayer
-        | PlayerScope::ParentObjectTargetController
-        | PlayerScope::SourceChosenPlayer => ability.controller,
+        | PlayerScope::SourceChosenPlayer => Some(ability.controller),
+        // CR 109.4 + CR 108.3: the controller/owner of the parent object target.
+        PlayerScope::ParentObjectTarget { possession } => match possession {
+            PossessionAxis::Controller => {
+                crate::game::ability_utils::parent_target_controller(ability, state)
+            }
+            PossessionAxis::Owner => crate::game::ability_utils::parent_target_owner(ability, state),
+        },
     };
-    state
-        .pending_next_spell_modifiers
-        .push(crate::types::game_state::PendingNextSpellModifier {
-            player,
-            modifier,
-            spell_filter,
-            source_id: Some(ability.source_id),
-        });
+    // CR 609.3: with no resolvable parent referent there is no recipient, so
+    // the grant does nothing rather than defaulting to the controller.
+    if let Some(player) = player {
+        state.pending_next_spell_modifiers.push(
+            crate::types::game_state::PendingNextSpellModifier {
+                player,
+                modifier,
+                spell_filter,
+                source_id: Some(ability.source_id),
+            },
+        );
+    }
     events.push(GameEvent::EffectResolved {
         kind: crate::types::ability::EffectKind::GrantNextSpellAbility,
         source_id: ability.source_id,
@@ -21859,10 +23534,3652 @@ fn resolve_add_pending_enters_modifications(
 mod tests {
     use super::*;
     use crate::database::synthesis::synthesize_extort;
+    use crate::game::scenario::{GameScenario, P0, P1};
     use crate::types::ability::{
         ChooseOneOfKind, LibraryInstructionActor, LibraryPosition, ParentTargetMissingReason,
-        SearchSelectionConstraint, SpentColor,
+        SearchSelectionConstraint, SpentColor, UNION_DEPTH_BUDGET,
     };
+
+    #[test]
+    fn optional_decline_selector_preserves_none_borrowed_and_owned_branches() {
+        let state = GameState::new_two_player(42);
+        let life = |value| {
+            ResolvedAbility::new(
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value },
+                    player: TargetFilter::Controller,
+                },
+                vec![TargetRef::Player(PlayerId(1))],
+                ObjectId(100),
+                PlayerId(0),
+            )
+        };
+        let performed = AbilityCondition::EffectOutcome {
+            signal: EffectOutcomeSignal::OptionalEffectPerformed,
+        };
+        let parent = life(0);
+        assert!(optional_decline_branch(&state, &parent).is_none());
+
+        let explicit = parent.clone().sub_ability(life(9)).else_ability(life(7));
+        let before = serde_json::to_value(&explicit).unwrap();
+        let Some(Cow::Borrowed(branch)) = optional_decline_branch(&state, &explicit) else {
+            panic!("explicit else must stay borrowed");
+        };
+        assert_eq!(
+            serde_json::to_value(branch).unwrap(),
+            serde_json::to_value(life(7)).unwrap()
+        );
+        assert_eq!(serde_json::to_value(&explicit).unwrap(), before);
+
+        let mut sibling = life(3).sub_ability(life(4));
+        sibling.sub_link = SubAbilityLink::SequentialSibling;
+        let sequential = parent.clone().sub_ability(sibling.clone());
+        let Some(Cow::Borrowed(branch)) = optional_decline_branch(&state, &sequential) else {
+            panic!("unconditional next instruction must stay borrowed");
+        };
+        assert_eq!(
+            serde_json::to_value(branch).unwrap(),
+            serde_json::to_value(&sibling).unwrap()
+        );
+
+        let mut step = life(6).sub_ability(sibling.clone());
+        step.sub_link = SubAbilityLink::ContinuationStep;
+        let skipped = parent.clone().sub_ability(step.clone());
+        let Some(Cow::Borrowed(branch)) = optional_decline_branch(&state, &skipped) else {
+            panic!("the continuation step is skipped before the independent sibling");
+        };
+        assert_eq!(
+            serde_json::to_value(branch).unwrap(),
+            serde_json::to_value(&sibling).unwrap()
+        );
+        step.sub_ability = None;
+        assert!(optional_decline_branch(&state, &parent.clone().sub_ability(step)).is_none());
+
+        let decline = life(11).condition(AbilityCondition::Not {
+            condition: Box::new(performed.clone()),
+        });
+        let accept = life(2)
+            .condition(performed.clone())
+            .sub_ability(life(5).sub_ability(decline.clone()));
+        let nested = parent.clone().sub_ability(accept);
+        let Some(Cow::Borrowed(branch)) = optional_decline_branch(&state, &nested) else {
+            panic!("nested printed decline clause must stay borrowed");
+        };
+        assert_eq!(
+            serde_json::to_value(branch).unwrap(),
+            serde_json::to_value(&decline).unwrap()
+        );
+
+        let double: Effect = serde_json::from_str(
+            r#"{"type":"DoublePT","mode":"Power","target":{"type":"Typed","type_filters":["Creature"],"controller":null,"properties":[]},"factor":2}"#,
+        ).unwrap();
+        let gate =
+            ResolvedAbility::new(double, vec![], ObjectId(100), PlayerId(0)).condition(performed);
+        assert!(
+            optional_decline_branch(&state, &parent.clone().sub_ability(gate.clone())).is_none()
+        );
+        let mut independent = life(2);
+        independent.sub_link = SubAbilityLink::SequentialSibling;
+        let with_tail = gate.sub_ability(independent);
+        let owned_parent = parent.sub_ability(with_tail.clone());
+        let before = serde_json::to_value(&owned_parent).unwrap();
+        let Some(Cow::Owned(branch)) = optional_decline_branch(&state, &owned_parent) else {
+            panic!("a reduced performed gate must remain owned");
+        };
+        assert_eq!(
+            serde_json::to_value(&branch).unwrap(),
+            serde_json::to_value(with_tail).unwrap()
+        );
+        assert_eq!(serde_json::to_value(&owned_parent).unwrap(), before);
+    }
+
+    #[test]
+    fn declined_search_mixed_empty_declarations_and_per_static_scalars_keep_their_roles() {
+        let state = GameState::new_two_player(42);
+        let object = TargetFilter::Typed(TypedFilter::creature());
+        let mixed = TargetFilter::Or {
+            filters: vec![TargetFilter::Player, object.clone()],
+        };
+        for (target, expected) in [
+            (object.clone(), true),
+            (TargetFilter::Player, false),
+            (mixed.clone(), false),
+        ] {
+            let mut node = declined_search_test_ability(Effect::PutCounter {
+                target,
+                count: QuantityExpr::Fixed { value: 1 },
+                counter_type: crate::types::counter::CounterType::Plus1Plus1,
+            });
+            node.optional_targeting = true;
+            node.chosen_target_slots = ChosenTargetSlots::Recorded(vec![]);
+            assert_eq!(declined_search_owns_target(&node), expected);
+            assert!(!declined_search_object_information(&state, &node));
+        }
+        assert!(!declined_search_object_witness(&TargetFilter::And {
+            filters: vec![object.clone(), mixed.clone()]
+        }));
+        assert!(declined_search_object_witness(&TargetFilter::And {
+            filters: vec![object.clone(), TargetFilter::Any]
+        }));
+        let mut actual = declined_search_test_ability(Effect::PutCounter {
+            target: mixed,
+            count: QuantityExpr::Fixed { value: 1 },
+            counter_type: crate::types::counter::CounterType::Plus1Plus1,
+        });
+        actual.targets = vec![TargetRef::Player(P1), TargetRef::Object(ObjectId(22))];
+        actual.chosen_target_slots = ChosenTargetSlots::Recorded(vec![0, 1]);
+        assert!(declined_search_owns_target(&actual));
+        assert!(declined_search_object_information(&state, &actual));
+        actual.chosen_target_slots = ChosenTargetSlots::Unrecorded;
+        assert!(!declined_search_owns_target(&actual));
+        assert!(!declined_search_object_information(&state, &actual));
+        for missing in [true, false] {
+            let dependent =
+                TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::Cmc {
+                    comparator: Comparator::GE,
+                    value: if missing {
+                        QuantityExpr::Ref {
+                            qty: QuantityRef::TrackedSetSize,
+                        }
+                    } else {
+                        QuantityExpr::Fixed { value: 0 }
+                    },
+                }]));
+            let node = declined_search_test_ability(Effect::GenericEffect {
+                target: None,
+                duration: None,
+                end_cost: None,
+                static_abilities: vec![
+                    StaticDefinition::continuous().affected(dependent),
+                    StaticDefinition::continuous().affected(TargetFilter::SelfRef),
+                ],
+            });
+            let prepared = prepare_declined_search_node(&state, &node).unwrap();
+            let Effect::GenericEffect {
+                static_abilities, ..
+            } = &prepared.effect
+            else {
+                unreachable!()
+            };
+            assert_eq!(static_abilities.len(), if missing { 1 } else { 2 });
+            assert_eq!(
+                static_abilities.last().unwrap().affected,
+                Some(TargetFilter::SelfRef)
+            );
+            assert_eq!(matches!(prepared, Cow::Owned(_)), missing);
+        }
+    }
+
+    #[test]
+    fn declined_search_indexed_references_share_read_bind_and_residual_authority() {
+        let mut scenario = GameScenario::new();
+        let source = scenario
+            .add_artifact_from_oracle(P0, "Carrier source", "")
+            .id();
+        let chosen = scenario
+            .add_creature(P0, "Independent prior slot", 2, 2)
+            .id();
+        let mut state = scenario.build().state().clone();
+        let mut player = ResolvedAbility::new(
+            Effect::TargetOnly {
+                target: TargetFilter::Player,
+            },
+            vec![TargetRef::Player(P1)],
+            source,
+            P0,
+        );
+        player.chosen_target_slots = ChosenTargetSlots::Recorded(vec![0]);
+        let mut object = ResolvedAbility::new(
+            Effect::TargetOnly {
+                target: TargetFilter::Typed(TypedFilter::creature()),
+            },
+            vec![TargetRef::Object(chosen)],
+            source,
+            P0,
+        );
+        object.chosen_target_slots = ChosenTargetSlots::Recorded(vec![0]);
+        object.target_pins = vec![Some(
+            crate::types::identifiers::ObjectIncarnationRef::from_object(&state.objects[&chosen]),
+        )];
+        state.resolving_stack_entry = Some(crate::types::game_state::StackEntry {
+            id: ObjectId(500),
+            source_id: source,
+            controller: P0,
+            kind: crate::types::game_state::StackEntryKind::ActivatedAbility {
+                source_id: source,
+                ability: Box::new(player.clone().sub_ability(object.clone())),
+            },
+        });
+        let mut body = declined_search_test_ability(Effect::PutCounter {
+            counter_type: crate::types::counter::CounterType::Plus1Plus1,
+            count: QuantityExpr::Fixed { value: 2 },
+            target: TargetFilter::ParentTargetSlot { index: 1 },
+        });
+        body.source_id = source;
+        body.target_reads = TargetReadOrigin::ParentAnnouncement;
+        assert!(!declined_search_owns_target(&body));
+        for index in 0..3 {
+            let filter = TargetFilter::ParentTargetSlot { index };
+            let expected = index == 1;
+            assert_eq!(
+                !declined_search_scalar_filter_dependency(&state, &filter, false, Some(&body)),
+                expected
+            );
+            assert_eq!(
+                !declined_search_filter_dependency(&state, &filter, false, Some(&body)),
+                expected
+            );
+            let mut bound = filter.clone();
+            crate::game::filter::bind_absent_search_predicate_with_context(
+                &mut bound,
+                false,
+                Some(&body),
+                &|filter, information, context| {
+                    declined_search_reference_available(&state, filter, information, context)
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                bound,
+                if expected {
+                    filter
+                } else {
+                    TargetFilter::Or { filters: vec![] }
+                }
+            );
+        }
+        assert!(matches!(
+            prepare_declined_search_node(&state, &body),
+            Some(Cow::Borrowed(_))
+        ));
+        assert!(!declined_search_fresh_authority(&body));
+        let descriptor = TargetFilter::Typed(
+            TypedFilter::new(crate::types::ability::TypeFilter::Artifact)
+                .controller(ControllerRef::You),
+        );
+        let mut mixed = body.clone();
+        mixed.effect = Effect::GainLife {
+            amount: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: TargetFilter::Or {
+                        filters: vec![
+                            TargetFilter::ParentTargetSlot { index: 1 },
+                            TargetFilter::ParentTargetSlot { index: 0 },
+                            descriptor.clone(),
+                        ],
+                    },
+                },
+            },
+            player: TargetFilter::Controller,
+        };
+        let prepared = prepare_declined_search_node(&state, &mixed).unwrap();
+        assert!(matches!(prepared, Cow::Owned(_)));
+        assert!(matches!(
+            &prepared.effect,
+            Effect::GainLife {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount { filter }
+                },
+                ..
+            } if *filter == TargetFilter::Or {
+                filters: vec![
+                    TargetFilter::ParentTargetSlot { index: 1 },
+                    TargetFilter::Or { filters: vec![] },
+                    descriptor,
+                ]
+            }
+        ));
+        let missing = declined_search_test_placement(TargetFilter::LastRevealed);
+        let tail = declined_search_test_ability(Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 3 },
+            player: TargetFilter::Controller,
+        });
+        body.sub_ability = Some(Box::new(missing.sub_ability(tail.clone())));
+        let kept = without_declined_search_object_dependencies(&state, &body).unwrap();
+        assert!(matches!(
+            kept.effect,
+            Effect::PutCounter {
+                target: TargetFilter::ParentTargetSlot { index: 1 },
+                ..
+            }
+        ));
+        assert!(*kept.sub_ability.unwrap() == tail);
+        let first_reader = QuantityExpr::Ref {
+            qty: QuantityRef::TargetObjectManaValue {
+                filter: Box::new(TargetFilter::ParentTargetSlot { index: 1 }),
+            },
+        };
+        assert!(
+            declined_search_scalar_quantity_dependency(&state, &first_reader, false, Some(&body)),
+            "indexed authority is not first-object information"
+        );
+        let raw = PlayerFilter::ControlsCount {
+            relation: PlayerRelation::All,
+            filter: TargetFilter::Typed(TypedFilter::creature()),
+            comparator: Comparator::GE,
+            count: Box::new(QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: TargetFilter::ParentTargetSlot { index: 1 },
+                },
+            }),
+        };
+        assert!(declined_search_player_dependency(&state, &raw));
+        state
+            .resolving_stack_entry
+            .as_mut()
+            .unwrap()
+            .ability_mut()
+            .unwrap()
+            .illegal_target_slots = vec![0];
+        assert!(
+            !declined_search_scalar_filter_dependency(
+                &state,
+                &TargetFilter::ParentTargetSlot { index: 1 },
+                false,
+                Some(&body)
+            ),
+            "illegal earlier slot never renumbers this Object"
+        );
+        state
+            .resolving_stack_entry
+            .as_mut()
+            .unwrap()
+            .ability_mut()
+            .unwrap()
+            .illegal_target_slots = vec![1];
+        assert!(prepare_declined_search_node(&state, &body).is_none());
+        // The same existing current-mode authority supplies local index zero.
+        player.modal_instruction_ordinal = Some(0);
+        object.modal_instruction_ordinal = Some(1);
+        *state
+            .resolving_stack_entry
+            .as_mut()
+            .unwrap()
+            .ability_mut()
+            .unwrap() = player.sub_ability(object);
+        state.resolving_modal_instruction = Some(1);
+        if let Effect::PutCounter { target, .. } = &mut body.effect {
+            *target = TargetFilter::ParentTargetSlot { index: 0 };
+        }
+        assert!(matches!(
+            prepare_declined_search_node(&state, &body),
+            Some(Cow::Borrowed(_))
+        ));
+        state.resolving_modal_instruction = Some(0);
+        assert!(
+            prepare_declined_search_node(&state, &body).is_none(),
+            "other mode's player slot cannot supply an Object"
+        );
+        state.resolving_modal_instruction = Some(1);
+        let pin =
+            crate::types::identifiers::ObjectIncarnationRef::from_object(&state.objects[&chosen]);
+        body.target_incarnations = vec![pin];
+        state.objects.get_mut(&chosen).unwrap().incarnation += 1;
+        assert!(prepare_declined_search_node(&state, &body).is_none());
+    }
+
+    #[test]
+    fn declined_search_each_power_recorded_sources_supply_first_object_information() {
+        let mut scenario = GameScenario::new();
+        let source = scenario.add_artifact_from_oracle(P0, "Source", "").id();
+        let first = scenario
+            .add_creature(P0, "First source", 2, 2)
+            .with_mana_cost(crate::types::mana::ManaCost::generic(2))
+            .id();
+        let extra = scenario
+            .add_creature(P0, "Extra source", 3, 3)
+            .with_mana_cost(crate::types::mana::ManaCost::generic(5))
+            .id();
+        let state = scenario.build().state().clone();
+        let mut node = ResolvedAbility::new(
+            Effect::EachDealsDamageEqualToPower {
+                sources: TargetFilter::Typed(TypedFilter::creature()),
+                extra_source: Some(TargetFilter::Typed(TypedFilter::creature())),
+                recipient: TargetFilter::Player,
+            },
+            vec![
+                TargetRef::Object(first),
+                TargetRef::Object(extra),
+                TargetRef::Player(P1),
+            ],
+            source,
+            P0,
+        );
+        node.multi_target = Some(crate::types::ability::MultiTargetSpec::fixed(0, 2));
+        node.target_pins = vec![
+            Some(
+                crate::types::identifiers::ObjectIncarnationRef::from_object(
+                    &state.objects[&first],
+                ),
+            ),
+            Some(
+                crate::types::identifiers::ObjectIncarnationRef::from_object(
+                    &state.objects[&extra],
+                ),
+            ),
+            None,
+        ];
+        node.chosen_target_slots = ChosenTargetSlots::Recorded(vec![0, 1, 2]);
+        assert!(
+            !crate::game::ability_utils::node_has_stack_target_declaration_matching(
+                &node,
+                &declined_search_object_witness
+            ),
+            "C0 preserves its recipient-only witness contract"
+        );
+        assert!(declined_search_owns_target(&node));
+        assert!(declined_search_object_information(&state, &node));
+        let scalar = QuantityExpr::Ref {
+            qty: QuantityRef::ObjectManaValue {
+                scope: ObjectScope::Target,
+            },
+        };
+        assert!(!declined_search_scalar_quantity_dependency(
+            &state,
+            &scalar,
+            declined_search_object_information(&state, &node),
+            Some(&node)
+        ));
+        assert_eq!(
+            crate::game::quantity::resolve_quantity_with_targets(&state, &scalar, &node),
+            2
+        );
+        node.chosen_target_slots = ChosenTargetSlots::Recorded(vec![1, 2]);
+        assert!(
+            !declined_search_object_information(&state, &node),
+            "an unproved first source may not be skipped to bless extra source"
+        );
+        node.targets = vec![TargetRef::Player(P1)];
+        node.target_pins = vec![None];
+        node.chosen_target_slots = ChosenTargetSlots::Recorded(vec![0]);
+        assert!(!declined_search_owns_target(&node));
+        assert!(!declined_search_object_information(&state, &node));
+        node.targets.clear();
+        node.target_pins.clear();
+        node.chosen_target_slots = ChosenTargetSlots::Recorded(vec![]);
+        assert!(!declined_search_owns_target(&node));
+        assert!(!declined_search_object_information(&state, &node));
+    }
+
+    #[test]
+    fn declined_search_raw_current_scope_and_searcher_keep_only_scalar_authority() {
+        let state = GameState::new_two_player(42);
+        for missing in [true, false] {
+            let scope = PlayerFilter::ControlsCount {
+                relation: PlayerRelation::All,
+                filter: TargetFilter::Typed(TypedFilter::creature()),
+                comparator: Comparator::GE,
+                count: Box::new(if missing {
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::TrackedSetSize,
+                    }
+                } else {
+                    QuantityExpr::Fixed { value: 0 }
+                }),
+            };
+            let mut node = declined_search_test_ability(Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            });
+            node.player_scope = Some(scope.clone());
+            assert_eq!(
+                prepare_declined_search_node(&state, &node).is_none(),
+                missing
+            );
+            if !missing {
+                assert!(matches!(
+                    prepare_declined_search_node(&state, &node),
+                    Some(Cow::Borrowed(_))
+                ));
+                assert!(matches_player_scope(&state, P0, &scope, P0, node.source_id));
+            }
+            let mut search = declined_search_test_search();
+            let searcher = TargetFilter::PlayerMatching {
+                player: Box::new(scope),
+            };
+            if let Effect::SearchLibrary { target_player, .. } = &mut search.effect {
+                *target_player = Some(searcher.clone());
+            }
+            assert_eq!(
+                prepare_declined_search_node(&state, &search).is_none(),
+                missing
+            );
+            if !missing {
+                let prepared = prepare_declined_search_node(&state, &search).unwrap();
+                assert!(matches!(prepared, Cow::Borrowed(_)));
+                assert!(*prepared == search);
+            }
+            // The explicit contextual Typed searcher wrapper is also operative.
+            let wrapper = TargetFilter::Typed(
+                TypedFilter {
+                    type_filters: vec![],
+                    controller: Some(ControllerRef::ParentTargetController),
+                    properties: vec![],
+                }
+                .properties(vec![FilterProp::Cmc {
+                    comparator: Comparator::GE,
+                    value: if missing {
+                        QuantityExpr::Ref {
+                            qty: QuantityRef::TrackedSetSize,
+                        }
+                    } else {
+                        QuantityExpr::Fixed { value: 0 }
+                    },
+                }]),
+            );
+            if let Effect::SearchLibrary { target_player, .. } = &mut search.effect {
+                *target_player = Some(wrapper);
+            }
+            assert_eq!(
+                prepare_declined_search_node(&state, &search).is_none(),
+                missing
+            );
+        }
+        let mut player = declined_search_test_ability(Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+            player: TargetFilter::ParentTarget,
+        });
+        for scope in [
+            PlayerFilter::Controller,
+            PlayerFilter::ParentObjectTargetController,
+            PlayerFilter::ParentObjectTargetOwner,
+            PlayerFilter::ChosenPlayer { index: 0 },
+            PlayerFilter::TargetPlayer,
+        ] {
+            player.player_scope = Some(scope);
+            assert!(matches!(
+                prepare_declined_search_node(&state, &player),
+                Some(Cow::Borrowed(_))
+            ));
+        }
+        let mut search = declined_search_test_search();
+        if let Effect::SearchLibrary { target_player, .. } = &mut search.effect {
+            *target_player = Some(TargetFilter::Typed(TypedFilter {
+                type_filters: vec![],
+                controller: Some(ControllerRef::ParentTargetController),
+                properties: vec![],
+            }));
+        }
+        assert!(search.effect.target_filter().is_none(), "the existing contextual searcher wrapper is intentionally hidden by the target accessor");
+        assert!(matches!(
+            prepare_declined_search_node(&state, &search),
+            Some(Cow::Borrowed(_))
+        ));
+        if let Effect::SearchLibrary { target_player, .. } = &mut search.effect {
+            *target_player = Some(TargetFilter::ParentTarget);
+        }
+        assert!(matches!(
+            prepare_declined_search_node(&state, &search),
+            Some(Cow::Borrowed(_))
+        ));
+        let mut announced_player = declined_search_test_ability(Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+            player: TargetFilter::PlayerMatching {
+                player: Box::new(PlayerFilter::All),
+            },
+        });
+        announced_player.targets = vec![TargetRef::Player(P1)];
+        announced_player.chosen_target_slots = ChosenTargetSlots::Recorded(vec![0]);
+        let tail = declined_search_test_ability(Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 3 },
+            player: TargetFilter::Controller,
+        });
+        let chain = announced_player.sub_ability(
+            declined_search_test_placement(TargetFilter::LastRevealed).sub_ability(tail.clone()),
+        );
+        let reduced = without_declined_search_object_dependencies(&state, &chain).unwrap();
+        assert!(matches!(
+            reduced.effect,
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                ..
+            }
+        ));
+        assert!(*reduced.sub_ability.unwrap() == tail);
+    }
+
+    #[test]
+    fn declined_search_complete_scalar_carriers_refuse_before_binding() {
+        let state = GameState::new_two_player(42);
+        for missing in [true, false] {
+            let threshold = if missing {
+                QuantityExpr::Ref {
+                    qty: QuantityRef::TrackedSetSize,
+                }
+            } else {
+                QuantityExpr::Fixed { value: 0 }
+            };
+            for property in [
+                FilterProp::Cmc {
+                    comparator: Comparator::EQ,
+                    value: threshold.clone(),
+                },
+                FilterProp::PtComparison {
+                    stat: crate::types::ability::PtStat::Power,
+                    scope: crate::types::ability::PtValueScope::Current,
+                    comparator: Comparator::EQ,
+                    value: threshold.clone(),
+                },
+                FilterProp::Counters {
+                    counters: crate::types::counter::CounterMatch::Any,
+                    comparator: Comparator::EQ,
+                    count: threshold.clone(),
+                },
+            ] {
+                let filter = TargetFilter::Typed(TypedFilter::creature().properties(vec![
+                    FilterProp::AnyOf {
+                        props: vec![FilterProp::Not {
+                            prop: Box::new(property),
+                        }],
+                    },
+                ]));
+                let objects = CardTypeSetSource::Objects {
+                    filter: filter.clone(),
+                };
+                let journal = CardTypeSetSource::TurnJournal {
+                    journal: crate::types::ability::TurnJournalKind::SpellsCast,
+                    scope: crate::types::ability::CountScope::Controller,
+                    filter: Some(filter.clone()),
+                };
+                let carriers = vec![
+                    QuantityRef::ObjectCount {
+                        filter: filter.clone(),
+                    },
+                    QuantityRef::ObjectCountDistinct {
+                        filter: filter.clone(),
+                        qualities: vec![SharedQuality::Name],
+                    },
+                    QuantityRef::ObjectCountBySharedQuality {
+                        filter: filter.clone(),
+                        quality: SharedQuality::Name,
+                        aggregate: crate::types::ability::AggregateFunction::Max,
+                    },
+                    QuantityRef::CountersOnObjects {
+                        filter: filter.clone(),
+                        counter_type: None,
+                    },
+                    QuantityRef::DistinctCounterKindsAmong {
+                        filter: filter.clone(),
+                    },
+                    QuantityRef::ControlledByEachPlayer {
+                        filter: filter.clone(),
+                        aggregate: crate::types::ability::AggregateFunction::Max,
+                        relation: PlayerRelation::All,
+                    },
+                    QuantityRef::EnteredThisTurn {
+                        filter: filter.clone(),
+                    },
+                    QuantityRef::SacrificedThisTurn {
+                        filter: filter.clone(),
+                        player: crate::types::ability::PlayerScope::Controller,
+                    },
+                    QuantityRef::BattlefieldEntriesThisTurn {
+                        filter: filter.clone(),
+                        player: crate::types::ability::PlayerScope::Controller,
+                    },
+                    QuantityRef::ZoneChangeCountThisTurn {
+                        filter: filter.clone(),
+                        from: None,
+                        to: None,
+                    },
+                    QuantityRef::ZoneChangeAggregateThisTurn {
+                        filter: filter.clone(),
+                        from: None,
+                        to: None,
+                        function: crate::types::ability::AggregateFunction::Sum,
+                        property: crate::types::ability::ObjectProperty::Power,
+                    },
+                    QuantityRef::CounterAddedThisTurn {
+                        target: filter.clone(),
+                        actor: crate::types::ability::CountScope::Controller,
+                        counters: crate::types::counter::CounterMatch::Any,
+                    },
+                    QuantityRef::TokensCreatedThisTurn {
+                        filter: filter.clone(),
+                        player: crate::types::ability::PlayerScope::Controller,
+                    },
+                    QuantityRef::FilteredTrackedSetSize {
+                        filter: Box::new(filter.clone()),
+                        caused_by: Some(ThisWayCause::Destroyed),
+                    },
+                    QuantityRef::PlayerCount {
+                        filter: PlayerFilter::ControlsCount {
+                            relation: PlayerRelation::All,
+                            filter: filter.clone(),
+                            comparator: Comparator::GE,
+                            count: Box::new(QuantityExpr::Fixed { value: 0 }),
+                        },
+                    },
+                    QuantityRef::EventContextPlayerCount {
+                        filter: PlayerFilter::ControlsCount {
+                            relation: PlayerRelation::All,
+                            filter: filter.clone(),
+                            comparator: Comparator::GE,
+                            count: Box::new(QuantityExpr::Fixed { value: 0 }),
+                        },
+                    },
+                    QuantityRef::PropertyAggregate(
+                        crate::types::ability::PropertyAggregate::new(
+                            crate::types::ability::AggregateFunction::Sum,
+                            crate::types::ability::ObjectProperty::Power,
+                            objects.clone(),
+                        )
+                        .unwrap(),
+                    ),
+                    QuantityRef::DistinctCardTypes {
+                        source: objects.clone(),
+                    },
+                    QuantityRef::SharedCardTypes {
+                        source: journal.clone(),
+                    },
+                    QuantityRef::DistinctSubtypes {
+                        source: objects.clone(),
+                        exclude: crate::types::ability::SubtypeExclusion::None,
+                    },
+                    QuantityRef::DistinctColorsAmong { source: journal },
+                    QuantityRef::ZoneCardCount {
+                        filter: Some(filter.clone()),
+                        zone: crate::types::ability::ZoneRef::Hand,
+                        scope: crate::types::ability::CountScope::Controller,
+                        card_types: vec![],
+                    },
+                    QuantityRef::SpellsCastThisTurn {
+                        filter: Some(filter.clone()),
+                        scope: crate::types::ability::CountScope::Controller,
+                    },
+                    QuantityRef::SpellsCastBeforeTriggeringSpell {
+                        filter: Some(filter.clone()),
+                        scope: crate::types::ability::CountScope::Controller,
+                    },
+                    QuantityRef::SpellsCastThisGame {
+                        filter: Some(filter.clone()),
+                        scope: crate::types::ability::CountScope::Controller,
+                    },
+                    QuantityRef::AttackedThisTurn {
+                        filter: Some(filter.clone()),
+                        scope: crate::types::ability::CountScope::Controller,
+                    },
+                    QuantityRef::DamageDealtThisTurn {
+                        source: Box::new(filter.clone()),
+                        target: Box::new(TargetFilter::Any),
+                        aggregate: crate::types::ability::AggregateFunction::Sum,
+                        group_by: None,
+                        damage_kind: crate::types::ability::DamageKindFilter::Any,
+                        channel: crate::types::ability::DamageChannel::Total,
+                    },
+                    QuantityRef::DamageDealtThisTurn {
+                        source: Box::new(TargetFilter::Any),
+                        target: Box::new(filter.clone()),
+                        aggregate: crate::types::ability::AggregateFunction::Sum,
+                        group_by: None,
+                        damage_kind: crate::types::ability::DamageKindFilter::Any,
+                        channel: crate::types::ability::DamageChannel::Total,
+                    },
+                    QuantityRef::ManaSpentToCast {
+                        scope: crate::types::ability::CastManaObjectScope::SelfObject,
+                        metric: crate::types::ability::CastManaSpentMetric::FromSource {
+                            source_filter: filter,
+                        },
+                    },
+                ];
+                for carrier in carriers {
+                    let quantity = QuantityExpr::Ref { qty: carrier };
+                    assert_eq!(
+                        declined_search_scalar_quantity_dependency(&state, &quantity, false, None),
+                        missing,
+                        "canonical carrier {quantity:?}"
+                    );
+                    let node = declined_search_test_ability(Effect::GainLife {
+                        amount: quantity,
+                        player: TargetFilter::Controller,
+                    });
+                    let before = node.clone();
+                    let prepared = prepare_declined_search_node(&state, &node);
+                    assert_eq!(
+                        prepared.is_none(),
+                        missing,
+                        "prepared carrier {:?}",
+                        node.effect
+                    );
+                    if let Some(prepared) = prepared {
+                        assert!(matches!(prepared, Cow::Borrowed(_)));
+                        assert!(*prepared == node);
+                    }
+                    let tail = declined_search_test_ability(Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 3 },
+                        player: TargetFilter::Controller,
+                    });
+                    let root = declined_search_test_search()
+                        .sub_ability(node.clone().sub_ability(tail.clone()));
+                    let selected = optional_decline_branch(&state, &root).unwrap();
+                    if missing {
+                        assert!(*selected == tail);
+                    } else {
+                        assert!(matches!(selected, Cow::Borrowed(_)));
+                    }
+                    assert!(before == node);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn declined_search_raw_effect_player_fields_are_required_inputs() {
+        let mut scenario = GameScenario::new();
+        let source = scenario
+            .add_artifact_from_oracle(P0, "Scalar source", "")
+            .with_mana_cost(crate::types::mana::ManaCost::generic(1))
+            .id();
+        scenario.add_creature(P0, "First population", 2, 2);
+        scenario.add_creature(P1, "Second population", 2, 2);
+        let state = scenario.build().state().clone();
+        for attribute in [false, true] {
+            for threshold in [
+                QuantityExpr::Ref {
+                    qty: QuantityRef::TrackedSetSize,
+                },
+                QuantityExpr::Fixed { value: 0 },
+                QuantityExpr::Ref {
+                    qty: QuantityRef::SelfManaValue,
+                },
+                QuantityExpr::Ref {
+                    qty: QuantityRef::HandSize {
+                        player: crate::types::ability::PlayerScope::Controller,
+                    },
+                },
+                QuantityExpr::Ref {
+                    qty: QuantityRef::HandSize {
+                        player: crate::types::ability::PlayerScope::ScopedPlayer,
+                    },
+                },
+            ] {
+                let missing = matches!(
+                    threshold,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::TrackedSetSize
+                    }
+                );
+                let scope = if attribute {
+                    PlayerFilter::PlayerAttribute {
+                        relation: PlayerRelation::All,
+                        attr: Box::new(QuantityRef::LifeTotal {
+                            player: crate::types::ability::PlayerScope::Controller,
+                        }),
+                        comparator: Comparator::GE,
+                        value: Box::new(threshold),
+                    }
+                } else {
+                    PlayerFilter::ControlsCount {
+                        relation: PlayerRelation::All,
+                        filter: TargetFilter::Typed(TypedFilter::creature()),
+                        comparator: Comparator::GE,
+                        count: Box::new(threshold),
+                    }
+                };
+                assert_eq!(declined_search_player_dependency(&state, &scope), missing);
+                if !missing {
+                    assert!(matches_player_scope(&state, P0, &scope, P0, source));
+                }
+                let branch = AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Ref {
+                            qty: QuantityRef::TrackedSetSize,
+                        },
+                        player: TargetFilter::Controller,
+                    },
+                );
+                let effects = [
+                    Effect::StartYourEngines {
+                        player_scope: scope.clone(),
+                    },
+                    Effect::ChangeSpeed {
+                        player_scope: scope.clone(),
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        direction: crate::types::ability::SpeedDelta::Increase,
+                        floor: None,
+                    },
+                    Effect::DamageAll {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Typed(TypedFilter::creature()),
+                        player_filter: Some(scope.clone()),
+                        damage_source: None,
+                    },
+                    Effect::DamageEachPlayer {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        player_filter: scope.clone(),
+                    },
+                    Effect::RevealChosenNumbers {
+                        players: scope.clone(),
+                    },
+                    Effect::Conjure {
+                        cards: vec![crate::types::ability::ConjureCard {
+                            source: crate::types::ability::ConjureSource::Named {
+                                name: "Island".into(),
+                            },
+                            count: QuantityExpr::Fixed { value: 1 },
+                        }],
+                        destination: Zone::Library,
+                        tapped: false,
+                        library_position: Some(LibraryPosition::Top),
+                        library_players: Some(scope.clone()),
+                    },
+                    Effect::ChooseOneOf {
+                        chooser: scope.clone(),
+                        branches: vec![branch],
+                        kind: ChooseOneOfKind::Ordinary,
+                    },
+                ];
+                for effect in effects {
+                    let mut node = declined_search_test_ability(effect);
+                    node.source_id = source;
+                    let before = node.clone();
+                    let prepared = prepare_declined_search_node(&state, &node);
+                    assert_eq!(prepared.is_none(), missing, "raw role {:?}", node.effect);
+                    if let Some(prepared) = prepared {
+                        assert!(matches!(prepared, Cow::Borrowed(_)));
+                        assert!(*prepared == node);
+                    }
+                    let tail = declined_search_test_ability(Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 3 },
+                        player: TargetFilter::Controller,
+                    });
+                    node.sub_ability = Some(Box::new(tail.clone()));
+                    let root = declined_search_test_search().sub_ability(node.clone());
+                    let selected = optional_decline_branch(&state, &root).unwrap();
+                    if missing {
+                        assert!(*selected == tail);
+                    } else {
+                        assert!(matches!(selected, Cow::Borrowed(_)));
+                        assert!(*selected == node);
+                    }
+                    assert!(before.effect == node.effect);
+                    if matches!(node.effect, Effect::ChooseOneOf { .. }) {
+                        node.modal_instruction_ordinal = Some(0);
+                        assert!(matches!(
+                            prepare_declined_search_node(&state, &node),
+                            Some(Cow::Borrowed(_))
+                        ));
+                        let root = declined_search_test_search().sub_ability(node.clone());
+                        assert!(matches!(
+                            optional_decline_branch(&state, &root),
+                            Some(Cow::Borrowed(_))
+                        ));
+                        node.modal_instruction_ordinal = None;
+                        node.reads_chosen_group = Some(crate::types::ability::ChosenGroupId(9));
+                        assert!(matches!(
+                            prepare_declined_search_node(&state, &node),
+                            Some(Cow::Borrowed(_))
+                        ));
+                        node.reads_chosen_group = None;
+                        node.reads_return_result = Some((
+                            crate::types::ability::ReturnResultId(9),
+                            crate::types::ability::ReturnResultReadSpec {
+                                noun: TargetFilter::Typed(TypedFilter::creature()),
+                                destination: Zone::Hand,
+                                recipient: ControllerRef::You,
+                            },
+                        ));
+                        assert!(matches!(
+                            prepare_declined_search_node(&state, &node),
+                            Some(Cow::Borrowed(_))
+                        ));
+                    }
+                    match &mut node.effect {
+                        Effect::DamageAll { player_filter, .. } => {
+                            *player_filter = None;
+                        }
+                        Effect::Conjure {
+                            library_players, ..
+                        } => {
+                            *library_players = None;
+                        }
+                        _ => continue,
+                    }
+                    assert!(matches!(
+                        prepare_declined_search_node(&state, &node),
+                        Some(Cow::Borrowed(_))
+                    ));
+                }
+            }
+        }
+        // A fixed current chooser does not read deferred branch definitions.
+        let deferred = declined_search_test_ability(Effect::ChooseOneOf {
+            chooser: PlayerFilter::Controller,
+            branches: vec![AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::StartYourEngines {
+                    player_scope: PlayerFilter::ControlsCount {
+                        relation: PlayerRelation::All,
+                        filter: TargetFilter::Typed(TypedFilter::creature()),
+                        comparator: Comparator::GE,
+                        count: Box::new(QuantityExpr::Ref {
+                            qty: QuantityRef::TrackedSetSize,
+                        }),
+                    },
+                },
+            )],
+            kind: ChooseOneOfKind::Ordinary,
+        });
+        assert!(matches!(
+            prepare_declined_search_node(&state, &deferred),
+            Some(Cow::Borrowed(_))
+        ));
+    }
+
+    #[test]
+    fn declined_search_retained_player_entry_views_keep_stored_descendants() {
+        let mut state = GameState::new_two_player(42);
+        let mut declaration = declined_search_test_ability(Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 0 },
+            player: TargetFilter::PlayerMatching {
+                player: Box::new(PlayerFilter::All),
+            },
+        });
+        declaration.targets = vec![TargetRef::Player(P1)];
+        declaration.target_reads = TargetReadOrigin::OwnAnnouncement;
+        declaration.chosen_target_slots = ChosenTargetSlots::Recorded(vec![0]);
+        let source = declaration.source_id;
+        state.resolving_stack_entry = Some(crate::types::game_state::StackEntry {
+            id: source,
+            source_id: source,
+            controller: P0,
+            kind: crate::types::game_state::StackEntryKind::ActivatedAbility {
+                source_id: source,
+                ability: Box::new(declaration.clone()),
+            },
+        });
+        for reference in [
+            QuantityRef::HandSize {
+                player: PlayerScope::Target,
+            },
+            QuantityRef::HandSize {
+                player: PlayerScope::ParentObjectTarget {
+                    possession: PossessionAxis::Controller,
+                },
+            },
+            QuantityRef::TargetControllerCounter {
+                kind: crate::types::player::PlayerCounterKind::Poison,
+            },
+        ] {
+            let mut scalar = declined_search_test_ability(Effect::GainLife {
+                amount: QuantityExpr::Ref { qty: reference },
+                player: TargetFilter::ParentTarget,
+            });
+            scalar.target_reads = TargetReadOrigin::ParentAnnouncement;
+            scalar.chosen_target_slots = ChosenTargetSlots::Recorded(vec![]);
+            let tail = declined_search_test_ability(Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 3 },
+                player: TargetFilter::Controller,
+            });
+            scalar.sub_ability = Some(Box::new(tail.clone()));
+            let mut parent = declined_search_test_ability(Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 0 },
+                player: TargetFilter::ParentTarget,
+            });
+            parent.target_reads = TargetReadOrigin::ParentAnnouncement;
+            parent.targets = vec![TargetRef::Player(P1)];
+            parent.chosen_target_slots = ChosenTargetSlots::Recorded(vec![]);
+            let view = declined_search_sub_input(&state, &parent, &scalar);
+            assert_eq!(view.targets, vec![TargetRef::Player(P1)]);
+            assert_eq!(view.chosen_target_slots, scalar.chosen_target_slots);
+            assert!(matches!(
+                prepare_declined_search_node_with_input(&state, &scalar, &view),
+                Some(Cow::Borrowed(_))
+            ));
+            assert!(prepare_declined_search_node(&state, &scalar).is_none());
+            assert!(scalar.targets.is_empty() && scalar.target_pins.is_empty());
+            assert!(scalar.effect_context_object.is_none());
+            for shape in 0..3 {
+                let mut branch = if shape == 0 {
+                    scalar.clone()
+                } else {
+                    let mut step = parent.clone();
+                    step.targets.clear();
+                    if shape == 1 {
+                        step.sub_ability = Some(Box::new(scalar.clone()));
+                    } else {
+                        step.condition = Some(AbilityCondition::QuantityCheck {
+                            lhs: QuantityExpr::Fixed { value: 0 },
+                            comparator: Comparator::GT,
+                            rhs: QuantityExpr::Fixed { value: 0 },
+                        });
+                        step.else_ability = Some(Box::new(scalar.clone()));
+                    }
+                    step
+                };
+                branch.sub_link = SubAbilityLink::SequentialSibling;
+                let mut search = declined_search_test_search().sub_ability(branch);
+                search.targets = vec![TargetRef::Player(P1)];
+                search.target_reads = TargetReadOrigin::ParentAnnouncement;
+                let selected = optional_decline_branch(&state, &search).unwrap();
+                assert_eq!(selected.targets, vec![TargetRef::Player(P1)]);
+                assert!(!declined_search_branch_requires_reduction(
+                    &state, &selected
+                ));
+                let reduced =
+                    without_declined_search_object_dependencies(&state, &selected).unwrap();
+                assert_eq!(reduced, *selected);
+                let descendant = if shape == 0 {
+                    None
+                } else if shape == 1 {
+                    reduced.sub_ability.as_deref()
+                } else {
+                    reduced.else_ability.as_deref()
+                };
+                if let Some(descendant) = descendant {
+                    assert_eq!(descendant, &scalar);
+                    assert!(descendant.targets.is_empty() && descendant.target_pins.is_empty());
+                    assert_eq!(
+                        descendant.chosen_target_slots,
+                        ChosenTargetSlots::Recorded(vec![])
+                    );
+                }
+            }
+            let mut gate = parent.clone();
+            gate.targets = vec![TargetRef::Player(P0)];
+            gate.condition = Some(AbilityCondition::QuantityCheck {
+                lhs: QuantityExpr::Fixed { value: 0 },
+                comparator: Comparator::GT,
+                rhs: QuantityExpr::Fixed { value: 0 },
+            });
+            gate.else_ability = Some(Box::new(scalar.clone()));
+            assert!(
+                declined_search_branch_requires_reduction(&state, &gate),
+                "top false uses current P0, which root P1 does not prove"
+            );
+            let top = without_declined_search_object_dependencies(&state, &gate).unwrap();
+            assert_eq!(top.else_ability.as_deref(), Some(&tail));
+            let nested = parent.clone().sub_ability(gate);
+            assert!(
+                !declined_search_branch_requires_reduction(&state, &nested),
+                "nested false uses actual preceding P1"
+            );
+            assert_eq!(
+                without_declined_search_object_dependencies(&state, &nested),
+                Some(nested.clone())
+            );
+            let mut removed = parent.clone();
+            removed.effect = Effect::GainLife {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::TrackedSetSize,
+                },
+                player: TargetFilter::ParentTarget,
+            };
+            removed.sub_ability = Some(Box::new(scalar.clone()));
+            assert_eq!(
+                without_declined_search_object_dependencies(&state, &removed),
+                Some(tail)
+            );
+        }
+        for players in [vec![P0, P1], vec![P1, P0], vec![P1, P1]] {
+            let mut root = declaration.clone();
+            root.targets = vec![TargetRef::Player(players[0])];
+            let mut second = declaration.clone();
+            second.targets = vec![TargetRef::Player(players[1])];
+            root.sub_ability = Some(Box::new(second));
+            *state
+                .resolving_stack_entry
+                .as_mut()
+                .unwrap()
+                .ability_mut()
+                .unwrap() = root;
+            let mut input = declaration.clone();
+            input.target_reads = TargetReadOrigin::ParentAnnouncement;
+            input.chosen_target_slots = ChosenTargetSlots::Recorded(vec![]);
+            input.targets = players.iter().copied().map(TargetRef::Player).collect();
+            assert!(!declined_search_player_scope_dependency(
+                &state,
+                &PlayerScope::Target,
+                Some(&input)
+            ));
+            assert!(declined_search_parent_controller_available(&state, &input));
+            let mut gated = input.clone();
+            gated.targets = vec![TargetRef::Player(P0)];
+            let empty = declined_search_test_ability(Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 0 },
+                player: TargetFilter::ParentTarget,
+            });
+            assert_eq!(
+                declined_search_else_input(&state, &input, &empty).targets,
+                input.targets
+            );
+            assert_eq!(
+                declined_search_else_input(&state, &gated, &empty).targets,
+                gated.targets
+            );
+            assert!(empty.targets.is_empty());
+        }
+        *state
+            .resolving_stack_entry
+            .as_mut()
+            .unwrap()
+            .ability_mut()
+            .unwrap() = declaration.clone();
+        let mut inherited = declaration.clone();
+        inherited.target_reads = TargetReadOrigin::ParentAnnouncement;
+        inherited.chosen_target_slots = ChosenTargetSlots::Recorded(vec![]);
+        assert!(!declined_search_player_scope_dependency(
+            &state,
+            &PlayerScope::Target,
+            Some(&inherited)
+        ));
+        inherited.targets = vec![TargetRef::Player(P0), TargetRef::Player(P1)];
+        assert!(declined_search_player_scope_dependency(
+            &state,
+            &PlayerScope::Target,
+            Some(&inherited)
+        ));
+        assert!(!declined_search_parent_controller_available(
+            &state, &inherited
+        ));
+        inherited.targets = vec![TargetRef::Player(P1)];
+        state
+            .resolving_stack_entry
+            .as_mut()
+            .unwrap()
+            .ability_mut()
+            .unwrap()
+            .illegal_target_slots = vec![0];
+        assert!(declined_search_player_scope_dependency(
+            &state,
+            &PlayerScope::Target,
+            Some(&inherited)
+        ));
+        state
+            .resolving_stack_entry
+            .as_mut()
+            .unwrap()
+            .ability_mut()
+            .unwrap()
+            .illegal_target_slots
+            .clear();
+        state
+            .resolving_stack_entry
+            .as_mut()
+            .unwrap()
+            .ability_mut()
+            .unwrap()
+            .modal_instruction_ordinal = Some(0);
+        state.resolving_modal_instruction = Some(1);
+        // A different actual current mode with no P1 declaration cannot authorize it.
+        let mut other_mode = declaration.clone();
+        other_mode.targets = vec![TargetRef::Player(P0)];
+        other_mode.modal_instruction_ordinal = Some(1);
+        state
+            .resolving_stack_entry
+            .as_mut()
+            .unwrap()
+            .ability_mut()
+            .unwrap()
+            .sub_ability = Some(Box::new(other_mode));
+        assert!(declined_search_player_scope_dependency(
+            &state,
+            &PlayerScope::Target,
+            Some(&inherited)
+        ));
+        state.resolving_modal_instruction = Some(0);
+        assert!(!declined_search_player_scope_dependency(
+            &state,
+            &PlayerScope::Target,
+            Some(&inherited)
+        ));
+        state.resolving_modal_instruction = None;
+        state
+            .stack
+            .push_back(state.resolving_stack_entry.as_ref().unwrap().clone());
+        state.resolving_stack_entry.as_mut().unwrap().kind =
+            crate::types::game_state::StackEntryKind::Spell {
+                card_id: crate::types::identifiers::CardId(1),
+                ability: None,
+                casting_variant: crate::types::game_state::CastingVariant::default(),
+                actual_mana_spent: 0,
+            };
+        assert!(
+            declined_search_player_scope_dependency(&state, &PlayerScope::Target, Some(&inherited)),
+            "first matching non-ability cannot search farther"
+        );
+        state.resolving_stack_entry = None;
+        state.stack.clear();
+        assert!(declined_search_player_scope_dependency(
+            &state,
+            &PlayerScope::Target,
+            Some(&inherited)
+        ));
+        assert!(!declined_search_parent_controller_available(
+            &state, &inherited
+        ));
+    }
+
+    #[test]
+    fn declined_search_candidate_entry_attribute_keeps_candidate_ledger_authority() {
+        let mut scenario = GameScenario::new();
+        let first = scenario
+            .add_creature(P0, "First flyer", 2, 2)
+            .with_keyword(crate::types::keywords::Keyword::Flying)
+            .id();
+        let departed = scenario
+            .add_creature(P0, "Departed flyer", 2, 2)
+            .with_keyword(crate::types::keywords::Keyword::Flying)
+            .id();
+        let other = scenario
+            .add_creature(P1, "Opponent flyer", 2, 2)
+            .with_keyword(crate::types::keywords::Keyword::Flying)
+            .id();
+        let land = scenario.add_basic_land(P1, crate::types::mana::ManaColor::Green);
+        let mut state = scenario.build().state().clone();
+        for id in [first, departed, other, land] {
+            crate::game::restrictions::record_battlefield_entry(&mut state, id);
+        }
+        let mut events = Vec::new();
+        crate::game::zone_pipeline::move_object_for_test(
+            &mut state,
+            crate::game::zone_pipeline::ZoneMoveRequest::pregame(departed, Zone::Graveyard),
+            &mut events,
+        );
+        assert_eq!(state.objects[&departed].zone, Zone::Graveyard);
+        let filter = TargetFilter::Typed(TypedFilter::creature().properties(vec![
+            FilterProp::WithKeyword {
+                value: crate::types::keywords::Keyword::Flying,
+            },
+        ]));
+        let attr = QuantityRef::BattlefieldEntriesThisTurn {
+            player: PlayerScope::ParentObjectTarget {
+                possession: PossessionAxis::Controller,
+            },
+            filter,
+        };
+        assert_eq!(
+            candidate_player_scalar_with_state(&state, &state.players[0], P0, &attr),
+            Some(2)
+        );
+        assert_eq!(
+            candidate_player_scalar_with_state(&state, &state.players[1], P0, &attr),
+            Some(1)
+        );
+        let player = PlayerFilter::PlayerAttribute {
+            relation: PlayerRelation::All,
+            attr: Box::new(attr.clone()),
+            comparator: Comparator::EQ,
+            value: Box::new(QuantityExpr::Fixed { value: 2 }),
+        };
+        assert!(!declined_search_player_dependency(&state, &player));
+        assert!(matches_player_scope(&state, P0, &player, P0, first));
+        assert!(!matches_player_scope(&state, P1, &player, P0, first));
+        let node = declined_search_test_ability(Effect::GainLife {
+            amount: QuantityExpr::Ref {
+                qty: QuantityRef::PlayerCount { filter: player },
+            },
+            player: TargetFilter::Controller,
+        });
+        assert!(matches!(
+            prepare_declined_search_node(&state, &node),
+            Some(Cow::Borrowed(_))
+        ));
+        assert_eq!(
+            crate::game::quantity::resolve_quantity_with_targets(
+                &state,
+                &QuantityExpr::Ref {
+                    qty: QuantityRef::PlayerCount {
+                        filter: PlayerFilter::PlayerAttribute {
+                            relation: PlayerRelation::All,
+                            attr: Box::new(attr),
+                            comparator: Comparator::GE,
+                            value: Box::new(QuantityExpr::Fixed { value: 1 }),
+                        }
+                    }
+                },
+                &node
+            ),
+            2
+        );
+        let nested = PlayerFilter::PlayerAttribute {
+            relation: PlayerRelation::All,
+            attr: Box::new(QuantityRef::BattlefieldEntriesThisTurn {
+                player: PlayerScope::Target,
+                filter: TargetFilter::Typed(TypedFilter::creature().properties(vec![
+                    FilterProp::Cmc {
+                        comparator: Comparator::GE,
+                        value: QuantityExpr::Ref {
+                            qty: QuantityRef::HandSize {
+                                player: PlayerScope::Target,
+                            },
+                        },
+                    },
+                ])),
+            }),
+            comparator: Comparator::GE,
+            value: Box::new(QuantityExpr::Fixed { value: 0 }),
+        };
+        assert!(declined_search_player_dependency(&state, &nested), "numeric ledger filters are structural reach only, not claimed supported candidate evaluation");
+        assert_eq!(
+            candidate_player_scalar_with_state(
+                &state,
+                &state.players[0],
+                P0,
+                &QuantityRef::TrackedSetSize
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn declined_search_sticker_mana_and_recipient_readers_keep_distinct_order() {
+        let mut scenario = GameScenario::new();
+        let source = scenario.add_creature(P0, "Source", 2, 2).id();
+        let first = scenario.add_creature(P0, "First live", 2, 2).id();
+        let selected = scenario
+            .add_creature(P0, "Selected", 2, 2)
+            .controlled_by(P1)
+            .id();
+        let mut state = scenario.build().state().clone();
+        let sticker = crate::types::stickers::AppliedSticker::Name {
+            locator: crate::types::stickers::StickerLocator {
+                sheet: "Fixture".to_string(),
+                index: 0,
+            },
+            text: "Hot Dog".to_string(),
+            position: 0,
+            timestamp: 0,
+        };
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .stickers
+            .push(sticker.clone());
+        state
+            .objects
+            .get_mut(&selected)
+            .unwrap()
+            .stickers
+            .push(sticker);
+        let missing = ObjectId(999999);
+        let mut node = ResolvedAbility::new(
+            Effect::PutCounter {
+                target: TargetFilter::Typed(TypedFilter::creature()),
+                count: QuantityExpr::Fixed { value: 1 },
+                counter_type: crate::types::counter::CounterType::Plus1Plus1,
+            },
+            vec![TargetRef::Object(selected)],
+            source,
+            P0,
+        );
+        node.chosen_target_slots = ChosenTargetSlots::Recorded(vec![0]);
+        assert!(
+            declined_search_player_scope_dependency(&state, &PlayerScope::Target, Some(&node)),
+            "an Object is not a Player target"
+        );
+        let source_sticker = QuantityExpr::Ref {
+            qty: QuantityRef::NameStickerLetterCount {
+                stickers: NameStickerSet::OnObject {
+                    scope: ObjectScope::Source,
+                },
+                letters: crate::types::ability::LetterQuery::Letter { letter: 'o' },
+            },
+        };
+        assert!(!declined_search_scalar_quantity_dependency(
+            &state,
+            &source_sticker,
+            false,
+            None
+        ));
+        assert_eq!(
+            crate::game::quantity::resolve_quantity_with_targets(&state, &source_sticker, &node),
+            2
+        );
+        for scope in [ObjectScope::Target, ObjectScope::Recipient] {
+            let quantity = QuantityExpr::Ref {
+                qty: QuantityRef::NameStickerLetterCount {
+                    stickers: NameStickerSet::OnObject { scope },
+                    letters: crate::types::ability::LetterQuery::Letter { letter: 'o' },
+                },
+            };
+            assert!(!declined_search_scalar_quantity_dependency(
+                &state,
+                &quantity,
+                true,
+                Some(&node)
+            ));
+            assert_eq!(
+                crate::game::quantity::resolve_quantity_with_targets(&state, &quantity, &node),
+                2
+            );
+            node.targets = vec![TargetRef::Object(missing), TargetRef::Object(selected)];
+            node.chosen_target_slots = ChosenTargetSlots::Recorded(vec![1]);
+            assert!(!declined_search_scalar_quantity_dependency(
+                &state,
+                &quantity,
+                false,
+                Some(&node)
+            ));
+            assert_eq!(
+                crate::game::quantity::resolve_quantity_with_targets(&state, &quantity, &node),
+                2
+            );
+            node.targets[0] = TargetRef::Object(first);
+            assert!(declined_search_scalar_quantity_dependency(
+                &state,
+                &quantity,
+                false,
+                Some(&node)
+            ));
+            node.targets.reverse();
+            node.chosen_target_slots = ChosenTargetSlots::Recorded(vec![0]);
+            assert!(!declined_search_scalar_quantity_dependency(
+                &state,
+                &quantity,
+                true,
+                Some(&node)
+            ));
+            node.targets.clear();
+            node.chosen_target_slots = ChosenTargetSlots::Recorded(vec![]);
+            assert_eq!(
+                declined_search_scalar_quantity_dependency(&state, &quantity, false, Some(&node)),
+                scope == ObjectScope::Target
+            );
+            if scope == ObjectScope::Recipient {
+                assert_eq!(
+                    crate::game::quantity::resolve_quantity_with_targets(&state, &quantity, &node),
+                    2
+                );
+            }
+            node.targets = vec![TargetRef::Object(selected)];
+            node.chosen_target_slots = ChosenTargetSlots::Recorded(vec![0]);
+        }
+        for metric in [
+            crate::types::ability::CastManaSpentMetric::Total,
+            crate::types::ability::CastManaSpentMetric::DistinctColors,
+            crate::types::ability::CastManaSpentMetric::OfColor {
+                color: crate::types::mana::ManaColor::Green,
+            },
+            crate::types::ability::CastManaSpentMetric::FromSource {
+                source_filter: TargetFilter::Typed(TypedFilter::land()),
+            },
+        ] {
+            let quantity = QuantityExpr::Ref {
+                qty: QuantityRef::ManaSpentToCast {
+                    scope: crate::types::ability::CastManaObjectScope::AbilityTarget,
+                    metric,
+                },
+            };
+            assert!(!declined_search_scalar_quantity_dependency(
+                &state,
+                &quantity,
+                declined_search_object_information(&state, &node),
+                Some(&node)
+            ));
+            assert_eq!(
+                crate::game::quantity::resolve_quantity_with_targets(&state, &quantity, &node),
+                0,
+                "real selected zero is available"
+            );
+            assert!(declined_search_scalar_quantity_dependency(
+                &state, &quantity, true, None
+            ));
+            node.targets = vec![TargetRef::Object(missing), TargetRef::Object(selected)];
+            node.chosen_target_slots = ChosenTargetSlots::Recorded(vec![1]);
+            assert!(declined_search_scalar_quantity_dependency(
+                &state,
+                &quantity,
+                declined_search_object_information(&state, &node),
+                Some(&node)
+            ));
+            node.targets = vec![TargetRef::Player(P0), TargetRef::Object(selected)];
+            assert!(!declined_search_scalar_quantity_dependency(
+                &state,
+                &quantity,
+                declined_search_object_information(&state, &node),
+                Some(&node)
+            ));
+            node.targets = vec![TargetRef::Object(selected)];
+            node.chosen_target_slots = ChosenTargetSlots::Recorded(vec![0]);
+        }
+        for scope in [
+            PlayerScope::RecipientController,
+            PlayerScope::AllPlayers {
+                aggregate: crate::types::ability::AggregateFunction::Sum,
+                exclude: Some(Box::new(PlayerScope::RecipientController)),
+            },
+        ] {
+            let quantity = QuantityExpr::Ref {
+                qty: QuantityRef::HandSize { player: scope },
+            };
+            assert!(!declined_search_scalar_quantity_dependency(
+                &state,
+                &quantity,
+                true,
+                Some(&node)
+            ));
+            assert!(!declined_search_scalar_quantity_dependency(
+                &state, &quantity, false, None
+            ));
+            node.targets = vec![TargetRef::Object(first), TargetRef::Object(selected)];
+            node.chosen_target_slots = ChosenTargetSlots::Recorded(vec![1]);
+            assert!(declined_search_scalar_quantity_dependency(
+                &state,
+                &quantity,
+                false,
+                Some(&node)
+            ));
+            node.targets[0] = TargetRef::Object(missing);
+            assert!(
+                !declined_search_scalar_quantity_dependency(&state, &quantity, false, Some(&node)),
+                "first missing Object uses source, never later Object"
+            );
+            node.targets = vec![TargetRef::Object(selected)];
+            node.chosen_target_slots = ChosenTargetSlots::Recorded(vec![0]);
+        }
+        let pin = ObjectIncarnationRef::from_object(&state.objects[&selected]);
+        state.objects.get_mut(&selected).unwrap().incarnation += 1;
+        for delayed in [false, true] {
+            node.target_pins = if delayed { vec![] } else { vec![Some(pin)] };
+            node.target_incarnations = if delayed { vec![pin] } else { vec![] };
+            for reference in [
+                QuantityRef::NameStickerLetterCount {
+                    stickers: NameStickerSet::OnObject {
+                        scope: ObjectScope::Target,
+                    },
+                    letters: crate::types::ability::LetterQuery::Letter { letter: 'o' },
+                },
+                QuantityRef::NameStickerLetterCount {
+                    stickers: NameStickerSet::OnObject {
+                        scope: ObjectScope::Recipient,
+                    },
+                    letters: crate::types::ability::LetterQuery::Letter { letter: 'o' },
+                },
+                QuantityRef::HandSize {
+                    player: PlayerScope::RecipientController,
+                },
+                QuantityRef::ManaSpentToCast {
+                    scope: crate::types::ability::CastManaObjectScope::AbilityTarget,
+                    metric: crate::types::ability::CastManaSpentMetric::Total,
+                },
+            ] {
+                let quantity = QuantityExpr::Ref { qty: reference };
+                assert!(declined_search_scalar_quantity_dependency(
+                    &state,
+                    &quantity,
+                    declined_search_object_information(&state, &node),
+                    Some(&node)
+                ));
+                let raw = PlayerFilter::ControlsCount {
+                    relation: PlayerRelation::All,
+                    filter: TargetFilter::Typed(TypedFilter::creature()),
+                    comparator: Comparator::GE,
+                    count: Box::new(quantity.clone()),
+                };
+                let uses_source_fallback = matches!(
+                    &quantity,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::NameStickerLetterCount {
+                            stickers: NameStickerSet::OnObject {
+                                scope: ObjectScope::Recipient
+                            },
+                            ..
+                        } | QuantityRef::HandSize {
+                            player: PlayerScope::RecipientController
+                        }
+                    }
+                );
+                assert_eq!(
+                    declined_search_player_dependency(&state, &raw),
+                    !uses_source_fallback
+                );
+            }
+        }
+        node.target_pins.clear();
+        node.target_incarnations.clear();
+        state.objects.get_mut(&selected).unwrap().stickers.clear();
+        let empty_stickers = QuantityExpr::Ref {
+            qty: QuantityRef::NameStickerLetterCount {
+                stickers: NameStickerSet::OnObject {
+                    scope: ObjectScope::Target,
+                },
+                letters: crate::types::ability::LetterQuery::Letter { letter: 'o' },
+            },
+        };
+        assert!(!declined_search_scalar_quantity_dependency(
+            &state,
+            &empty_stickers,
+            true,
+            Some(&node)
+        ));
+        assert_eq!(
+            crate::game::quantity::resolve_quantity_with_targets(&state, &empty_stickers, &node),
+            0
+        );
+        for scope in [
+            crate::types::ability::CastManaObjectScope::SelfObject,
+            crate::types::ability::CastManaObjectScope::TriggeringSpell,
+        ] {
+            let quantity = QuantityExpr::Ref {
+                qty: QuantityRef::ManaSpentToCast {
+                    scope,
+                    metric: crate::types::ability::CastManaSpentMetric::Total,
+                },
+            };
+            assert!(!declined_search_scalar_quantity_dependency(
+                &state, &quantity, false, None
+            ));
+        }
+        let nested = QuantityExpr::Ref {
+            qty: QuantityRef::ManaSpentToCast {
+                scope: crate::types::ability::CastManaObjectScope::AbilityTarget,
+                metric: crate::types::ability::CastManaSpentMetric::FromSource {
+                    source_filter: TargetFilter::Typed(TypedFilter::land().properties(vec![
+                        FilterProp::Cmc {
+                            comparator: Comparator::EQ,
+                            value: QuantityExpr::Ref {
+                                qty: QuantityRef::TrackedSetSize,
+                            },
+                        },
+                    ])),
+                },
+            },
+        };
+        assert!(declined_search_scalar_quantity_dependency(
+            &state,
+            &nested,
+            true,
+            Some(&node)
+        ));
+    }
+
+    #[test]
+    fn declined_search_player_scope_axes_use_the_immediate_consumer_role() {
+        let mut scenario = GameScenario::new();
+        let source = scenario.add_creature(P0, "Scope source", 2, 2).id();
+        let selected = scenario
+            .add_creature(P0, "Scope recipient", 2, 2)
+            .controlled_by(P1)
+            .id();
+        let earlier = scenario.add_creature(P0, "Earlier unproved", 2, 2).id();
+        let mut state = scenario.build().state().clone();
+        state.players[0].poison_counters = 1;
+        state.players[1].poison_counters = 2;
+        let mut node = declined_search_test_ability(Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 0 },
+            player: TargetFilter::PlayerMatching {
+                player: Box::new(PlayerFilter::All),
+            },
+        });
+        node.targets = vec![TargetRef::Player(P1)];
+        node.target_reads = TargetReadOrigin::OwnAnnouncement;
+        node.chosen_target_slots = ChosenTargetSlots::Recorded(vec![0]);
+        for scope in [
+            PlayerScope::RecipientController,
+            PlayerScope::AllPlayers {
+                aggregate: crate::types::ability::AggregateFunction::Sum,
+                exclude: Some(Box::new(PlayerScope::RecipientController)),
+            },
+            PlayerScope::Target,
+            PlayerScope::ParentObjectTarget {
+                possession: PossessionAxis::Controller,
+            },
+            PlayerScope::AllPlayers {
+                aggregate: crate::types::ability::AggregateFunction::Sum,
+                exclude: Some(Box::new(PlayerScope::Target)),
+            },
+            PlayerScope::AllPlayers {
+                aggregate: crate::types::ability::AggregateFunction::Sum,
+                exclude: Some(Box::new(PlayerScope::ParentObjectTarget {
+                    possession: PossessionAxis::Controller,
+                })),
+            },
+        ] {
+            let needs_parent = match &scope {
+                PlayerScope::RecipientController => false,
+                PlayerScope::AllPlayers {
+                    exclude: Some(exclude),
+                    ..
+                } => !matches!(exclude.as_ref(), PlayerScope::RecipientController),
+                _ => true,
+            };
+            let player = scope;
+            for reference in [
+                QuantityRef::HandSize {
+                    player: player.clone(),
+                },
+                QuantityRef::LifeTotal {
+                    player: player.clone(),
+                },
+                QuantityRef::GraveyardSize {
+                    player: player.clone(),
+                },
+                QuantityRef::StartingLifeTotal {
+                    player: player.clone(),
+                },
+                QuantityRef::LifeLostThisTurn {
+                    player: player.clone(),
+                },
+                QuantityRef::PartySize {
+                    player: player.clone(),
+                },
+                QuantityRef::Speed {
+                    player: player.clone(),
+                },
+                QuantityRef::SacrificedThisTurn {
+                    player: player.clone(),
+                    filter: TargetFilter::Any,
+                },
+                QuantityRef::LifeGainedThisTurn {
+                    player: player.clone(),
+                },
+                QuantityRef::CardsDrawnThisTurn {
+                    player: player.clone(),
+                },
+                QuantityRef::BattlefieldEntriesThisTurn {
+                    player: player.clone(),
+                    filter: TargetFilter::Any,
+                },
+                QuantityRef::LandsPlayedThisTurn {
+                    player: player.clone(),
+                    from_zones: None,
+                },
+                QuantityRef::PlayerChosenNumber {
+                    player: player.clone(),
+                },
+                QuantityRef::LoyaltyAbilitiesActivatedThisTurn {
+                    player: player.clone(),
+                },
+                QuantityRef::CardsDiscardedThisTurn {
+                    player: player.clone(),
+                },
+                QuantityRef::TokensCreatedThisTurn {
+                    player: player.clone(),
+                    filter: TargetFilter::Any,
+                },
+                QuantityRef::PlayerActionsThisTurn {
+                    player: player.clone(),
+                    action: crate::types::events::PlayerActionKind::ShuffledLibrary,
+                },
+            ] {
+                let quantity = QuantityExpr::Ref {
+                    qty: reference.clone(),
+                };
+                if !needs_parent {
+                    let mut recipient = ResolvedAbility::new(
+                        Effect::PutCounter {
+                            target: TargetFilter::Typed(TypedFilter::creature()),
+                            count: QuantityExpr::Fixed { value: 1 },
+                            counter_type: crate::types::counter::CounterType::Plus1Plus1,
+                        },
+                        vec![TargetRef::Object(selected)],
+                        source,
+                        P0,
+                    );
+                    recipient.chosen_target_slots = ChosenTargetSlots::Recorded(vec![0]);
+                    assert!(!declined_search_scalar_quantity_dependency(
+                        &state,
+                        &quantity,
+                        true,
+                        Some(&recipient)
+                    ));
+                    recipient.targets =
+                        vec![TargetRef::Object(earlier), TargetRef::Object(selected)];
+                    recipient.chosen_target_slots = ChosenTargetSlots::Recorded(vec![1]);
+                    assert!(declined_search_scalar_quantity_dependency(
+                        &state,
+                        &quantity,
+                        false,
+                        Some(&recipient)
+                    ));
+                    recipient.targets[0] = TargetRef::Object(ObjectId(999999));
+                    assert!(!declined_search_scalar_quantity_dependency(
+                        &state,
+                        &quantity,
+                        false,
+                        Some(&recipient)
+                    ));
+                }
+
+                assert_eq!(
+                    declined_search_scalar_quantity_dependency(&state, &quantity, false, None),
+                    needs_parent
+                );
+                assert!(!declined_search_scalar_quantity_dependency(
+                    &state,
+                    &quantity,
+                    false,
+                    Some(&node)
+                ));
+                assert!(!declined_search_quantity_dependency(
+                    &state,
+                    &quantity,
+                    false,
+                    Some(&node)
+                ));
+                let attr = PlayerFilter::PlayerAttribute {
+                    relation: PlayerRelation::All,
+                    attr: Box::new(reference.clone()),
+                    comparator: Comparator::EQ,
+                    value: Box::new(QuantityExpr::Fixed { value: 0 }),
+                };
+                assert!(
+                    !declined_search_player_dependency(&state, &attr),
+                    "candidate scope is inert"
+                );
+                let value = PlayerFilter::PlayerAttribute {
+                    relation: PlayerRelation::All,
+                    attr: Box::new(QuantityRef::HandSize {
+                        player: PlayerScope::Controller,
+                    }),
+                    comparator: Comparator::EQ,
+                    value: Box::new(quantity.clone()),
+                };
+                let count = PlayerFilter::ControlsCount {
+                    relation: PlayerRelation::All,
+                    filter: TargetFilter::Typed(TypedFilter::creature()),
+                    comparator: Comparator::GE,
+                    count: Box::new(quantity.clone()),
+                };
+                for raw in [value, count] {
+                    assert_eq!(
+                        declined_search_player_dependency(&state, &raw),
+                        needs_parent
+                    );
+                    let mut outer = node.clone();
+                    outer.player_scope = Some(raw);
+                    assert_eq!(
+                        prepare_declined_search_node(&state, &outer).is_none(),
+                        needs_parent
+                    );
+                }
+                let mut amount = node.clone();
+                if let Effect::GainLife { amount, .. } = &mut amount.effect {
+                    *amount = quantity;
+                }
+                assert!(matches!(
+                    prepare_declined_search_node(&state, &amount),
+                    Some(Cow::Borrowed(_))
+                ));
+                assert_eq!(
+                    prepare_declined_search_node(&state, &amount)
+                        .unwrap()
+                        .as_ref(),
+                    &amount
+                );
+            }
+        }
+        let inert = PlayerScope::AllPlayers {
+            aggregate: crate::types::ability::AggregateFunction::Sum,
+            exclude: Some(Box::new(PlayerScope::AllPlayers {
+                aggregate: crate::types::ability::AggregateFunction::Sum,
+                exclude: Some(Box::new(PlayerScope::Target)),
+            })),
+        };
+        assert!(!declined_search_scalar_quantity_dependency(
+            &state,
+            &QuantityExpr::Ref {
+                qty: QuantityRef::HandSize { player: inert }
+            },
+            false,
+            None
+        ));
+        let unsupported = PlayerFilter::PlayerAttribute {
+            relation: PlayerRelation::All,
+            attr: Box::new(QuantityRef::TrackedSetSize),
+            comparator: Comparator::EQ,
+            value: Box::new(QuantityExpr::Fixed { value: 0 }),
+        };
+        assert!(declined_search_player_dependency(&state, &unsupported));
+    }
+
+    #[test]
+    fn declined_search_target_controller_scalar_preserves_ordered_authority() {
+        let mut scenario = GameScenario::new();
+        let source = scenario
+            .add_artifact_from_oracle(P0, "Scalar source", "")
+            .id();
+        let object = scenario
+            .add_creature(P0, "Controlled by P1", 2, 2)
+            .with_mana_cost(crate::types::mana::ManaCost::generic(2))
+            .id();
+        let mut state = scenario.build().state().clone();
+        state.objects.get_mut(&object).unwrap().controller = P1;
+        state.players[0].poison_counters = 1;
+        state.players[1].poison_counters = 2;
+        let scalar = QuantityExpr::Ref {
+            qty: QuantityRef::TargetControllerCounter {
+                kind: crate::types::player::PlayerCounterKind::Poison,
+            },
+        };
+        let nested = QuantityExpr::Ref {
+            qty: QuantityRef::ZoneCardCount {
+                zone: crate::types::ability::ZoneRef::Hand,
+                scope: crate::types::ability::CountScope::Controller,
+                card_types: vec![],
+                filter: Some(TargetFilter::Typed(TypedFilter::card().properties(vec![
+                    FilterProp::Cmc {
+                        comparator: Comparator::EQ,
+                        value: scalar.clone(),
+                    },
+                ]))),
+            },
+        };
+        let mut node = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: scalar.clone(),
+                player: TargetFilter::PlayerMatching {
+                    player: Box::new(PlayerFilter::All),
+                },
+            },
+            vec![TargetRef::Player(P1)],
+            source,
+            P0,
+        );
+        node.target_reads = TargetReadOrigin::OwnAnnouncement;
+        node.chosen_target_slots = ChosenTargetSlots::Recorded(vec![0]);
+        for quantity in [&scalar, &nested] {
+            assert!(!declined_search_scalar_quantity_dependency(
+                &state,
+                quantity,
+                false,
+                Some(&node)
+            ));
+            assert!(!declined_search_quantity_dependency(
+                &state,
+                quantity,
+                false,
+                Some(&node)
+            ));
+            assert!(declined_search_scalar_quantity_dependency(
+                &state, quantity, true, None
+            ));
+        }
+        assert_eq!(
+            crate::game::quantity::resolve_quantity_with_targets(&state, &scalar, &node),
+            2
+        );
+        assert!(matches!(
+            prepare_declined_search_node(&state, &node),
+            Some(Cow::Borrowed(_))
+        ));
+        let mut no_declaration = node.clone();
+        no_declaration.effect = Effect::GainLife {
+            amount: scalar.clone(),
+            player: TargetFilter::Controller,
+        };
+        assert!(
+            prepare_declined_search_node(&state, &no_declaration).is_none(),
+            "OwnAnnouncement plus arbitrary target is not a declaration"
+        );
+        let mut raw_outer = node.clone();
+        raw_outer.effect = Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+            player: TargetFilter::PlayerMatching {
+                player: Box::new(PlayerFilter::All),
+            },
+        };
+        raw_outer.player_scope = Some(PlayerFilter::ControlsCount {
+            relation: PlayerRelation::All,
+            filter: TargetFilter::Typed(TypedFilter::creature()),
+            comparator: Comparator::GE,
+            count: Box::new(scalar.clone()),
+        });
+        assert!(
+            prepare_declined_search_node(&state, &raw_outer).is_none(),
+            "raw player count receives None despite an actual selected P1"
+        );
+        for origin in [
+            TargetReadOrigin::OwnAnnouncement,
+            TargetReadOrigin::ParentAnnouncement,
+        ] {
+            let mut unavailable = node.clone();
+            unavailable.targets.clear();
+            unavailable.target_pins.clear();
+            unavailable.chosen_target_slots = ChosenTargetSlots::Recorded(vec![]);
+            unavailable.target_reads = origin;
+            assert!(declined_search_scalar_quantity_dependency(
+                &state,
+                &scalar,
+                false,
+                Some(&unavailable)
+            ));
+            assert!(prepare_declined_search_node(&state, &unavailable).is_none());
+            let mut unproved = node.clone();
+            unproved.target_reads = TargetReadOrigin::ParentAnnouncement;
+            assert!(prepare_declined_search_node(&state, &unproved).is_none());
+        }
+        for (targets, expected) in [
+            (vec![TargetRef::Player(P0), TargetRef::Object(object)], 1),
+            (vec![TargetRef::Object(object), TargetRef::Player(P0)], 2),
+        ] {
+            node.targets = targets;
+            node.target_pins = node
+                .targets
+                .iter()
+                .map(|target| match target {
+                    TargetRef::Object(_) => Some(
+                        crate::types::identifiers::ObjectIncarnationRef::from_object(
+                            &state.objects[&object],
+                        ),
+                    ),
+                    TargetRef::Player(_) => None,
+                })
+                .collect();
+            node.chosen_target_slots = ChosenTargetSlots::Recorded(vec![0, 1]);
+            assert!(declined_search_object_information(&state, &node));
+            assert!(!declined_search_scalar_quantity_dependency(
+                &state,
+                &scalar,
+                true,
+                Some(&node)
+            ));
+            assert_eq!(
+                crate::game::quantity::resolve_quantity_with_targets(&state, &scalar, &node),
+                expected
+            );
+            let first_object = QuantityExpr::Ref {
+                qty: QuantityRef::ObjectManaValue {
+                    scope: ObjectScope::Target,
+                },
+            };
+            assert!(!declined_search_scalar_quantity_dependency(
+                &state,
+                &first_object,
+                declined_search_object_information(&state, &node),
+                Some(&node)
+            ));
+            assert_eq!(
+                crate::game::quantity::resolve_quantity_with_targets(&state, &first_object, &node),
+                2
+            );
+        }
+        let mut hostile = node.clone();
+        hostile.chosen_target_slots = ChosenTargetSlots::Recorded(vec![1]);
+        assert!(
+            prepare_declined_search_node(&state, &hostile).is_none(),
+            "the earlier resolvable but unselected Object cannot be skipped"
+        );
+        let pin =
+            crate::types::identifiers::ObjectIncarnationRef::from_object(&state.objects[&object]);
+        state.objects.get_mut(&object).unwrap().incarnation += 1;
+        assert!(
+            prepare_declined_search_node(&state, &node).is_none(),
+            "positional stale pin refuses"
+        );
+        node.target_pins.clear();
+        node.target_incarnations = vec![pin];
+        assert!(
+            prepare_declined_search_node(&state, &node).is_none(),
+            "delayed stale pin refuses"
+        );
+        node.target_incarnations.clear();
+        assert!(matches!(
+            prepare_declined_search_node(&state, &node),
+            Some(Cow::Borrowed(_))
+        ));
+        let current_pin =
+            crate::types::identifiers::ObjectIncarnationRef::from_object(&state.objects[&object]);
+        let mut duplicate = node.clone();
+        duplicate.targets = vec![TargetRef::Object(object), TargetRef::Object(object)];
+        duplicate.chosen_target_slots = ChosenTargetSlots::Recorded(vec![0, 1]);
+        duplicate.target_pins = vec![Some(pin), Some(current_pin)];
+        assert!(
+            prepare_declined_search_node(&state, &duplicate).is_none(),
+            "later current occurrence of the same id cannot rescue a stale first occurrence"
+        );
+        duplicate.target_pins = vec![Some(current_pin), Some(pin)];
+        assert!(matches!(
+            prepare_declined_search_node(&state, &duplicate),
+            Some(Cow::Borrowed(_))
+        ));
+        node.targets = vec![TargetRef::Object(ObjectId(u64::MAX)), TargetRef::Player(P1)];
+        node.target_pins.clear();
+        node.chosen_target_slots = ChosenTargetSlots::Recorded(vec![1]);
+        assert!(
+            !declined_search_scalar_quantity_dependency(&state, &scalar, false, Some(&node)),
+            "an actually unresolvable Object is skipped by the real helper"
+        );
+        assert_eq!(
+            crate::game::quantity::resolve_quantity_with_targets(&state, &scalar, &node),
+            2
+        );
+        // Raw player values never inherit this same outer ability's targets.
+        for player in [
+            PlayerFilter::ControlsCount {
+                relation: PlayerRelation::All,
+                filter: TargetFilter::Typed(TypedFilter::creature()),
+                comparator: Comparator::GE,
+                count: Box::new(scalar.clone()),
+            },
+            PlayerFilter::PlayerAttribute {
+                relation: PlayerRelation::All,
+                attr: Box::new(QuantityRef::LifeTotal {
+                    player: crate::types::ability::PlayerScope::Controller,
+                }),
+                comparator: Comparator::GE,
+                value: Box::new(scalar.clone()),
+            },
+        ] {
+            assert!(declined_search_player_dependency(&state, &player));
+        }
+        node.targets = vec![TargetRef::Player(P1)];
+        node.chosen_target_slots = ChosenTargetSlots::Unrecorded;
+        assert!(
+            !declined_search_scalar_quantity_dependency(&state, &scalar, false, Some(&node)),
+            "legacy genuine Player declaration retains its role"
+        );
+        node.effect = Effect::PutCounter {
+            counter_type: crate::types::counter::CounterType::Plus1Plus1,
+            count: scalar.clone(),
+            target: TargetFilter::Typed(TypedFilter::creature()),
+        };
+        node.targets = vec![TargetRef::Object(object)];
+        assert!(!declined_search_scalar_quantity_dependency(
+            &state,
+            &scalar,
+            true,
+            Some(&node)
+        ));
+        assert_eq!(
+            crate::game::quantity::resolve_quantity_with_targets(&state, &scalar, &node),
+            2
+        );
+        assert!(matches!(
+            prepare_declined_search_node(&state, &node),
+            Some(Cow::Borrowed(_))
+        ));
+        for missing in [true, false] {
+            let value = QuantityExpr::Ref {
+                qty: QuantityRef::TargetObjectManaValue {
+                    filter: Box::new(TargetFilter::Typed(TypedFilter::creature().properties(
+                        vec![FilterProp::Cmc {
+                            comparator: Comparator::GE,
+                            value: if missing {
+                                QuantityExpr::Ref {
+                                    qty: QuantityRef::TrackedSetSize,
+                                }
+                            } else {
+                                QuantityExpr::Fixed { value: 0 }
+                            },
+                        }],
+                    ))),
+                },
+            };
+            assert_eq!(
+                declined_search_scalar_quantity_dependency(&state, &value, true, Some(&node)),
+                missing
+            );
+            if let Effect::PutCounter { count, .. } = &mut node.effect {
+                *count = value;
+            }
+            assert_eq!(
+                prepare_declined_search_node(&state, &node).is_none(),
+                missing
+            );
+        }
+        if let Effect::PutCounter { count, .. } = &mut node.effect {
+            *count = scalar.clone();
+        }
+        node.targets.clear();
+        assert!(
+            declined_search_owns_target(&node),
+            "optional-empty structural object declaration is retained"
+        );
+        assert!(
+            prepare_declined_search_node(&state, &node).is_none(),
+            "empty declaration supplies no scalar information"
+        );
+    }
+
+    #[test]
+    fn declined_search_target_controller_scalar_keeps_captured_context_after_departure() {
+        let mut state = GameState::new_two_player(42);
+        state.players[0].poison_counters = 1;
+        state.players[1].poison_counters = 2;
+        let object = ObjectId(765);
+        let mut event = zone_change_event(object, Zone::Battlefield, Zone::Graveyard, 2);
+        if let GameEvent::ZoneChanged { record, .. } = &mut event {
+            record.controller = P1;
+        }
+        let snapshot = parent_referent_context_from_events(&state, &[event])
+            .expect("actual moved referent capture");
+        assert_eq!(snapshot.object_id, object);
+        assert_eq!(snapshot.lki.controller, P1);
+        let parent = declined_search_test_ability(Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+            player: TargetFilter::Controller,
+        });
+        let scalar = QuantityExpr::Ref {
+            qty: QuantityRef::TargetControllerCounter {
+                kind: crate::types::player::PlayerCounterKind::Poison,
+            },
+        };
+        let mut child = declined_search_test_ability(Effect::GainLife {
+            amount: scalar.clone(),
+            player: TargetFilter::Controller,
+        });
+        apply_parent_chain_context(&mut child, &parent, Some(&snapshot), &mut state);
+        assert_eq!(
+            child.effect_context_object.as_ref().unwrap().object_id,
+            object
+        );
+        assert!(!state.objects.contains_key(&object));
+        state.last_revealed_ids = vec![ObjectId(999)];
+        assert_eq!(
+            crate::game::ability_utils::parent_target_controller(&child, &state),
+            Some(P1)
+        );
+        assert_eq!(
+            crate::game::quantity::resolve_quantity_with_targets(&state, &scalar, &child),
+            2
+        );
+        for origin in [
+            TargetReadOrigin::OwnAnnouncement,
+            TargetReadOrigin::ParentAnnouncement,
+        ] {
+            child.target_reads = origin;
+            let Some(Cow::Borrowed(retained)) = prepare_declined_search_node(&state, &child) else {
+                panic!("frozen controller metadata remains available");
+            };
+            assert!(retained.effect_context_object == child.effect_context_object);
+            assert!(!declined_search_quantity_dependency(
+                &state,
+                &scalar,
+                false,
+                Some(&child)
+            ));
+        }
+        let mut unresolved = child.clone();
+        unresolved.targets = vec![TargetRef::Object(ObjectId(u64::MAX))];
+        assert!(
+            matches!(
+                prepare_declined_search_node(&state, &unresolved),
+                Some(Cow::Borrowed(_))
+            ),
+            "only a genuinely unresolvable target permits the actual snapshot fallback"
+        );
+        let mut shadowed = child.clone();
+        shadowed.targets = vec![TargetRef::Player(P0)];
+        assert!(
+            prepare_declined_search_node(&state, &shadowed).is_none(),
+            "a resolvable unproved Player prevents falling through to context"
+        );
+        let mut missing = child.clone();
+        missing.effect_context_object = None;
+        assert!(prepare_declined_search_node(&state, &missing).is_none());
+        let raw = PlayerFilter::ControlsCount {
+            relation: PlayerRelation::All,
+            filter: TargetFilter::Typed(TypedFilter::creature()),
+            comparator: Comparator::GE,
+            count: Box::new(scalar),
+        };
+        assert!(declined_search_player_dependency(&state, &raw));
+    }
+
+    #[test]
+    fn declined_search_rebound_counter_descriptor_preserves_population_gate() {
+        let mut scenario = GameScenario::new();
+        let artifact = scenario
+            .add_artifact_from_oracle(P0, "Independent artifact", "")
+            .id();
+        let creature = scenario.add_creature(P0, "Independent creature", 3, 3).id();
+        let opponent = scenario
+            .add_artifact_from_oracle(P1, "Opponent artifact", "")
+            .id();
+        let runner = scenario.build();
+        let absent = TargetFilter::Typed(TypedFilter::creature().properties(vec![
+            FilterProp::InTrackedSet {
+                id: TrackedSetId(0),
+            },
+        ]));
+        let independent = TargetFilter::Typed(
+            TypedFilter::new(crate::types::ability::TypeFilter::Artifact)
+                .controller(ControllerRef::You),
+        );
+        let descriptor = TargetFilter::Or {
+            filters: vec![absent.clone(), independent.clone()],
+        };
+        let mut bound_absent = absent.clone();
+        let TargetFilter::Typed(typed) = &mut bound_absent else {
+            unreachable!()
+        };
+        typed.properties[0] = FilterProp::AnyOf { props: vec![] };
+        let expected_descriptor = TargetFilter::Or {
+            filters: vec![bound_absent, independent.clone()],
+        };
+        for typed in [false, true] {
+            let effect = if typed {
+                Effect::MultiplyCounter {
+                    counter_type: crate::types::counter::CounterType::Plus1Plus1,
+                    multiplier: 2,
+                    target: descriptor.clone(),
+                }
+            } else {
+                Effect::Double {
+                    target_kind: crate::types::ability::DoubleTarget::Counters {
+                        counter_type: None,
+                    },
+                    target: descriptor.clone(),
+                }
+            };
+            let mut node = ResolvedAbility::new(effect, vec![], artifact, P0);
+            node.target_choice_timing = TargetChoiceTiming::Resolution;
+            assert!(node.targets.is_empty());
+            assert!(node.multi_target.is_none());
+            assert!(!node.optional_targeting);
+            assert!(descriptor.names_enumerable_population());
+            assert_eq!(
+                counters::nontargeted_counter_population_ids(runner.state(), &node, &descriptor),
+                Some(vec![artifact])
+            );
+            let prepared = prepare_declined_search_node(&GameState::new_two_player(42), &node)
+                .expect("independent artifact survives");
+            assert!(matches!(prepared, Cow::Owned(_)));
+            let bound = prepared.effect.target_filter().unwrap();
+            assert_eq!(bound, &expected_descriptor);
+            assert!(bound.names_enumerable_population());
+            assert_eq!(
+                counters::nontargeted_counter_population_ids(runner.state(), &prepared, bound),
+                Some(vec![artifact])
+            );
+            let mut parent = node.clone();
+            parent.targets = vec![TargetRef::Object(creature)];
+            assert!(!should_propagate_parent_targets(&parent, &prepared));
+            assert_eq!(parent.targets, vec![TargetRef::Object(creature)]);
+            for guard in 0..4 {
+                let mut refused = prepared.clone().into_owned();
+                match guard {
+                    0 => refused.target_choice_timing = TargetChoiceTiming::Stack,
+                    1 => refused.targets = vec![TargetRef::Object(creature)],
+                    // Local API-only control: Oracle does not currently emit this bit.
+                    2 => refused.optional_targeting = true,
+                    3 => {
+                        refused.multi_target =
+                            Some(crate::types::ability::MultiTargetSpec::fixed(0, 2))
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    counters::nontargeted_counter_population_ids(runner.state(), &refused, bound),
+                    None
+                );
+            }
+            for unclassified in [
+                TargetFilter::Any,
+                TargetFilter::Typed(TypedFilter::default()),
+                TargetFilter::Or { filters: vec![] },
+            ] {
+                assert_eq!(
+                    counters::nontargeted_counter_population_ids(
+                        runner.state(),
+                        &prepared,
+                        &unclassified
+                    ),
+                    None
+                );
+            }
+        }
+        // True constants keep their original Typed/Not(Typed) envelopes. This
+        // intentionally broad typed API predicate matches every battlefield object.
+        let mut broad = TargetFilter::Or {
+            filters: vec![
+                TargetFilter::Not {
+                    filter: Box::new(absent.clone()),
+                },
+                independent.clone(),
+            ],
+        };
+        let original = broad.clone();
+        assert!(original.names_enumerable_population());
+        assert_eq!(
+            crate::game::filter::bind_absent_search_predicate(&mut broad),
+            Some(Some(true))
+        );
+        assert!(broad.names_enumerable_population());
+        let mut node = declined_search_test_ability(Effect::Double {
+            target_kind: crate::types::ability::DoubleTarget::Counters { counter_type: None },
+            target: broad.clone(),
+        });
+        node.target_choice_timing = TargetChoiceTiming::Resolution;
+        let mut expected = vec![artifact, creature, opponent];
+        expected.sort();
+        for descriptor in [&original, &broad] {
+            let mut ids =
+                counters::nontargeted_counter_population_ids(runner.state(), &node, descriptor)
+                    .unwrap();
+            ids.sort();
+            assert_eq!(ids, expected);
+        }
+        for (mut descriptor, mut selected) in [
+            (
+                TargetFilter::And {
+                    filters: vec![
+                        independent.clone(),
+                        TargetFilter::Not {
+                            filter: Box::new(absent.clone()),
+                        },
+                    ],
+                },
+                vec![artifact],
+            ),
+            (
+                TargetFilter::Not {
+                    filter: Box::new(absent.clone()),
+                },
+                vec![artifact, creature, opponent],
+            ),
+        ] {
+            let original = descriptor.clone();
+            assert!(original.names_enumerable_population());
+            assert!(crate::game::filter::bind_absent_search_predicate(&mut descriptor).is_some());
+            assert!(descriptor.names_enumerable_population());
+            selected.sort();
+            for descriptor in [&original, &descriptor] {
+                let mut ids =
+                    counters::nontargeted_counter_population_ids(runner.state(), &node, descriptor)
+                        .unwrap();
+                ids.sort();
+                assert_eq!(ids, selected);
+            }
+        }
+        let mut property_only =
+            TargetFilter::Typed(TypedFilter::default().properties(vec![FilterProp::Not {
+                prop: Box::new(FilterProp::InTrackedSet {
+                    id: TrackedSetId(0),
+                }),
+            }]));
+        let original_property_only = property_only.clone();
+        assert!(property_only.names_enumerable_population());
+        assert_eq!(
+            crate::game::filter::bind_absent_search_predicate(&mut property_only),
+            Some(Some(true))
+        );
+        assert!(property_only.names_enumerable_population());
+        assert!(!property_only.denotes_battlefield_objects());
+        assert!(
+            matches!(&property_only, TargetFilter::Typed(tf) if tf.properties == vec![FilterProp::Not { prop: Box::new(FilterProp::AnyOf { props: vec![] }) }])
+        );
+        for descriptor in [&original_property_only, &property_only] {
+            let mut ids =
+                counters::nontargeted_counter_population_ids(runner.state(), &node, descriptor)
+                    .unwrap();
+            ids.sort();
+            assert_eq!(ids, expected);
+        }
+        let mut private = TargetFilter::Or {
+            filters: vec![
+                TargetFilter::Typed(TypedFilter::creature().properties(vec![
+                    FilterProp::InZone {
+                        zone: Zone::Graveyard,
+                    },
+                    FilterProp::InTrackedSet {
+                        id: TrackedSetId(0),
+                    },
+                ])),
+                independent,
+            ],
+        };
+        assert_eq!(
+            counters::nontargeted_counter_population_ids(runner.state(), &node, &private),
+            None
+        );
+        assert_eq!(
+            crate::game::filter::bind_absent_search_predicate(&mut private),
+            Some(None)
+        );
+        assert!(
+            matches!(&private, TargetFilter::Or { filters } if matches!(&filters[0], TargetFilter::Typed(tf) if tf.properties[0] == (FilterProp::InZone { zone: Zone::Graveyard })))
+        );
+        assert_eq!(
+            counters::nontargeted_counter_population_ids(runner.state(), &node, &private),
+            None
+        );
+        let impossible = declined_search_test_ability(Effect::Double {
+            target_kind: crate::types::ability::DoubleTarget::Counters { counter_type: None },
+            target: absent,
+        });
+        let mut impossible = impossible;
+        impossible.target_choice_timing = TargetChoiceTiming::Resolution;
+        assert!(
+            prepare_declined_search_node(&GameState::new_two_player(42), &impossible).is_none()
+        );
+    }
+
+    #[test]
+    fn declined_search_rebound_host_preserves_object_population_gate() {
+        let mut scenario = GameScenario::new();
+        let equipment = scenario
+            .add_artifact_from_oracle(P0, "Equipment", "")
+            .with_subtypes(vec!["Equipment"])
+            .id();
+        let first = scenario.add_creature(P0, "First host", 3, 3).id();
+        let second = scenario.add_creature(P0, "Second host", 3, 3).id();
+        let _opponent = scenario.add_creature(P1, "Opponent", 3, 3).id();
+        let mut runner = scenario.build();
+        let absent = TargetFilter::Typed(TypedFilter::creature().properties(vec![
+            FilterProp::InTrackedSet {
+                id: TrackedSetId(0),
+            },
+        ]));
+        let independent =
+            TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You));
+        let host = TargetFilter::Or {
+            filters: vec![absent, independent],
+        };
+        let mut node = declined_search_test_ability(Effect::Attach {
+            attachment: TargetFilter::SpecificObject { id: equipment },
+            target: host.clone(),
+            selection: crate::types::ability::AttachSelection::Targeted,
+        });
+        node.source_id = equipment;
+        node.target_choice_timing = TargetChoiceTiming::Resolution;
+        assert!(host.denotes_battlefield_objects());
+        assert!(host.names_enumerable_population());
+        let prepared = prepare_declined_search_node(&GameState::new_two_player(42), &node).unwrap();
+        assert!(matches!(prepared, Cow::Owned(_)));
+        let Effect::Attach {
+            attachment, target, ..
+        } = &prepared.effect
+        else {
+            unreachable!()
+        };
+        assert_eq!(attachment, &TargetFilter::SpecificObject { id: equipment });
+        assert!(target.denotes_battlefield_objects());
+        assert!(
+            matches!(target, TargetFilter::Or { filters } if matches!(&filters[0], TargetFilter::Typed(tf) if tf.properties == vec![FilterProp::AnyOf { props: vec![] }]))
+        );
+        // Supplemental actual consumer check; the integration test also reaches
+        // this prompt through cast/payment and the public optional decision.
+        resolve_ability_chain(runner.state_mut(), &prepared, &mut Vec::new(), 0).unwrap();
+        let WaitingFor::EffectZoneChoice {
+            cards, effect_kind, ..
+        } = &runner.state().waiting_for
+        else {
+            panic!("expected host choice")
+        };
+        assert_eq!(*effect_kind, EffectKind::Attach);
+        let mut cards = cards.clone();
+        cards.sort();
+        let mut expected = vec![first, second];
+        expected.sort();
+        assert_eq!(cards, expected);
+        let mut absent_attachment = node.clone();
+        let Effect::Attach { attachment, .. } = &mut absent_attachment.effect else {
+            unreachable!()
+        };
+        *attachment = TargetFilter::ParentTarget;
+        assert!(
+            prepare_declined_search_node(&GameState::new_two_player(42), &absent_attachment)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn declined_search_host_truth_and_refusal_controls_keep_actual_candidates() {
+        let mut scenario = GameScenario::new();
+        let equipment = scenario
+            .add_artifact_from_oracle(P0, "Equipment", "")
+            .with_subtypes(vec!["Equipment"])
+            .id();
+        let first = scenario.add_creature(P0, "First host", 3, 3).id();
+        let second = scenario.add_creature(P0, "Second host", 3, 3).id();
+        let opponent = scenario.add_creature(P1, "Opponent host", 3, 3).id();
+        let baseline = scenario.build().state().clone();
+        let absent = TargetFilter::Typed(TypedFilter::creature().properties(vec![
+            FilterProp::InTrackedSet {
+                id: TrackedSetId(0),
+            },
+        ]));
+        let independent =
+            TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You));
+        for (host, mut expected) in [
+            (
+                TargetFilter::And {
+                    filters: vec![
+                        independent.clone(),
+                        TargetFilter::Not {
+                            filter: Box::new(absent.clone()),
+                        },
+                    ],
+                },
+                vec![first, second],
+            ),
+            // Deliberately broad typed API reading: the true Not(Typed(false))
+            // leg admits opponent creatures too; real Equipment legality still applies.
+            (
+                TargetFilter::Or {
+                    filters: vec![
+                        TargetFilter::Not {
+                            filter: Box::new(absent.clone()),
+                        },
+                        independent,
+                    ],
+                },
+                vec![first, second, opponent],
+            ),
+        ] {
+            assert!(host.denotes_battlefield_objects());
+            let mut node = declined_search_test_ability(Effect::Attach {
+                attachment: TargetFilter::SpecificObject { id: equipment },
+                target: host,
+                selection: crate::types::ability::AttachSelection::Targeted,
+            });
+            node.source_id = equipment;
+            node.target_choice_timing = TargetChoiceTiming::Resolution;
+            let prepared =
+                prepare_declined_search_node(&GameState::new_two_player(42), &node).unwrap();
+            let target = prepared.effect.target_filter().unwrap();
+            assert!(target.names_enumerable_population());
+            assert!(target.denotes_battlefield_objects());
+            for consumer in [&node, prepared.as_ref()] {
+                let mut state = baseline.clone();
+                resolve_ability_chain(&mut state, consumer, &mut Vec::new(), 0).unwrap();
+                let WaitingFor::EffectZoneChoice {
+                    cards, effect_kind, ..
+                } = &state.waiting_for
+                else {
+                    panic!("expected host choice")
+                };
+                assert_eq!(*effect_kind, EffectKind::Attach);
+                let mut cards = cards.clone();
+                cards.sort();
+                expected.sort();
+                assert_eq!(cards, expected);
+            }
+        }
+        let property_only =
+            TargetFilter::Typed(TypedFilter::default().properties(vec![FilterProp::Not {
+                prop: Box::new(FilterProp::InTrackedSet {
+                    id: TrackedSetId(0),
+                }),
+            }]));
+        for mut refused in [
+            property_only,
+            TargetFilter::Player,
+            TargetFilter::Any,
+            TargetFilter::Typed(TypedFilter::default()),
+            TargetFilter::Or { filters: vec![] },
+            TargetFilter::Typed(TypedFilter::creature().properties(vec![
+                FilterProp::InZone { zone: Zone::Hand },
+                FilterProp::Not {
+                    prop: Box::new(FilterProp::InTrackedSet {
+                        id: TrackedSetId(0),
+                    }),
+                },
+            ])),
+            TargetFilter::Typed(TypedFilter::creature().properties(vec![
+                FilterProp::InAnyZone {
+                    zones: vec![Zone::Library, Zone::Graveyard],
+                },
+                FilterProp::InTrackedSet {
+                    id: TrackedSetId(0),
+                },
+            ])),
+        ] {
+            assert!(!refused.denotes_battlefield_objects());
+            assert!(crate::game::filter::bind_absent_search_predicate(&mut refused).is_some());
+            assert!(!refused.denotes_battlefield_objects());
+        }
+        let mut empty = declined_search_test_ability(Effect::Attach {
+            attachment: TargetFilter::SpecificObject { id: equipment },
+            target: absent,
+            selection: crate::types::ability::AttachSelection::Targeted,
+        });
+        empty.target_choice_timing = TargetChoiceTiming::Resolution;
+        assert!(prepare_declined_search_node(&GameState::new_two_player(42), &empty).is_none());
+    }
+
+    #[test]
+    fn declined_search_quantity_populations_bind_before_final_dependency_and_resolve() {
+        let mut scenario = GameScenario::new();
+        let artifact = scenario
+            .add_artifact_from_oracle(P0, "Independent artifact", "")
+            .id();
+        scenario.add_creature(P0, "Nonmember creature", 3, 3);
+        let mut runner = scenario.build();
+        let filter = TargetFilter::Or {
+            filters: vec![
+                TargetFilter::Typed(TypedFilter::creature().properties(vec![
+                    FilterProp::InTrackedSet {
+                        id: TrackedSetId(0),
+                    },
+                ])),
+                TargetFilter::Typed(
+                    TypedFilter::new(crate::types::ability::TypeFilter::Artifact)
+                        .controller(ControllerRef::You),
+                ),
+            ],
+        };
+        let mut expected_filter = filter.clone();
+        let TargetFilter::Or { filters } = &mut expected_filter else {
+            unreachable!()
+        };
+        let TargetFilter::Typed(first) = &mut filters[0] else {
+            unreachable!()
+        };
+        first.properties[0] = FilterProp::AnyOf { props: vec![] };
+        let source = CardTypeSetSource::Objects {
+            filter: filter.clone(),
+        };
+        for quantity in [
+            QuantityRef::DistinctCardTypes {
+                source: source.clone(),
+            },
+            QuantityRef::SharedCardTypes {
+                source: source.clone(),
+            },
+            QuantityRef::DistinctSubtypes {
+                source: source.clone(),
+                exclude: Default::default(),
+            },
+            QuantityRef::DistinctColorsAmong {
+                source: source.clone(),
+            },
+            QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    crate::types::ability::AggregateFunction::Sum,
+                    crate::types::ability::ObjectProperty::Power,
+                    source,
+                )
+                .unwrap(),
+            ),
+        ] {
+            let node = ResolvedAbility::new(
+                Effect::GainLife {
+                    amount: QuantityExpr::Ref { qty: quantity },
+                    player: TargetFilter::Controller,
+                },
+                vec![],
+                artifact,
+                P0,
+            );
+            let prepared = prepare_declined_search_node(&GameState::new_two_player(42), &node)
+                .expect("independent population survives");
+            assert!(matches!(prepared, Cow::Owned(_)));
+            let Effect::GainLife {
+                amount: QuantityExpr::Ref { qty },
+                ..
+            } = &prepared.effect
+            else {
+                unreachable!()
+            };
+            let source = match qty {
+                QuantityRef::DistinctCardTypes { source }
+                | QuantityRef::SharedCardTypes { source }
+                | QuantityRef::DistinctSubtypes { source, .. }
+                | QuantityRef::DistinctColorsAmong { source } => source,
+                QuantityRef::PropertyAggregate(aggregate) => aggregate.source(),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                source,
+                &CardTypeSetSource::Objects {
+                    filter: expected_filter.clone()
+                }
+            );
+        }
+        let node = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount { filter },
+                },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            artifact,
+            P0,
+        );
+        let prepared = prepare_declined_search_node(&GameState::new_two_player(42), &node).unwrap();
+        assert!(matches!(prepared, Cow::Owned(_)));
+        let Effect::GainLife { amount, .. } = &prepared.effect else {
+            unreachable!()
+        };
+        assert_eq!(
+            amount,
+            &QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: expected_filter
+                }
+            }
+        );
+        assert_eq!(
+            crate::game::quantity::resolve_quantity(runner.state(), amount, P0, artifact),
+            1
+        );
+        resolve_ability_chain(runner.state_mut(), &prepared, &mut Vec::new(), 0).unwrap();
+        assert_eq!(
+            runner.state().players[0].life,
+            21,
+            "the retained operative expression reaches the real life consumer"
+        );
+        let unresolved = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(
+                            TypedFilter::creature()
+                                .properties(vec![FilterProp::SameNameAsParentTarget]),
+                        ),
+                    },
+                },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            artifact,
+            P0,
+        );
+        assert!(
+            prepare_declined_search_node(&GameState::new_two_player(42), &unresolved).is_none(),
+            "a reference without absent-membership semantics remains dependent after binding"
+        );
+    }
+
+    #[test]
+    fn declined_search_empty_discard_alternative_keeps_the_ordinary_choice() {
+        let mut scenario = GameScenario::new();
+        let source = scenario.add_artifact_from_oracle(P0, "Source", "").id();
+        let first = scenario.add_spell_to_hand(P0, "First discard", false).id();
+        let second = scenario.add_spell_to_hand(P0, "Second discard", false).id();
+        let third = scenario.add_spell_to_hand(P0, "Third discard", false).id();
+        let mut runner = scenario.build();
+        let effect: Effect = serde_json::from_value(serde_json::json!({
+            "type":"Discard", "count":{"type":"Fixed","value":2},
+            "target":{"type":"Controller"},
+            "unless_filter":{"type":"Typed","type_filters":["Creature"],"properties":[{"type":"InTrackedSet","id":0}]}
+        })).unwrap();
+        let node = ResolvedAbility::new(effect, vec![], source, P0);
+        let prepared = prepare_declined_search_node(&GameState::new_two_player(42), &node).unwrap();
+        assert!(matches!(prepared, Cow::Owned(_)));
+        assert!(
+            matches!(&prepared.effect, Effect::Discard { unless_filter: Some(TargetFilter::Typed(tf)), .. } if tf.properties == vec![FilterProp::AnyOf { props: vec![] }])
+        );
+        resolve_ability_chain(runner.state_mut(), &prepared, &mut Vec::new(), 0).unwrap();
+        let WaitingFor::DiscardChoice {
+            player,
+            count,
+            cards,
+            unless_filter,
+            ..
+        } = &runner.state().waiting_for
+        else {
+            panic!("ordinary discard remains available")
+        };
+        assert_eq!(*player, P0);
+        assert_eq!(*count, 2);
+        let mut cards = cards.clone();
+        cards.sort();
+        let mut expected = vec![first, second, third];
+        expected.sort();
+        assert_eq!(cards, expected);
+        assert!(
+            matches!(unless_filter, Some(TargetFilter::Typed(tf)) if tf.properties == vec![FilterProp::AnyOf { props: vec![] }])
+        );
+    }
+
+    #[test]
+    fn declined_search_secondary_inputs_precede_owned_application_and_freshness() {
+        let mut own = declined_search_test_ability(Effect::GenericEffect {
+            target: Some(TargetFilter::Typed(TypedFilter::creature())),
+            static_abilities: vec![
+                StaticDefinition::continuous().affected(TargetFilter::ParentTarget)
+            ],
+            duration: None,
+            end_cost: None,
+        });
+        assert!(declined_search_owns_target(&own));
+        assert!(matches!(
+            prepare_declined_search_node(&GameState::new_two_player(42), &own),
+            Some(Cow::Borrowed(_))
+        ));
+        own.repeat_for = Some(QuantityExpr::Ref {
+            qty: QuantityRef::TrackedSetSize,
+        });
+        assert!(prepare_declined_search_node(&GameState::new_two_player(42), &own).is_none());
+        own.repeat_for = None;
+        let mut chosen_host = declined_search_test_ability(Effect::Attach {
+            attachment: TargetFilter::ParentTarget,
+            target: TargetFilter::Typed(TypedFilter::creature()),
+            selection: crate::types::ability::AttachSelection::Targeted,
+        });
+        assert!(declined_search_owns_target(&chosen_host));
+        assert!(
+            prepare_declined_search_node(&GameState::new_two_player(42), &chosen_host).is_none(),
+            "own host does not own the missing secondary attachment"
+        );
+        if let Effect::Attach { attachment, .. } = &mut chosen_host.effect {
+            *attachment = TargetFilter::SpecificObject { id: ObjectId(7) };
+        }
+        assert!(matches!(
+            prepare_declined_search_node(&GameState::new_two_player(42), &chosen_host),
+            Some(Cow::Borrowed(_))
+        ));
+        for value in [
+            QuantityExpr::Ref {
+                qty: QuantityRef::TrackedSetSize,
+            },
+            QuantityExpr::Fixed { value: 1 },
+            QuantityExpr::Ref {
+                qty: QuantityRef::TurnsTaken,
+            },
+        ] {
+            let dependent = matches!(
+                value,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::TrackedSetSize
+                }
+            );
+            let effect: Effect = serde_json::from_value(serde_json::json!({
+                "type":"Dig", "count":{"type":"Fixed","value":3},
+                "keep_count_expr":{"type":"Fixed","value":1},
+                "rest_split_top_count":value, "rest_destination":"Library"
+            }))
+            .unwrap();
+            let node = declined_search_test_ability(effect);
+            let mut search = declined_search_test_search();
+            let independent = declined_search_test_ability(Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 3 },
+                player: TargetFilter::Controller,
+            });
+            let node = node.sub_ability(independent.clone());
+            search.sub_ability = Some(Box::new(node.clone()));
+            let branch = optional_decline_branch(&GameState::new_two_player(42), &search).unwrap();
+            assert_eq!(matches!(branch, Cow::Owned(_)), dependent);
+            assert_eq!(
+                branch.effect,
+                if dependent {
+                    independent.effect.clone()
+                } else {
+                    node.effect.clone()
+                }
+            );
+            assert_eq!(
+                prepare_declined_search_node(&GameState::new_two_player(42), &node).is_none(),
+                dependent,
+                "the split slot alone determines the unavailable scalar input"
+            );
+        }
+        for target_kind in [
+            crate::types::ability::DoubleTarget::LifeTotal,
+            crate::types::ability::DoubleTarget::ManaPool { color: None },
+        ] {
+            let player = declined_search_test_ability(Effect::Double {
+                target_kind,
+                target: TargetFilter::ParentTarget,
+            });
+            assert!(matches!(
+                prepare_declined_search_node(&GameState::new_two_player(42), &player),
+                Some(Cow::Borrowed(_))
+            ));
+        }
+    }
+
+    // Structural controls for C6; printed runtime coverage lives in the
+    // search_result_conditional_destination integration module.
+    fn declined_search_test_ability(effect: Effect) -> ResolvedAbility {
+        let mut ability = ResolvedAbility::new(effect, vec![], ObjectId(1), PlayerId(0));
+        ability.sub_link = SubAbilityLink::SequentialSibling;
+        ability
+    }
+
+    fn declined_search_test_search() -> ResolvedAbility {
+        let mut search = declined_search_test_ability(Effect::SearchLibrary {
+            source_zones: vec![Zone::Library],
+            filter: TargetFilter::Any,
+            count: QuantityExpr::Fixed { value: 1 },
+            reveal: false,
+            target_player: None,
+            selection_constraint: SearchSelectionConstraint::None,
+            split: None,
+        });
+        search.optional = true;
+        search
+    }
+
+    fn declined_search_test_placement(target: TargetFilter) -> ResolvedAbility {
+        declined_search_test_ability(Effect::PutAtLibraryPosition {
+            target,
+            count: QuantityExpr::Fixed { value: 1 },
+            position: LibraryPosition::Top,
+        })
+    }
+
+    // Structural contract control, not a claim about a printed card reaching
+    // the population walk's depth budget.
+    #[test]
+    fn declined_search_population_dependency_respects_walk_completion() {
+        for leaf in [
+            CardTypeSetSource::ExiledBySource,
+            CardTypeSetSource::TrackedSet {
+                set: TrackedAnaphorSource::ChainSet,
+                caused_by: Some(ThisWayCause::Destroyed),
+            },
+            CardTypeSetSource::TrackedSet {
+                set: TrackedAnaphorSource::ChainSet,
+                caused_by: None,
+            },
+            CardTypeSetSource::Objects {
+                filter: TargetFilter::ParentTarget,
+            },
+        ] {
+            let leaf_dependent = declined_search_population_dependency(
+                &GameState::new_two_player(42),
+                &leaf,
+                false,
+                None,
+            );
+            assert_eq!(
+                leaf_dependent,
+                matches!(
+                    &leaf,
+                    CardTypeSetSource::TrackedSet {
+                        caused_by: None,
+                        ..
+                    } | CardTypeSetSource::Objects { .. }
+                )
+            );
+            for nesting in [0, UNION_DEPTH_BUDGET - 1, UNION_DEPTH_BUDGET] {
+                let mut population = leaf.clone();
+                for _ in 0..nesting {
+                    population = CardTypeSetSource::any_of(vec![
+                        population,
+                        CardTypeSetSource::ExiledBySource,
+                    ])
+                    .unwrap();
+                }
+                let mut seen = 0;
+                let mut seen_dependent = false;
+                let complete = population.try_for_each_member(UNION_DEPTH_BUDGET, &mut |member| {
+                    seen += 1;
+                    seen_dependent |= declined_search_population_dependency(
+                        &GameState::new_two_player(42),
+                        member,
+                        false,
+                        None,
+                    );
+                });
+                assert_eq!(complete, nesting < UNION_DEPTH_BUDGET);
+                assert!(seen > 0, "truncation is not an empty population");
+                assert_eq!(
+                    seen_dependent,
+                    leaf_dependent && complete,
+                    "the dependent leaf is unseen when the budget is exhausted"
+                );
+                let dependent = leaf_dependent || !complete;
+                assert_eq!(
+                    declined_search_population_dependency(
+                        &GameState::new_two_player(42),
+                        &population,
+                        false,
+                        None
+                    ),
+                    dependent
+                );
+
+                for quantity in [
+                    QuantityRef::DistinctCardTypes {
+                        source: population.clone(),
+                    },
+                    QuantityRef::SharedCardTypes {
+                        source: population.clone(),
+                    },
+                    QuantityRef::DistinctSubtypes {
+                        source: population.clone(),
+                        exclude: Default::default(),
+                    },
+                    QuantityRef::DistinctColorsAmong {
+                        source: population.clone(),
+                    },
+                ] {
+                    let mut independent = declined_search_test_ability(Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 3 },
+                        player: TargetFilter::ParentTarget,
+                    });
+                    independent.targets = vec![TargetRef::Player(PlayerId(1))];
+                    let mut consumer = independent.clone();
+                    consumer.effect = Effect::GainLife {
+                        amount: QuantityExpr::Ref { qty: quantity },
+                        player: TargetFilter::ParentTarget,
+                    };
+                    consumer.sub_ability = Some(Box::new(independent.clone()));
+                    assert_eq!(
+                        prepare_declined_search_node(&GameState::new_two_player(42), &consumer)
+                            .is_none(),
+                        dependent
+                    );
+                    let mut root = declined_search_test_search();
+                    root.sub_ability = Some(Box::new(consumer.clone()));
+                    let branch =
+                        optional_decline_branch(&GameState::new_two_player(42), &root).unwrap();
+                    assert_eq!(matches!(branch, Cow::Owned(_)), dependent);
+                    let expected = if dependent { &independent } else { &consumer };
+                    assert_eq!(branch.effect, expected.effect);
+                    assert_eq!(branch.targets, expected.targets);
+                    assert_eq!(branch.sub_ability.is_some(), !dependent);
+                    if let Some(sibling) = &branch.sub_ability {
+                        assert_eq!(sibling.effect, independent.effect);
+                        assert_eq!(sibling.targets, independent.targets);
+                        assert!(sibling.sub_ability.is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Structural — CR 608.2c + CR 609.3: remove the whole nonexistent-object
+    /// instruction before either gate, but preserve player work and both edges.
+    #[test]
+    fn declined_search_reduces_object_units_without_pruning_player_or_prior_authorities() {
+        let dependent = declined_search_test_placement(TargetFilter::ParentTarget);
+        let life = declined_search_test_ability(Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 3 },
+            player: TargetFilter::ParentTarget,
+        });
+        let mut gated = dependent.clone();
+        gated.targets = vec![TargetRef::Object(ObjectId(99))];
+        gated.target_reads = TargetReadOrigin::ParentAnnouncement;
+        gated.condition = Some(AbilityCondition::QuantityCheck {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectManaValue {
+                    scope: ObjectScope::Recipient,
+                },
+            },
+            comparator: Comparator::LE,
+            rhs: QuantityExpr::Fixed { value: 2 },
+        });
+        gated.else_ability = Some(Box::new(dependent.clone()));
+        let mut step = life.clone();
+        step.sub_link = SubAbilityLink::ContinuationStep;
+        gated.sub_ability = relink_in_printed_order(vec![&step, &life]);
+        let mut root = declined_search_test_search();
+        root.sub_ability = Some(Box::new(gated));
+        let reduced = optional_decline_branch(&GameState::new_two_player(42), &root)
+            .expect("independent player instruction survives");
+        assert!(matches!(reduced, Cow::Owned(_)));
+        assert!(matches!(reduced.effect, Effect::GainLife { .. }));
+        assert!(
+            reduced.sub_ability.is_none(),
+            "dependent resolution step was skipped with its object instruction"
+        );
+
+        for effect in [
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::ParentTarget,
+            },
+            Effect::Shuffle {
+                target: TargetFilter::ParentTarget,
+            },
+            life.effect.clone(),
+            Effect::DealDamage {
+                amount: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::ParentTarget,
+                damage_source: None,
+                excess: None,
+            },
+        ] {
+            let mut player = declined_search_test_ability(effect);
+            player.targets = vec![TargetRef::Player(PlayerId(1))];
+            assert!(
+                !prepare_declined_search_node(&GameState::new_two_player(42), &player).is_none(),
+                "player operand is not an absent found object: {:?}",
+                player.effect
+            );
+            root.sub_ability = Some(Box::new(player));
+            assert!(matches!(
+                optional_decline_branch(&GameState::new_two_player(42), &root),
+                Some(Cow::Borrowed(_))
+            ));
+        }
+        for filter in [
+            TargetFilter::ParentTarget,
+            TargetFilter::ParentTargetSlot { index: 0 },
+            TargetFilter::LastRevealed,
+            TargetFilter::TrackedSet {
+                id: TrackedSetId(0),
+            },
+        ] {
+            root.sub_ability = Some(Box::new(declined_search_test_placement(filter.clone())));
+            assert!(
+                optional_decline_branch(&GameState::new_two_player(42), &root).is_none(),
+                "stale inherited targets cannot manufacture a result: {filter:?}"
+            );
+        }
+        for filter in [
+            TargetFilter::SelfRef,
+            TargetFilter::TriggeringSource,
+            TargetFilter::CostPaidObject,
+            TargetFilter::SpecificObject { id: ObjectId(7) },
+            TargetFilter::TrackedSet {
+                id: TrackedSetId(7),
+            },
+            TargetFilter::TrackedSetFiltered {
+                id: TrackedSetId(0),
+                filter: Box::new(TargetFilter::Any),
+                caused_by: Some(ThisWayCause::Destroyed),
+            },
+        ] {
+            root.sub_ability = Some(Box::new(declined_search_test_placement(filter)));
+            assert!(
+                matches!(
+                    optional_decline_branch(&GameState::new_two_player(42), &root),
+                    Some(Cow::Borrowed(_))
+                ),
+                "an explicit prior/source/cost authority is independent"
+            );
+        }
+        let mut player = life.clone();
+        player.optional = true;
+        player.condition = Some(AbilityCondition::And {
+            conditions: vec![
+                AbilityCondition::effect_performed(),
+                AbilityCondition::QuantityCheck {
+                    lhs: QuantityExpr::Fixed { value: 1 },
+                    comparator: Comparator::EQ,
+                    rhs: QuantityExpr::Fixed { value: 1 },
+                },
+            ],
+        });
+        player.sub_ability = Some(Box::new(dependent.clone()));
+        player.else_ability = Some(Box::new(dependent));
+        let reduced =
+            without_declined_search_object_dependencies(&GameState::new_two_player(42), &player)
+                .unwrap();
+        assert_eq!(reduced.condition, player.condition);
+        assert!(reduced.optional);
+        assert!(reduced.sub_ability.is_none() && reduced.else_ability.is_none());
+    }
+
+    /// Structural — independent targets and real producers reset the authority;
+    /// producer-shaped instructions consuming absent inputs do not.
+    #[test]
+    fn declined_search_preserves_fresh_producers_but_checks_their_inputs_first() {
+        let dependent = declined_search_test_placement(TargetFilter::ParentTarget);
+        let mut root = declined_search_test_search();
+        for effect in [
+            declined_search_test_search().effect,
+            serde_json::from_value(serde_json::json!({"type":"ChooseFromZone", "zone":"Hand"})).unwrap(),
+            Effect::RevealTop { player: TargetFilter::ParentTarget, count: 1 },
+            Effect::RevealHand { target: TargetFilter::ParentTarget, card_filter: TargetFilter::Any, count: Some(QuantityExpr::Fixed { value: 1 }), selection: Default::default(), choice_optional: false, reveal: true },
+            Effect::ExileFromTopUntil { player: TargetFilter::ParentTarget, until: UntilCondition::NextMatches { filter: TargetFilter::Any, count: QuantityExpr::Fixed { value: 1 } } },
+            Effect::Reveal { target: TargetFilter::SpecificObject { id: ObjectId(7) } },
+            serde_json::from_value(serde_json::json!({"type":"Token", "name":"Independent token", "power":{"type":"Fixed","value":1}, "toughness":{"type":"Fixed","value":1}})).unwrap(),
+        ] {
+            let producer = declined_search_test_ability(effect).sub_ability(dependent.clone());
+            root.sub_ability = Some(Box::new(producer));
+            let branch = optional_decline_branch(&GameState::new_two_player(42), &root).unwrap();
+            assert!(matches!(branch, Cow::Borrowed(_)));
+            assert!(branch.sub_ability.is_some(), "new producer owns the later ParentTarget");
+        }
+        let mut own = declined_search_test_placement(TargetFilter::Typed(TypedFilter::creature()));
+        own.targets = vec![TargetRef::Object(ObjectId(8))];
+        own.sub_ability = Some(Box::new(dependent.clone()));
+        assert!(declined_search_owns_target(&own));
+        root.sub_ability = Some(Box::new(own));
+        assert!(matches!(
+            optional_decline_branch(&GameState::new_two_player(42), &root),
+            Some(Cow::Borrowed(_))
+        ));
+        let mut dependent_producer = declined_search_test_search();
+        dependent_producer.effect = Effect::Reveal {
+            target: TargetFilter::ParentTarget,
+        };
+        assert!(
+            prepare_declined_search_node(&GameState::new_two_player(42), &dependent_producer)
+                .is_none()
+        );
+        assert!(without_declined_search_object_dependencies(
+            &GameState::new_two_player(42),
+            &dependent_producer
+        )
+        .is_none());
+        let mut count_dependent = declined_search_test_search();
+        if let Effect::SearchLibrary { count, .. } = &mut count_dependent.effect {
+            *count = QuantityExpr::Ref {
+                qty: QuantityRef::TrackedSetSize,
+            };
+        }
+        assert!(
+            prepare_declined_search_node(&GameState::new_two_player(42), &count_dependent)
+                .is_none()
+        );
+        assert!(without_declined_search_object_dependencies(
+            &GameState::new_two_player(42),
+            &count_dependent
+        )
+        .is_none());
+        if let Effect::SearchLibrary { count, .. } = &mut count_dependent.effect {
+            *count = QuantityExpr::Ref {
+                qty: QuantityRef::FilteredTrackedSetSize {
+                    filter: Box::new(TargetFilter::Any),
+                    caused_by: Some(ThisWayCause::Destroyed),
+                },
+            };
+        }
+        assert!(
+            !prepare_declined_search_node(&GameState::new_two_player(42), &count_dependent)
+                .is_none(),
+            "explicit earlier action remains its own quantity authority"
+        );
+        let mut secondary = declined_search_test_ability(
+            serde_json::from_value(
+                serde_json::json!({"type":"Token", "name":"Counter-input token"}),
+            )
+            .unwrap(),
+        );
+        if let Effect::Token {
+            enter_with_counters,
+            ..
+        } = &mut secondary.effect
+        {
+            enter_with_counters.push((
+                CounterType::Plus1Plus1,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::TrackedSetSize,
+                },
+            ));
+        }
+        assert!(
+            prepare_declined_search_node(&GameState::new_two_player(42), &secondary).is_none(),
+            "secondary quantity input is checked before a token becomes fresh"
+        );
+        assert!(without_declined_search_object_dependencies(
+            &GameState::new_two_player(42),
+            &secondary
+        )
+        .is_none());
+        let mut named_prior = dependent.clone();
+        named_prior.reads_chosen_group = Some(crate::types::ability::ChosenGroupId(7));
+        root.sub_ability = Some(Box::new(named_prior));
+        assert!(
+            matches!(
+                optional_decline_branch(&GameState::new_two_player(42), &root),
+                Some(Cow::Borrowed(_))
+            ),
+            "an explicitly named earlier group keeps its own result authority"
+        );
+        let mut mode = dependent.clone();
+        mode.modal_instruction_ordinal = Some(1);
+        assert!(
+            without_declined_search_object_dependencies(&GameState::new_two_player(42), &mode)
+                .is_some()
+        );
+        mode.sub_link = SubAbilityLink::ContinuationStep;
+        let crossing = dependent.clone().sub_ability(mode);
+        let preserved_mode =
+            without_declined_search_object_dependencies(&GameState::new_two_player(42), &crossing)
+                .unwrap();
+        assert_eq!(
+            preserved_mode.modal_instruction_ordinal,
+            Some(1),
+            "mode reset is independent of the preceding instruction's link kind"
+        );
+        let mut forward = declined_search_test_ability(serde_json::from_value(serde_json::json!({"type":"ChangeZone", "destination":"Hand", "target":{"type":"SpecificObject","id":7}})).unwrap());
+        forward.forward_result = true;
+        forward.sub_ability = Some(Box::new(dependent.clone()));
+        assert!(without_declined_search_object_dependencies(
+            &GameState::new_two_player(42),
+            &forward
+        )
+        .unwrap()
+        .sub_ability
+        .is_some());
+        let generic = declined_search_test_ability(Effect::GenericEffect {
+            target: None,
+            duration: None,
+            end_cost: None,
+            static_abilities: vec![
+                StaticDefinition::continuous().affected(TargetFilter::SelfRef),
+                StaticDefinition::continuous().affected(TargetFilter::ParentTarget),
+            ],
+        });
+        let reduced =
+            without_declined_search_object_dependencies(&GameState::new_two_player(42), &generic)
+                .unwrap();
+        let Effect::GenericEffect {
+            static_abilities, ..
+        } = reduced.effect
+        else {
+            panic!("grant remains");
+        };
+        assert_eq!(static_abilities.len(), 1);
+        assert_eq!(static_abilities[0].affected, Some(TargetFilter::SelfRef));
+        let mut both_dependent = generic.clone();
+        if let Effect::GenericEffect { target, .. } = &mut both_dependent.effect {
+            *target = Some(TargetFilter::ParentTarget);
+        }
+        assert!(without_declined_search_object_dependencies(
+            &GameState::new_two_player(42),
+            &both_dependent
+        )
+        .is_none());
+        root.else_ability = Some(Box::new(dependent));
+        assert!(
+            matches!(
+                optional_decline_branch(&GameState::new_two_player(42), &root),
+                Some(Cow::Borrowed(_))
+            ),
+            "explicit decline branch retains its original authority"
+        );
+    }
+
+    /// Structural mirror control: the actual ordering reader consumes the same
+    /// reduced selector result, including its independent top placement and reset.
+    #[test]
+    fn declined_search_ordering_mirror_uses_the_shared_reduced_branch() {
+        let state = GameState::new_two_player(42);
+        let mut outer = declined_search_test_search();
+        outer.optional = false;
+        let mut optional = declined_search_test_search();
+        let mut dependent = declined_search_test_placement(TargetFilter::ParentTarget);
+        dependent.condition = Some(AbilityCondition::QuantityCheck {
+            lhs: QuantityExpr::Fixed { value: 1 },
+            comparator: Comparator::EQ,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        });
+        let independent = declined_search_test_placement(TargetFilter::Any);
+        dependent.sub_ability = Some(Box::new(independent));
+        optional.sub_ability = Some(Box::new(dependent));
+        outer.sub_ability = Some(Box::new(optional.clone()));
+        let reduced = optional_decline_branch(&GameState::new_two_player(42), &optional).unwrap();
+        assert!(matches!(
+            reduced.effect,
+            Effect::PutAtLibraryPosition {
+                target: TargetFilter::Any,
+                ..
+            }
+        ));
+        assert_eq!(search_library::search_ordering_hint(&state, &outer, 1), crate::types::ability::SearchOrderingHint::Unordered, "the nested accepted search resets the outer result even though its decline retains independent work");
+        let mut selected_branch = outer.clone();
+        selected_branch.sub_ability = Some(Box::new(reduced.into_owned()));
+        assert_eq!(
+            search_library::search_ordering_hint(&state, &selected_branch, 1),
+            crate::types::ability::SearchOrderingHint::OrderedToLibraryTop,
+            "the actual reduced branch retains its independent top placement"
+        );
+        let mut later = declined_search_test_search();
+        later.optional = false;
+        optional.sub_ability = Some(Box::new(later));
+        outer.sub_ability = Some(Box::new(optional));
+        assert_eq!(
+            search_library::search_ordering_hint(&state, &outer, 1),
+            crate::types::ability::SearchOrderingHint::Unordered
+        );
+    }
+
+    /// Structural/public-choice supplement — CR 608.2c + CR 609.3: an older
+    /// actual reveal and inherited object do not rescue a declined search's
+    /// object instruction, while its independently bound player still gains life.
+    #[test]
+    fn declined_search_public_choice_keeps_player_work_despite_stale_reveal() {
+        let mut state = GameState::new_two_player(7);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Search source".into(),
+            Zone::Battlefield,
+        );
+        let old = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Prior revealed card".into(),
+            Zone::Library,
+        );
+        let prior = ResolvedAbility::new(
+            Effect::Reveal {
+                target: TargetFilter::SpecificObject { id: old },
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        resolve_ability_chain(&mut state, &prior, &mut Vec::new(), 1).unwrap();
+        assert_eq!(state.last_revealed_ids, vec![old]);
+        let mut root = declined_search_test_search();
+        root.source_id = source;
+        root.targets = vec![TargetRef::Object(old)];
+        let mut destination = declined_search_test_placement(TargetFilter::LastRevealed);
+        destination.source_id = source;
+        let mut player = declined_search_test_ability(Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 3 },
+            player: TargetFilter::ParentTarget,
+        });
+        player.source_id = source;
+        player.targets = vec![TargetRef::Player(PlayerId(1))];
+        destination.sub_ability = Some(Box::new(player));
+        root.sub_ability = Some(Box::new(destination));
+        resolve_ability_chain(&mut state, &root, &mut Vec::new(), 1).unwrap();
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::OptionalEffectChoice {
+                player: PlayerId(0),
+                ..
+            }
+        ));
+        let events = crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::DecideOptionalEffect { accept: false },
+        )
+        .unwrap()
+        .events;
+        assert_eq!(state.players[1].life, 23);
+        assert_eq!(state.players[0].life, 20);
+        assert_eq!(state.objects[&source].zone, Zone::Battlefield);
+        assert_eq!(state.objects[&old].zone, Zone::Library);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GameEvent::EffectResolved {
+                kind: EffectKind::GainLife,
+                ..
+            }
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            GameEvent::ZoneChanged { .. } | GameEvent::CardsRevealed { .. }
+        )));
+        assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+        assert!(state.stack.is_empty() && state.resolution_stack.is_empty());
+        assert!(
+            state.active_library_searches.is_empty()
+                && state.active_search_decision_controls.is_empty()
+        );
+        assert!(state.pending_search_found_batch.is_none());
+    }
 
     /// CR 608.2c: the pile placement after a reveal-only until-loop is bound to the
     /// exact cards that reveal looked at, on the continuation itself — so an
@@ -22928,6 +28245,7 @@ mod tests {
             parent.sub_ability = Some(Box::new(sub));
             parent
         }
+        let state = GameState::new_two_player(42);
         let rider = ResolvedAbility::new(
             effect_from_json(
                 r#"{"type":"AddPendingEntersModifications","rider":{"modifications":[{"type":"AddKeyword","keyword":"Haste"}]}}"#,
@@ -22938,7 +28256,7 @@ mod tests {
         );
         let rider_parent = cast_parent_with_sub(rider.clone());
         assert!(
-            optional_decline_branch(&rider_parent).is_none(),
+            optional_decline_branch(&state, &rider_parent).is_none(),
             "a declined cast grant must not select its gains rider as the decline branch"
         );
 
@@ -22959,7 +28277,7 @@ mod tests {
             draw
         }));
         let rider_with_tail_parent = cast_parent_with_sub(rider_with_tail);
-        let branch = optional_decline_branch(&rider_with_tail_parent);
+        let branch = optional_decline_branch(&state, &rider_with_tail_parent);
         assert!(
             matches!(
                 branch.as_ref().map(|branch| &branch.effect),
@@ -22979,7 +28297,7 @@ mod tests {
             PlayerId(0),
         );
         let parent = cast_parent_with_sub(sibling);
-        let branch = optional_decline_branch(&parent);
+        let branch = optional_decline_branch(&state, &parent);
         assert!(
             matches!(
                 branch.as_ref().map(|branch| &branch.effect),
@@ -46886,6 +52204,539 @@ mod dandan_read_sweep_tests {
             "reach: Standard counts the seat's own pile"
         );
         assert_eq!(read(&standard, 0), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod entry_observation_settlement_tests {
+    //! U2 — the instruction-boundary settlement helper (B0, G1, G2, S-b) and the deferral
+    //! predicate D (D1 over the subtree, frame-held and nested carriers; D2; D3).
+    use super::*;
+    use crate::game::zones::{create_object, record_and_emit_entry_from_no_zone};
+    use crate::types::ability::{AttachSelection, PerpetualModification};
+    use crate::types::counter::CounterType;
+    use crate::types::game_state::{
+        BatchCompletion, LibrarySearchDeliveryResume, PendingAttachmentRemainder,
+        PendingBatchDeliveries, PendingChooseOneOf, PendingRepeatIteration,
+        ZoneDeliveryExileTracking,
+    };
+    use crate::types::identifiers::CardId;
+    use crate::types::resolution::PendingDieRoll;
+    use crate::types::zones::EtbTapState;
+
+    fn node(effect: Effect) -> ResolvedAbility {
+        ResolvedAbility::new(effect, Vec::new(), ObjectId(100), PlayerId(0))
+    }
+
+    fn put_counter() -> Effect {
+        Effect::PutCounter {
+            counter_type: CounterType::Plus1Plus1,
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::ParentTarget,
+        }
+    }
+
+    fn generic() -> Effect {
+        Effect::GenericEffect {
+            static_abilities: Vec::new(),
+            duration: None,
+            target: None,
+            end_cost: None,
+        }
+    }
+
+    fn animate() -> Effect {
+        Effect::Animate {
+            power: None,
+            toughness: None,
+            types: vec!["Artifact".to_string()],
+            remove_types: Vec::new(),
+            target: TargetFilter::Any,
+            keywords: Vec::new(),
+        }
+    }
+
+    fn return_as_aura() -> Effect {
+        Effect::ReturnAsAura {
+            enchant_filter: TargetFilter::Any,
+            grants: Vec::new(),
+        }
+    }
+
+    fn apply_perpetual() -> Effect {
+        Effect::ApplyPerpetual {
+            target: TargetFilter::Any,
+            modification: PerpetualModification::SetBasePowerToughness {
+                power: 1,
+                toughness: 1,
+            },
+        }
+    }
+
+    fn attach() -> Effect {
+        Effect::Attach {
+            attachment: TargetFilter::Any,
+            target: TargetFilter::Any,
+            selection: AttachSelection::Targeted,
+        }
+    }
+
+    fn return_to_battlefield() -> Effect {
+        Effect::ChangeZone {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Battlefield,
+            target: TargetFilter::Any,
+            owner_library: false,
+            enter_transformed: false,
+            enters_under: None,
+            enter_tapped: EtbTapState::Unspecified,
+            enters_attacking: false,
+            up_to: false,
+            enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
+            face_down_profile: None,
+            enters_modified_if: None,
+        }
+    }
+
+    fn deferred(
+        state: &GameState,
+        next: &ResolvedAbility,
+        completed: Option<&ResolvedAbility>,
+    ) -> bool {
+        entry_observation_deferred(state, next, completed)
+    }
+
+    /// A completed battlefield entry (no row yet) and its events.
+    fn entered(state: &mut GameState, card: u64) -> (ObjectId, Vec<GameEvent>) {
+        let mut events = Vec::new();
+        let id = create_object(
+            state,
+            CardId(card),
+            PlayerId(0),
+            format!("Entrant {card}"),
+            Zone::Battlefield,
+        );
+        record_and_emit_entry_from_no_zone(state, id, &mut events).expect("entered");
+        (id, events)
+    }
+
+    #[test]
+    fn deferral_predicate_subtree_kinds() {
+        let state = GameState::new_two_player(3);
+        let completed = node(return_to_battlefield());
+        assert!(!deferred(&state, &node(put_counter()), Some(&completed)));
+        assert!(deferred(&state, &node(generic()), Some(&completed)));
+        assert!(deferred(
+            &state,
+            &node(put_counter()).sub_ability(node(generic())),
+            Some(&completed)
+        ));
+        assert!(deferred(&state, &node(animate()), Some(&completed)));
+        assert!(deferred(&state, &node(return_as_aura()), Some(&completed)));
+        assert!(deferred(&state, &node(apply_perpetual()), Some(&completed)));
+        assert!(deferred(
+            &state,
+            &node(put_counter()).else_ability(node(generic())),
+            Some(&completed)
+        ));
+    }
+
+    #[test]
+    fn deferral_predicate_attach_and_scoped_seat() {
+        let state = GameState::new_two_player(3);
+        let mut forwarded = node(return_to_battlefield());
+        forwarded.forward_result = true;
+        let mut not_forwarded = node(return_to_battlefield());
+        not_forwarded.forward_result = false;
+        assert!(
+            deferred(&state, &node(attach()), Some(&forwarded)),
+            "D2 forwarded"
+        );
+        assert!(
+            !deferred(&state, &node(attach()), Some(&not_forwarded)),
+            "D2 negative"
+        );
+        assert!(
+            deferred(&state, &node(attach()), None),
+            "D2 unknown completion"
+        );
+        let mut seat = node(put_counter());
+        seat.scoped_player = Some(PlayerId(1));
+        assert!(deferred(&state, &seat, Some(&not_forwarded)), "D3");
+        assert!(
+            !deferred(&state, &node(put_counter()), Some(&not_forwarded)),
+            "D3 positive pair"
+        );
+    }
+
+    #[test]
+    fn deferral_predicate_walks_frame_carriers() {
+        let head = node(put_counter());
+        let completed = node(return_to_battlefield());
+
+        // AbilityContinuation frame.
+        let mut state = GameState::new_two_player(3);
+        assert!(!deferred(&state, &head, Some(&completed)), "no frame");
+        let pending = PendingContinuation::new(Box::new(node(generic())), &state);
+        state
+            .resolution_stack
+            .push_inner(ResolutionFrame::AbilityContinuation(
+                AbilityContinuationFrame {
+                    pending,
+                    choose_zone_trigger_context: None,
+                },
+            ));
+        assert!(
+            deferred(&state, &head, Some(&completed)),
+            "continuation chain"
+        );
+
+        // RepeatFor frame.
+        let repeat = |effect: Effect| PendingRepeatIteration {
+            ability: Box::new(node(effect)),
+            tracked_members: Vec::new(),
+            iterated_counter_kinds: Vec::new(),
+            next_iteration: 1,
+            total_iterations: 2,
+            copy_order_fixed: None,
+        };
+        let mut state = GameState::new_two_player(3);
+        state
+            .resolution_stack
+            .push_inner(ResolutionFrame::RepeatFor(repeat(put_counter())));
+        assert!(
+            !deferred(&state, &head, Some(&completed)),
+            "repeat positive pair"
+        );
+        let mut state = GameState::new_two_player(3);
+        state
+            .resolution_stack
+            .push_inner(ResolutionFrame::RepeatFor(repeat(generic())));
+        assert!(
+            deferred(&state, &head, Some(&completed)),
+            "repeat remainder"
+        );
+
+        // ChooseOneOf frame whose branches hold an Animate.
+        let choose = |effect: Effect| PendingChooseOneOf {
+            controller: PlayerId(0),
+            source_id: ObjectId(100),
+            branches: vec![AbilityDefinition::new(AbilityKind::Spell, effect)],
+            parent_occurrences: Default::default(),
+            context: Box::default(),
+            continuation: None,
+            replacement_applied: HashSet::new(),
+            remaining_players: Vec::new(),
+            trigger_context: None,
+        };
+        let mut state = GameState::new_two_player(3);
+        state
+            .resolution_stack
+            .push_inner(ResolutionFrame::ChooseOneOf(choose(put_counter())));
+        assert!(
+            !deferred(&state, &head, Some(&completed)),
+            "branch positive pair"
+        );
+        let mut state = GameState::new_two_player(3);
+        state
+            .resolution_stack
+            .push_inner(ResolutionFrame::ChooseOneOf(choose(animate())));
+        assert!(deferred(&state, &head, Some(&completed)), "branch template");
+    }
+
+    #[test]
+    fn deferral_predicate_walks_nested_carriers() {
+        let head = node(put_counter());
+        let completed = node(return_to_battlefield());
+
+        // (a) attachment_remainder.producer
+        let with_remainder = |effect: Effect| {
+            let mut state = GameState::new_two_player(3);
+            let mut pending = PendingContinuation::new(Box::new(node(put_counter())), &state);
+            pending.attachment_remainder = Some(PendingAttachmentRemainder {
+                producer: Box::new(node(effect)),
+            });
+            state
+                .resolution_stack
+                .push_inner(ResolutionFrame::AbilityContinuation(
+                    AbilityContinuationFrame {
+                        pending,
+                        choose_zone_trigger_context: None,
+                    },
+                ));
+            state
+        };
+        assert!(deferred(
+            &with_remainder(return_as_aura()),
+            &head,
+            Some(&completed)
+        ));
+        assert!(!deferred(
+            &with_remainder(put_counter()),
+            &head,
+            Some(&completed)
+        ));
+
+        // (b) DieRoll results_table
+        let with_die = |effect: Effect| {
+            let mut state = GameState::new_two_player(3);
+            state
+                .resolution_stack
+                .push_inner(ResolutionFrame::DieRoll(Box::new(PendingDieRoll {
+                    source_id: ObjectId(100),
+                    controller: PlayerId(0),
+                    roller: PlayerId(0),
+                    targets: Vec::new(),
+                    sides: 6,
+                    results: vec![3, 4],
+                    ignore_rules: Vec::new(),
+                    results_table: vec![crate::types::ability::DieResultBranch {
+                        min: 1,
+                        max: 6,
+                        effect: Box::new(AbilityDefinition::new(AbilityKind::Spell, effect)),
+                    }],
+                    modifier: None,
+                    die_result: None,
+                    next_index: 0,
+                    running_total: 0,
+                    rolled_any: false,
+                    forced_ignored: Vec::new(),
+                    chain_root_targets: Vec::new(),
+                })));
+            state
+        };
+        assert!(deferred(
+            &with_die(apply_perpetual()),
+            &head,
+            Some(&completed)
+        ));
+        assert!(!deferred(&with_die(put_counter()), &head, Some(&completed)));
+
+        // (c) BatchDelivery completion carrying a scoped library-search resume.
+        let with_batch = |effect: Effect| {
+            let mut state = GameState::new_two_player(3);
+            let mut logical_zone_change_group = state.allocate_logical_zone_change_group(&[]);
+            logical_zone_change_group
+                .latch_immediately_before(Vec::new(), Vec::new())
+                .expect("empty batch group retains its pre-delivery latch");
+            let pending = PendingBatchDeliveries {
+                logical_zone_change_group,
+                paused_current: None,
+                remaining: Vec::new(),
+                destination: Zone::Battlefield,
+                source_id: None,
+                enter_tapped: EtbTapState::Unspecified,
+                exile_tracking: ZoneDeliveryExileTracking::None,
+                library_placement: None,
+                completion: Some(BatchCompletion::LibrarySearchDeliverySettled {
+                    resume: LibrarySearchDeliveryResume::Scoped {
+                        player: PlayerId(0),
+                        source_id: ObjectId(100),
+                        search_keys: Vec::new(),
+                        grants: Vec::new(),
+                        after_scope: Some(Box::new(node(effect))),
+                    },
+                }),
+                replacement_applied: HashSet::new(),
+                requests: Vec::new(),
+                attempted: Vec::new(),
+                zone_change_record_start: state.zone_changes_this_turn.len(),
+                deferred_events: Vec::new(),
+            };
+            state
+                .resolution_stack
+                .push_inner(ResolutionFrame::BatchDelivery(Box::new(pending)));
+            state
+        };
+        assert!(deferred(&with_batch(generic()), &head, Some(&completed)));
+        assert!(!deferred(
+            &with_batch(put_counter()),
+            &head,
+            Some(&completed)
+        ));
+    }
+
+    /// B0: an entering `ContinuationStep` is a co-entrant, not a boundary.
+    #[test]
+    fn boundary_skips_same_instruction_co_entry() {
+        let completed = node(return_to_battlefield());
+        let mut co_entry = node(return_to_battlefield());
+        co_entry.sub_link = SubAbilityLink::ContinuationStep;
+        let mut state = GameState::new_two_player(3);
+        let (_, events) = entered(&mut state, 1);
+        settle_entries_before_instruction(&mut state, &events, &co_entry, Some(&completed));
+        assert!(state.battlefield_entry_observations.is_empty(), "B0");
+
+        let mut sibling = co_entry.clone();
+        sibling.sub_link = SubAbilityLink::SequentialSibling;
+        let mut state = GameState::new_two_player(3);
+        let (_, events) = entered(&mut state, 1);
+        settle_entries_before_instruction(&mut state, &events, &sibling, Some(&completed));
+        assert_eq!(
+            state.battlefield_entry_observations.len(),
+            1,
+            "B0 positive pair"
+        );
+    }
+
+    /// G1: nothing is settled while a resolution choice is pending.
+    #[test]
+    fn boundary_waits_for_pending_resolution_choice() {
+        let completed = node(return_to_battlefield());
+        let next = node(put_counter());
+        let mut state = GameState::new_two_player(3);
+        let (id, events) = entered(&mut state, 1);
+        state.waiting_for = WaitingFor::ScryChoice {
+            player: PlayerId(0),
+            cards: vec![id],
+        };
+        settle_entries_before_instruction(&mut state, &events, &next, Some(&completed));
+        assert!(state.battlefield_entry_observations.is_empty(), "G1");
+
+        let mut state = GameState::new_two_player(3);
+        let (_, events) = entered(&mut state, 1);
+        assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+        settle_entries_before_instruction(&mut state, &events, &next, Some(&completed));
+        assert_eq!(
+            state.battlefield_entry_observations.len(),
+            1,
+            "G1 positive pair"
+        );
+    }
+
+    /// G2: a parked mid-entry entry is skipped by its ledger key, even under a
+    /// `CopyTargetChoice` (which `waits_for_resolution_choice` does not cover) and even when
+    /// the parked copy's record differs in an unrelated field.
+    #[test]
+    fn boundary_skips_parked_mid_entry_by_key() {
+        let completed = node(return_to_battlefield());
+        let next = node(put_counter());
+        for perturb in [false, true] {
+            let mut state = GameState::new_two_player(3);
+            let (parked, mut events) = entered(&mut state, 1);
+            let (other, more) = entered(&mut state, 2);
+            events.extend(more);
+            let mut parked_event = events[0].clone();
+            if perturb {
+                if let GameEvent::ZoneChanged { record, .. } = &mut parked_event {
+                    record.co_departed.push(ObjectId(999));
+                }
+            }
+            state.deferred_entry_events = vec![parked_event];
+            state.waiting_for = WaitingFor::CopyTargetChoice {
+                player: PlayerId(0),
+                source_id: parked,
+                valid_targets: vec![other],
+                max_mana_value: None,
+                purpose: crate::types::ability::CopyTargetPurpose::BecomeCopy,
+            };
+            settle_entries_before_instruction(&mut state, &events, &next, Some(&completed));
+            let observed: Vec<ObjectId> = state
+                .battlefield_entry_observations
+                .values()
+                .map(|row| row.identity.reference.object_id)
+                .collect();
+            assert_eq!(
+                observed,
+                vec![other],
+                "only the unparked entry (perturb={perturb})"
+            );
+        }
+    }
+
+    /// S-b: the resume call (`completed = None`) settles a completed entry before a resumed
+    /// chain that leaves the entrant alone, and defers before one carrying a D1 kind.
+    #[test]
+    fn resume_boundary_settles_completed_entry() {
+        let mut state = GameState::new_two_player(3);
+        let (_, events) = entered(&mut state, 1);
+        settle_entries_before_instruction(&mut state, &events, &node(put_counter()), None);
+        assert_eq!(state.battlefield_entry_observations.len(), 1, "S-b settles");
+
+        let mut state = GameState::new_two_player(3);
+        let (_, events) = entered(&mut state, 1);
+        settle_entries_before_instruction(
+            &mut state,
+            &events,
+            &node(put_counter()).sub_ability(node(generic())),
+            None,
+        );
+        assert!(
+            state.battlefield_entry_observations.is_empty(),
+            "S-b defers on D1"
+        );
+    }
+
+    /// CR 603.10 + CR 608.2c: under a cast parent the boundary is the next WRITTEN instruction
+    /// after the consumed metadata run (`cast_from_zone::cast_metadata_continuation`). An earlier
+    /// entrant is observed before a written instruction beneath a gains rider changes it, and a
+    /// pure-metadata chain completes without a boundary of its own (its entries are read live, as
+    /// at any chain end).
+    ///
+    /// REVERT: dropping the walker's `settle_entries_before_instruction` call leaves no row in
+    /// the first case; settling on the raw sub (before the splice) records a row in the second.
+    #[test]
+    fn cast_metadata_rider_boundary_is_the_next_written_instruction() {
+        let cast_parent = |sub: ResolvedAbility| {
+            let mut parent = node(
+                serde_json::from_str(
+                    r#"{"type":"CastFromZone","target":{"type":"ParentTarget"},"without_paying_mana_cost":true,"mode":"Cast","driver":"DuringResolution"}"#,
+                )
+                .expect("cast parent"),
+            );
+            parent.sub_ability = Some(Box::new(sub));
+            parent
+        };
+        let gains_rider = || {
+            let mut rider = node(Effect::AddPendingEntersModifications {
+                rider: Default::default(),
+            });
+            rider.sub_link = SubAbilityLink::SequentialSibling;
+            rider
+        };
+
+        // Rider → "put a +1/+1 counter on it": observed before the written instruction.
+        let mut state = GameState::new_two_player(3);
+        let (id, mut events) = entered(&mut state, 1);
+        let mut counter = ResolvedAbility::new(
+            Effect::PutCounter {
+                counter_type: CounterType::Plus1Plus1,
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Any,
+            },
+            vec![TargetRef::Object(id)],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        counter.sub_link = SubAbilityLink::SequentialSibling;
+        let mut rider = gains_rider();
+        rider.sub_ability = Some(Box::new(counter));
+        resolve_ability_chain(&mut state, &cast_parent(rider), &mut events, 0)
+            .expect("the chain must resolve");
+        assert_eq!(
+            state.objects[&id].counters.get(&CounterType::Plus1Plus1),
+            Some(&1),
+            "reach guard: the written instruction beneath the rider resolved"
+        );
+        let rows: Vec<_> = state.battlefield_entry_observations.values().collect();
+        assert_eq!(rows.len(), 1, "the earlier entrant is observed");
+        assert_eq!(rows[0].identity.reference.object_id, id);
+        assert!(
+            rows[0].lki.counters.is_empty(),
+            "observed before the written instruction changed it: {:?}",
+            rows[0].lki.counters
+        );
+
+        // Pure metadata: the chain completes and no boundary settles the entry.
+        let mut state = GameState::new_two_player(3);
+        let (_, mut events) = entered(&mut state, 1);
+        resolve_ability_chain(&mut state, &cast_parent(gains_rider()), &mut events, 0)
+            .expect("a pure-metadata chain must complete");
+        assert!(
+            state.battlefield_entry_observations.is_empty(),
+            "a pure-metadata chain has no next written instruction"
+        );
     }
 }
 

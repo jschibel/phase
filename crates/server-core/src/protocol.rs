@@ -3473,6 +3473,28 @@ mod tests {
         }
     }
 
+    /// v155: `PendingChangeZoneIteration.remaining` carries each member's
+    /// pre-event entry modifications (`ChangeZoneMemberEntry`, CR 603.6a +
+    /// CR 614.12) and drops the raw gate fields, and the persisted resolution
+    /// state moves from version 6 to 7; a v154 peer cannot parse a parked
+    /// ChangeZone frame, so it must be refused before it receives v155 state.
+    ///
+    /// v154: `PendingCostMoveResume` gains `CounterCostRemovalPayment` (a
+    /// counter-removal cost paused on a CR 616.1 replacement choice, whose
+    /// settled count the activation reads, CR 118.11) and
+    /// `ManaAbilityCostCursor` gains `counter_removal`, both carried in
+    /// `GameState::pending_cost_move_resume`; a v153 peer cannot parse the new
+    /// tag, so it must be refused before it receives v154 state;
+    /// `PausedCounterCostRemoval` carries its `replacement_subtree` boundary.
+    ///
+    /// v153: `GrantAllActivatedAbilitiesOf` gains the optional `kind` selector
+    /// and the loyalty-grant sibling variant is removed. A v152 peer
+    /// drops the defaulted field silently and over-grants, so it must be
+    /// refused before it receives v153 state.
+    ///
+    /// v152: `ShortcutDecisionSchema` gains `suggested_declaration` and
+    /// `leading_aims`, and `ShortcutProposal` gains `leading_aims`; a v151 peer
+    /// drops them, so it must be refused before it receives v152 state.
     /// v151: populated Bestow form payloads require a versioned full-game peer.
     /// v149: `GameState::deferred_spell_delivery` is gone and
     /// `GameState::resolving_spell_final_part` marks the CR 608.2n final part a
@@ -3714,8 +3736,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_151_for_populated_bestow_payloads() {
-        assert_eq!(PROTOCOL_VERSION, 151);
+    fn protocol_version_is_155_for_pre_event_change_zone_entries() {
+        assert_eq!(PROTOCOL_VERSION, 155);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3726,7 +3748,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_151_for_populated_bestow_payloads` stays
+    /// `protocol_version_is_155_for_pre_event_change_zone_entries` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
