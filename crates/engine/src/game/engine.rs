@@ -5217,8 +5217,10 @@ fn shortcut_count_is_drivable(
         }
 }
 
-/// CR 800.4a: the seat that should receive priority when a loop-shortcut resolution hands
-/// priority back. Priority passes to the next player in turn order still in the game — the
+/// CR 800.4a + CR 800.4j: the seat that should receive priority where the active player
+/// would: when a loop-shortcut resolution hands priority back, and when a completed
+/// resolution's carrier settles. Priority passes to the next player in turn order still in
+/// the game — the
 /// active player if it is still in the game, otherwise the next living seat in turn order
 /// (elimination does not advance `active_player` when a non-acting seat concedes during the
 /// APNAP window, so `active_player` may be a departed player).
