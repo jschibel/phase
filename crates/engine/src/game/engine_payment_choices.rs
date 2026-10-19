@@ -4248,9 +4248,21 @@ mod tests {
         }
     }
 
+    /// The non-life output of a completion delayed observer: draw one card.
+    fn completion_draw() -> AbilityDefinition {
+        AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+        )
+    }
+
     fn add_completion_delayed_observer(
         scenario: &mut crate::game::scenario::GameScenario,
         exclude_two: bool,
+        body: AbilityDefinition,
     ) -> ObjectId {
         use crate::types::ability::{Comparator, DelayedTriggerCondition, WheneverEventExpiry};
         let p2 = PlayerId(2);
@@ -4270,13 +4282,7 @@ mod tests {
                         trigger: Box::new(trigger),
                         expiry: WheneverEventExpiry::EndOfTurn,
                     },
-                    effect: Box::new(AbilityDefinition::new(
-                        AbilityKind::Spell,
-                        Effect::Draw {
-                            count: QuantityExpr::Fixed { value: 1 },
-                            target: TargetFilter::Controller,
-                        },
-                    )),
+                    effect: Box::new(body),
                     uses_tracked_set: false,
                 },
             ))
@@ -4355,7 +4361,24 @@ mod tests {
     fn transaction_keeps_carrier_until_inner_and_outer_choices_finish() {
         for energy in [2, 0] {
             let (mut scenario, source, land) = completion_payment_scenario(true, true, true);
-            let observer = add_completion_delayed_observer(&mut scenario, true);
+            // CR 603.3b: each firing also puts its own occurrence's amount of
+            // counters on the observer, so firings off distinct life gains are
+            // distinguishable and their controller orders them; identical
+            // commuting draws would be announced without a choice.
+            let observer = add_completion_delayed_observer(
+                &mut scenario,
+                true,
+                completion_draw().sub_ability(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::PutCounter {
+                        counter_type: crate::types::counter::CounterType::Plus1Plus1,
+                        count: QuantityExpr::Ref {
+                            qty: crate::types::ability::QuantityRef::EventContextAmount,
+                        },
+                        target: TargetFilter::SelfRef,
+                    },
+                )),
+            );
             let lower = scenario
                 .add_spell_to_hand(PlayerId(0), "Unresolved lower instant", true)
                 .with_mana_cost(ManaCost::zero())
@@ -4498,6 +4521,15 @@ mod tests {
             }
             assert_eq!(runner.state().stack[0].id, lower);
             assert_eq!(runner.state().players[2].hand.len(), hand + expected.len());
+            // Every firing resolved once, with its own occurrence's amount.
+            assert_eq!(
+                runner.state().objects[&observer]
+                    .counters
+                    .get(&crate::types::counter::CounterType::Plus1Plus1)
+                    .copied()
+                    .unwrap_or(0),
+                u32::try_from(expected.iter().sum::<i32>()).expect("life gains are positive")
+            );
             assert_eq!(runner.state().delayed_triggers.len(), 1);
             assert_completion_entitlement(runner.state());
             assert_eq!(
@@ -4542,7 +4574,7 @@ mod tests {
         use crate::types::counter::CounterType;
         for energy in [2, 0] {
             let (mut scenario, source, land) = completion_payment_scenario(false, false, false);
-            let delayed = add_completion_delayed_observer(&mut scenario, false);
+            let delayed = add_completion_delayed_observer(&mut scenario, false, completion_draw());
             let lower = scenario
                 .add_spell_to_hand(PlayerId(0), "Unresolved lower instant", true)
                 .with_mana_cost(ManaCost::zero())

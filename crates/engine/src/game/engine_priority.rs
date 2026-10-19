@@ -251,6 +251,8 @@ fn run_post_action_pipeline_core(
     // once those instructions are done. This boundary completes it, before the
     // scan below; the final part's triggers wait for this pass's batch.
     let mut effective_default = default_wf.clone();
+    // CR 117.3b + CR 117.5: set only when this pass retires its exact carrier.
+    let mut completion_recipient = None;
     let carrier_before_final_part = state.resolving_stack_entry.as_ref().map(|entry| entry.id);
     let final_part_ran = super::engine::run_spell_final_part_if_due(state, events)
         || final_part_boundary == SpellFinalPartBoundary::RanBeforePass;
@@ -259,6 +261,7 @@ fn run_post_action_pipeline_core(
         && matches!(state.waiting_for, WaitingFor::Priority { .. })
     {
         effective_default = state.waiting_for.clone();
+        completion_recipient = completed_priority_recipient(&effective_default);
     }
     let completed_resolution_batch = completed_resolution.is_some();
     let payment_owned = state.payment_transaction.is_some() || state.payment_transaction_replay;
@@ -579,7 +582,10 @@ fn run_post_action_pipeline_core(
                         &delayed_input,
                     );
                 }
-                persist_carried_recipient_across_prompt(state, carried_priority_recipient);
+                persist_carried_recipient_across_prompt(
+                    state,
+                    carried_priority_recipient.or(completion_recipient),
+                );
                 state.consumed_before_priority_trigger_events.clear();
                 return Ok(waiting_for);
             }
@@ -650,7 +656,10 @@ fn run_post_action_pipeline_core(
             );
             if let Some(waiting_for) = outcome.prompt {
                 state.waiting_for = waiting_for.clone();
-                persist_carried_recipient_across_prompt(state, carried_priority_recipient);
+                persist_carried_recipient_across_prompt(
+                    state,
+                    carried_priority_recipient.or(completion_recipient),
+                );
                 state.consumed_before_priority_trigger_events.clear();
                 return Ok(waiting_for);
             }
@@ -684,6 +693,7 @@ fn run_post_action_pipeline_core(
             && matches!(state.waiting_for, WaitingFor::Priority { .. })
         {
             effective_default = state.waiting_for.clone();
+            completion_recipient = completed_priority_recipient(&effective_default);
         }
         if let Some(wf) =
             triggers::drain_deferred_triggers_after_stack_object_announcement(state, events)
@@ -794,7 +804,10 @@ fn run_post_action_pipeline_core(
         if matches!(state.waiting_for, WaitingFor::GameOver { .. }) {
             match_flow::handle_game_over_transition(state);
         }
-        persist_carried_recipient_across_prompt(state, carried_priority_recipient);
+        persist_carried_recipient_across_prompt(
+            state,
+            carried_priority_recipient.or(completion_recipient),
+        );
         state.consumed_before_priority_trigger_events.clear();
         return Ok(state.waiting_for.clone());
     }
@@ -830,7 +843,10 @@ fn run_post_action_pipeline_core(
     // sets pending_trigger and is re-derived at begin_pending_trigger_target_selection)
     // is untouched.
     if matches!(state.waiting_for, WaitingFor::OrderTriggers { .. }) {
-        persist_carried_recipient_across_prompt(state, carried_priority_recipient);
+        persist_carried_recipient_across_prompt(
+            state,
+            carried_priority_recipient.or(completion_recipient),
+        );
         return Ok(state.waiting_for.clone());
     }
 
@@ -841,7 +857,10 @@ fn run_post_action_pipeline_core(
 
     if let Some(waiting_for) = begin_pending_trigger_target_selection(state)? {
         state.waiting_for = waiting_for.clone();
-        persist_carried_recipient_across_prompt(state, carried_priority_recipient);
+        persist_carried_recipient_across_prompt(
+            state,
+            carried_priority_recipient.or(completion_recipient),
+        );
         return Ok(waiting_for);
     }
 
@@ -947,7 +966,12 @@ fn sba_choice_requires_combined_trigger_batch(waiting_for: &WaitingFor) -> bool 
 /// the construction finisher can hand priority back to that player once the
 /// batch has finished announcing.
 ///
-/// With `carried_priority_recipient == None` — every ordinary wrapper — this is
+/// CR 117.3b + CR 117.5: a pass that retired its exact resolving carrier
+/// supplies that completion's synchronized active-player recipient here as
+/// well, so constructing the batch it completes cannot hand priority to the
+/// trigger controller instead.
+///
+/// With no recipient — every ordinary wrapper that retired no carrier — this is
 /// a no-op, and the existing active-player/controller fallbacks at each
 /// construction seam are untouched. When ordering opens, the same player is
 /// stored in both authorities: `PendingTriggerOrder::resume_after_ordering`
@@ -968,6 +992,15 @@ fn persist_carried_recipient_across_prompt(
         triggers::preserve_order_triggers_resume(state, WaitingFor::Priority { player });
     }
     triggers::preserve_trigger_construction_priority_recipient(state, player);
+}
+
+/// CR 117.3b: the player a completed resolution's synchronized wait gives
+/// priority to.
+fn completed_priority_recipient(completed: &WaitingFor) -> Option<PlayerId> {
+    match completed {
+        WaitingFor::Priority { player } => Some(*player),
+        _ => None,
+    }
 }
 
 /// The zone-change occurrences a paused logical zone-change owner retains for

@@ -11084,10 +11084,12 @@ pub(crate) fn drain_deferred_triggers_after_trigger_construction(
 
 /// CR 117.3c + CR 117.5 + CR 605.4a: record the player who must receive
 /// priority once a settled trigger batch has finished announcing, when that
-/// player is not the active player.
+/// player is not the active player. CR 117.3b + CR 117.5: likewise record the
+/// active player a resolution completed in the same pass hands priority to.
 ///
 /// The recipient is installed only from the settled-Priority convergence core's
-/// own exhaustively validated `WaitingFor::Priority { player }`, before any
+/// own exhaustively validated `WaitingFor::Priority { player }`, or from the
+/// synchronized wait of an exact carrier that core just retired, before any
 /// ordered or singleton construction step can pause. Reinstalling the same
 /// player is idempotent; observing a *different* player while the field is live
 /// is an internal invariant error. The one carved-out rewrite is
