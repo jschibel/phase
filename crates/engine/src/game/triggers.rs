@@ -10662,6 +10662,11 @@ pub(crate) enum TriggeredManaReadiness {
 /// the stack: cast triggers go above the spells that caused them once the parent
 /// resolution is complete.
 pub(crate) fn resolution_completion_can_settle(state: &GameState) -> bool {
+    // CR 608.2c + CR 118.3: a staged payment still owns this instruction;
+    // its stripped replay root cannot complete the enclosing resolution.
+    if state.payment_transaction.is_some() || state.payment_transaction_replay {
+        return false;
+    }
     if is_pending_trigger_construction_active(state) {
         return false;
     }
@@ -11785,6 +11790,17 @@ pub(crate) struct UnclaimedTriggerEvents {
 }
 
 impl UnclaimedTriggerEvents {
+    /// Keep full-buffer positions when a live owner retains an occurrence.
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&GameEvent) -> bool) {
+        let (positions, events) = std::mem::take(&mut self.positions)
+            .into_iter()
+            .zip(std::mem::take(&mut self.events))
+            .filter(|(_, event)| keep(event))
+            .unzip();
+        self.positions = positions;
+        self.events = events;
+    }
+
     /// CR 603.2c: the full-buffer identity of a claim made over `self.events`.
     fn full_buffer_claim(
         &self,

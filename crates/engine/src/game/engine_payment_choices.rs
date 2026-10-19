@@ -4024,6 +4024,666 @@ mod tests {
         }
     }
 
+    fn completion_choice(value: i32) -> AbilityDefinition {
+        AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChooseOneOf {
+                chooser: crate::types::ability::PlayerFilter::Controller,
+                branches: vec![AbilityDefinition::new(AbilityKind::Spell, gain_life(value))],
+                kind: crate::types::ability::ChooseOneOfKind::Ordinary,
+            },
+        )
+    }
+
+    // Synthetic class fixture; every owner is installed by ordinary activation.
+    fn completion_payment_scenario(
+        inner_choice: bool,
+        outer_choice: bool,
+        paid_riders: bool,
+    ) -> (crate::game::scenario::GameScenario, ObjectId, ObjectId) {
+        use crate::game::scenario::GameScenario;
+        use crate::types::ability::{QuantityModification, ReplacementDefinition};
+        use crate::types::mana::{ManaColor, ManaCostShard};
+        use crate::types::replacements::ReplacementEvent;
+        let p2 = PlayerId(2);
+        let mut scenario = GameScenario::new_n_player(3, 42);
+        scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
+        let mut replacement_gain = AbilityDefinition::new(AbilityKind::Spell, gain_life(1));
+        if inner_choice {
+            replacement_gain = replacement_gain.sub_ability(completion_choice(2));
+        }
+        let replacement = ReplacementDefinition::new(ReplacementEvent::LoseLife)
+            .quantity_modification(QuantityModification::Plus { value: 0 })
+            .execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::ChooseOneOf {
+                    chooser: crate::types::ability::PlayerFilter::Controller,
+                    branches: vec![replacement_gain],
+                    kind: crate::types::ability::ChooseOneOfKind::Ordinary,
+                },
+            ));
+        let mut tail = AbilityDefinition::new(AbilityKind::Spell, gain_life(11));
+        tail.sub_link = SubAbilityLink::SequentialSibling;
+        if outer_choice {
+            let mut outer = completion_choice(5).sub_ability(tail);
+            outer.sub_link = SubAbilityLink::SequentialSibling;
+            tail = outer;
+        }
+        if paid_riders {
+            let mut unpaid = AbilityDefinition::new(AbilityKind::Spell, gain_life(7))
+                .condition(payment_condition(false))
+                .sub_ability(tail);
+            unpaid.sub_link = SubAbilityLink::SequentialSibling;
+            let mut paid = AbilityDefinition::new(AbilityKind::Spell, gain_life(3))
+                .condition(AbilityCondition::And {
+                    conditions: vec![
+                        AbilityCondition::effect_performed(),
+                        AbilityCondition::effect_performed(),
+                    ],
+                })
+                .sub_ability(unpaid);
+            paid.sub_link = SubAbilityLink::SequentialSibling;
+            tail = paid;
+        }
+        let root = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::PayCost {
+                cost: AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Mana {
+                            cost: ManaCost::Cost {
+                                shards: vec![ManaCostShard::PhyrexianBlack],
+                                generic: 1,
+                            },
+                        },
+                        AbilityCost::PayEnergy {
+                            amount: QuantityExpr::Fixed { value: 1 },
+                        },
+                    ],
+                },
+                scale: None,
+                payer: TargetFilter::Controller,
+            },
+        )
+        .sub_ability(tail);
+        let source = scenario
+            .add_creature(p2, "Staged completion", 1, 1)
+            .with_replacement_definition(replacement)
+            .with_ability_definition(root)
+            .id();
+        let land = scenario.add_basic_land(p2, ManaColor::White);
+        (scenario, source, land)
+    }
+
+    fn pass_to_completion_payer(runner: &mut crate::game::scenario::GameRunner) {
+        use crate::game::scenario::{P0, P1};
+        for player in [P0, P1] {
+            assert_eq!(runner.state().waiting_for, WaitingFor::Priority { player });
+            runner.act(GameAction::PassPriority).unwrap();
+        }
+        assert_eq!(
+            runner.state().waiting_for,
+            WaitingFor::Priority {
+                player: PlayerId(2)
+            }
+        );
+    }
+
+    fn begin_completion_payment(
+        runner: &mut crate::game::scenario::GameRunner,
+        source: ObjectId,
+    ) -> Vec<GameEvent> {
+        use crate::game::scenario::{P0, P1};
+        let p2 = PlayerId(2);
+        pass_to_completion_payer(runner);
+        let mut events = runner
+            .act(GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            })
+            .unwrap()
+            .events;
+        assert_eq!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { player: p2 }
+        );
+        for player in [p2, P0, P1] {
+            assert_eq!(runner.state().waiting_for, WaitingFor::Priority { player });
+            events.extend(runner.act(GameAction::PassPriority).unwrap().events);
+        }
+        assert!(
+            matches!(runner.state().waiting_for, WaitingFor::ChooseOneOfBranch { player, .. } if player == p2)
+        );
+        assert!(runner.state().resolving_stack_entry.is_some());
+        assert!(runner.state().payment_transaction.is_some());
+        events
+    }
+
+    fn assert_completion_entitlement(state: &GameState) {
+        use crate::game::scenario::{P0, P1};
+        assert_eq!(state.waiting_for, WaitingFor::Priority { player: P0 });
+        assert_eq!(state.priority_player, P0);
+        assert!(state.priority_passes.is_empty());
+        assert_eq!(state.phase, crate::types::phase::Phase::PreCombatMain);
+        assert!(state.resolving_stack_entry.is_none());
+        let mut accepted = state.clone();
+        assert!(crate::game::engine::apply(&mut accepted, P0, GameAction::PassPriority).is_ok());
+        for wrong in [P1, PlayerId(2)] {
+            let mut rejected = state.clone();
+            assert!(
+                crate::game::engine::apply(&mut rejected, wrong, GameAction::PassPriority).is_err()
+            );
+            assert_eq!(rejected.players[2].life, state.players[2].life);
+            assert_eq!(rejected.phase, state.phase);
+            assert_eq!(rejected.turn_number, state.turn_number);
+        }
+    }
+
+    #[test]
+    fn completed_transaction_returns_to_active_player_across_three_seats() {
+        let p2 = PlayerId(2);
+        for energy in [2, 0] {
+            let (scenario, source, land) = completion_payment_scenario(false, false, true);
+            let mut runner = scenario.build();
+            runner.state_mut().players[2].energy = energy;
+            let turn = runner.state().turn_number;
+            let mut events = begin_completion_payment(&mut runner, source);
+            assert_eq!(runner.state().players[2].life, 20);
+            assert!(!runner.state().objects[&land].tapped);
+            let projected = crate::game::payment_transaction::project(runner.state());
+            assert_eq!(projected.players[2].life, 18);
+            assert!(projected.objects[&land].tapped);
+            assert!(projected.pending_deferred_life_cost_resume.is_some());
+            events.extend(
+                runner
+                    .act(GameAction::ChooseBranch { index: 0 })
+                    .unwrap()
+                    .events,
+            );
+            assert_eq!(
+                runner.state().players[2].life,
+                if energy == 2 { 33 } else { 38 }
+            );
+            assert_eq!(
+                runner.state().players[2].energy,
+                if energy == 2 { 1 } else { 0 }
+            );
+            assert_eq!(runner.state().objects[&land].tapped, energy == 2);
+            assert_eq!(runner.state().players[2].mana_pool.total(), 0);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        GameEvent::EnergyChanged {
+                            player: PlayerId(2),
+                            delta: -1
+                        }
+                    ))
+                    .count(),
+                usize::from(energy == 2)
+            );
+            for (amount, count) in [
+                (-2, usize::from(energy == 2)),
+                (1, usize::from(energy == 2)),
+                (3, usize::from(energy == 2)),
+                (7, usize::from(energy == 0)),
+                (11, 1),
+            ] {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event,
+                    GameEvent::LifeChanged { player_id, amount: actual, .. }
+                        if *player_id == p2 && *actual == amount))
+                        .count(),
+                    count
+                );
+            }
+            assert!(runner.state().payment_transaction.is_none());
+            assert!(runner.state().pending_deferred_life_cost_resume.is_none());
+            assert_eq!(runner.state().turn_number, turn);
+            // CR 117.3b: active P0 differs from chooser/controller P2 and closer P1.
+            assert_completion_entitlement(runner.state());
+        }
+    }
+
+    fn add_completion_delayed_observer(
+        scenario: &mut crate::game::scenario::GameScenario,
+        exclude_two: bool,
+    ) -> ObjectId {
+        use crate::types::ability::{Comparator, DelayedTriggerCondition, WheneverEventExpiry};
+        let p2 = PlayerId(2);
+        let mut trigger = TriggerDefinition::new(TriggerMode::LifeGained);
+        if exclude_two {
+            trigger.life_amount = Some((Comparator::NE, 2));
+        }
+        for index in 0..8 {
+            scenario.add_card_to_library_top(p2, &format!("Observer draw {index}"));
+        }
+        scenario
+            .add_creature(p2, "Duration observer", 1, 1)
+            .with_ability_definition(AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::CreateDelayedTrigger {
+                    condition: DelayedTriggerCondition::WheneverEvent {
+                        trigger: Box::new(trigger),
+                        expiry: WheneverEventExpiry::EndOfTurn,
+                    },
+                    effect: Box::new(AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::Draw {
+                            count: QuantityExpr::Fixed { value: 1 },
+                            target: TargetFilter::Controller,
+                        },
+                    )),
+                    uses_tracked_set: false,
+                },
+            ))
+            .id()
+    }
+
+    fn install_completion_delayed_observer(
+        runner: &mut crate::game::scenario::GameRunner,
+        source: ObjectId,
+    ) {
+        pass_to_completion_payer(runner);
+        runner.activate(source, 0).resolve();
+        assert_eq!(runner.state().delayed_triggers.len(), 1);
+        assert!(runner.state().stack.is_empty());
+    }
+
+    fn completion_order_contexts(state: &GameState) -> Vec<(ObjectId, GameEvent)> {
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::OrderTriggers {
+                player: PlayerId(2),
+                ..
+            }
+        ));
+        let groups = &state.pending_trigger_order.as_ref().unwrap().groups;
+        assert_eq!(groups.len(), 1);
+        groups[0]
+            .triggers
+            .iter()
+            .map(|context| {
+                (
+                    context.pending.source_id,
+                    context.pending.trigger_event.clone().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn completion_stack_contexts(state: &GameState) -> Vec<(ObjectId, GameEvent)> {
+        state
+            .stack
+            .iter()
+            .map(|entry| {
+                let crate::types::game_state::StackEntryKind::TriggeredAbility {
+                    trigger_event,
+                    ..
+                } = &entry.kind
+                else {
+                    panic!("expected announced observer: {entry:?}");
+                };
+                (entry.source_id, trigger_event.clone().unwrap())
+            })
+            .collect()
+    }
+
+    fn completion_amount(event: &GameEvent) -> i32 {
+        let GameEvent::LifeChanged {
+            player_id: PlayerId(2),
+            amount,
+            ..
+        } = event
+        else {
+            panic!("expected the payer's exact life occurrence: {event:?}");
+        };
+        *amount
+    }
+
+    #[test]
+    fn transaction_keeps_carrier_until_inner_and_outer_choices_finish() {
+        for energy in [2, 0] {
+            let (mut scenario, source, land) = completion_payment_scenario(true, true, true);
+            let observer = add_completion_delayed_observer(&mut scenario, true);
+            let mut runner = scenario.build();
+            runner.state_mut().players[2].energy = energy;
+            install_completion_delayed_observer(&mut runner, observer);
+            let mut events = begin_completion_payment(&mut runner, source);
+            let carrier = runner.state().resolving_stack_entry.as_ref().unwrap().id;
+            events.extend(
+                runner
+                    .act(GameAction::ChooseBranch { index: 0 })
+                    .unwrap()
+                    .events,
+            );
+            assert!(matches!(
+                runner.state().waiting_for,
+                WaitingFor::ChooseOneOfBranch {
+                    player: PlayerId(2),
+                    ..
+                }
+            ));
+            assert_eq!(runner.state().players[2].life, 20);
+            assert_eq!(runner.state().players[2].energy, energy);
+            assert!(!runner.state().objects[&land].tapped);
+            assert!(runner.state().payment_transaction.is_some());
+            assert_eq!(
+                runner.state().resolving_stack_entry.as_ref().unwrap().id,
+                carrier
+            );
+            assert_eq!(
+                crate::game::payment_transaction::project(runner.state()).players[2].life,
+                19
+            );
+            assert!(runner.state().stack.is_empty());
+            events.extend(
+                runner
+                    .act(GameAction::ChooseBranch { index: 0 })
+                    .unwrap()
+                    .events,
+            );
+            let state = runner.state();
+            assert!(state.payment_transaction.is_none());
+            assert!(state.pending_deferred_life_cost_resume.is_none());
+            assert!(matches!(
+                state.waiting_for,
+                WaitingFor::ChooseOneOfBranch {
+                    player: PlayerId(2),
+                    ..
+                }
+            ));
+            assert_eq!(state.resolving_stack_entry.as_ref().unwrap().id, carrier);
+            assert_eq!(state.players[2].life, if energy == 2 { 24 } else { 27 });
+            assert_eq!(state.objects[&land].tapped, energy == 2);
+            assert_eq!(state.players[2].energy, if energy == 2 { 1 } else { 0 });
+            assert_eq!(state.players[2].mana_pool.total(), 0);
+            assert!(!events
+                .iter()
+                .any(|event| matches!(completion_amount_if_payer(event), Some(5 | 11))));
+            assert!(state.stack.is_empty());
+            let retained: Vec<_> = state
+                .deferred_triggers
+                .iter()
+                .map(|context| completion_amount(context.pending.trigger_event.as_ref().unwrap()))
+                .collect();
+            assert_eq!(retained, if energy == 2 { vec![1, 3] } else { vec![7] });
+            events.extend(
+                runner
+                    .act(GameAction::ChooseBranch { index: 0 })
+                    .unwrap()
+                    .events,
+            );
+            assert_eq!(
+                runner.state().players[2].life,
+                if energy == 2 { 40 } else { 43 }
+            );
+            assert!(runner.state().resolving_stack_entry.is_none());
+            let contexts = completion_order_contexts(runner.state());
+            assert!(contexts
+                .iter()
+                .all(|(source, event)| *source == observer && events.contains(event)));
+            let expected = if energy == 2 {
+                vec![1, 3, 5, 11]
+            } else {
+                vec![7, 5, 11]
+            };
+            assert_eq!(
+                contexts.len(),
+                expected.len(),
+                "FIRST ordering window is the whole group"
+            );
+            for amount in &expected {
+                assert_eq!(
+                    contexts
+                        .iter()
+                        .filter(|(_, event)| completion_amount(event) == *amount)
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| completion_amount_if_payer(event) == Some(*amount))
+                        .count(),
+                    1
+                );
+            }
+            let order = if energy == 2 {
+                vec![2, 0, 3, 1]
+            } else {
+                vec![1, 0, 2]
+            };
+            let selected: Vec<_> = order.iter().map(|index| contexts[*index].clone()).collect();
+            runner.act(GameAction::OrderTriggers { order }).unwrap();
+            assert_eq!(completion_stack_contexts(runner.state()), selected);
+            let hand = runner.state().players[2].hand.len();
+            runner.advance_until_stack_empty();
+            assert_eq!(runner.state().players[2].hand.len(), hand + expected.len());
+            assert_eq!(runner.state().delayed_triggers.len(), 1);
+            assert_completion_entitlement(runner.state());
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        GameEvent::EnergyChanged {
+                            player: PlayerId(2),
+                            delta: -1
+                        }
+                    ))
+                    .count(),
+                usize::from(energy == 2)
+            );
+            for amount in [-2, 1, 2, 3] {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| completion_amount_if_payer(event) == Some(amount))
+                        .count(),
+                    usize::from(energy == 2)
+                );
+            }
+        }
+    }
+
+    fn completion_amount_if_payer(event: &GameEvent) -> Option<i32> {
+        match event {
+            GameEvent::LifeChanged {
+                player_id: PlayerId(2),
+                amount,
+                ..
+            } => Some(*amount),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn canonical_payment_tail_does_not_recollect_replayed_delayed_occurrences() {
+        use crate::types::ability::Comparator;
+        use crate::types::counter::CounterType;
+        use crate::types::game_state::TargetRef;
+        for energy in [2, 0] {
+            let (mut scenario, source, land) = completion_payment_scenario(false, false, false);
+            let delayed = add_completion_delayed_observer(&mut scenario, false);
+            let sentinel = scenario
+                .add_creature(PlayerId(2), "Cost sentinel", 1, 1)
+                .id();
+            let decoy = scenario
+                .add_creature(PlayerId(2), "Other legal target", 1, 1)
+                .id();
+            let counter = |target| {
+                AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::PutCounter {
+                        counter_type: CounterType::Plus1Plus1,
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target,
+                    },
+                )
+            };
+            let ordinary = scenario
+                .add_creature(PlayerId(2), "Ordinary gain observer", 1, 1)
+                .with_trigger_definition(
+                    TriggerDefinition::new(TriggerMode::LifeGained)
+                        .execute(counter(TargetFilter::Typed(TypedFilter::creature()))),
+                )
+                .id();
+            let mut cost_trigger = TriggerDefinition::new(TriggerMode::LifeLost)
+                .execute(counter(TargetFilter::SelfRef));
+            cost_trigger.life_amount = Some((Comparator::EQ, 2));
+            // Separate source and output make the initial direct cost observable.
+            let cost = scenario
+                .add_creature(PlayerId(2), "Cost observer", 1, 1)
+                .with_trigger_definition(cost_trigger)
+                .id();
+            let mut runner = scenario.build();
+            runner.state_mut().players[2].energy = energy;
+            install_completion_delayed_observer(&mut runner, delayed);
+            let mut events = begin_completion_payment(&mut runner, source);
+            assert_eq!(runner.state().players[2].life, 20);
+            assert_eq!(
+                crate::game::payment_transaction::project(runner.state()).players[2].life,
+                18
+            );
+            events.extend(
+                runner
+                    .act(GameAction::ChooseBranch { index: 0 })
+                    .unwrap()
+                    .events,
+            );
+            assert_eq!(
+                runner.state().players[2].life,
+                if energy == 2 { 30 } else { 31 }
+            );
+            assert_eq!(runner.state().objects[&land].tapped, energy == 2);
+            assert_eq!(
+                runner.state().players[2].energy,
+                if energy == 2 { 1 } else { 0 }
+            );
+            assert_eq!(runner.state().players[2].mana_pool.total(), 0);
+            for amount in [-2, 1, 11] {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| completion_amount_if_payer(event) == Some(amount))
+                        .count(),
+                    if amount == 11 {
+                        1
+                    } else {
+                        usize::from(energy == 2)
+                    }
+                );
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        GameEvent::EnergyChanged {
+                            player: PlayerId(2),
+                            delta: -1
+                        }
+                    ))
+                    .count(),
+                usize::from(energy == 2)
+            );
+            assert!(runner.state().payment_transaction.is_none());
+            assert!(runner.state().pending_deferred_life_cost_resume.is_none());
+            assert!(runner.state().resolving_stack_entry.is_none());
+            let contexts = completion_order_contexts(runner.state());
+            let expected = if energy == 2 {
+                vec![
+                    (cost, -2),
+                    (ordinary, 1),
+                    (delayed, 1),
+                    (ordinary, 11),
+                    (delayed, 11),
+                ]
+            } else {
+                vec![(ordinary, 11), (delayed, 11)]
+            };
+            assert_eq!(
+                contexts.len(),
+                expected.len(),
+                "FIRST whole group precedes all construction"
+            );
+            let mut order = Vec::new();
+            for (source, amount) in &expected {
+                let found: Vec<_> = contexts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (actual_source, event))| {
+                        actual_source == source && completion_amount(event) == *amount
+                    })
+                    .collect();
+                assert_eq!(
+                    found.len(),
+                    1,
+                    "source plus exact occurrence identifies each firing"
+                );
+                assert!(
+                    events.contains(&found[0].1 .1),
+                    "context is an actually published occurrence"
+                );
+                order.push(found[0].0);
+            }
+            if energy == 2 {
+                order = vec![order[3], order[1], order[4], order[0], order[2]];
+            }
+            let selected: Vec<_> = order.iter().map(|index| contexts[*index].clone()).collect();
+            runner.act(GameAction::OrderTriggers { order }).unwrap();
+            let mut target_choices = 0;
+            for _ in 0..8 {
+                let WaitingFor::TriggerTargetSelection { target_slots, .. } =
+                    &runner.state().waiting_for
+                else {
+                    break;
+                };
+                assert!(target_slots[0].legal_targets.len() >= 2);
+                assert!(target_slots[0]
+                    .legal_targets
+                    .contains(&TargetRef::Object(sentinel)));
+                assert!(target_slots[0]
+                    .legal_targets
+                    .contains(&TargetRef::Object(decoy)));
+                runner
+                    .act(GameAction::ChooseTarget {
+                        target: Some(TargetRef::Object(sentinel)),
+                    })
+                    .unwrap();
+                target_choices += 1;
+            }
+            assert_eq!(target_choices, if energy == 2 { 2 } else { 1 });
+            assert_eq!(completion_stack_contexts(runner.state()), selected);
+            let hand = runner.state().players[2].hand.len();
+            runner.advance_until_stack_empty();
+            let gains = if energy == 2 { 2 } else { 1 };
+            assert_eq!(runner.state().players[2].hand.len(), hand + gains);
+            assert_eq!(
+                runner.state().objects[&sentinel]
+                    .counters
+                    .get(&CounterType::Plus1Plus1)
+                    .copied()
+                    .unwrap_or(0),
+                gains as u32
+            );
+            assert_eq!(
+                runner.state().objects[&cost]
+                    .counters
+                    .get(&CounterType::Plus1Plus1)
+                    .copied()
+                    .unwrap_or(0),
+                u32::from(energy == 2)
+            );
+            assert_eq!(runner.state().delayed_triggers.len(), 1);
+            assert_completion_entitlement(runner.state());
+        }
+    }
+
     fn gain_life(value: i32) -> Effect {
         Effect::GainLife {
             amount: QuantityExpr::Fixed { value },

@@ -58,6 +58,61 @@ pub(crate) fn run_post_action_pipeline_from(
         },
         None,
         SpellFinalPartBoundary::AtPassTop,
+        None,
+        None,
+    )
+}
+
+/// CR 603.2c + CR 603.3b: replay history is already collected; only the
+/// canonical continuation's suffix joins this completed resolution's batch.
+pub(crate) fn run_post_action_pipeline_for_canonical_tail(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+    continuation_event_start: usize,
+    default_wf: &WaitingFor,
+    completed_resolution: Option<ObjectId>,
+) -> Result<WaitingFor, EngineError> {
+    run_post_action_pipeline_from_with_policy(
+        state,
+        events,
+        continuation_event_start,
+        default_wf,
+        false,
+        DeferredTriggerDrainPolicy::ResolutionSafe,
+        None,
+        SpellFinalPartBoundary::AtPassTop,
+        Some(continuation_event_start),
+        completed_resolution,
+    )
+}
+
+/// CR 603.3b: an ordinary choice that retired its exact parent joins the
+/// answer's observers to everything retained during that resolution.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_post_action_pipeline_after_resumed_resolution(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+    event_start: usize,
+    default_wf: &WaitingFor,
+    skip_trigger_scan: bool,
+    skip_deferred_trigger_drain: bool,
+    completed_resolution: ObjectId,
+) -> Result<WaitingFor, EngineError> {
+    run_post_action_pipeline_from_with_policy(
+        state,
+        events,
+        event_start,
+        default_wf,
+        skip_trigger_scan,
+        if skip_deferred_trigger_drain {
+            DeferredTriggerDrainPolicy::Skip
+        } else {
+            DeferredTriggerDrainPolicy::ResolutionSafe
+        },
+        None,
+        SpellFinalPartBoundary::AtPassTop,
+        Some(0),
+        Some(completed_resolution),
     )
 }
 
@@ -101,6 +156,8 @@ pub(crate) fn run_post_action_pipeline_from_settled_priority(
         DeferredTriggerDrainPolicy::SettledPriority,
         Some(player),
         SpellFinalPartBoundary::AtPassTop,
+        None,
+        None,
     )?;
     Ok(triggers::finish_trigger_construction_action(
         state, events, produced,
@@ -126,6 +183,8 @@ pub(super) fn run_post_action_pipeline_after_spell_final_part(
         DeferredTriggerDrainPolicy::ResolutionSafe,
         None,
         SpellFinalPartBoundary::RanBeforePass,
+        None,
+        None,
     )
 }
 
@@ -150,6 +209,8 @@ fn run_post_action_pipeline_from_with_policy(
     drain_policy: DeferredTriggerDrainPolicy,
     carried_priority_recipient: Option<PlayerId>,
     final_part_boundary: SpellFinalPartBoundary,
+    delayed_event_start: Option<usize>,
+    completed_resolution: Option<ObjectId>,
 ) -> Result<WaitingFor, EngineError> {
     #[cfg(feature = "test-support")]
     crate::game::perf_counters::record_post_action_pipeline_pass();
@@ -163,6 +224,8 @@ fn run_post_action_pipeline_from_with_policy(
         drain_policy,
         carried_priority_recipient,
         final_part_boundary,
+        delayed_event_start,
+        completed_resolution,
     );
     // The pass scanned the buffer through its end; later announcement staging
     // in this action starts after it.
@@ -180,13 +243,25 @@ fn run_post_action_pipeline_core(
     drain_policy: DeferredTriggerDrainPolicy,
     carried_priority_recipient: Option<PlayerId>,
     final_part_boundary: SpellFinalPartBoundary,
+    delayed_event_start: Option<usize>,
+    completed_resolution: Option<ObjectId>,
 ) -> Result<WaitingFor, EngineError> {
     // CR 608.2c + CR 608.2n: an instant or sorcery whose instructions paused
     // is put into its owner's graveyard as the final part of its resolution,
     // once those instructions are done. This boundary completes it, before the
     // scan below; the final part's triggers wait for this pass's batch.
+    let mut effective_default = default_wf.clone();
+    let carrier_before_final_part = state.resolving_stack_entry.as_ref().map(|entry| entry.id);
     let final_part_ran = super::engine::run_spell_final_part_if_due(state, events)
         || final_part_boundary == SpellFinalPartBoundary::RanBeforePass;
+    if carrier_before_final_part.is_some()
+        && state.resolving_stack_entry.is_none()
+        && matches!(state.waiting_for, WaitingFor::Priority { .. })
+    {
+        effective_default = state.waiting_for.clone();
+    }
+    let completed_resolution_batch = completed_resolution.is_some();
+    let payment_owned = state.payment_transaction.is_some() || state.payment_transaction_replay;
     // CR 608.2n + CR 117.5 + CR 603.3: once the final part has run the resolution
     // is over, so the batch it completes goes on the stack above any spell still
     // below it (that spell has not begun to resolve, CR 405.5). The #1793 guard
@@ -229,7 +304,10 @@ fn run_post_action_pipeline_core(
     let mut delayed_trigger_events = Vec::new();
     // Where this pass's delayed scan starts in `events`: the whole buffer,
     // unless the announced-cast batch below already scanned a prefix of it.
-    let mut delayed_scan_start = 0;
+    // None retains old wrappers' whole-buffer Priority scan. Some(start)
+    // additionally owns delivery before a further prompt, including Some(0)
+    // on abort. The bound itself never proves carrier completion.
+    let mut delayed_scan_start = delayed_event_start.unwrap_or(0);
     // CR 603.3 + CR 603.3b: the cast observers latched during a finished
     // resolution are put on the stack with this action's fresh observers as
     // ONE batch, above the cast spells; the fresh observers join the queue
@@ -265,7 +343,10 @@ fn run_post_action_pipeline_core(
         // retained ZoneChanged occurrences into deferred trigger contexts. Do
         // not rediscover those records through the generic post-action scan;
         // its batched definitions remain reserved for final settlement.
-        let retained_logical_zone_events = retained_logical_zone_events(state);
+        let mut retained_logical_zone_events = retained_logical_zone_events(state);
+        if payment_owned || delayed_event_start.is_some() {
+            retained_logical_zone_events.extend(retained_cost_events(state));
+        }
         // A completed logical owner has already collected its segment and
         // settlement contexts into the deferred queue, and a paused owner that
         // drained may instead have claimed them in the consumed ledger.
@@ -360,6 +441,8 @@ fn run_post_action_pipeline_core(
             // priority — the parked triggers, its final part's and this
             // answer's — on the stack as one batch, through the drain below.
             || final_part_ran
+            || payment_owned
+            || completed_resolution_batch
         {
             triggers::collect_triggers_into_deferred(state, &filtered_events);
         } else if announced_cast_batch && state.game_end.is_none() {
@@ -468,6 +551,8 @@ fn run_post_action_pipeline_core(
             if state.pending_resolution_completion.is_some()
                 || announced_cast_batch
                 || final_part_ran
+                || payment_owned
+                || completed_resolution_batch
             {
                 triggers::collect_triggers_into_deferred(state, &sba_events);
             } else {
@@ -478,6 +563,20 @@ fn run_post_action_pipeline_core(
             // next SBA pass.
             if let Some(waiting_for) = begin_pending_trigger_target_selection(state)? {
                 state.waiting_for = waiting_for.clone();
+                if delayed_event_start.is_some() || payment_owned {
+                    let delayed_input = unclaimed_delayed_trigger_input(
+                        state,
+                        events,
+                        delayed_scan_start,
+                        &mut consumed_trigger_events,
+                        delayed_event_start,
+                    );
+                    triggers::collect_unclaimed_delayed_triggers_into_deferred(
+                        state,
+                        events,
+                        &delayed_input,
+                    );
+                }
                 persist_carried_recipient_across_prompt(state, carried_priority_recipient);
                 state.consumed_before_priority_trigger_events.clear();
                 return Ok(waiting_for);
@@ -529,6 +628,8 @@ fn run_post_action_pipeline_core(
             || state.pending_resolution_completion.is_some()
             || announced_cast_batch
             || final_part_ran
+            || payment_owned
+            || completed_resolution_batch
         {
             triggers::collect_triggers_into_deferred(state, &unconsumed_exile_return_events);
         } else {
@@ -561,7 +662,27 @@ fn run_post_action_pipeline_core(
     // / mid-spell settles; same-controller groups get `OrderTriggers` first).
     // A drained trigger that itself needs input returns its own WaitingFor,
     // handled by the check below.
+    // CR 603.3b: collect the whole completed group before the first drain or
+    // emptiness decision, including a group containing only delayed observers.
+    if completed_resolution_batch && !payment_owned && state.game_end.is_none() {
+        let delayed_input = unclaimed_delayed_trigger_input(
+            state,
+            events,
+            delayed_scan_start,
+            &mut consumed_trigger_events,
+            delayed_event_start,
+        );
+        triggers::collect_unclaimed_delayed_triggers_into_deferred(state, events, &delayed_input);
+        delayed_scan_start = events.len();
+    }
+    let carrier_before_terminal = state.resolving_stack_entry.as_ref().map(|entry| entry.id);
     if settle_pending_resolution_completion(state, events) {
+        if carrier_before_terminal.is_some()
+            && state.resolving_stack_entry.is_none()
+            && matches!(state.waiting_for, WaitingFor::Priority { .. })
+        {
+            effective_default = state.waiting_for.clone();
+        }
         if let Some(wf) =
             triggers::drain_deferred_triggers_after_stack_object_announcement(state, events)
         {
@@ -570,7 +691,10 @@ fn run_post_action_pipeline_core(
     } else if matches!(state.waiting_for, WaitingFor::Priority { .. })
         && !state.deferred_triggers.is_empty()
     {
-        if deferred_trigger_batch_was_sba_choice_parked && !delayed_trigger_events.is_empty() {
+        if !payment_owned
+            && deferred_trigger_batch_was_sba_choice_parked
+            && !delayed_trigger_events.is_empty()
+        {
             // This is the one post-answer CR 603.3b ordering attempt owned by
             // the completed SBA choice. Consuming the marker before dispatch
             // ensures a trigger that pauses again re-parks as ordinary work.
@@ -611,7 +735,7 @@ fn run_post_action_pipeline_core(
         } else {
             // CR 603.3: the observers of spells cast and announced during a
             // finished resolution go on the stack above those spells.
-            let policy = if announced_cast_batch || final_part_ran {
+            let policy = if announced_cast_batch || final_part_ran || completed_resolution_batch {
                 // CR 603.2 + CR 603.3b: the action's delayed observers (of its
                 // own events, its state-based actions and its exile returns)
                 // join the announced-cast or final-part batch, through the one
@@ -624,6 +748,7 @@ fn run_post_action_pipeline_core(
                     events,
                     delayed_scan_start,
                     &mut consumed_trigger_events,
+                    delayed_event_start,
                 );
                 triggers::collect_unclaimed_delayed_triggers_into_deferred(
                     state,
@@ -648,6 +773,22 @@ fn run_post_action_pipeline_core(
     }
 
     if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+        // CR 603.2c + CR 603.7b: a further canonical prompt retains fresh
+        // delayed occurrences now; its later answer has a different buffer.
+        if (delayed_event_start.is_some() || payment_owned) && state.game_end.is_none() {
+            let delayed_input = unclaimed_delayed_trigger_input(
+                state,
+                events,
+                delayed_scan_start,
+                &mut consumed_trigger_events,
+                delayed_event_start,
+            );
+            triggers::collect_unclaimed_delayed_triggers_into_deferred(
+                state,
+                events,
+                &delayed_input,
+            );
+        }
         if matches!(state.waiting_for, WaitingFor::GameOver { .. }) {
             match_flow::handle_game_over_transition(state);
         }
@@ -658,7 +799,7 @@ fn run_post_action_pipeline_core(
 
     // CR 800.4: If SBAs eliminated the player who was about to receive priority,
     // respect the reassignment that eliminate_player() already performed.
-    if let Some(player) = default_wf.acting_player() {
+    if let Some(player) = effective_default.acting_player() {
         if !players::is_alive(state, player) {
             state.consumed_before_priority_trigger_events.clear();
             return Ok(state.waiting_for.clone());
@@ -670,7 +811,13 @@ fn run_post_action_pipeline_core(
         events,
         delayed_scan_start,
         &mut consumed_trigger_events,
+        delayed_event_start,
     );
+    if payment_owned {
+        triggers::collect_unclaimed_delayed_triggers_into_deferred(state, events, &delayed_input);
+        state.consumed_before_priority_trigger_events.clear();
+        return Ok(state.waiting_for.clone());
+    }
     let delayed_events = triggers::check_delayed_triggers(state, &delayed_input.events);
     events.extend(delayed_events);
     state.consumed_before_priority_trigger_events.clear();
@@ -700,7 +847,7 @@ fn run_post_action_pipeline_core(
         let outgoing = flush_pending_priority_intercepts(
             state,
             settled_priority_wait.clone(),
-            default_wf.acting_player(),
+            effective_default.acting_player(),
         );
         return Ok(outgoing);
     }
@@ -709,8 +856,8 @@ fn run_post_action_pipeline_core(
 
     Ok(flush_pending_priority_intercepts(
         state,
-        default_wf.clone(),
-        default_wf.acting_player(),
+        effective_default.clone(),
+        effective_default.acting_player(),
     ))
 }
 
@@ -727,16 +874,57 @@ fn unclaimed_delayed_trigger_input(
     events: &[GameEvent],
     start: usize,
     consumed: &mut Vec<triggers::ConsumedTriggerEventOccurrence>,
+    delivery_start: Option<usize>,
 ) -> triggers::UnclaimedTriggerEvents {
     consumed.extend(std::mem::take(
         &mut state.consumed_before_priority_trigger_events,
     ));
-    triggers::unclaimed_trigger_events_from(
+    let mut input = triggers::unclaimed_trigger_events_from(
         events,
         start,
         triggers::TriggerCollectionRequester::Delayed,
         consumed,
-    )
+    );
+    if delivery_start.is_some()
+        || state.payment_transaction.is_some()
+        || state.payment_transaction_replay
+    {
+        let mut retained = retained_logical_zone_events(state);
+        retained.extend(retained_cost_events(state));
+        input.retain(|event| {
+            !matches!(event, GameEvent::PhaseChanged { .. })
+                && !state.deferred_entry_events.contains(event)
+                && !retained.contains(event)
+        });
+    }
+    input
+}
+
+/// CR 603.2c: exact cost occurrences still retained by their typed payment
+/// owner, including suspended parent mana cursors, await that owner's scan.
+pub(crate) fn retained_cost_events(state: &GameState) -> Vec<GameEvent> {
+    use crate::types::game_state::PendingCostMoveResume;
+    let mut retained = Vec::new();
+    if let Some(PendingCostMoveResume::SacrificeForCost {
+        deferred_cost_events,
+        ..
+    }) = state.pending_cost_move_resume.as_ref()
+    {
+        retained.extend(deferred_cost_events.iter().cloned());
+    }
+    if let Some(PendingCostMoveResume::ManaAbilityPayment { cursor, .. }) =
+        state.pending_cost_move_resume.as_ref()
+    {
+        let mut cursor = cursor;
+        loop {
+            retained.extend(cursor.deferred_cost_events.iter().cloned());
+            let Some(parent) = cursor.parent.as_ref() else {
+                break;
+            };
+            cursor = parent.cursor.as_ref();
+        }
+    }
+    retained
 }
 
 /// CR 903.9a + CR 704.5j + CR 310.11: SBA-owned commander, legend, and
@@ -839,13 +1027,17 @@ pub(super) fn settle_pending_resolution_completion(
     }) {
         return false;
     }
-
+    let Some(carrier) = state.resolving_stack_entry.as_ref().map(|entry| entry.id) else {
+        return false;
+    };
+    // CR 608.2c: remove only this terminal marker while checking every other
+    // instruction owner. Refusal leaves the terminal obligation installed.
+    let completion = state.pending_resolution_completion.take();
+    if !super::engine::resolution_instructions_are_done(state) {
+        state.pending_resolution_completion = completion;
+        return false;
+    }
     ensure_terminal_cast_spell_triggers_collected(state, final_cast);
-
-    // The source check at batch completion proved this is the active Ripple
-    // resolution. Now its terminal instruction has completed, so clear the
-    // resolution-only LKI before the explicit post-announcement drain.
-    state.pending_resolution_completion = None;
     // CR 608.2n: the rippled spell's own final part runs first, through the
     // single final-part authority; should it park a question of its own, the
     // carrier stays and the parked triggers wait for the ordinary
@@ -854,14 +1046,12 @@ pub(super) fn settle_pending_resolution_completion(
     if super::stack::resolving_spell_owes_final_part(state) {
         super::engine::run_spell_final_part_if_due(state, events);
     } else {
-        super::stack::finish_resolving_stack_entry(
-            state,
-            super::lifecycle::DelayedTerminalDisposition::Resolved,
-        );
-        // CR 400.7j: resolution-scoped self-move state ends with its carrier.
-        state.resolution_source_relatch = None;
+        super::engine::settle_resolving_stack_entry_after_continuation_resume(state);
     }
-    state.resolving_stack_entry.is_none()
+    state
+        .resolving_stack_entry
+        .as_ref()
+        .is_none_or(|entry| entry.id != carrier)
 }
 
 /// CR 603.2 + CR 603.3b + CR 608.2g: replacement-resume casts can complete

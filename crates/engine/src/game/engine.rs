@@ -9068,6 +9068,17 @@ fn settle_finished_resolving_stack_entry(state: &mut GameState) {
     );
     // CR 400.7j: resolution-scoped self-move state ends with its carrier.
     state.resolution_source_relatch = None;
+    // CR 117.3b: completion of this nonmana stack object grants priority to
+    // the active player, after settlement. A real prompt retains its owner.
+    if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+        super::priority::reset_priority(state);
+        super::public_state::sync_waiting_for(
+            state,
+            &WaitingFor::Priority {
+                player: state.active_player,
+            },
+        );
+    }
 }
 
 /// CR 608.2c + CR 608.2n: the single authority that completes an instant or
@@ -9096,16 +9107,34 @@ pub(super) fn run_spell_final_part_if_due(
     {
         return false;
     }
+    let carrier = state.resolving_stack_entry.as_ref().map(|entry| entry.id);
+    let owed = state.resolving_spell_final_part;
     let final_part_start = events.len();
     match super::stack::finish_deferred_spell_resolution(state, events) {
         super::stack::DeferredFinalPart::Parked => {}
-        super::stack::DeferredFinalPart::Completed | super::stack::DeferredFinalPart::NotOwed => {
-            super::stack::finish_resolving_stack_entry(
-                state,
-                super::lifecycle::DelayedTerminalDisposition::Resolved,
+        super::stack::DeferredFinalPart::Completed => {
+            // CR 608.2n: discharge only the exact carrier's completed final
+            // part before asking the ordinary readiness gate to retire it.
+            assert!(
+                carrier.is_some_and(|id| {
+                    state
+                        .resolving_stack_entry
+                        .as_ref()
+                        .is_some_and(|entry| entry.id == id)
+                        && owed.is_some_and(|marker| marker.spell == id)
+                        && state.resolving_spell_final_part == owed
+                }),
+                "completed final part must retain its exact carrier and debt"
             );
-            // CR 400.7j: resolution-scoped self-move state ends with its carrier.
-            state.resolution_source_relatch = None;
+            state.resolving_spell_final_part = None;
+            settle_resolving_stack_entry_after_continuation_resume(state);
+        }
+        super::stack::DeferredFinalPart::NotOwed => {
+            assert!(
+                !super::stack::resolving_spell_owes_final_part(state),
+                "NotOwed cannot discharge an installed final-part debt"
+            );
+            settle_resolving_stack_entry_after_continuation_resume(state);
         }
     }
     let final_part_events: Vec<GameEvent> = events[final_part_start..]
@@ -11625,6 +11654,7 @@ fn apply_non_priority_pass_action(
     stack_len_before_action: usize,
 ) -> Result<ActionResult, EngineError> {
     let mut triggers_processed_inline = false;
+    let mut completed_resolution = None;
     let skip_deferred_trigger_drain = false;
     let action_for_divergence = action.clone();
 
@@ -11662,15 +11692,13 @@ fn apply_non_priority_pass_action(
                 epoch: response_epoch,
                 decision: ResolveAllConsentDecision::Decline,
             },
-        ) => {
-            respond_resolve_all_consent(
-                state,
-                *epoch,
-                *representative,
-                response_epoch,
-                ResolveAllConsentDecision::Decline,
-            )?
-        }
+        ) => respond_resolve_all_consent(
+            state,
+            *epoch,
+            *representative,
+            response_epoch,
+            ResolveAllConsentDecision::Decline,
+        )?,
         (
             WaitingFor::ResolveAllConsent {
                 epoch,
@@ -11680,13 +11708,7 @@ fn apply_non_priority_pass_action(
                 epoch: response_epoch,
                 decision,
             },
-        ) => respond_resolve_all_consent(
-            state,
-            *epoch,
-            *representative,
-            response_epoch,
-            decision,
-        )?,
+        ) => respond_resolve_all_consent(state, *epoch, *representative, response_epoch, decision)?,
         (
             WaitingFor::ResolveAllConsent { .. } | WaitingFor::ResolveAllReady { .. },
             GameAction::RevokeResolveAllConsent {
@@ -11952,10 +11974,7 @@ fn apply_non_priority_pass_action(
                 return Err(EngineError::NotYourPriority);
             }
             let permission_index = casting::current_resolution_cast_permission_index(
-                state,
-                *player,
-                *object_id,
-                *card_id,
+                state, *player, *object_id, *card_id,
             )
             .ok_or_else(|| {
                 EngineError::ActionNotAllowed(
@@ -11968,8 +11987,7 @@ fn apply_non_priority_pass_action(
                 *object_id,
                 *card_id,
                 permission_index,
-            )
-            ?
+            )?
             .ok_or_else(|| {
                 EngineError::InvalidAction(
                     "Resolution face choice permission provenance is stale or mismatched"
@@ -12000,10 +12018,7 @@ fn apply_non_priority_pass_action(
                 return Err(EngineError::NotYourPriority);
             }
             let resolution_permission = casting::current_resolution_cast_permission_index(
-                state,
-                *player,
-                *object_id,
-                *card_id,
+                state, *player, *object_id, *card_id,
             );
             // Validate the exact indexed paid-cleanup root before changing the
             // visible face or its election flags. A forged receipt must leave
@@ -12078,7 +12093,9 @@ fn apply_non_priority_pass_action(
                         state.objects.insert(*object_id, object);
                     }
                 }
-                return result.map(|waiting_for| ActionResult::applied(std::mem::take(&mut events), waiting_for));
+                return result.map(|waiting_for| {
+                    ActionResult::applied(std::mem::take(&mut events), waiting_for)
+                });
             }
             // CR 712.12 / CR 712.11b: Route the re-entry by the now-active face's
             // type. A land face is put onto the battlefield via the play-land
@@ -12156,17 +12173,15 @@ fn apply_non_priority_pass_action(
                         &mut events,
                     )?
                 }
-                AlternativeCastKeyword::Dash => {
-                    casting::handle_dash_cost_choice_with_payment_mode(
-                        state,
-                        *player,
-                        *object_id,
-                        *card_id,
-                        choice,
-                        *payment_mode,
-                        &mut events,
-                    )?
-                }
+                AlternativeCastKeyword::Dash => casting::handle_dash_cost_choice_with_payment_mode(
+                    state,
+                    *player,
+                    *object_id,
+                    *card_id,
+                    choice,
+                    *payment_mode,
+                    &mut events,
+                )?,
                 AlternativeCastKeyword::Blitz => {
                     casting::handle_blitz_cost_choice_with_payment_mode(
                         state,
@@ -12596,22 +12611,18 @@ fn apply_non_priority_pass_action(
             | CostResume::SpellCost {
                 spell: pending_cast,
                 ..
-            } => {
-                casting_costs::handle_remove_counter_distribution_for_cost(
-                    state,
-                    *player,
-                    *pending_cast.clone(),
-                    *counter_count,
-                    counter_type.clone(),
-                    *selection,
-                    choices,
-                    &distribution,
-                    &mut events,
-                )?
-            }
-            CostResume::ManaAbility {
-                ..
-            } => {
+            } => casting_costs::handle_remove_counter_distribution_for_cost(
+                state,
+                *player,
+                *pending_cast.clone(),
+                *counter_count,
+                counter_type.clone(),
+                *selection,
+                choices,
+                &distribution,
+                &mut events,
+            )?,
+            CostResume::ManaAbility { .. } => {
                 return Err(EngineError::InvalidAction(
                     "Counter-cost distribution is not valid for mana abilities".to_string(),
                 ));
@@ -12650,54 +12661,65 @@ fn apply_non_priority_pass_action(
                     _ => None,
                 };
                 match kind {
-                PayCostKind::Discard => engine_casting::handle_discard_for_cost(
-                    state,
-                    *player,
-                    *pending_cast.clone(),
-                    *count,
-                    choices,
-                    &chosen,
-                    &mut events,
-                )?,
-                PayCostKind::Reveal => engine_casting::handle_reveal_for_cost(
-                    state,
-                    *player,
-                    *pending_cast.clone(),
-                    *count,
-                    choices,
-                    &chosen,
-                    &mut events,
-                )?,
-	                PayCostKind::Sacrifice => engine_casting::handle_sacrifice_for_cost(
-	                    state,
-	                    *player,
-	                    *pending_cast.clone(),
-	                    paid_cost,
-	                    casting_costs::CostSelection {
-	                        min_count: *min_count,
-	                        count: *count,
-	                        legal_permanents: choices,
-	                        chosen: &chosen,
-	                    },
-	                    &mut events,
-	                )?,
-                PayCostKind::ReturnToHand => engine_casting::handle_return_to_hand_for_cost(
-                    state,
-                    *player,
-                    *pending_cast.clone(),
-                    *count,
-                    choices,
-                    &chosen,
-                    &mut events,
-                )?,
-                // CR 601.2h: A ChangeZone effect-as-cost carries the optional
-                // any-number exile selection and its cast-time reduction.
-                PayCostKind::ExileFromZone { zone }
-                    if paid_cost.as_ref().is_some_and(|payment| {
-                        casting_costs::is_exile_any_number_effect_cost(payment.cost)
-                    }) =>
-                {
-                    casting_costs::handle_exile_any_number_for_cost(
+                    PayCostKind::Discard => engine_casting::handle_discard_for_cost(
+                        state,
+                        *player,
+                        *pending_cast.clone(),
+                        *count,
+                        choices,
+                        &chosen,
+                        &mut events,
+                    )?,
+                    PayCostKind::Reveal => engine_casting::handle_reveal_for_cost(
+                        state,
+                        *player,
+                        *pending_cast.clone(),
+                        *count,
+                        choices,
+                        &chosen,
+                        &mut events,
+                    )?,
+                    PayCostKind::Sacrifice => engine_casting::handle_sacrifice_for_cost(
+                        state,
+                        *player,
+                        *pending_cast.clone(),
+                        paid_cost,
+                        casting_costs::CostSelection {
+                            min_count: *min_count,
+                            count: *count,
+                            legal_permanents: choices,
+                            chosen: &chosen,
+                        },
+                        &mut events,
+                    )?,
+                    PayCostKind::ReturnToHand => engine_casting::handle_return_to_hand_for_cost(
+                        state,
+                        *player,
+                        *pending_cast.clone(),
+                        *count,
+                        choices,
+                        &chosen,
+                        &mut events,
+                    )?,
+                    // CR 601.2h: A ChangeZone effect-as-cost carries the optional
+                    // any-number exile selection and its cast-time reduction.
+                    PayCostKind::ExileFromZone { zone }
+                        if paid_cost.as_ref().is_some_and(|payment| {
+                            casting_costs::is_exile_any_number_effect_cost(payment.cost)
+                        }) =>
+                    {
+                        casting_costs::handle_exile_any_number_for_cost(
+                            state,
+                            *player,
+                            *zone,
+                            *pending_cast.clone(),
+                            *count,
+                            choices,
+                            &chosen,
+                            &mut events,
+                        )?
+                    }
+                    PayCostKind::ExileFromZone { zone } => engine_casting::handle_exile_for_cost(
                         state,
                         *player,
                         *zone,
@@ -12706,92 +12728,80 @@ fn apply_non_priority_pass_action(
                         choices,
                         &chosen,
                         &mut events,
-                    )?
-                }
-                PayCostKind::ExileFromZone { zone } => engine_casting::handle_exile_for_cost(
-                    state,
-                    *player,
-                    *zone,
-                    *pending_cast.clone(),
-                    *count,
-                    choices,
-                    &chosen,
-                    &mut events,
-                )?,
-                // CR 601.2h + CR 701.13: Exile a battlefield permanent the player
-                // controls as an additional/alternative cost (Food Chain class).
-                PayCostKind::ExilePermanent { filter } => {
-                    engine_casting::handle_exile_permanent_for_cost(
+                    )?,
+                    // CR 601.2h + CR 701.13: Exile a battlefield permanent the player
+                    // controls as an additional/alternative cost (Food Chain class).
+                    PayCostKind::ExilePermanent { filter } => {
+                        engine_casting::handle_exile_permanent_for_cost(
+                            state,
+                            *player,
+                            filter.clone(),
+                            *pending_cast.clone(),
+                            *count,
+                            choices,
+                            &chosen,
+                            &mut events,
+                        )?
+                    }
+                    // CR 701.3d + CR 608.2k: Unattach a matching attachment from the
+                    // source as an activation cost (Captain America's Throw). The
+                    // handler snapshots the detached Equipment as the cost-referent,
+                    // then re-surfaces the deferred damage division.
+                    PayCostKind::UnattachFrom { filter } => {
+                        casting_costs::handle_unattach_for_cost(
+                            state,
+                            *player,
+                            filter,
+                            *pending_cast.clone(),
+                            choices,
+                            &chosen,
+                            &mut events,
+                        )?
+                    }
+                    // CR 702.167a/b: Craft materials exile across the
+                    // battlefield/graveyard union.
+                    PayCostKind::ExileMaterials { materials } => {
+                        engine_casting::handle_exile_materials_for_cost(
+                            state,
+                            *player,
+                            materials.clone(),
+                            *pending_cast.clone(),
+                            (*min_count, *count),
+                            choices,
+                            &chosen,
+                            &mut events,
+                        )?
+                    }
+                    // CR 117.1 + CR 601.2b + CR 608.2c: Aggregate-threshold "exile
+                    // any number" cost (Baron Helmut Zemo's Boast); the handler
+                    // validates the threshold, exiles, publishes the tracked set, and
+                    // binds the resolving ability's tracked-set sentinel to it.
+                    PayCostKind::ExileAggregate {
+                        zone,
+                        function,
+                        property,
+                        comparator,
+                        value,
+                        filter,
+                    } => engine_casting::handle_exile_aggregate_for_cost(
                         state,
                         *player,
-                        filter.clone(),
-                        *pending_cast.clone(),
-                        *count,
-                        choices,
-                        &chosen,
-                        &mut events,
-                    )?
-                }
-                // CR 701.3d + CR 608.2k: Unattach a matching attachment from the
-                // source as an activation cost (Captain America's Throw). The
-                // handler snapshots the detached Equipment as the cost-referent,
-                // then re-surfaces the deferred damage division.
-                PayCostKind::UnattachFrom { filter } => {
-                    casting_costs::handle_unattach_for_cost(
-                        state,
-                        *player,
+                        *zone,
+                        *function,
+                        *property,
+                        *comparator,
+                        *value,
                         filter,
                         *pending_cast.clone(),
                         choices,
                         &chosen,
                         &mut events,
-                    )?
-                }
-                // CR 702.167a/b: Craft materials exile across the
-                // battlefield/graveyard union.
-                PayCostKind::ExileMaterials { materials } => {
-                    engine_casting::handle_exile_materials_for_cost(
-                        state,
-                        *player,
-                        materials.clone(),
-                        *pending_cast.clone(),
-                        (*min_count, *count),
-                        choices,
-                        &chosen,
-                        &mut events,
-                    )?
-                }
-                // CR 117.1 + CR 601.2b + CR 608.2c: Aggregate-threshold "exile
-                // any number" cost (Baron Helmut Zemo's Boast); the handler
-                // validates the threshold, exiles, publishes the tracked set, and
-                // binds the resolving ability's tracked-set sentinel to it.
-                PayCostKind::ExileAggregate {
-                    zone,
-                    function,
-                    property,
-                    comparator,
-                    value,
-                    filter,
-                } => engine_casting::handle_exile_aggregate_for_cost(
-                    state,
-                    *player,
-                    *zone,
-                    *function,
-                    *property,
-                    *comparator,
-                    *value,
-                    filter,
-                    *pending_cast.clone(),
-                    choices,
-                    &chosen,
-                    &mut events,
-                )?,
-                PayCostKind::RemoveCounter {
-                    counter_type,
-                    count: counter_count,
-                    selection,
-                } => {
-                    casting_costs::handle_remove_counter_for_cost(
+                    )?,
+                    PayCostKind::RemoveCounter {
+                        counter_type,
+                        count: counter_count,
+                        selection,
+                    } => casting_costs::handle_remove_counter_for_cost(
                         state,
                         *player,
                         *pending_cast.clone(),
@@ -12801,38 +12811,37 @@ fn apply_non_priority_pass_action(
                         choices,
                         &chosen,
                         &mut events,
-                    )?
-                }
-                PayCostKind::TapCreatures { mode } => {
-                    engine_casting::handle_tap_creatures_for_spell_cost(
+                    )?,
+                    PayCostKind::TapCreatures { mode } => {
+                        engine_casting::handle_tap_creatures_for_spell_cost(
+                            state,
+                            *player,
+                            *pending_cast.clone(),
+                            *min_count,
+                            *count,
+                            *mode,
+                            choices,
+                            &chosen,
+                            &mut events,
+                        )?
+                    }
+                    PayCostKind::Behold { action } => engine_casting::handle_behold_for_cost(
                         state,
                         *player,
                         *pending_cast.clone(),
-                        *min_count,
                         *count,
-                        *mode,
                         choices,
+                        *action,
                         &chosen,
                         &mut events,
-                    )?
-                }
-                PayCostKind::Behold { action } => engine_casting::handle_behold_for_cost(
-                    state,
-                    *player,
-                    *pending_cast.clone(),
-                    *count,
-                    choices,
-                    *action,
-                    &chosen,
-                    &mut events,
-                )?,
-                // ExileFromManaZone is mana-ability-only; never appears with a
-                // spell-cast resume.
-                PayCostKind::ExileFromManaZone { .. } => {
-                    return Err(EngineError::InvalidAction(
-                        "ExileFromManaZone cost cannot resume a spell cast".into(),
-                    ));
-                }
+                    )?,
+                    // ExileFromManaZone is mana-ability-only; never appears with a
+                    // spell-cast resume.
+                    PayCostKind::ExileFromManaZone { .. } => {
+                        return Err(EngineError::InvalidAction(
+                            "ExileFromManaZone cost cannot resume a spell cast".into(),
+                        ));
+                    }
                 }
             }
             CostResume::ManaAbility {
@@ -13271,7 +13280,8 @@ fn apply_non_priority_pass_action(
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::PairWith,
                 source_id: *source_id,
-            subject: None,});
+                subject: None,
+            });
             state.waiting_for = WaitingFor::Priority { player: *player };
             state.priority_player = *player;
             resume_pending_continuation_if_priority(state, &mut events)?;
@@ -13644,12 +13654,9 @@ fn apply_non_priority_pass_action(
                     }
                 }
             }
-            let pending = state
-                .pending_cast
-                .as_mut()
-                .ok_or_else(|| {
-                    EngineError::InvalidAction("No pending cast awaiting X".to_string())
-                })?;
+            let pending = state.pending_cast.as_mut().ok_or_else(|| {
+                EngineError::InvalidAction("No pending cast awaiting X".to_string())
+            })?;
             // CR 601.2b + CR 601.2f + CR 601.2h: Concretize {X} into generic mana in the cost structure.
             // Payment restrictions ("Spend only [colors] mana on X") are carried as payment-allocation
             // metadata in SpellMeta and enforced during mana payment.
@@ -13905,12 +13912,11 @@ fn apply_non_priority_pass_action(
                     .ok_or_else(|| EngineError::InvalidAction("Player not found".to_string()))?;
                 let activation_ability_index = pending_ref.activation_ability_index;
                 let current_shards = if let Some(ability_index) = activation_ability_index {
-                    let activation_context =
-                        casting::activation_payment_context(
-                            state,
-                            spell_object,
-                            Some(ability_index),
-                        );
+                    let activation_context = casting::activation_payment_context(
+                        state,
+                        spell_object,
+                        Some(ability_index),
+                    );
                     let activation_ctx = activation_context.as_payment_context();
                     let mana_spend_permission = casting::player_mana_spend_permission_for_payment(
                         state,
@@ -13919,7 +13925,9 @@ fn apply_non_priority_pass_action(
                         Some(&activation_ctx),
                     );
                     let permissions = super::static_abilities::build_cost_permission_context(
-                        state, player, mana_spend_permission,
+                        state,
+                        player,
+                        mana_spend_permission,
                     );
                     mana_payment::compute_phyrexian_shards(
                         &player_pool,
@@ -13939,7 +13947,9 @@ fn apply_non_priority_pass_action(
                         spell_ctx.as_ref(),
                     );
                     let permissions = super::static_abilities::build_cost_permission_context(
-                        state, player, mana_spend_permission,
+                        state,
+                        player,
+                        mana_spend_permission,
                     );
                     mana_payment::compute_phyrexian_shards(
                         &player_pool,
@@ -14005,8 +14015,8 @@ fn apply_non_priority_pass_action(
                 ability_index,
             },
         ) => {
-            let (player, resume) = payment_window_resume(window)
-                .expect("the arm matches only payment windows");
+            let (player, resume) =
+                payment_window_resume(window).expect("the arm matches only payment windows");
             let obj = state
                 .objects
                 .get(&source_id)
@@ -14050,16 +14060,11 @@ fn apply_non_priority_pass_action(
             window @ (WaitingFor::ManaPayment { .. } | WaitingFor::ManaAbilityManaPayment { .. }),
             GameAction::TapLandForMana { selection },
         ) => {
-            let (player, resume) = payment_window_resume(window)
-                .expect("the arm matches only payment windows");
+            let (player, resume) =
+                payment_window_resume(window).expect("the arm matches only payment windows");
             let events_before = events.len();
-            let wf = handle_tap_land_for_mana(
-                state,
-                player,
-                &selection,
-                resume.clone(),
-                &mut events,
-            )?;
+            let wf =
+                handle_tap_land_for_mana(state, player, &selection, resume.clone(), &mut events)?;
             // CR 605.1b + CR 605.4a: the manual land tap has no cursor wrapper
             // of its own — `activate_mana_source_option`'s no-ability branch
             // taps and produces directly — so this arm IS its completed mana
@@ -14174,7 +14179,8 @@ fn apply_non_priority_pass_action(
                     pending.object_id,
                     pending.casting_variant == CastingVariant::Fuse,
                 )
-            }) => {
+            }) =>
+        {
             let player = *player;
             if mana_type != crate::types::mana::ManaType::Colorless {
                 return Err(EngineError::ActionNotAllowed(
@@ -14559,12 +14565,19 @@ fn apply_non_priority_pass_action(
                 engine_combat::finish_declare_attackers(state, &mut events, false)?
             }
         }
-        (WaitingFor::ReplacementChoice { .. }, GameAction::ChooseReplacementAndRemember { choice }) => {
+        (
+            WaitingFor::ReplacementChoice { .. },
+            GameAction::ChooseReplacementAndRemember { choice },
+        ) => {
             // CR 616.1: validate the full response and eligibility before any mutation.
             if !replacement::validate_remembered_replacement(state, &choice) {
-                return Err(EngineError::InvalidAction("Invalid remembered replacement choice".into()));
+                return Err(EngineError::InvalidAction(
+                    "Invalid remembered replacement choice".into(),
+                ));
             }
-            if let Some(waiting_for) = casting_costs::abandon_stale_resolution_sacrifice_cursor(state, &mut events) {
+            if let Some(waiting_for) =
+                casting_costs::abandon_stale_resolution_sacrifice_cursor(state, &mut events)
+            {
                 waiting_for
             } else {
                 let index = replacement::remember_replacement_choice(state, choice);
@@ -14689,7 +14702,8 @@ fn apply_non_priority_pass_action(
                         events.push(crate::types::events::GameEvent::EffectResolved {
                             kind: crate::types::ability::EffectKind::ChangeZone,
                             source_id: pending.source_id,
-                        subject: None,});
+                            subject: None,
+                        });
                     }
                     state.waiting_for = WaitingFor::Priority {
                         player: active_player,
@@ -14830,8 +14844,13 @@ fn apply_non_priority_pass_action(
             state.waiting_for = WaitingFor::Priority {
                 player: active_player,
             };
-            super::effects::token::resolve_with_host_override(state, &pending, &mut events, Some(host))
-                .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
+            super::effects::token::resolve_with_host_override(
+                state,
+                &pending,
+                &mut events,
+                Some(host),
+            )
+            .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
             if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
                 return Ok(ActionResult::applied(events, state.waiting_for.clone()));
             }
@@ -15162,8 +15181,8 @@ fn apply_non_priority_pass_action(
                 description: Some("Miracle — you may cast this card".to_string()),
                 may_trigger_origin: None,
                 subject_match_count: None,
-        die_result: None,
-            provenance: None,
+                die_result: None,
+                provenance: None,
             };
             super::triggers::push_pending_trigger_to_stack(state, trigger, &mut events);
 
@@ -15328,6 +15347,7 @@ fn apply_non_priority_pass_action(
             }
         }
         (waiting_for, action) if engine_resolution_choices::handles(waiting_for) => {
+            let carrier = state.resolving_stack_entry.as_ref().map(|entry| entry.id);
             match engine_resolution_choices::handle_resolution_choice(
                 state,
                 waiting_for.clone(),
@@ -15335,6 +15355,15 @@ fn apply_non_priority_pass_action(
                 &mut events,
             )? {
                 engine_resolution_choices::ResolutionChoiceOutcome::WaitingFor(waiting_for) => {
+                    if matches!(waiting_for, WaitingFor::Priority { .. })
+                        && state.game_end.is_none()
+                        && state.payment_transaction.is_none()
+                        && !state.payment_transaction_replay
+                        && state.resolving_stack_entry.is_none()
+                        && !triggers::is_pending_trigger_construction_active(state)
+                    {
+                        completed_resolution = carrier;
+                    }
                     waiting_for
                 }
                 engine_resolution_choices::ResolutionChoiceOutcome::WaitingForWithInlineTriggers(
@@ -15466,11 +15495,10 @@ fn apply_non_priority_pass_action(
             engine_stack::handle_multi_target_selection(state, waiting_for, &selected, &mut events)?
         }
         // CR 702.139a: Pre-game companion reveal
-        (
-            WaitingFor::CompanionReveal { player, .. },
-            GameAction::DeclareCompanion { choice },
-        ) => super::companion::handle_declare_companion(state, *player, choice, &mut events)
-            .map_err(EngineError::InvalidAction)?,
+        (WaitingFor::CompanionReveal { player, .. }, GameAction::DeclareCompanion { choice }) => {
+            super::companion::handle_declare_companion(state, *player, choice, &mut events)
+                .map_err(EngineError::InvalidAction)?
+        }
         // CR 702.139a: Special action — pay {3} to put companion into hand (see rule 116.2g).
         (WaitingFor::Priority { player }, GameAction::CompanionToHand) => {
             super::companion::handle_companion_to_hand(state, *player, &mut events)?
@@ -15485,10 +15513,7 @@ fn apply_non_priority_pass_action(
         // and no card in the shipped class states one. This deliberately
         // diverges from `CompanionToHand` above, whose CR 116.2g DOES carry a
         // sorcery-speed restriction.
-        (
-            WaitingFor::Priority { player },
-            GameAction::EndContinuousEffect { group, .. },
-        ) => {
+        (WaitingFor::Priority { player }, GameAction::EndContinuousEffect { group, .. }) => {
             if state.priority_player
                 != turn_control::authorized_submitter_for_player(state, *player)
             {
@@ -15541,11 +15566,7 @@ fn apply_non_priority_pass_action(
             let p = *player;
             let copy_id = effects::paradigm::cast_paradigm_copy(state, src, p, &mut events)
                 .map_err(EngineError::InvalidAction)?;
-            let remaining: Vec<ObjectId> = offers
-                .iter()
-                .copied()
-                .filter(|id| *id != src)
-                .collect();
+            let remaining: Vec<ObjectId> = offers.iter().copied().filter(|id| *id != src).collect();
             // CR 707.10c: If the paradigm spell has target slots, open target
             // selection via CopyRetarget. Otherwise re-offer any remaining
             // paradigm sources before returning to priority.
@@ -15617,13 +15638,8 @@ fn apply_non_priority_pass_action(
                     pending: pending.clone(),
                 }],
             );
-            if !effects::proliferate::apply_proliferate(
-                state,
-                p,
-                &targets,
-                completion,
-                &mut events,
-            ) {
+            if !effects::proliferate::apply_proliferate(state, p, &targets, completion, &mut events)
+            {
                 return Ok(ActionResult::applied(events, state.waiting_for.clone()));
             }
             if !effects::proliferate::continue_proliferate_actions(state, pending, &mut events) {
@@ -15676,7 +15692,8 @@ fn apply_non_priority_pass_action(
                     events.push(GameEvent::EffectResolved {
                         kind: crate::types::ability::EffectKind::TimeTravel,
                         source_id: ObjectId(0),
-                    subject: None,});
+                        subject: None,
+                    });
                     state.waiting_for = WaitingFor::Priority { player: p };
                     state.priority_player = p;
                     resume_pending_continuation_if_priority(state, &mut events)?;
@@ -15686,7 +15703,8 @@ fn apply_non_priority_pass_action(
                 events.push(GameEvent::EffectResolved {
                     kind: crate::types::ability::EffectKind::TimeTravel,
                     source_id: ObjectId(0),
-                subject: None,});
+                    subject: None,
+                });
                 state.waiting_for = WaitingFor::Priority { player: p };
                 state.priority_player = p;
                 resume_pending_continuation_if_priority(state, &mut events)?;
@@ -15805,8 +15823,8 @@ fn apply_non_priority_pass_action(
             },
             GameAction::ChooseTarget { target },
         ) => {
-            let (walk, picks) = effects::copy_choice::walk_of(&state.waiting_for)
-                .ok_or_else(|| {
+            let (walk, picks) =
+                effects::copy_choice::walk_of(&state.waiting_for).ok_or_else(|| {
                     EngineError::InvalidAction("Copy target walk is not normalized".to_string())
                 })?;
             let picks = effects::copy_choice::advance_walk(state, &walk, &picks, &target)?;
@@ -15822,8 +15840,8 @@ fn apply_non_priority_pass_action(
             },
             GameAction::KeepAllCopyTargets,
         ) => {
-            let (walk, picks) = effects::copy_choice::walk_of(&state.waiting_for)
-                .ok_or_else(|| {
+            let (walk, picks) =
+                effects::copy_choice::walk_of(&state.waiting_for).ok_or_else(|| {
                     EngineError::InvalidAction("Copy target walk is not normalized".to_string())
                 })?;
             if !effects::copy_choice::keep_rest_is_admissible(state, &walk, &picks) {
@@ -16036,37 +16054,35 @@ fn apply_non_priority_pass_action(
                 // construction cursors so the resolver may now fire it.
                 pending_trigger.ability.distribution =
                     Some(distribution.iter().map(|(t, a)| (t.clone(), *a)).collect());
-                let produced = if !triggers::finalize_pending_trigger_entry(
-                    state,
-                    &pending_trigger.ability,
-                ) {
-                    // Unexpected dangling cursor: the entry is no longer on the
-                    // stack. Recover per CR 608.1 (resolution selects the
-                    // spell or ability on top of the stack, so an entry absent
-                    // from it is never selected to begin resolving) — record
-                    // the diagnostic, abandon, and return priority instead of
-                    // panicking (re-normalized next pass; CR 117.3b would give
-                    // the active player).
-                    triggers::abandon_ceased_pending_trigger(state, &pending_trigger.ability);
-                    priority::clear_priority_passes(state);
-                    WaitingFor::Priority { player: p }
-                } else {
-                    priority::clear_priority_passes(state);
-                    // CR 113.2c + CR 603.2 + CR 603.3b: Drain siblings deferred
-                    // behind this distribute-among trigger so each independent
-                    // instance reaches the stack (issue #416).
-                    debug_assert!(
-                        !triggers::is_pending_trigger_construction_active(state),
-                        "deferred-trigger drain entered with construction still active",
-                    );
-                    if let Some(waiting_for) =
-                        triggers::drain_deferred_trigger_queue(state, &mut events)
-                    {
-                        waiting_for
-                    } else {
+                let produced =
+                    if !triggers::finalize_pending_trigger_entry(state, &pending_trigger.ability) {
+                        // Unexpected dangling cursor: the entry is no longer on the
+                        // stack. Recover per CR 608.1 (resolution selects the
+                        // spell or ability on top of the stack, so an entry absent
+                        // from it is never selected to begin resolving) — record
+                        // the diagnostic, abandon, and return priority instead of
+                        // panicking (re-normalized next pass; CR 117.3b would give
+                        // the active player).
+                        triggers::abandon_ceased_pending_trigger(state, &pending_trigger.ability);
+                        priority::clear_priority_passes(state);
                         WaitingFor::Priority { player: p }
-                    }
-                };
+                    } else {
+                        priority::clear_priority_passes(state);
+                        // CR 113.2c + CR 603.2 + CR 603.3b: Drain siblings deferred
+                        // behind this distribute-among trigger so each independent
+                        // instance reaches the stack (issue #416).
+                        debug_assert!(
+                            !triggers::is_pending_trigger_construction_active(state),
+                            "deferred-trigger drain entered with construction still active",
+                        );
+                        if let Some(waiting_for) =
+                            triggers::drain_deferred_trigger_queue(state, &mut events)
+                        {
+                            waiting_for
+                        } else {
+                            WaitingFor::Priority { player: p }
+                        }
+                    };
                 // Round-20 seam 4: the trigger-owned division arm's produced
                 // wait — dangling recovery, deferred sibling, or success — goes
                 // through the construction finisher exactly once. The
@@ -16263,13 +16279,25 @@ fn apply_non_priority_pass_action(
         // still the only placement that beats the SBA pass. Same gate as that boundary call, one
         // authority; keeping it here also avoids two full pipeline passes per settling action.
         effects::token::realize_settled_token_battlefield_entry(state, &mut events);
-        let wf = engine_priority::run_post_action_pipeline(
-            state,
-            &mut events,
-            &waiting_for,
-            triggers_processed_inline,
-            skip_deferred_trigger_drain,
-        )?;
+        let wf = if let Some(carrier) = completed_resolution {
+            engine_priority::run_post_action_pipeline_after_resumed_resolution(
+                state,
+                &mut events,
+                0,
+                &waiting_for,
+                triggers_processed_inline,
+                skip_deferred_trigger_drain,
+                carrier,
+            )?
+        } else {
+            engine_priority::run_post_action_pipeline(
+                state,
+                &mut events,
+                &waiting_for,
+                triggers_processed_inline,
+                skip_deferred_trigger_drain,
+            )?
+        };
         // CR 732.2a: the SECOND sampling site — a stack entry announced while a player
         // answers a FORCED pre-priority window.
         //
@@ -27022,6 +27050,590 @@ mod resolving_carrier_settle_tests {
             "the final part's trigger is on the stack"
         );
         assert!(state.deferred_triggers.is_empty());
+    }
+    fn nonactive_completion_choice() -> crate::types::ability::AbilityDefinition {
+        use crate::types::ability::{
+            AbilityDefinition, AbilityKind, ChooseOneOfKind, PlayerFilter,
+        };
+        let gain = |value| Effect::GainLife {
+            amount: QuantityExpr::Fixed { value },
+            player: TargetFilter::Controller,
+        };
+        AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChooseOneOf {
+                chooser: PlayerFilter::Controller,
+                branches: vec![AbilityDefinition::new(AbilityKind::Spell, gain(1))],
+                kind: ChooseOneOfKind::Ordinary,
+            },
+        )
+        .sub_ability(AbilityDefinition::new(AbilityKind::Spell, gain(11)))
+    }
+
+    fn nonactive_priority_window(runner: &mut crate::game::scenario::GameRunner) {
+        for player in [PlayerId(0), PlayerId(1)] {
+            assert_eq!(runner.state().waiting_for, WaitingFor::Priority { player });
+            runner.act(GameAction::PassPriority).unwrap();
+        }
+        assert_eq!(
+            runner.state().waiting_for,
+            WaitingFor::Priority {
+                player: PlayerId(2)
+            }
+        );
+    }
+
+    fn resolve_from_nonactive_window(
+        runner: &mut crate::game::scenario::GameRunner,
+    ) -> Vec<GameEvent> {
+        let mut events = Vec::new();
+        for player in [PlayerId(2), PlayerId(0), PlayerId(1)] {
+            assert_eq!(runner.state().waiting_for, WaitingFor::Priority { player });
+            events.extend(runner.act(GameAction::PassPriority).unwrap().events);
+        }
+        events
+    }
+
+    fn assert_nonactive_completion(state: &GameState, turn: u32) {
+        // CR 117.3b: a completed nonmana stack carrier returns priority to AP.
+        assert_eq!(
+            state.waiting_for,
+            WaitingFor::Priority {
+                player: PlayerId(0)
+            }
+        );
+        assert_eq!(state.priority_player, PlayerId(0));
+        assert!(state.priority_passes.is_empty());
+        assert_eq!(state.phase, Phase::PreCombatMain);
+        assert_eq!(state.turn_number, turn);
+        assert!(state.resolving_stack_entry.is_none());
+        let mut accepted = state.clone();
+        assert!(apply(&mut accepted, PlayerId(0), GameAction::PassPriority).is_ok());
+        for wrong in [PlayerId(1), PlayerId(2)] {
+            let mut rejected = state.clone();
+            assert!(apply(&mut rejected, wrong, GameAction::PassPriority).is_err());
+            assert_eq!(rejected.turn_number, turn);
+            assert_eq!(rejected.phase, Phase::PreCombatMain);
+            assert_eq!(rejected.players[2].life, state.players[2].life);
+        }
+    }
+
+    #[test]
+    fn paused_nonpayment_resolution_returns_to_active_player() {
+        use crate::game::scenario::GameScenario;
+        use crate::types::ability::{AbilityDefinition, AbilityKind, ReplacementDefinition};
+        use crate::types::mana::ManaCost;
+        use crate::types::replacements::ReplacementEvent;
+        use crate::types::zones::EtbTapState;
+        let p2 = PlayerId(2);
+        // Ordinary activated choice and unpaused activation are independent
+        // siblings of the staged PayCost regression.
+        for paused in [true, false] {
+            let mut scenario = GameScenario::new_n_player(3, 42);
+            scenario.at_phase(Phase::PreCombatMain);
+            let mut ability = nonactive_completion_choice();
+            ability.kind = AbilityKind::Activated;
+            if !paused {
+                ability = AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 12 },
+                        player: TargetFilter::Controller,
+                    },
+                );
+            }
+            let source = scenario
+                .add_creature(p2, "Ordinary completion", 1, 1)
+                .with_ability_definition(ability)
+                .id();
+            let mut runner = scenario.build();
+            let turn = runner.state().turn_number;
+            nonactive_priority_window(&mut runner);
+            runner
+                .act(GameAction::ActivateAbility {
+                    source_id: source,
+                    ability_index: 0,
+                })
+                .unwrap();
+            let mut events = resolve_from_nonactive_window(&mut runner);
+            if paused {
+                assert!(
+                    matches!(runner.state().waiting_for, WaitingFor::ChooseOneOfBranch { player, .. } if player == p2)
+                );
+                assert!(runner.state().resolving_stack_entry.is_some());
+                events.extend(
+                    runner
+                        .act(GameAction::ChooseBranch { index: 0 })
+                        .unwrap()
+                        .events,
+                );
+                for amount in [1, 11] {
+                    assert_eq!(events.iter().filter(|event| matches!(event,
+                        GameEvent::LifeChanged { player_id, amount: actual, .. } if *player_id == p2 && *actual == amount)).count(), 1);
+                }
+            } else {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event,
+                    GameEvent::LifeChanged { player_id, amount: 12, .. } if *player_id == p2))
+                        .count(),
+                    1
+                );
+            }
+            assert_eq!(runner.state().players[2].life, 32);
+            assert!(runner.state().payment_transaction.is_none());
+            assert_nonactive_completion(runner.state(), turn);
+        }
+        // Synthetic {0} instant: successful final move and a real final-move
+        // replacement question exercise Completed and Parked separately.
+        for parked in [false, true] {
+            let mut scenario = GameScenario::new_n_player(3, 42);
+            scenario.at_phase(Phase::PreCombatMain);
+            let spell = scenario
+                .add_spell_to_hand(p2, "Ordinary paused instant", true)
+                .with_mana_cost(ManaCost::zero())
+                .with_ability_definition(nonactive_completion_choice())
+                .id();
+            if parked {
+                for name in ["Final move replacement A", "Final move replacement B"] {
+                    scenario
+                        .add_creature(p2, name, 1, 1)
+                        .with_replacement_definition(
+                            ReplacementDefinition::new(ReplacementEvent::Moved)
+                                .destination_zone(Zone::Graveyard)
+                                .execute(AbilityDefinition::new(
+                                    AbilityKind::Spell,
+                                    Effect::ChangeZone {
+                                        destination: Zone::Exile,
+                                        origin: None,
+                                        target: TargetFilter::SelfRef,
+                                        owner_library: false,
+                                        enter_transformed: false,
+                                        enters_under: None,
+                                        enter_tapped: EtbTapState::Unspecified,
+                                        enters_attacking: false,
+                                        up_to: false,
+                                        enter_with_counters: vec![],
+                                        conditional_enter_with_counters: vec![],
+                                        face_down_profile: None,
+                                        enters_modified_if: None,
+                                    },
+                                )),
+                        );
+                }
+            }
+            let mut runner = scenario.build();
+            let turn = runner.state().turn_number;
+            nonactive_priority_window(&mut runner);
+            runner.cast(spell).commit();
+            let mut events = resolve_from_nonactive_window(&mut runner);
+            assert!(
+                matches!(runner.state().waiting_for, WaitingFor::ChooseOneOfBranch { player, .. } if player == p2)
+            );
+            assert!(runner.state().resolving_spell_final_part.is_some());
+            events.extend(
+                runner
+                    .act(GameAction::ChooseBranch { index: 0 })
+                    .unwrap()
+                    .events,
+            );
+            if parked {
+                assert!(matches!(
+                    runner.state().waiting_for,
+                    WaitingFor::ReplacementChoice { .. }
+                ));
+                assert!(runner.state().resolving_stack_entry.is_some());
+                events.extend(
+                    runner
+                        .act(GameAction::ChooseReplacement { index: 0 })
+                        .unwrap()
+                        .events,
+                );
+            }
+            assert_eq!(runner.state().players[2].life, 32);
+            assert_eq!(
+                runner.state().objects[&spell].zone,
+                if parked { Zone::Exile } else { Zone::Graveyard }
+            );
+            assert!(runner.state().resolving_spell_final_part.is_none());
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event,
+                GameEvent::StackResolved { object_id, .. } if *object_id == spell))
+                    .count(),
+                1
+            );
+            assert_eq!(events.iter().filter(|event| matches!(event,
+                GameEvent::ZoneChanged { object_id, from: Some(Zone::Stack), .. } if *object_id == spell)).count(), 1);
+            assert_nonactive_completion(runner.state(), turn);
+        }
+    }
+
+    #[test]
+    fn nonactive_mana_ability_retains_its_priority_window() {
+        use crate::game::scenario::GameScenario;
+        use crate::types::ability::{
+            AbilityCost, AbilityDefinition, AbilityKind, ManaProduction, QuantityModification,
+            ReplacementDefinition,
+        };
+        use crate::types::replacements::ReplacementEvent;
+        let p2 = PlayerId(2);
+        for paused in [true, false] {
+            let mut scenario = GameScenario::new_n_player(3, 42);
+            scenario.at_phase(Phase::PreCombatMain);
+            let ability = AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Mana {
+                    produced: ManaProduction::Colorless {
+                        count: QuantityExpr::Fixed { value: 1 },
+                    },
+                    target: None,
+                    restrictions: vec![],
+                    grants: vec![],
+                    expiry: None,
+                },
+            )
+            .cost(AbilityCost::PayLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+            });
+            let source = scenario
+                .add_creature(p2, "Direct mana completion", 1, 1)
+                .with_ability_definition(ability)
+                .id();
+            if paused {
+                let mut replacement = nonactive_completion_choice();
+                replacement.sub_ability = None;
+                scenario
+                    .add_creature(p2, "Mana life replacement", 1, 1)
+                    .with_replacement_definition(
+                        ReplacementDefinition::new(ReplacementEvent::LoseLife)
+                            .quantity_modification(QuantityModification::Plus { value: 0 })
+                            .execute(replacement),
+                    );
+            }
+            let mut runner = scenario.build();
+            let turn = runner.state().turn_number;
+            nonactive_priority_window(&mut runner);
+            let mut events = runner
+                .act(GameAction::ActivateAbility {
+                    source_id: source,
+                    ability_index: 0,
+                })
+                .unwrap()
+                .events;
+            if paused {
+                assert!(
+                    matches!(runner.state().waiting_for, WaitingFor::ChooseOneOfBranch { player, .. } if player == p2)
+                );
+                assert!(runner.state().pending_deferred_life_cost_resume.is_some());
+                assert!(runner.state().stack.is_empty());
+                assert!(runner.state().resolving_stack_entry.is_none());
+                events.extend(
+                    runner
+                        .act(GameAction::ChooseBranch { index: 0 })
+                        .unwrap()
+                        .events,
+                );
+            }
+            assert_eq!(runner.state().players[2].life, if paused { 20 } else { 19 });
+            assert_eq!(runner.state().players[2].mana_pool.total(), 1);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event,
+                GameEvent::LifeChanged { player_id, amount: -1, .. } if *player_id == p2))
+                    .count(),
+                1
+            );
+            assert!(runner.state().resolving_stack_entry.is_none());
+            assert!(runner.state().pending_deferred_life_cost_resume.is_none());
+            // CR 117.3c + CR 605.3b: this nonstack mana root keeps P2's window.
+            assert_eq!(
+                runner.state().waiting_for,
+                WaitingFor::Priority { player: p2 }
+            );
+            assert_eq!(runner.state().priority_player, p2);
+            assert_eq!(runner.state().turn_number, turn);
+            assert_eq!(runner.state().phase, Phase::PreCombatMain);
+        }
+    }
+    #[test]
+    fn ripple_terminal_completion_returns_to_active_player_without_stack_growth() {
+        use crate::game::scenario::GameScenario;
+        use crate::types::ability::{
+            AbilityDefinition, AbilityKind, TriggerDefinition, TypedFilter,
+        };
+        use crate::types::actions::CastChoice;
+        use crate::types::counter::CounterType;
+        use crate::types::game_state::TargetRef;
+        use crate::types::keywords::Keyword;
+        use crate::types::mana::{ManaCost, ManaType, ManaUnit};
+        use crate::types::TriggerMode;
+        // Exact pinned Oracle, plus the explicit keyword metadata used in
+        // production. Ripple's trigger resolves separately from the spell.
+        const ORACLE: &str = "Ripple 4 (When you cast this spell, you may reveal the top four cards of your library. You may cast spells with the same name as this spell from among those cards without paying their mana costs. Put the rest on the bottom of your library.)\nSurging Flame deals 2 damage to any target.";
+        let p2 = PlayerId(2);
+        for accept_hit in [false, true] {
+            let mut scenario = GameScenario::new_n_player(3, 42);
+            scenario.at_phase(Phase::PreCombatMain);
+            scenario.with_mana_pool(
+                p2,
+                vec![
+                    ManaUnit::new(ManaType::Red, ObjectId(0), false, vec![]),
+                    ManaUnit::new(ManaType::Red, ObjectId(0), false, vec![]),
+                ],
+            );
+            let original = scenario
+                .add_spell_to_hand_from_oracle(p2, "Surging Flame", true, ORACLE)
+                .with_mana_cost(ManaCost::Cost {
+                    shards: vec![crate::types::mana::ManaCostShard::Red],
+                    generic: 1,
+                })
+                .with_keyword(Keyword::Ripple(4))
+                .id();
+            let observer = if accept_hit {
+                let observer = scenario
+                    .add_creature(p2, "Cast observer target", 1, 1)
+                    .with_trigger_definition(
+                        TriggerDefinition::new(TriggerMode::SpellCast).execute(
+                            AbilityDefinition::new(
+                                AbilityKind::Spell,
+                                Effect::PutCounter {
+                                    counter_type: CounterType::Plus1Plus1,
+                                    count: QuantityExpr::Fixed { value: 1 },
+                                    target: TargetFilter::Typed(TypedFilter::creature()),
+                                },
+                            ),
+                        ),
+                    )
+                    .id();
+                scenario.add_creature(p2, "Other cast observer target", 1, 1);
+                Some(observer)
+            } else {
+                None
+            };
+            let deep = scenario.add_card_to_library_top(p2, "Deep card");
+            let misses: Vec<_> = (0..if accept_hit { 3 } else { 4 })
+                .map(|index| scenario.add_card_to_library_top(p2, &format!("Ripple miss {index}")))
+                .collect();
+            let hit = accept_hit.then(|| {
+                scenario
+                    .add_spell_to_library_top(p2, "Surging Flame", true)
+                    .from_oracle_text(ORACLE)
+                    .with_mana_cost(ManaCost::Cost {
+                        shards: vec![crate::types::mana::ManaCostShard::Red],
+                        generic: 1,
+                    })
+                    .with_keyword(Keyword::Ripple(4))
+                    .id()
+            });
+            let mut runner = scenario.build();
+            let turn = runner.state().turn_number;
+            nonactive_priority_window(&mut runner);
+            let card_id = runner.state().objects[&original].card_id;
+            runner
+                .act(GameAction::CastSpell {
+                    object_id: original,
+                    card_id,
+                    targets: vec![],
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+                })
+                .unwrap();
+            assert!(matches!(
+                runner.state().waiting_for,
+                WaitingFor::TargetSelection { .. }
+            ));
+            runner
+                .act(GameAction::ChooseTarget {
+                    target: Some(TargetRef::Player(PlayerId(1))),
+                })
+                .unwrap();
+            assert_eq!(runner.state().players[2].mana_pool.total(), 0);
+            if let Some(observer) = observer {
+                // First cast's two observers are announced and its ordinary
+                // observer resolves before entering the selected Ripple.
+                let order_state = runner.state().pending_trigger_order.as_ref().unwrap();
+                let contexts = &order_state.groups[0].triggers;
+                assert_eq!(contexts.len(), 2);
+                let ripple = contexts
+                    .iter()
+                    .position(|context| context.pending.source_id == original)
+                    .unwrap();
+                let ordinary = contexts
+                    .iter()
+                    .position(|context| context.pending.source_id == observer)
+                    .unwrap();
+                runner
+                    .act(GameAction::OrderTriggers {
+                        order: vec![ripple, ordinary],
+                    })
+                    .unwrap();
+                assert!(matches!(
+                    runner.state().waiting_for,
+                    WaitingFor::TriggerTargetSelection { .. }
+                ));
+                runner
+                    .act(GameAction::ChooseTarget {
+                        target: Some(TargetRef::Object(observer)),
+                    })
+                    .unwrap();
+                assert_eq!(runner.state().stack.len(), 3);
+                // No lower spell is resolved to obtain the intended window.
+                resolve_from_nonactive_window(&mut runner);
+                assert_eq!(
+                    runner.state().objects[&observer]
+                        .counters
+                        .get(&CounterType::Plus1Plus1),
+                    Some(&1)
+                );
+                assert_eq!(runner.state().stack.len(), 2);
+                nonactive_priority_window(&mut runner);
+            }
+            resolve_from_nonactive_window(&mut runner);
+            assert!(
+                matches!(runner.state().waiting_for, WaitingFor::RippleRevealChoice { player, count: 4, .. } if player == p2)
+            );
+            assert_eq!(runner.state().stack.len(), 1);
+            assert_eq!(runner.state().objects[&original].zone, Zone::Stack);
+            let mut events = runner
+                .act(GameAction::RippleChoice {
+                    choice: CastChoice::Cast,
+                })
+                .unwrap()
+                .events;
+            if let Some(hit) = hit {
+                assert!(matches!(
+                    runner.state().waiting_for,
+                    WaitingFor::CastOffer { .. }
+                ));
+                events.extend(
+                    runner
+                        .act(GameAction::RippleChoice {
+                            choice: CastChoice::Cast,
+                        })
+                        .unwrap()
+                        .events,
+                );
+                assert!(matches!(
+                    runner.state().waiting_for,
+                    WaitingFor::TargetSelection { .. }
+                ));
+                events.extend(
+                    runner
+                        .act(GameAction::ChooseTarget {
+                            target: Some(TargetRef::Player(PlayerId(1))),
+                        })
+                        .unwrap()
+                        .events,
+                );
+                assert_eq!(runner.state().objects[&hit].zone, Zone::Stack);
+            }
+            let offered = match &runner.state().waiting_for {
+                WaitingFor::RippleBottomOrder { player, cards, .. } => {
+                    assert_eq!(*player, p2);
+                    let mut actual = cards.clone();
+                    actual.sort();
+                    let mut expected = misses.clone();
+                    expected.sort();
+                    assert_eq!(actual, expected);
+                    cards.clone()
+                }
+                other => panic!("actual bottom-order prompt required: {other:?}"),
+            };
+            let ordered: Vec<_> = offered.iter().rev().copied().collect();
+            assert_ne!(ordered, offered);
+            events.extend(
+                runner
+                    .act(GameAction::SelectCards {
+                        cards: ordered.clone(),
+                    })
+                    .unwrap()
+                    .events,
+            );
+            let library: Vec<_> = runner.state().players[2].library.iter().copied().collect();
+            assert_eq!(library[0], deep);
+            assert_eq!(
+                &library[library.len() - ordered.len()..],
+                ordered.as_slice()
+            );
+            assert!(runner.state().pending_resolution_completion.is_none());
+            assert!(runner.state().resolving_stack_entry.is_none());
+            assert_eq!(runner.state().objects[&original].zone, Zone::Stack);
+            if let (Some(hit), Some(observer)) = (hit, observer) {
+                let groups = &runner
+                    .state()
+                    .pending_trigger_order
+                    .as_ref()
+                    .unwrap()
+                    .groups;
+                assert_eq!(groups.len(), 1);
+                let contexts = &groups[0].triggers;
+                assert_eq!(
+                    contexts.len(),
+                    2,
+                    "accepted cast gets one whole terminal observer batch"
+                );
+                for context in contexts {
+                    assert!(
+                        matches!(context.pending.trigger_event, Some(GameEvent::SpellCast { object_id, .. }) if object_id == hit)
+                    );
+                }
+                let ripple = contexts
+                    .iter()
+                    .position(|context| context.pending.source_id == hit)
+                    .unwrap();
+                let ordinary = contexts
+                    .iter()
+                    .position(|context| context.pending.source_id == observer)
+                    .unwrap();
+                events.extend(
+                    runner
+                        .act(GameAction::OrderTriggers {
+                            order: vec![ripple, ordinary],
+                        })
+                        .unwrap()
+                        .events,
+                );
+                let WaitingFor::TriggerTargetSelection { target_slots, .. } =
+                    &runner.state().waiting_for
+                else {
+                    panic!("accepted cast observer must construct its real target");
+                };
+                assert!(target_slots[0].legal_targets.len() >= 2);
+                events.extend(
+                    runner
+                        .act(GameAction::ChooseTarget {
+                            target: Some(TargetRef::Object(observer)),
+                        })
+                        .unwrap()
+                        .events,
+                );
+                assert_eq!(runner.state().stack.len(), 4);
+                assert_eq!(runner.state().stack[0].id, original);
+                assert_eq!(runner.state().stack[1].id, hit);
+                assert_eq!(runner.state().stack[2].source_id, hit);
+                assert_eq!(runner.state().stack[3].source_id, observer);
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event,
+                    GameEvent::SpellCast { object_id, .. } if *object_id == hit))
+                        .count(),
+                    1
+                );
+            } else {
+                assert_eq!(
+                    runner.state().stack.len(),
+                    1,
+                    "no-hit completion has no stack growth"
+                );
+            }
+            // CR 117.3b + CR 702.60a: completing Ripple grants AP priority
+            // immediately, while both damage spells remain unresolved below.
+            assert_nonactive_completion(runner.state(), turn);
+        }
     }
 }
 
