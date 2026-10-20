@@ -266,10 +266,16 @@ fn direct_board() -> (GameRunner, ObjectId) {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let mut runner = scenario.build();
+    let spell = push_stack_spell(&mut runner, P0);
+    (runner, spell)
+}
+
+/// An instant controlled by `controller`, on the stack.
+fn push_stack_spell(runner: &mut GameRunner, controller: PlayerId) -> ObjectId {
     let spell = create_object(
         runner.state_mut(),
         CardId(901),
-        P0,
+        controller,
         "Shock".to_string(),
         Zone::Stack,
     );
@@ -283,7 +289,7 @@ fn direct_board() -> (GameRunner, ObjectId) {
     runner.state_mut().stack.push_back(StackEntry {
         id: spell,
         source_id: spell,
-        controller: P0,
+        controller,
         kind: StackEntryKind::Spell {
             card_id: CardId(901),
             ability: None,
@@ -291,7 +297,7 @@ fn direct_board() -> (GameRunner, ObjectId) {
             actual_mana_spent: 0,
         },
     });
-    (runner, spell)
+    spell
 }
 
 fn run_counter_chain(
@@ -1023,5 +1029,137 @@ fn payment_outcome_independent_sibling_follows_counter_or_paid_suppression() {
             "independent sibling runs exactly once in both outcomes"
         );
         assert_eq!(result.events.iter().filter(|event| matches!(event, GameEvent::SpellCountered { object_id, .. } if *object_id == spell)).count(), usize::from(!pay));
+    }
+}
+
+/// CR 118.12a + CR 608.2c, synthetic mechanism chain (no printed card has this
+/// shape; card data has no unless head whose dependent step is followed by an
+/// independent instruction): a Counter head with an unless cost, a dependent
+/// resolution step of that head (`ContinuationStep`, gain 3 life), then the
+/// next independent instruction (`SequentialSibling`, gain 7 life). Declining
+/// lets the head and its step happen, then the sibling. Paying suppresses the
+/// head and its step, and the walk resumes at the sibling, which still happens
+/// once.
+#[test]
+fn paid_suppression_skips_a_dependent_step_to_the_next_independent_instruction() {
+    use engine::types::ability::SubAbilityLink;
+    use engine::types::events::GameEvent;
+    for pay in [false, true] {
+        let (mut runner, spell) = direct_board();
+        let mut root = ResolvedAbility::new(
+            Effect::Counter {
+                target: TargetFilter::Any,
+                source_rider: None,
+                countered_spell_zone: None,
+            },
+            vec![TargetRef::Object(spell)],
+            ObjectId(9000),
+            P1,
+        );
+        root.unless_pay = Some(UnlessPayModifier {
+            cost: zero_cost(),
+            payer: TargetFilter::ParentTargetController,
+        });
+        let mut step = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 3 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(9000),
+            P1,
+        );
+        assert_eq!(step.sub_link, SubAbilityLink::ContinuationStep);
+        let mut sibling = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 7 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(9000),
+            P1,
+        );
+        sibling.sub_link = SubAbilityLink::SequentialSibling;
+        step.sub_ability = Some(Box::new(sibling));
+        root.sub_ability = Some(Box::new(step));
+        resolve_ability_chain(runner.state_mut(), &root, &mut Vec::new(), 0)
+            .expect("mechanism root produces payment");
+        // Reach guards: the payer is prompted for {0}, and nothing has
+        // resolved yet.
+        assert_eq!(unless_cost(&runner), Some((P0, zero_cost())));
+        assert_eq!(zone(&runner, spell), Zone::Stack);
+        assert_eq!(runner.state().players[1].life, 20);
+        let result = runner
+            .act(GameAction::PayUnlessCost { pay })
+            .expect("apply actual payment action");
+        assert_eq!(
+            zone(&runner, spell),
+            if pay { Zone::Stack } else { Zone::Graveyard }
+        );
+        assert_eq!(result.events.iter().filter(|event| matches!(event, GameEvent::SpellCountered { object_id, .. } if *object_id == spell)).count(), usize::from(!pay));
+        assert_eq!(
+            runner.state().players[1].life,
+            if pay { 27 } else { 30 },
+            "pay={pay}: the dependent step follows the head; the sibling runs once either way"
+        );
+        assert_eq!(runner.state().players[0].life, 20);
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+    }
+}
+
+/// CR 117.3b + CR 800.4j: the active player left the game earlier in its turn
+/// (three players, turn order P0 -> P1 -> P2), and the turn continues. P1's
+/// unless-Counter asks P2, the controller of the target spell. Whether P2 pays
+/// or declines, the answered prompt hands the resolution back where the active
+/// player would receive priority, so the next player in turn order still in the
+/// game, P1, receives it, not the departed seat.
+#[test]
+fn answered_unless_prompt_after_the_active_player_left_gives_priority_to_the_next_living_seat() {
+    let p2 = PlayerId(2);
+    for pay in [false, true] {
+        let mut scenario = GameScenario::new_n_player(3, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        let mut runner = scenario.build();
+        assert_eq!(runner.state().active_player, P0);
+        assert_eq!(runner.state().seat_order, [P0, P1, p2]);
+        assert_eq!(
+            runner.state().turn_direction,
+            engine::types::phase::TurnDirection::Normal
+        );
+        // CR 800.4a: P0 leaves through the engine's elimination authority.
+        engine::game::elimination::eliminate_player(runner.state_mut(), P0, &mut Vec::new());
+        assert!(runner.state().players[0].is_eliminated);
+        assert!(runner.state().game_end.is_none());
+        assert_eq!(runner.state().active_player, P0);
+
+        let spell = push_stack_spell(&mut runner, p2);
+        run_counter_chain(
+            &mut runner,
+            spell,
+            zero_cost(),
+            TargetFilter::ParentTargetController,
+        );
+        // Reach guards: the target spell's controller is asked for {0}, and the
+        // spell is still on the stack.
+        assert_eq!(unless_cost(&runner), Some((p2, zero_cost())));
+        assert_eq!(zone(&runner, spell), Zone::Stack);
+
+        runner
+            .act(GameAction::PayUnlessCost { pay })
+            .expect("P2 answers the unless prompt");
+        assert_eq!(
+            zone(&runner, spell),
+            if pay { Zone::Stack } else { Zone::Graveyard }
+        );
+        assert_eq!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { player: P1 },
+            "pay={pay}"
+        );
+        assert_eq!(runner.state().priority_player, P1);
+        assert_eq!(runner.state().active_player, P0);
     }
 }

@@ -24,8 +24,8 @@ use crate::types::ResolutionOptionalPaymentChoice;
 use super::costs::{self, PaymentOutcome};
 use super::effects;
 use super::engine::{
-    handle_tap_land_for_mana, handle_untap_land_for_mana, resume_pending_continuation_if_priority,
-    CostMoveDrainBoundary, EngineError,
+    handle_tap_land_for_mana, handle_untap_land_for_mana, living_priority_seat,
+    resume_pending_continuation_if_priority, CostMoveDrainBoundary, EngineError,
 };
 use super::engine_priority;
 use super::mana_abilities;
@@ -1993,15 +1993,24 @@ pub(crate) fn finish_successful_unless_payment(
     // do, [alternative]." A paid cost suppresses the primary effect and runs
     // an `IfAPlayerDoes` alternative outcome.
     // CR 608.2c: independent siblings also run; each condition evaluates the
-    // paid context normally. An unconditional dependent continuation stays off.
-    if let Some(sub) = pending_effect.sub_ability.as_ref().filter(|sub| {
-        sub.sub_link == SubAbilityLink::SequentialSibling
+    // paid context normally. A dependent continuation that does not read the
+    // payment's outcome is a resolution step of the suppressed head, so it
+    // stays off together with the steps below it, and the walk resumes at the
+    // next independent instruction printed after them.
+    let paid_successor = pending_effect.sub_ability.as_deref().and_then(|sub| {
+        if sub.sub_link == SubAbilityLink::SequentialSibling
             || sub
                 .condition
                 .as_ref()
                 .is_some_and(payment_outcome_condition)
-    }) {
-        let mut sub_resolved = sub.as_ref().clone();
+        {
+            Some(sub)
+        } else {
+            effects::next_independent_instruction(sub.sub_ability.as_deref())
+        }
+    });
+    if let Some(sub) = paid_successor {
+        let mut sub_resolved = sub.clone();
         if sub_resolved.targets.is_empty() {
             sub_resolved.mirror_targets_from(pending_effect);
         }
@@ -2096,16 +2105,79 @@ fn resolve_ability_chain_for_unless_payment(
 }
 
 /// Identify this payment's consumers; the normal evaluator still decides truth.
+///
+/// Exhaustive, with no wildcard: a new condition or outcome signal needs a
+/// deliberate decision about whether it reads the payment's outcome.
 fn payment_outcome_condition(condition: &AbilityCondition) -> bool {
+    use crate::types::ability::EffectOutcomeSignal;
+
     match condition {
-        AbilityCondition::EffectOutcome {
-            signal: crate::types::ability::EffectOutcomeSignal::OptionalEffectPerformed,
-        } => true,
+        // CR 118.12a + CR 608.2c: "If they do" reads whether the unless cost
+        // was paid, through the optional-effect-performed signal.
+        AbilityCondition::EffectOutcome { signal } => match signal {
+            EffectOutcomeSignal::OptionalEffectPerformed => true,
+            EffectOutcomeSignal::CurrentScopeSucceeded
+            | EffectOutcomeSignal::Guessed { .. }
+            | EffectOutcomeSignal::RevealUntilMatched => false,
+        },
         AbilityCondition::Not { condition } => payment_outcome_condition(condition),
         AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => {
             conditions.iter().any(payment_outcome_condition)
         }
-        _ => false,
+        AbilityCondition::TriggerEventTargetDamagedBySourceThisTurn
+        | AbilityCondition::TriggerEventTargetExploitedBySource
+        | AbilityCondition::AdditionalCostPaid { .. }
+        | AbilityCondition::AdditionalCostPaidInstead
+        | AbilityCondition::AlternativeManaCostPaid
+        | AbilityCondition::EventOutcomeWon
+        | AbilityCondition::CoinFlipOutcome { .. }
+        | AbilityCondition::WhenYouDo
+        | AbilityCondition::WasCast { .. }
+        | AbilityCondition::CastDuringPhase { .. }
+        | AbilityCondition::CurrentPhaseIs { .. }
+        | AbilityCondition::CastTimingPermission { .. }
+        | AbilityCondition::ManaColorSpent { .. }
+        | AbilityCondition::RevealedHasCardType { .. }
+        | AbilityCondition::ObjectsShareQuality { .. }
+        | AbilityCondition::TargetSharesNameWithOtherExiledThisWay { .. }
+        | AbilityCondition::SourceEnteredThisTurn
+        | AbilityCondition::CastVariantPaid { .. }
+        | AbilityCondition::CastVariantPaidInstead { .. }
+        | AbilityCondition::QuantityCheck { .. }
+        | AbilityCondition::PreviousEffectAmount { .. }
+        | AbilityCondition::HasMaxSpeed
+        | AbilityCondition::IsMonarch
+        | AbilityCondition::IsInitiative
+        | AbilityCondition::HasCityBlessing
+        | AbilityCondition::HasEnduringStory
+        | AbilityCondition::ControlsCommander { .. }
+        | AbilityCondition::DiscardedCardMatchesFilter { .. }
+        | AbilityCondition::IsRingBearer
+        | AbilityCondition::CompletedDungeon { .. }
+        | AbilityCondition::TargetHasKeywordInstead { .. }
+        | AbilityCondition::TargetMatchesFilter { .. }
+        | AbilityCondition::HasObjectTarget
+        | AbilityCondition::TriggeringSpellTargetsFilter { .. }
+        | AbilityCondition::SourceMatchesFilter { .. }
+        | AbilityCondition::PostReplacementDamageSourceMatchesFilter { .. }
+        | AbilityCondition::ZoneChangeObjectMatchesFilter { .. }
+        | AbilityCondition::ControllerControlsMatching { .. }
+        | AbilityCondition::ControllerControlledMatchingAsCast { .. }
+        | AbilityCondition::IsYourTurn
+        | AbilityCondition::WasStartingPlayer { .. }
+        | AbilityCondition::SpellCastWithVariantThisTurn { .. }
+        | AbilityCondition::FirstCombatPhaseOfTurn
+        | AbilityCondition::FirstEndStepOfTurn
+        | AbilityCondition::ZoneChangedThisWay { .. }
+        | AbilityCondition::CostPaidObjectMatchesFilter { .. }
+        | AbilityCondition::SourceIsTapped
+        | AbilityCondition::SourceAttachedToCreature
+        | AbilityCondition::ConditionInstead { .. }
+        | AbilityCondition::DayNightIsNeither
+        | AbilityCondition::DayNightIs { .. }
+        | AbilityCondition::AbilityUseCountThisTurn { .. }
+        | AbilityCondition::SourceLacksKeyword { .. }
+        | AbilityCondition::ScopedPlayerMatches { .. } => false,
     }
 }
 
@@ -2902,11 +2974,15 @@ pub(super) fn resume_unless_bounce_cost_move(
     )
 }
 
+/// CR 117.3b + CR 800.4j: consume an answered prompt (an unless payment, an
+/// optional effect, a tribute choice) by handing the resolution back to the
+/// active player's priority. Once the active player has
+/// left the game, the next player in turn order still in the game receives it
+/// instead, and `priority_player` names the same seat.
 fn set_active_priority(state: &mut GameState) {
-    state.waiting_for = WaitingFor::Priority {
-        player: state.active_player,
-    };
-    state.priority_player = state.active_player;
+    let player = living_priority_seat(state);
+    state.waiting_for = WaitingFor::Priority { player };
+    state.priority_player = player;
 }
 
 fn action_result(events: &mut Vec<GameEvent>, waiting_for: WaitingFor) -> ActionResult {

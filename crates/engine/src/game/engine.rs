@@ -1862,10 +1862,7 @@ fn recover_orphaned_devour_completion_at_priority_boundary(state: &mut GameState
         return false;
     }
 
-    priority::reset_priority(&mut recovered);
-    recovered.waiting_for = WaitingFor::Priority {
-        player: recovered.active_player,
-    };
+    grant_completed_resolution_priority(&mut recovered);
     *state = recovered;
     true
 }
@@ -1892,10 +1889,7 @@ fn recover_orphaned_spell_resolution_at_priority_boundary(state: &mut GameState)
         return false;
     }
 
-    priority::reset_priority(&mut recovered);
-    recovered.waiting_for = WaitingFor::Priority {
-        player: recovered.active_player,
-    };
+    grant_completed_resolution_priority(&mut recovered);
     *state = recovered;
     true
 }
@@ -2047,10 +2041,7 @@ fn recover_ownerless_post_replacement_completion_at_priority_boundary(
         return false;
     }
 
-    priority::reset_priority(&mut recovered);
-    recovered.waiting_for = WaitingFor::Priority {
-        player: recovered.active_player,
-    };
+    grant_completed_resolution_priority(&mut recovered);
     *state = recovered;
     true
 }
@@ -5422,13 +5413,14 @@ fn shortcut_count_is_drivable(
 }
 
 /// CR 800.4a + CR 800.4j: the seat that should receive priority where the active player
-/// would: when a loop-shortcut resolution hands priority back, and when a completed
-/// resolution's carrier settles. Priority passes to the next player in turn order still in
+/// would: when a loop-shortcut resolution hands priority back, when a completed
+/// resolution's carrier settles (including the restore-boundary recoveries), and when an
+/// answered resolution prompt hands the resolution back. Priority passes to the next player in turn order still in
 /// the game — the
 /// active player if it is still in the game, otherwise the next living seat in turn order
 /// (elimination does not advance `active_player` when a non-acting seat concedes during the
 /// APNAP window, so `active_player` may be a departed player).
-fn living_priority_seat(state: &GameState) -> PlayerId {
+pub(super) fn living_priority_seat(state: &GameState) -> PlayerId {
     if crate::game::players::is_alive(state, state.active_player) {
         state.active_player
     } else {
@@ -9388,14 +9380,22 @@ fn settle_finished_resolving_stack_entry(state: &mut GameState) {
     // CR 800.4j: once the active player has left the game, the next player in
     // turn order receives that priority instead.
     if completed_resolution_grants_priority(state) {
-        super::priority::reset_priority(state);
-        super::public_state::sync_waiting_for(
-            state,
-            &WaitingFor::Priority {
-                player: living_priority_seat(state),
-            },
-        );
+        grant_completed_resolution_priority(state);
     }
+}
+
+/// CR 117.3b + CR 800.4j: a completed resolution gives priority to the active
+/// player, or, once the active player has left the game, to the next player in
+/// turn order still in the game. The pass record is cleared and
+/// `priority_player` names the same seat as the published window.
+fn grant_completed_resolution_priority(state: &mut GameState) {
+    super::priority::reset_priority(state);
+    super::public_state::sync_waiting_for(
+        state,
+        &WaitingFor::Priority {
+            player: living_priority_seat(state),
+        },
+    );
 }
 
 /// CR 117.3b + CR 117.3c + CR 608.2n: retire, without a priority grant, a
@@ -29050,6 +29050,95 @@ mod resolving_carrier_settle_tests {
             let mut rejected = state.clone();
             assert!(apply(&mut rejected, wrong, GameAction::PassPriority).is_err());
             assert_eq!(rejected.stack.len(), 2);
+        }
+    }
+
+    /// CR 117.3b + CR 800.4j: the restore-boundary recovery of a bare
+    /// permanent-spell rest (one `SpellResolution` frame over its finished
+    /// `Spell` carrier, priority frozen on another seat) gives the recovered
+    /// priority to the active player. Once the active player has left the game
+    /// earlier in the turn, the next player in turn order still in the game
+    /// receives it instead. The living-active row is the control.
+    #[test]
+    fn restore_recovery_of_a_spell_rest_skips_a_departed_active_player() {
+        use crate::game::scenario::GameScenario;
+        use crate::types::game_state::{CastingVariant, PendingSpellResolution};
+        let (p0, p1, p2) = (PlayerId(0), PlayerId(1), PlayerId(2));
+        for active_left in [false, true] {
+            let mut scenario = GameScenario::new_n_player(3, 42);
+            scenario.at_phase(Phase::PreCombatMain);
+            let mut runner = scenario.build();
+            let state = runner.state_mut();
+            // Turn order runs P0 -> P1 -> P2, and it is P0's turn.
+            assert_eq!(state.active_player, p0);
+            assert_eq!(state.seat_order, [p0, p1, p2]);
+            assert_eq!(
+                state.turn_direction,
+                crate::types::phase::TurnDirection::Normal
+            );
+            if active_left {
+                // CR 800.4a: P0 leaves through the engine's elimination
+                // authority; the turn continues without an active player.
+                crate::game::elimination::eliminate_player(state, p0, &mut Vec::new());
+                assert!(state.players[0].is_eliminated);
+                assert!(state.game_end.is_none());
+                assert_eq!(state.active_player, p0);
+            }
+            // The rest: P2's permanent spell has resolved onto the battlefield,
+            // and only its completion frame and carrier remain.
+            let spell = create_object(
+                state,
+                CardId(9_201),
+                p2,
+                "Resolved permanent".to_string(),
+                Zone::Battlefield,
+            );
+            state.push_spell_resolution(PendingSpellResolution {
+                object_id: spell,
+                controller: p2,
+                casting_variant: CastingVariant::Normal,
+                cast_from_zone: None,
+                cast_controller: None,
+                cast_timing_permission: None,
+                spell_targets: Vec::new(),
+                actual_mana_spent: 0,
+                kickers_paid: Vec::new(),
+                additional_cost_payment_count: 0,
+                additional_cost_payments: Vec::new(),
+                convoked_creatures: Vec::new(),
+            });
+            state.resolving_stack_entry = Some(StackEntry {
+                id: spell,
+                source_id: spell,
+                controller: p2,
+                kind: StackEntryKind::Spell {
+                    card_id: CardId(9_201),
+                    ability: None,
+                    casting_variant: CastingVariant::Normal,
+                    actual_mana_spent: 0,
+                },
+            });
+            state.waiting_for = WaitingFor::Priority { player: p2 };
+            state.priority_player = p2;
+            // Reach guard: the shape is the exact bare spell rest this
+            // recovery retires.
+            assert!(state.stack.is_empty());
+            assert!(super::is_orphaned_spell_resolution_at_priority_boundary(
+                state
+            ));
+
+            assert!(super::recover_terminal_resolution_rest_on_restore(state)
+                .expect("the bare spell rest recovers"));
+            assert!(state.resolving_stack_entry.is_none());
+            assert!(state.resolution_stack.is_empty());
+            let seat = if active_left { p1 } else { p0 };
+            assert_eq!(
+                state.waiting_for,
+                WaitingFor::Priority { player: seat },
+                "active player left: {active_left}"
+            );
+            assert_eq!(state.priority_player, seat);
+            assert!(state.priority_passes.is_empty());
         }
     }
 }

@@ -22,7 +22,8 @@ use engine::types::actions::{AlternativeCastDecision, GameAction, MulliganChoice
 use engine::types::card_type::CoreType;
 use engine::types::game_state::{
     CastOfferKind, CompanionDeclaration, CostResume, DistributionUnit, GameState, ManaChoice,
-    ManaChoiceContext, ManaChoicePrompt, MulliganDecisionPhase, PendingMulliganAction, WaitingFor,
+    ManaChoiceContext, ManaChoicePrompt, MulliganDecisionPhase, PendingMulliganAction,
+    StackEntryKind, WaitingFor,
 };
 use engine::types::identifiers::{ObjectId, ObjectIdentityBinding, ObjectIncarnationRef};
 use engine::types::keywords::Keyword;
@@ -423,7 +424,7 @@ fn choose_action_with_session_inner(
 
     // CR 118.5 + CR 118.12a: acknowledge a free Counter payment to protect
     // the spell. Other unless effects can make declining strategically useful.
-    if zero_counter_payment_owed_by(&state.waiting_for, ai_player) {
+    if zero_counter_payment_owed_by(state, ai_player) {
         if let Some(action) = bind_specialist(GameAction::PayUnlessCost { pay: true }) {
             return direct(Some(action));
         }
@@ -1224,17 +1225,38 @@ fn issued_selection(contract: &AiDecisionContract) -> Option<GameAction> {
 
 /// CR 118.5 + CR 118.12a: a payable zero Mana cost protecting a spell from
 /// Counter uses the specialist. Other heads/costs retain their scored policy.
-fn zero_counter_payment_owed_by(waiting_for: &WaitingFor, payer: PlayerId) -> bool {
-    matches!(
-        waiting_for,
-        WaitingFor::UnlessPayment {
-            player,
-            cost: AbilityCost::Mana { cost },
-            pending_effect,
-            ..
-        } if *player == payer && *cost == ManaCost::zero()
-            && matches!(pending_effect.effect, Effect::Counter { .. })
-    )
+///
+/// CR 701.6a: paying protects the payer only when the instruction would counter
+/// a spell the payer controls. A payer polled to protect another player's
+/// spell ("unless any player pays") keeps the scored policy. The countered
+/// referent is the engine's own resolver binding.
+fn zero_counter_payment_owed_by(state: &GameState, payer: PlayerId) -> bool {
+    let WaitingFor::UnlessPayment {
+        player,
+        cost: AbilityCost::Mana { cost },
+        pending_effect,
+        trigger_event,
+        ..
+    } = &state.waiting_for
+    else {
+        return false;
+    };
+    if *player != payer || *cost != ManaCost::zero() {
+        return false;
+    }
+    let countered = engine::game::effects::unless_payment_countered_stack_ids(
+        state,
+        pending_effect,
+        trigger_event.as_ref(),
+    );
+    !countered.is_empty()
+        && countered.iter().all(|id| {
+            state.stack.iter().any(|entry| {
+                entry.id == *id
+                    && entry.controller == payer
+                    && matches!(entry.kind, StackEntryKind::Spell { .. })
+            })
+        })
 }
 
 /// Produce a safe action when the AI has no scored candidates.
@@ -1697,7 +1719,7 @@ pub fn fallback_action(
         // Unless payment: pay a zero-Mana Counter cost (CR 118.5);
         // decline every other unless payment.
         WaitingFor::UnlessPayment { player, .. } => Some(GameAction::PayUnlessCost {
-            pay: zero_counter_payment_owed_by(&state.waiting_for, *player),
+            pay: zero_counter_payment_owed_by(state, *player),
         }),
 
         // Disjunctive activation costs: default to the first payable branch.
@@ -6740,20 +6762,56 @@ mod tests {
     }
 
     /// A mechanism fixture for the Counter specialist's cost/seat boundary.
+    /// The Counter targets a spell on the stack that the payer controls.
     fn unless_payment_state(
         cost: AbilityCost,
         payer: PlayerId,
         remaining: Vec<PlayerId>,
     ) -> GameState {
+        unless_payment_state_countering(cost, payer, remaining, Some(payer))
+    }
+
+    /// The same fixture with the countered spell controlled by
+    /// `spell_controller`. `None` is the untargeted Counter, which counters
+    /// nothing.
+    fn unless_payment_state_countering(
+        cost: AbilityCost,
+        payer: PlayerId,
+        remaining: Vec<PlayerId>,
+        spell_controller: Option<PlayerId>,
+    ) -> GameState {
         let mut state = make_state();
         let source = ObjectId(900);
+        let targets = spell_controller
+            .map(|controller| {
+                let spell = create_object(
+                    &mut state,
+                    CardId(901),
+                    controller,
+                    "Countered Spell".to_string(),
+                    Zone::Stack,
+                );
+                state.stack.push_back(StackEntry {
+                    id: spell,
+                    source_id: spell,
+                    controller,
+                    kind: StackEntryKind::Spell {
+                        card_id: CardId(901),
+                        ability: None,
+                        casting_variant: engine::types::game_state::CastingVariant::Normal,
+                        actual_mana_spent: 0,
+                    },
+                });
+                vec![TargetRef::Object(spell)]
+            })
+            .unwrap_or_default();
         let pending_effect = ResolvedAbility::new(
             Effect::Counter {
                 target: TargetFilter::Any,
                 source_rider: None,
                 countered_spell_zone: None,
             },
-            Vec::new(),
+            targets,
             source,
             PlayerId(0),
         );
@@ -6829,10 +6887,20 @@ mod tests {
     #[test]
     fn real_unless_payment_keeps_the_scored_path() {
         let payer = PlayerId(1);
-        let one = unless_payment_state(mana_unless_cost(ManaCost::generic(1)), payer, vec![]);
+        // The scored-path tally keeps the untargeted Counter, so that board is
+        // unchanged by the spell-protection premise below. The predicate rows
+        // at the end show the cost alone excludes a {1} protecting the payer's
+        // own spell.
+        let one = unless_payment_state_countering(
+            mana_unless_cost(ManaCost::generic(1)),
+            payer,
+            vec![],
+            None,
+        );
         let zero = unless_payment_state(mana_unless_cost(ManaCost::zero()), payer, vec![]);
         for difficulty in UNLESS_LEVELS {
-            // Reach guard: the identical harness and seeds at {0} pay 40/40.
+            // Reach guard: the same seeds at {0} protecting the payer's spell
+            // pay 40/40.
             assert_eq!(unless_answers(&zero, payer, difficulty), (40, 0));
             let (pays, declines) = unless_answers(&one, payer, difficulty);
             assert!(
@@ -6844,16 +6912,14 @@ mod tests {
         let pay_life_zero = AbilityCost::PayLife {
             amount: QuantityExpr::Fixed { value: 0 },
         };
-        for cost in [no_cost, pay_life_zero] {
+        let generic_one = mana_unless_cost(ManaCost::generic(1));
+        for cost in [no_cost, pay_life_zero, generic_one] {
             let state = unless_payment_state(cost.clone(), payer, vec![]);
-            assert!(
-                !zero_counter_payment_owed_by(&state.waiting_for, payer),
-                "{cost:?}"
-            );
+            assert!(!zero_counter_payment_owed_by(&state, payer), "{cost:?}");
         }
-        assert!(zero_counter_payment_owed_by(&zero.waiting_for, payer));
+        assert!(zero_counter_payment_owed_by(&zero, payer));
         assert!(
-            !zero_counter_payment_owed_by(&zero.waiting_for, PlayerId(0)),
+            !zero_counter_payment_owed_by(&zero, PlayerId(0)),
             "the predicate is keyed to the prompted seat"
         );
     }
@@ -6899,11 +6965,55 @@ mod tests {
             let contract = AiDecisionContract::issue(&state, P0);
             assert!(contract.contains_action(&state, &GameAction::PayUnlessCost { pay: true }));
             assert!(contract.contains_action(&state, &GameAction::PayUnlessCost { pay: false }));
-            assert!(!zero_counter_payment_owed_by(&state.waiting_for, P0));
+            assert!(!zero_counter_payment_owed_by(&state, P0));
             assert_eq!(
                 fallback_action(&state, &config, &contract),
                 Some(GameAction::PayUnlessCost { pay: false })
             );
+        }
+
+        // CR 701.6a + CR 118.12a: P0 is polled first, with P1 still to be
+        // asked (the "unless any player pays" shape). Paying {0} protects
+        // P0's own spell, which forces the payment (positive control). Paying
+        // to protect P1's spell, or for a Counter that counters nothing, is not
+        // forced; the ordinary policy answers it.
+        for (spell_controller, forced) in [(Some(P0), true), (Some(P1), false), (None, false)] {
+            let state = unless_payment_state_countering(
+                mana_unless_cost(ManaCost::zero()),
+                P0,
+                vec![P1],
+                spell_controller,
+            );
+            // Reach guard: the payer's prompt issues both answers, and the
+            // countered spell's controller is the only difference.
+            assert!(state.waiting_for.acting_players().contains(&P0));
+            assert_eq!(
+                state
+                    .stack
+                    .iter()
+                    .map(|entry| entry.controller)
+                    .collect::<Vec<_>>(),
+                spell_controller.into_iter().collect::<Vec<_>>()
+            );
+            let contract = AiDecisionContract::issue(&state, P0);
+            assert!(contract.contains_action(&state, &GameAction::PayUnlessCost { pay: true }));
+            assert!(contract.contains_action(&state, &GameAction::PayUnlessCost { pay: false }));
+            assert_eq!(
+                zero_counter_payment_owed_by(&state, P0),
+                forced,
+                "{spell_controller:?}"
+            );
+            assert_eq!(
+                fallback_action(&state, &config, &contract),
+                Some(GameAction::PayUnlessCost { pay: forced }),
+                "{spell_controller:?}"
+            );
+            if forced {
+                assert_eq!(
+                    choose_action(&state, P0, &config, &mut SmallRng::seed_from_u64(9943)),
+                    Some(GameAction::PayUnlessCost { pay: true })
+                );
+            }
         }
     }
 

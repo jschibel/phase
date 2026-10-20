@@ -6628,7 +6628,8 @@ pub(crate) fn sub_outlives_false_parent_gate(sub: &ResolvedAbility) -> bool {
 /// CR 608.2c: whether `node` is the next printed instruction of its chain
 /// rather than a resolution step of the node before it (see
 /// [`SubAbilityLink`]). The one instruction-unit authority for the walks that
-/// skip part of a printed chain: `first_independent_forward_result_sibling`,
+/// skip part of a printed chain: [`next_independent_instruction`] (used by
+/// `first_independent_forward_result_sibling` and the paid unless-cost path),
 /// [`declined_gate_surviving_instructions`], and the per-player decline scan
 /// in `resolve_chain_body`. A skipped node takes the resolution steps that
 /// follow it with it, because they depend on it; the nodes printed before it
@@ -16622,6 +16623,39 @@ pub(crate) fn resolve_ability_chain_step(
     resolve_ability_chain_with_payment_choice(state, ability, events, depth, None)
 }
 
+/// CR 118.12a + CR 701.6a: the stack objects (by id) that an unless-paused
+/// `Counter` instruction would counter if its cost goes unpaid. `pending_effect`
+/// and `trigger_event` are the `WaitingFor::UnlessPayment` prompt's own
+/// payload. The referent is read with the resolver's own binding
+/// (`counter::countered_targets` + `counter::countered_stack_index`), with the
+/// prompt's captured trigger event as the event "that spell" names (CR 608.2k).
+/// Any other instruction counters nothing.
+pub fn unless_payment_countered_stack_ids(
+    state: &GameState,
+    pending_effect: &ResolvedAbility,
+    trigger_event: Option<&GameEvent>,
+) -> Vec<ObjectId> {
+    if !matches!(pending_effect.effect, Effect::Counter { .. }) {
+        return Vec::new();
+    }
+    let countered_ids = |board: &GameState| -> Vec<ObjectId> {
+        counter::countered_targets(board, pending_effect)
+            .into_iter()
+            .filter_map(|target| match target {
+                TargetRef::Object(id) => counter::countered_stack_index(board, pending_effect, id)
+                    .map(|index| board.stack[index].id),
+                TargetRef::Player(_) => None,
+            })
+            .collect()
+    };
+    if state.current_trigger_event.as_ref() == trigger_event {
+        return countered_ids(state);
+    }
+    let mut board = state.clone();
+    board.current_trigger_event = trigger_event.cloned();
+    countered_ids(&board)
+}
+
 /// CR 118.12a + CR 608.2c: the unpaid root still reads its predecessor's
 /// context at admission. Its known payment choice owns only its outgoing result.
 pub(crate) fn resolve_unpaid_unless_ability_chain(
@@ -21880,9 +21914,18 @@ fn without_missing_forward_result_dependencies(
 fn first_independent_forward_result_sibling(
     ability: Option<&ResolvedAbility>,
 ) -> Option<ResolvedAbility> {
-    std::iter::successors(ability, |node| node.sub_ability.as_deref())
+    next_independent_instruction(ability).and_then(without_missing_forward_result_dependencies)
+}
+
+/// CR 608.2c: the first node at or below `node`, in printed order, that starts
+/// an independent instruction ([`starts_independent_instruction`]). The nodes
+/// passed on the way are resolution steps of a node before them, so a walk that
+/// skips that node skips them with it.
+pub(crate) fn next_independent_instruction(
+    node: Option<&ResolvedAbility>,
+) -> Option<&ResolvedAbility> {
+    std::iter::successors(node, |node| node.sub_ability.as_deref())
         .find(|node| starts_independent_instruction(node))
-        .and_then(without_missing_forward_result_dependencies)
 }
 
 fn effect_depends_on_missing_chosen_player(ability: &ResolvedAbility) -> bool {
