@@ -9381,6 +9381,48 @@ fn resolving_carrier_parity_is_coherent(state: &GameState) -> bool {
 }
 
 fn settle_finished_resolving_stack_entry(state: &mut GameState) {
+    retire_finished_resolving_stack_entry(state);
+    // CR 117.3b: completion of this nonmana stack object grants priority to
+    // the active player, after settlement. A real prompt retains its owner,
+    // and a window a player has already passed in keeps its pass succession.
+    // CR 800.4j: once the active player has left the game, the next player in
+    // turn order receives that priority instead.
+    if completed_resolution_grants_priority(state) {
+        super::priority::reset_priority(state);
+        super::public_state::sync_waiting_for(
+            state,
+            &WaitingFor::Priority {
+                player: living_priority_seat(state),
+            },
+        );
+    }
+}
+
+/// CR 117.3b + CR 117.3c + CR 608.2n: retire, without a priority grant, a
+/// carrier whose resolution had already finished when this action began.
+///
+/// A published `Priority` window with a finished carrier means the resolution
+/// ended before that window opened: its settlement lagged behind the answer
+/// that put the batch it created on the stack (CR 603.3d). The moment at which
+/// that resolution gave the active player priority (CR 117.3b + CR 117.5) has
+/// passed, and this window belongs to the player who holds it. Whatever that
+/// player does now is their own action (CR 117.3c, or a pass, CR 117.3d), so
+/// the old carrier is retired before it runs and nothing later in the action
+/// can treat it as a resolution this action completed. A carrier that is not
+/// finished yet, or that still owes its spell's final part, is left in place:
+/// it completes in this action, through the ordinary settlement and its grant.
+fn retire_resolution_finished_before_action(state: &mut GameState) {
+    if matches!(state.waiting_for, WaitingFor::Priority { .. })
+        && resolving_stack_entry_can_settle(state)
+    {
+        retire_finished_resolving_stack_entry(state);
+    }
+}
+
+/// CR 608.2n: the finished resolution's carrier leaves the stack and ceases to
+/// exist. This only retires it; whether its completion grants priority is the
+/// caller's question.
+fn retire_finished_resolving_stack_entry(state: &mut GameState) {
     debug_assert!(
         resolving_stack_entry_can_settle(state),
         "only a fully completed resolution carrier may settle"
@@ -9411,35 +9453,22 @@ fn settle_finished_resolving_stack_entry(state: &mut GameState) {
     );
     // CR 400.7j: resolution-scoped self-move state ends with its carrier.
     state.resolution_source_relatch = None;
-    // CR 117.3b: completion of this nonmana stack object grants priority to
-    // the active player, after settlement. A real prompt retains its owner,
-    // and a window a player has already passed in keeps its pass succession.
-    // CR 800.4j: once the active player has left the game, the next player in
-    // turn order receives that priority instead.
-    if completed_resolution_grants_priority(state) {
-        super::priority::reset_priority(state);
-        super::public_state::sync_waiting_for(
-            state,
-            &WaitingFor::Priority {
-                player: living_priority_seat(state),
-            },
-        );
-    }
 }
 
 /// CR 117.3b + CR 117.4: whether settling a finished carrier at this boundary
 /// is the moment its resolution gives the active player priority.
 ///
-/// Only a `Priority` wait receives that grant; a real prompt retains its owner.
-/// And only while no player has passed in that window: every player passed to
+/// A carrier that had already finished when the action began was retired at
+/// its start without this grant (`retire_resolution_finished_before_action`),
+/// so the carrier settling here finished during this action. Only a
+/// `Priority` wait receives the grant; a real prompt retains its owner. And
+/// only while no player has passed in that window: every player passed to
 /// begin this resolution, which cleared the pass record, so a recorded pass
-/// was made in a window opened after that. Such a window is either the
-/// priority the finished resolution already granted, with the carrier's
-/// settlement lagging behind it, or a provisional window a turn-structure
-/// handler keeps while the carrier is live (a departure from CR 502.4 /
-/// CR 514.3). Granting again there would undo the passes already made in
-/// succession (CR 117.4) and move priority back from the next player in turn
-/// order who received it (CR 117.3d).
+/// was made in a window published while the carrier was still live, such as
+/// the provisional window a turn-structure handler keeps for it (a departure
+/// from CR 502.4 / CR 514.3). Granting there would undo the passes already
+/// made in succession (CR 117.4) and move priority back from the next player
+/// in turn order who received it (CR 117.3d).
 pub(super) fn completed_resolution_grants_priority(state: &GameState) -> bool {
     matches!(state.waiting_for, WaitingFor::Priority { .. }) && state.priority_passes.is_empty()
 }
@@ -11700,6 +11729,12 @@ fn apply_action(
         });
         return Ok(ActionResult::applied(events, state.waiting_for.clone()));
     }
+
+    // CR 117.3b + CR 117.3c + CR 608.2n: a resolution that had already
+    // finished when the player holding this Priority window acts is retired
+    // first, without a priority grant. Only a resolution this action completes
+    // returns priority to the active player.
+    retire_resolution_finished_before_action(state);
 
     // PR-3 (Option C): CR 732.2a loop-detection ring invalidation. Any deliberate
     // non-pass action (cast / activate / play-land) breaks a self-refilling mandatory
@@ -28855,6 +28890,166 @@ mod resolving_carrier_settle_tests {
         assert_eq!(runner.state().stack[0].id, flame);
         assert_eq!(runner.state().objects[&flame].zone, Zone::Stack);
         assert_priority_skips_the_departed_active_player(runner.state(), turn);
+    }
+
+    /// CR 117.3c + CR 603.12 + CR 608.2n: a reflexive trigger is put on the
+    /// stack, choosing its target, while the ability that created it is still
+    /// resolving (CR 603.3d), so that ability's carrier outlives the target
+    /// answer. Kitt Kanto is controlled by non-active P1: in P0's turn its
+    /// beginning-of-combat trigger resolves, P1 taps two creatures, and P1
+    /// answers the reflexive's target. P1 then holds priority, nobody has
+    /// passed, and the finished carrier is still installed. P1 casts Shock, a
+    /// targeted instant. That resolution ended before P1's window opened, so
+    /// retiring its carrier during the cast grants no priority: P1 had
+    /// priority when casting Shock and receives priority afterward.
+    #[test]
+    fn a_finished_lagging_carrier_does_not_take_priority_from_a_nonactive_caster() {
+        use crate::game::scenario::GameScenario;
+        use crate::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
+        // Exact pinned Oracle.
+        const KITT_KANTO: &str = "When Kitt Kanto enters, create a 1/1 green and white Citizen creature token.\nAt the beginning of combat on each player's turn, you may tap two untapped creatures you control. When you do, target creature that player controls gets +2/+2 and gains trample until end of turn. Goad that creature.";
+        const SHOCK: &str = "Shock deals 2 damage to any target.";
+        let (p0, p1, p2) = (PlayerId(0), PlayerId(1), PlayerId(2));
+        let mut scenario = GameScenario::new_n_player(3, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        let kitt = scenario
+            .add_creature_from_oracle(p1, "Kitt Kanto, Mayhem Diva", 3, 3, KITT_KANTO)
+            .id();
+        let tapped_for_kitt = [
+            scenario.add_creature(p1, "Grizzly Bears", 2, 2).id(),
+            scenario.add_creature(p1, "Grizzly Bears", 2, 2).id(),
+        ];
+        // Two creatures of the active player, so the reflexive's target and
+        // Shock's target are each a real choice.
+        let reflexive_target = scenario.add_creature(p0, "Grizzly Bears", 2, 2).id();
+        let shock_target = scenario.add_creature(p0, "Grizzly Bears", 2, 2).id();
+        let shock = scenario
+            .add_spell_to_hand_from_oracle(p1, "Shock", true, SHOCK)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 0,
+            })
+            .id();
+        let mut runner = scenario.build();
+        let turn = runner.state().turn_number;
+
+        // CR 117.4: all players pass on the empty stack, so the main phase
+        // ends; Kitt Kanto's trigger goes on the stack (CR 603.3).
+        for player in [p0, p1, p2] {
+            assert_eq!(runner.state().waiting_for, WaitingFor::Priority { player });
+            runner.act(GameAction::PassPriority).unwrap();
+        }
+        assert_eq!(runner.state().phase, Phase::BeginCombat);
+        assert_eq!(runner.state().active_player, p0);
+        assert_eq!(runner.state().stack.len(), 1);
+        assert_eq!(runner.state().stack[0].source_id, kitt);
+        assert_eq!(runner.state().stack[0].controller, p1);
+        let kitt_trigger = runner.state().stack[0].id;
+
+        // CR 117.4: all players pass, so the trigger resolves; P1 accepts the
+        // optional tap and taps two creatures (CR 608.2c).
+        for player in [p0, p1, p2] {
+            assert_eq!(runner.state().waiting_for, WaitingFor::Priority { player });
+            runner.act(GameAction::PassPriority).unwrap();
+        }
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::OptionalEffectChoice { player, .. } if player == p1
+        ));
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: true })
+            .unwrap();
+        assert!(matches!(
+            &runner.state().waiting_for,
+            WaitingFor::PayCost { player, choices, count: 2, .. }
+                if *player == p1 && tapped_for_kitt.iter().all(|id| choices.contains(id))
+        ));
+        runner
+            .act(GameAction::SelectCards {
+                cards: tapped_for_kitt.to_vec(),
+            })
+            .unwrap();
+        assert!(tapped_for_kitt
+            .iter()
+            .all(|id| runner.state().objects[id].tapped));
+        // Reach guard: the reflexive's target prompt opens while Kitt Kanto's
+        // trigger is still the installed resolving carrier.
+        assert!(matches!(
+            &runner.state().waiting_for,
+            WaitingFor::TriggerTargetSelection { player, .. } if *player == p1
+        ));
+        assert_eq!(
+            runner
+                .state()
+                .resolving_stack_entry
+                .as_ref()
+                .map(|entry| entry.id),
+            Some(kitt_trigger)
+        );
+        runner.act(choose_object_target(reflexive_target)).unwrap();
+
+        // Reach guards for the lagging carrier. The reflexive is on the stack
+        // and P1 holds this window: that is the construction seam's existing
+        // recipient for the trigger's controller, which this test relies on
+        // only to give P1 the window, not as the rules-derived recipient.
+        // Kitt Kanto's trigger has finished resolving, yet its carrier is
+        // still installed, and nobody has passed since.
+        let state = runner.state();
+        assert_eq!(state.waiting_for, WaitingFor::Priority { player: p1 });
+        assert!(state.priority_passes.is_empty());
+        assert_eq!(state.stack.len(), 1);
+        assert_eq!(state.stack[0].source_id, kitt);
+        assert_ne!(state.stack[0].id, kitt_trigger);
+        assert_eq!(
+            state.resolving_stack_entry.as_ref().map(|entry| entry.id),
+            Some(kitt_trigger)
+        );
+        assert!(resolving_stack_entry_can_settle(state));
+
+        // P1 casts Shock while holding priority, choosing its target as a
+        // cast step.
+        runner.state_mut().players[1].mana_pool.add(ManaUnit::new(
+            ManaType::Red,
+            ObjectId(0),
+            false,
+            vec![],
+        ));
+        let card_id = runner.state().objects[&shock].card_id;
+        runner
+            .act(GameAction::CastSpell {
+                object_id: shock,
+                card_id,
+                targets: vec![],
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+            })
+            .unwrap();
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ));
+        runner.act(choose_object_target(shock_target)).unwrap();
+
+        // Reach guards: Shock is paid for and on the stack above the
+        // reflexive, and the finished carrier has settled during the cast.
+        let state = runner.state();
+        assert_eq!(state.players[1].mana_pool.total(), 0);
+        assert_eq!(state.stack.len(), 2);
+        assert_eq!(state.stack.last().map(|entry| entry.id), Some(shock));
+        assert_eq!(state.objects[&shock].zone, Zone::Stack);
+        assert!(state.resolving_stack_entry.is_none());
+        // CR 117.3c: P1 had priority when casting Shock, so P1 receives
+        // priority afterward; active P0 does not.
+        assert_eq!(state.waiting_for, WaitingFor::Priority { player: p1 });
+        assert_eq!(state.priority_player, p1);
+        assert_eq!(state.phase, Phase::BeginCombat);
+        assert_eq!(state.turn_number, turn);
+        let mut accepted = state.clone();
+        assert!(apply(&mut accepted, p1, GameAction::PassPriority).is_ok());
+        for wrong in [p0, p2] {
+            let mut rejected = state.clone();
+            assert!(apply(&mut rejected, wrong, GameAction::PassPriority).is_err());
+            assert_eq!(rejected.stack.len(), 2);
+        }
     }
 }
 
