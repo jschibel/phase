@@ -9412,10 +9412,11 @@ fn settle_finished_resolving_stack_entry(state: &mut GameState) {
     // CR 400.7j: resolution-scoped self-move state ends with its carrier.
     state.resolution_source_relatch = None;
     // CR 117.3b: completion of this nonmana stack object grants priority to
-    // the active player, after settlement. A real prompt retains its owner.
+    // the active player, after settlement. A real prompt retains its owner,
+    // and a window a player has already passed in keeps its pass succession.
     // CR 800.4j: once the active player has left the game, the next player in
     // turn order receives that priority instead.
-    if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+    if completed_resolution_grants_priority(state) {
         super::priority::reset_priority(state);
         super::public_state::sync_waiting_for(
             state,
@@ -9424,6 +9425,23 @@ fn settle_finished_resolving_stack_entry(state: &mut GameState) {
             },
         );
     }
+}
+
+/// CR 117.3b + CR 117.4: whether settling a finished carrier at this boundary
+/// is the moment its resolution gives the active player priority.
+///
+/// Only a `Priority` wait receives that grant; a real prompt retains its owner.
+/// And only while no player has passed in that window: every player passed to
+/// begin this resolution, which cleared the pass record, so a recorded pass
+/// was made in a window opened after that. Such a window is either the
+/// priority the finished resolution already granted, with the carrier's
+/// settlement lagging behind it, or a provisional window a turn-structure
+/// handler keeps while the carrier is live (a departure from CR 502.4 /
+/// CR 514.3). Granting again there would undo the passes already made in
+/// succession (CR 117.4) and move priority back from the next player in turn
+/// order who received it (CR 117.3d).
+pub(super) fn completed_resolution_grants_priority(state: &GameState) -> bool {
+    matches!(state.waiting_for, WaitingFor::Priority { .. }) && state.priority_passes.is_empty()
 }
 
 /// CR 608.2c + CR 608.2n: the single authority that completes an instant or
@@ -27598,6 +27616,16 @@ mod resolving_carrier_settle_tests {
         events
     }
 
+    /// The target answer naming `object`. Built here, apart from the prompt
+    /// assertions it answers, so the `loop_shortcut` source census of
+    /// `apply_action`'s `TriggerTargetSelection` reducer arms counts only the
+    /// production arms.
+    fn choose_object_target(object: ObjectId) -> GameAction {
+        GameAction::ChooseTarget {
+            target: Some(crate::types::ability::TargetRef::Object(object)),
+        }
+    }
+
     fn assert_nonactive_completion(state: &GameState, turn: u32) {
         // CR 117.3b: a completed nonmana stack carrier returns priority to AP.
         assert_eq!(
@@ -28130,11 +28158,7 @@ mod resolving_carrier_settle_tests {
                     runner.state().waiting_for,
                     WaitingFor::TriggerTargetSelection { .. }
                 ));
-                runner
-                    .act(GameAction::ChooseTarget {
-                        target: Some(TargetRef::Object(observer)),
-                    })
-                    .unwrap();
+                runner.act(choose_object_target(observer)).unwrap();
                 assert_eq!(runner.state().stack.len(), 3);
                 // No lower spell is resolved to obtain the intended window.
                 resolve_from_nonactive_window(&mut runner);
@@ -28263,14 +28287,7 @@ mod resolving_carrier_settle_tests {
                     panic!("accepted cast observer must construct its real target");
                 };
                 assert!(target_slots[0].legal_targets.len() >= 2);
-                events.extend(
-                    runner
-                        .act(GameAction::ChooseTarget {
-                            target: Some(TargetRef::Object(observer)),
-                        })
-                        .unwrap()
-                        .events,
-                );
+                events.extend(runner.act(choose_object_target(observer)).unwrap().events);
                 assert_eq!(runner.state().stack.len(), 4);
                 assert_eq!(runner.state().stack[0].id, original);
                 assert_eq!(runner.state().stack[1].id, hit);

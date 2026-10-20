@@ -264,7 +264,7 @@ fn run_post_action_pipeline_core(
         && matches!(state.waiting_for, WaitingFor::Priority { .. })
     {
         effective_default = state.waiting_for.clone();
-        completion_recipient = completed_priority_recipient(&effective_default);
+        completion_recipient = completed_priority_recipient(state);
     }
     let completed_resolution_batch = completed_resolution.is_some();
     let payment_owned = state.payment_transaction.is_some() || state.payment_transaction_replay;
@@ -698,7 +698,7 @@ fn run_post_action_pipeline_core(
             && matches!(state.waiting_for, WaitingFor::Priority { .. })
         {
             effective_default = state.waiting_for.clone();
-            completion_recipient = completed_priority_recipient(&effective_default);
+            completion_recipient = completed_priority_recipient(state);
         }
         if let Some(wf) =
             triggers::drain_deferred_triggers_after_stack_object_announcement(state, events)
@@ -1018,9 +1018,14 @@ fn persist_carried_recipient_across_prompt(
 }
 
 /// CR 117.3b: the player a completed resolution's synchronized wait gives
-/// priority to.
-fn completed_priority_recipient(completed: &WaitingFor) -> Option<PlayerId> {
-    match completed {
+/// priority to. CR 117.4: none when the settlement granted no priority because
+/// a player had already passed in that window; the pass succession, not the
+/// completion, owns that window's recipient.
+fn completed_priority_recipient(state: &GameState) -> Option<PlayerId> {
+    if !super::engine::completed_resolution_grants_priority(state) {
+        return None;
+    }
+    match &state.waiting_for {
         WaitingFor::Priority { player } => Some(*player),
         _ => None,
     }
