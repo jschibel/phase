@@ -1226,10 +1226,10 @@ fn issued_selection(contract: &AiDecisionContract) -> Option<GameAction> {
 /// CR 118.5 + CR 118.12a: a payable zero Mana cost protecting a spell from
 /// Counter uses the specialist. Other heads/costs retain their scored policy.
 ///
-/// CR 701.6a: paying protects the payer only when the instruction would counter
-/// a spell the payer controls. A payer polled to protect another player's
-/// spell ("unless any player pays") keeps the scored policy. The countered
-/// referent is the engine's own resolver binding.
+/// Paying is forced only when every object the instruction would counter is a
+/// spell the payer controls; a Counter of another player's spell, of an
+/// ability, or of nothing keeps the scored policy. The countered referent is
+/// the engine's own resolver binding.
 fn zero_counter_payment_owed_by(state: &GameState, payer: PlayerId) -> bool {
     let WaitingFor::UnlessPayment {
         player,
