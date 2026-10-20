@@ -9409,8 +9409,9 @@ fn settle_finished_resolving_stack_entry(state: &mut GameState) {
 /// player does now is their own action (CR 117.3c, or a pass, CR 117.3d), so
 /// the old carrier is retired before it runs and nothing later in the action
 /// can treat it as a resolution this action completed. A carrier that is not
-/// finished yet, or that still owes its spell's final part, is left in place:
-/// it completes in this action, through the ordinary settlement and its grant.
+/// finished yet, or that still owes its spell's final part, is left in place
+/// for the ordinary settlement; whether that settlement grants priority is
+/// `completed_resolution_grants_priority`'s question.
 fn retire_resolution_finished_before_action(state: &mut GameState) {
     if matches!(state.waiting_for, WaitingFor::Priority { .. })
         && resolving_stack_entry_can_settle(state)
