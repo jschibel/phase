@@ -24672,7 +24672,11 @@ fn activation_cost_passes_early_affordability_gate(
         // (`OnlyForTaggedActivation`) is spendable at the real payment step,
         // so a gate that judged the cost without the tag would refuse
         // activations the payment step would have allowed.
-        cost.is_payable_for_activation(state, player, source_id, Some(ability_index))
+        // CR 601.2g + CR 119.4: a printed "Pay N life" is judged by the life the
+        // player can have when it is paid, as `can_pay_ability_cost_now` is.
+        payable_with_mana_ability_window_life(state, player, source_id, cost, |state| {
+            cost.is_payable_for_activation(state, player, source_id, Some(ability_index))
+        })
     }
 }
 
@@ -25588,16 +25592,136 @@ pub(crate) fn can_pay_ability_cost_now(
     ability_index: Option<usize>,
 ) -> bool {
     let excluded_sources = ability_mana_payment_excluded_sources(cost, source_id);
-    super::costs::can_pay(
-        state,
-        player,
-        source_id,
-        cost,
-        &super::costs::PaymentScope::Activation {
-            excluded_sources: &excluded_sources,
-            ability_index,
-        },
-    )
+    payable_with_mana_ability_window_life(state, player, source_id, cost, |state| {
+        super::costs::can_pay(
+            state,
+            player,
+            source_id,
+            cost,
+            &super::costs::PaymentScope::Activation {
+                excluded_sources: &excluded_sources,
+                ability_index,
+            },
+        )
+    })
+}
+
+/// CR 601.2g + CR 601.2h + CR 119.4: life follows the same structural rule as
+/// mana in an activation's pre-payment checks. An activation's mana is judged
+/// by what the player's mana abilities can produce during the CR 601.2g
+/// opportunity, not by the current pool; its life — a printed "Pay N life", a
+/// Phyrexian symbol paid with 2 life, or a {B} paid with life under a
+/// payment permission (K'rrik, Son of Yawgmoth) — is paid only in CR 601.2h, so
+/// it is judged by the life total the player can have by then. A mana ability
+/// that also gains its controller life (Pristine Talisman: "{T}: Add {C}. You
+/// gain 1 life.") changes that total during the opportunity (CR 119.3), so a
+/// check `payable` refuses on the current board is retried once on a witness
+/// board where every such ability the player can activate has been activated
+/// (see [`mana_ability_window_life_witness`]). The opportunity exists only when
+/// `cost`'s total includes a mana payment (CR 601.2g); a cost that is only life
+/// is paid at once, with the life the player has now. The witness only ever
+/// ADDS an offer, and only one the player can actually complete; the payment
+/// itself still checks the life the player has when paying (CR 119.4 +
+/// CR 118.3).
+pub(crate) fn payable_with_mana_ability_window_life(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    cost: &AbilityCost,
+    payable: impl Fn(&GameState) -> bool,
+) -> bool {
+    if payable(state) {
+        return true;
+    }
+    let mana = activation_mana_component(cost);
+    if mana.mana_value() == 0 && !casting_costs::cost_has_x(&mana) {
+        return false;
+    }
+    let excluded_sources = ability_mana_payment_excluded_sources(cost, source_id);
+    mana_ability_window_life_witness(state, player, source_id, &excluded_sources)
+        .is_some_and(|witness| payable(&witness))
+}
+
+/// CR 601.2g + CR 605.3b + CR 119.3: a witness board for
+/// [`payable_with_mana_ability_window_life`]: a clone on which `player` has
+/// activated, through the real mana-ability authority, every mana ability of a
+/// permanent they control that gains its controller life and costs no more than
+/// tapping or untapping its source. Each resolves at once (CR 605.3b), adding
+/// its mana to the pool — still available to the payment, so activating it
+/// first never takes mana away — and its life to the total. Sources the
+/// activation itself needs untapped (`excluded_sources`, and the activation's
+/// own source) are left alone; an ability that would stop for a choice (a mana
+/// color) is skipped. `None` when no activated ability gained any life, i.e.
+/// when the witness could not change any life-based verdict.
+fn mana_ability_window_life_witness(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    excluded_sources: &HashSet<ObjectId>,
+) -> Option<GameState> {
+    let candidates: Vec<(ObjectId, usize)> = state
+        .battlefield
+        .iter()
+        .filter(|id| **id != source_id && !excluded_sources.contains(*id))
+        .filter_map(|id| state.objects.get(id))
+        .filter(|obj| obj.controller == player)
+        .flat_map(|obj| {
+            obj.abilities
+                .iter()
+                .enumerate()
+                .filter(|(_, def)| {
+                    super::mana_sources::mana_ability_gains_controller_life(def)
+                        && super::mana_sources::cost_conclusively_payable_by_cheap_gate(&def.cost)
+                        && super::mana_abilities::is_mana_ability(def)
+                })
+                .map(move |(index, _)| (obj.id, index))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let life = |state: &GameState| state.players.get(player.0 as usize).map(|p| p.life);
+    crate::game::perf_counters::record_state_clone_for_legality();
+    let mut witness = state.clone();
+    let mut gained_life = false;
+    for (mana_source, index) in candidates {
+        let Some(def) = witness
+            .objects
+            .get(&mana_source)
+            .and_then(|obj| obj.abilities.get(index))
+            .cloned()
+        else {
+            continue;
+        };
+        if !super::mana_abilities::can_activate_mana_ability_now(
+            &witness,
+            player,
+            mana_source,
+            index,
+            &def,
+        ) {
+            continue;
+        }
+        let mut next = witness.clone();
+        let resolved = super::mana_abilities::activate_mana_ability(
+            &mut next,
+            mana_source,
+            player,
+            index,
+            &def,
+            &mut Vec::new(),
+            ManaAbilityResume::Priority,
+            None,
+        );
+        // CR 605.3b: only an activation that resolved at once (no choice left
+        // open) is part of the witness.
+        if matches!(resolved, Ok(WaitingFor::Priority { .. })) {
+            gained_life |= life(&next) > life(&witness);
+            next.waiting_for = witness.waiting_for.clone();
+            witness = next;
+        }
+    }
+    gained_life.then_some(witness)
 }
 
 /// CR 602.2: True when `obj` has an activated ability that `player` may begin to
@@ -27120,16 +27244,28 @@ fn ensure_x_locked_activation_payable(
         EngineError::InvalidAction("an X-locked activation must be pending".to_string())
     })?;
     let mana_obligation = selected_mana_obligation(pending, &pending.cost);
-    let mana_payable = mana_obligation.mana_value() == 0
-        || can_feasibly_pay_mana_cost(state, player, Some(pending.object_id), &mana_obligation);
-    if mana_payable
-        && activation_x_whole_cost(pending).is_payable_for_activation(
-            state,
-            player,
-            pending.object_id,
-            pending.activation_ability_index,
-        )
-    {
+    let whole_cost = activation_x_whole_cost(pending);
+    // CR 601.2g + CR 119.4: life in the locked total is judged by the life the
+    // player can have when it is paid, exactly as the offer judged it.
+    let payable = |state: &GameState| {
+        (mana_obligation.mana_value() == 0
+            || can_feasibly_pay_mana_cost(state, player, Some(pending.object_id), &mana_obligation))
+            && whole_cost.is_payable_for_activation(
+                state,
+                player,
+                pending.object_id,
+                pending.activation_ability_index,
+            )
+    };
+    let selected_cost =
+        selected_activation_cost_for_payability(&whole_cost, pending_native_phyrexian(pending));
+    if payable_with_mana_ability_window_life(
+        state,
+        player,
+        pending.object_id,
+        &selected_cost,
+        payable,
+    ) {
         Ok(())
     } else {
         Err(EngineError::ActionNotAllowed(

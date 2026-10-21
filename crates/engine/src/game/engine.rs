@@ -16692,6 +16692,7 @@ fn apply_non_priority_pass_action(
                 player,
                 source_id,
                 available,
+                max_total,
                 pending_effect,
                 ..
             },
@@ -16703,6 +16704,7 @@ fn apply_non_priority_pass_action(
                 &selections,
                 *source_id,
                 available,
+                *max_total,
                 pending_effect,
             )
             .map_err(|err| EngineError::InvalidAction(err.to_string()))?;

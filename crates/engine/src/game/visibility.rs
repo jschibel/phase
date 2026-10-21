@@ -6642,6 +6642,7 @@ mod tests {
                     source_id: paid,
                     counter_type: None,
                     available: Vec::new(),
+                    max_total: None,
                     pending_effect: effect(),
                 }),
             ),

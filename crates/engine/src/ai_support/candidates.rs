@@ -317,28 +317,35 @@ fn counter_move_distribution_candidates(
     actions
 }
 
-/// CR 107.1c: Coarse candidates for a `RemoveCountersChoice` prompt — the two
-/// extremal legal answers: "remove none" (empty selection) and "remove all"
-/// (every available counter of every type). The full legal space (any per-type
-/// subset) is combinatorial, so the AI only needs enough variety to never
-/// wedge. The engine validates every submitted selection directly.
+/// CR 107.1c + CR 608.2d: Coarse candidates for a `RemoveCountersChoice`
+/// prompt — the two extremal legal answers: "remove none" (empty selection) and
+/// "remove the most" (every available counter of every type, or — for a capped
+/// "remove up to N counters" prompt — the first `max_total` of them in
+/// published order). The full legal space (any per-type subset) is
+/// combinatorial, so the AI only needs enough variety to never wedge. The
+/// engine validates every submitted selection directly.
 // ponytail: two extremal candidates; add per-type partials if a policy ever
 // wants finer counter-shedding control.
 fn counter_removal_candidates(
     player: PlayerId,
     available: &[(crate::types::counter::CounterType, u32)],
+    max_total: Option<u32>,
 ) -> Vec<CandidateAction> {
     let mut actions = vec![candidate(
         GameAction::ChooseCountersToRemove { selections: vec![] },
         TacticalClass::Selection,
         Some(player),
     )];
+    let mut budget = max_total.unwrap_or(u32::MAX);
     let remove_all: Vec<CounterRemoveChoice> = available
         .iter()
-        .filter(|(_, count)| *count > 0)
-        .map(|(counter_type, count)| CounterRemoveChoice {
-            counter_type: counter_type.clone(),
-            count: *count,
+        .filter_map(|(counter_type, count)| {
+            let take = (*count).min(budget);
+            budget -= take;
+            (take > 0).then(|| CounterRemoveChoice {
+                counter_type: counter_type.clone(),
+                count: take,
+            })
         })
         .collect();
     if !remove_all.is_empty() {
@@ -493,8 +500,11 @@ pub fn candidate_actions_exact(state: &GameState) -> Vec<CandidateAction> {
             ..
         } => counter_move_distribution_candidates(*player, available, destinations),
         WaitingFor::RemoveCountersChoice {
-            player, available, ..
-        } => counter_removal_candidates(*player, available),
+            player,
+            available,
+            max_total,
+            ..
+        } => counter_removal_candidates(*player, available, *max_total),
         // CR 603.3b: Trigger ordering enumeration. Full n! permutations explode
         // (8! = 40320) so cap at n <= 4 (24 perms); larger groups generate only
         // identity + reverse, which is enough variety for search lookahead to

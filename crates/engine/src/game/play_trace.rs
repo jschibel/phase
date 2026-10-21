@@ -2136,6 +2136,7 @@ mod tests {
                     source_id: source,
                     counter_type: None,
                     available: vec![(CounterType::Plus1Plus1, 2)],
+                    max_total: None,
                     pending_effect: effect(source),
                 },
                 Optional,
