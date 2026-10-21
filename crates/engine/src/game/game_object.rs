@@ -71,13 +71,25 @@ pub struct PreparedState;
 
 /// CR 702.103b: Bestow form marker — `Some(_)` while this object has the
 /// type-changing effect that turns it into an Aura with "enchant creature".
-/// Parallels `PreparedState` — empty struct in `Option` instead of bare `bool`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct BestowFormState;
+/// Parallels `PreparedState` — a typed struct in `Option` instead of bare `bool`.
+///
+/// CR 205.1a: a bestowed Aura is not a creature, so the creature types of its
+/// printed face are removed while it is bestowed. The form rewrites
+/// `base_card_types` directly (the stack is not layered), so the removed
+/// subtypes are recorded here and restored by `revert_bestow_aura_form` when
+/// the object ceases to be bestowed (CR 702.103e-g). Like `CleaveFormState`,
+/// the payload captures what the revert must restore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BestowFormState {
+    /// The creature-set subtypes removed from `base_card_types` by the form,
+    /// in printed order. Empty for a legacy marker and for a face with none.
+    #[serde(default)]
+    pub removed_creature_subtypes: Vec<String>,
+}
 
 /// CR 702.140a-c: Mutate form marker — `Some(_)` while this object is a
 /// mutating creature spell on the stack (cast for its mutate cost). Parallels
-/// `BestowFormState`: an empty typed marker (not a bool) set when the mutate
+/// `PreparedState`: an empty typed marker (not a bool) set when the mutate
 /// cost is paid (`apply_mutate_form`) and cleared by `revert_mutate_form` when
 /// the spell's target is illegal at resolution (CR 702.140b) so the spell
 /// resolves as a plain creature spell. It does NOT persist onto the merged
@@ -94,7 +106,7 @@ pub struct MutateFormState;
 ///
 /// This adapter must not be used for markers that carry payload. Adding payload
 /// requires a deliberately versioned wire representation rather than silently
-/// discarding it behind this presence bit.
+/// discarding it behind this presence bit (see `bestow_form_serde`).
 mod unit_marker_option_serde {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -114,6 +126,59 @@ mod unit_marker_option_serde {
             Some(true) | None => Ok(Some(T::default())),
             Some(false) => Ok(None),
         }
+    }
+}
+
+/// Serde adapter for `GameObject::bestow_form`, the one marker with payload.
+///
+/// Wire shapes: `Some` with an empty payload is the legacy-canonical bool `true`
+/// (so states saved before the payload existed, and payload-free forms, are
+/// unchanged); `Some` with a non-empty payload is the struct object. On read,
+/// `null` / `true` restore an empty payload (a legacy marker: the old engine
+/// never removed creature subtypes, so there is nothing to restore), `false`
+/// restores `None`, and an object restores its payload.
+mod bestow_form_serde {
+    use super::BestowFormState;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize)]
+    #[serde(untagged)]
+    enum WireOut<'a> {
+        Flag(bool),
+        Payload(&'a BestowFormState),
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum WireIn {
+        Flag(Option<bool>),
+        Payload(BestowFormState),
+    }
+
+    pub(super) fn serialize<S>(
+        value: &Option<BestowFormState>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(form) if !form.removed_creature_subtypes.is_empty() => {
+                WireOut::Payload(form).serialize(serializer)
+            }
+            other => WireOut::Flag(other.is_some()).serialize(serializer),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<BestowFormState>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match WireIn::deserialize(deserializer)? {
+            WireIn::Flag(Some(false)) => None,
+            WireIn::Flag(Some(true) | None) => Some(BestowFormState::default()),
+            WireIn::Payload(form) => Some(form),
+        })
     }
 }
 
@@ -154,14 +219,12 @@ pub struct SignatureSpellState {}
 /// cleave text-changing effect is live (the spell was cast for its cleave cost
 /// and the bracket-removed ability set is currently installed on the object).
 ///
-/// Unlike `BestowFormState` (an empty marker whose revert is formulaic — re-add
-/// Creature, drop the synthesized Aura subtype/keyword), a cleave revert cannot
-/// be recomputed: the text-changing effect swaps in a separately parsed ability
-/// set, so restoring the printed form requires the captured snapshot of the four
-/// ability classes as they were before the swap. This struct carries that
-/// snapshot so `apply_zone_exit_cleanup` can restore it when the spell leaves
-/// the stack (CR 702.148a: the abilities function only while the spell is on the
-/// stack). Parallels `BestowFormState` — a typed `Option` marker, never a bool.
+/// A cleave revert restores the captured snapshot of the four ability classes
+/// as they were before the text-changing effect installed a separately parsed
+/// ability set. This struct carries that snapshot so `apply_zone_exit_cleanup`
+/// can restore it when the spell leaves the stack (CR 702.148a: the abilities
+/// function only while the spell is on the stack). Like `BestowFormState`, it
+/// stores the restoration payload in a typed `Option`, never a bool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CleaveFormState {
     pub abilities: Arc<Vec<AbilityDefinition>>,
@@ -1151,7 +1214,7 @@ pub struct GameObject {
     /// CR 702.103e–g (illegal target, unattach, zone exit).
     #[serde(
         default,
-        with = "unit_marker_option_serde",
+        with = "bestow_form_serde",
         skip_serializing_if = "Option::is_none"
     )]
     pub bestow_form: Option<BestowFormState>,
@@ -1269,15 +1332,35 @@ pub struct GameObject {
     pub blocked_abilities: Vec<AbilityBlockEntry>,
 
     /// CR 606.3 + CR 606.1: Per-permanent loyalty-ability activation count for
-    /// the current turn. Default cap is 1 (CR 606.3 "once per turn"); raised
-    /// for the controller by `GameState::extra_loyalty_activations_this_turn`
-    /// (The Chain Veil class). The gate logic lives in
+    /// the current turn. Default cap is 1 (CR 606.3 "once per turn"), or the value a
+    /// `ModifyActivationLimit` static sets (Oath of Teferi); raised by two grants,
+    /// both composed in `planeswalker::loyalty_activation_cap`: for
+    /// the controller's planeswalkers by `GameState::extra_loyalty_activations_this_turn`
+    /// (The Chain Veil class), and for this permanent's own characteristic loyalty
+    /// abilities by `GameObject::extra_loyalty_activations_this_turn` (the
+    /// Comet, Stellar Pup class). The gate logic lives in
     /// `planeswalker::can_activate_loyalty_ability`. The historical bool
     /// "loyalty_activated_this_turn" is replaced by `count > 0`. Cleared at
     /// turn start (CR 606.3 "that turn" reset) and on battlefield re-entry
     /// (CR 400.7 — a re-entering permanent is a new object with no memory).
     #[serde(skip_deserializing, default, skip_serializing_if = "is_zero_u32_field")]
     pub loyalty_activations_this_turn: u32,
+
+    /// CR 606.3 + CR 101.1: Extra loyalty-ability activations a resolved
+    /// `Effect::GrantExtraLoyaltyActivations { target: SelfRef }` granted to THIS
+    /// permanent for the current turn. Added to the cap on top of the player-wide
+    /// `GameState::extra_loyalty_activations_this_turn`, and only for this
+    /// permanent's own characteristic loyalty abilities (the card's ruling, not
+    /// CR text; a layer-6-gained ability is not covered, CR 613.1f).
+    ///
+    /// Runtime-only and never on the wire: `#[serde(skip)]` omits it from
+    /// serialization, so serialized bytes are identical to a build without the
+    /// field, and a restored object starts at 0 together with
+    /// `loyalty_activations_this_turn` (which `skip_deserializing` also resets).
+    /// Shares that counter's lifecycle: cleared at turn start (CR 514.2) and on
+    /// battlefield re-entry (CR 400.7), and not copied (CR 707.2).
+    #[serde(skip)]
+    pub extra_loyalty_activations_this_turn: u32,
 
     // Commander: whether this object is a commander card
     #[serde(default, skip_serializing_if = "is_false")]
@@ -1816,6 +1899,10 @@ fn _gameobject_partition_is_total(o: &GameObject) {
         available_mana_pips: _,
         blocked_abilities: _,
         loyalty_activations_this_turn: _,
+        // Per-turn accumulator, omitted from the strict comparator like the sibling
+        // above: runtime-only and wire-skipped, compensated analysis-locally by
+        // `loyalty_activation_counts_match`.
+        extra_loyalty_activations_this_turn: _,
         is_commander: _,
         signature_spell: _,
         commander_tax: _,
@@ -3079,6 +3166,7 @@ impl GameObject {
             available_mana_pips: Vec::new(),
             blocked_abilities: Vec::new(),
             loyalty_activations_this_turn: 0,
+            extra_loyalty_activations_this_turn: 0,
             is_commander: false,
             signature_spell: None,
             commander_tax: None,
@@ -3182,6 +3270,84 @@ impl GameObject {
         }
     }
 
+    /// CR 603.10 + CR 400.7: write an observed projection's characteristics and battlefield
+    /// status onto this object — the field-for-field inverse of the `TriggerSourceContext`
+    /// `snapshot_for_zone_change` builds. Builds a read-only view for filter evaluation; never
+    /// applied to an object in `GameState`.
+    ///
+    /// Abilities (`trigger_entries`) are not projected; the base object supplies them. The
+    /// projection's state-level relationships with no `GameObject` counterpart
+    /// (`linked_exile_snapshot`, `cards_exiled_this_turn`, `combat_status`, `granting_object`)
+    /// are left to their state-level authorities.
+    pub(crate) fn overlay_source_projection(&mut self, context: &TriggerSourceContext) {
+        let lki = &context.lki;
+        // Identity.
+        self.incarnation = context.identity.reference.incarnation;
+        // allow-raw-zone: writes a detached read-only view for filter evaluation, never an object in `GameState`; no zone change occurs (CR 603.10).
+        self.zone = context.identity.expected_zone;
+        self.card_id = context.card_id;
+        self.printed_ref = context.printed_ref.clone();
+        self.token_image_ref = lki.token_image_ref.clone();
+        // Public characteristics (layer-applied at observation time).
+        self.name = lki.name.clone();
+        self.power = lki.power;
+        self.toughness = lki.toughness;
+        self.layer_base_power = lki.base_power;
+        self.layer_base_toughness = lki.base_toughness;
+        self.controller = lki.controller;
+        self.owner = lki.owner;
+        self.card_types.core_types = lki.card_types.clone();
+        self.card_types.subtypes = lki.subtypes.clone();
+        self.card_types.supertypes = lki.supertypes.clone();
+        self.keywords = lki.keywords.clone();
+        self.color = lki.colors.clone();
+        self.chosen_attributes = lki.chosen_attributes.clone();
+        self.counters = lki.counters.clone();
+        self.tapped = lki.tapped;
+        self.is_suspected = lki.is_suspected;
+        // Relationships.
+        self.attachments = context
+            .attachments
+            .iter()
+            .map(|attachment| attachment.object_id)
+            .collect();
+        self.attached_to = context.attached_to;
+        self.paired_with = context.paired_with;
+        self.pair_controller = context.pair_controller;
+        // Object status and as-cast / as-entered facts.
+        self.is_token = context.is_token;
+        self.face_down = context.face_down;
+        self.mana_cost = context.mana_cost.clone();
+        self.transformed = context.transformed;
+        self.is_renowned = context.is_renowned;
+        self.is_saddled = context.is_saddled;
+        self.echo_due = context.echo_due;
+        self.harnessed = context.harnessed;
+        self.saddled_by = context.saddled_by.clone();
+        self.convoked_creatures = context.convoked_creatures.clone();
+        self.case_state = context.case_state.clone();
+        self.class_level = context.class_level;
+        self.timestamp = context.timestamp;
+        self.entered_battlefield_turn = context.entered_battlefield_turn;
+        self.cast_from_zone = context.cast_from_zone;
+        self.played_from_zone = context.played_from_zone;
+        self.entered_via_ability_source = context.entered_via_ability_source;
+        self.cast_controller = context.cast_controller;
+        self.phase_status = context.phase_status;
+        self.cast_variant_paid = context.cast_variant_paid;
+        self.cast_timing_permission = context.cast_timing_permission;
+        self.cost_x_paid = context.cost_x_paid;
+        self.cast_spell_keywords = context.cast_spell_keywords.clone();
+        self.mana_spent_to_cast = context.mana_spent_to_cast;
+        self.colors_spent_to_cast = context.colors_spent_to_cast.clone();
+        self.mana_spent_to_cast_amount = context.mana_spent_to_cast_amount;
+        self.mana_spent_source_snapshots = context.mana_spent_source_snapshots.clone();
+        self.kickers_paid = context.kickers_paid.clone();
+        self.additional_cost_payment_count = context.additional_cost_payment_count;
+        self.additional_cost_payments = context.additional_cost_payments.clone();
+        self.cast_cost_paid_object = context.cast_cost_paid_object.clone();
+    }
+
     /// CR 106.3 + CR 601.2h: Capture the public source characteristics needed
     /// by source-qualified "mana spent to cast" effects.
     pub fn snapshot_for_mana_spent(&self) -> LKISnapshot {
@@ -3244,6 +3410,10 @@ impl GameObject {
         self.damage_marked = 0;
         self.dealt_deathtouch_damage = false;
         self.loyalty_activations_this_turn = 0;
+        // CR 400.7 + CR 606.3: a re-entering permanent is a new object, so a
+        // per-permanent extra-activation grant made to its previous incarnation
+        // does not carry over.
+        self.extra_loyalty_activations_this_turn = 0;
         self.is_suspected = false;
         self.is_renowned = false;
         self.monstrous = false;
@@ -4533,6 +4703,31 @@ mod tests {
         );
     }
 
+    /// CR 400.7 + CR 606.3: a permanent re-entering the battlefield is a new
+    /// object, so a per-permanent extra loyalty-activation grant (and the
+    /// activation count it extends) made to the previous incarnation is gone.
+    /// The incarnation bump is the reach-guard: it proves the entry reset ran
+    /// over an object that held a non-zero grant.
+    #[test]
+    fn reset_for_battlefield_entry_clears_extra_loyalty_activations() {
+        let mut obj = GameObject::new(
+            ObjectId(1),
+            CardId(1),
+            PlayerId(0),
+            "Probe Walker".to_string(),
+            Zone::Exile,
+        );
+        obj.loyalty_activations_this_turn = 1;
+        obj.extra_loyalty_activations_this_turn = 2;
+        let incarnation = obj.incarnation;
+
+        obj.reset_for_battlefield_entry(1, 1);
+
+        assert_eq!(obj.incarnation, incarnation + 1, "the entry reset ran");
+        assert_eq!(obj.extra_loyalty_activations_this_turn, 0);
+        assert_eq!(obj.loyalty_activations_this_turn, 0);
+    }
+
     /// CR 400.7d + CR 603.4 (issue #5943 review round): the zone-change
     /// snapshot latches all four trigger-relevant mana-payment stamps — including the
     /// per-mana-unit source-snapshot vector — into the owned trigger source
@@ -5674,5 +5869,85 @@ mod tests {
         entering.prepared_copy_source = Some(ObjectId(77));
         entering.reset_for_battlefield_exit();
         assert_eq!(entering.prepared_copy_source, None);
+    }
+
+    /// U1 — CR 603.10 + CR 400.7: `overlay_source_projection` is the inverse of the
+    /// latch projection for every field an enter observer's filter can read, on both a
+    /// live-entrant base and a `GameObject::new` skeleton.
+    #[test]
+    fn overlay_source_projection_inverts_snapshot() {
+        use crate::types::counter::CounterType;
+        use crate::types::game_state::GameState;
+        use crate::types::keywords::Keyword;
+
+        let mut state = GameState::new_two_player(7);
+        let id = crate::game::zones::create_object(
+            &mut state,
+            CardId(42),
+            PlayerId(0),
+            "Observed Bear".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&id).expect("created");
+            obj.card_types.core_types = vec![CoreType::Creature];
+            obj.card_types.subtypes = vec!["Bear".to_string()];
+            obj.power = Some(2);
+            obj.toughness = Some(2);
+            obj.layer_base_power = Some(2);
+            obj.layer_base_toughness = Some(2);
+            obj.keywords = vec![Keyword::Flying];
+            obj.counters.insert(CounterType::Plus1Plus1, 1);
+            obj.tapped = true;
+            obj.controller = PlayerId(0);
+            obj.incarnation = 3;
+        }
+        let original = state.objects[&id].clone();
+        let ctx = crate::game::triggers::trigger_source_context_for_latch(&state, &original);
+
+        let assert_inverse = |view: &GameObject| {
+            assert_eq!(view.incarnation, original.incarnation);
+            assert_eq!(view.zone, original.zone);
+            assert_eq!(view.card_id, original.card_id);
+            assert_eq!(view.name, original.name);
+            assert_eq!(view.power, original.power);
+            assert_eq!(view.toughness, original.toughness);
+            assert_eq!(view.layer_base_power, original.layer_base_power);
+            assert_eq!(view.layer_base_toughness, original.layer_base_toughness);
+            assert_eq!(view.controller, original.controller);
+            assert_eq!(view.owner, original.owner);
+            assert_eq!(view.card_types.core_types, original.card_types.core_types);
+            assert_eq!(view.card_types.subtypes, original.card_types.subtypes);
+            assert_eq!(view.card_types.supertypes, original.card_types.supertypes);
+            assert_eq!(view.keywords, original.keywords);
+            assert_eq!(view.color, original.effective_colors());
+            assert_eq!(view.counters, original.counters);
+            assert_eq!(view.tapped, original.tapped);
+            assert_eq!(view.is_token, original.is_token);
+            assert_eq!(view.attachments, original.attachments);
+            assert_eq!(view.phase_status, original.phase_status);
+            assert_eq!(view.timestamp, original.timestamp);
+        };
+
+        // Live base: later changes on the object are overwritten by the projection.
+        let mut live = original.clone();
+        live.counters.insert(CounterType::Plus1Plus1, 3);
+        live.power = Some(4);
+        live.keywords.push(Keyword::Haste);
+        live.controller = PlayerId(1);
+        live.tapped = false;
+        live.incarnation = 4;
+        assert_ne!(
+            live.counters, original.counters,
+            "precondition: the live base differs"
+        );
+        live.overlay_source_projection(&ctx);
+        assert_inverse(&live);
+
+        // Skeleton base.
+        let mut skeleton =
+            GameObject::new(id, CardId(0), PlayerId(1), String::new(), Zone::Graveyard);
+        skeleton.overlay_source_projection(&ctx);
+        assert_inverse(&skeleton);
     }
 }

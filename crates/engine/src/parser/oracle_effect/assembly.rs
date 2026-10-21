@@ -25,11 +25,11 @@ use crate::parser::oracle_nom::bridge::nom_on_lower;
 use crate::parser::oracle_nom::error::OracleError;
 use crate::parser::oracle_nom::target::chain_text_mentions_chosen_object;
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
-    CastFromZoneDriver, CastingPermission, ChoiceType, ChosenGroupId, Comparator, ControllerRef,
-    DamageChannel, Effect, EffectScope, FilterProp, PlayerFilter, PlayerScope, QuantityExpr,
-    QuantityRef, ReturnResultId, SharedQuality, SharedQualityRelation, SiblingCondition,
-    StaticCondition, SubAbilityLink, TapStateChange, TargetFilter, TypedFilter,
+    effect_variant_name, AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind,
+    AggregateFunction, CastFromZoneDriver, CastingPermission, ChoiceType, ChosenGroupId,
+    Comparator, ControllerRef, DamageChannel, Effect, EffectScope, FilterProp, PlayerFilter,
+    PlayerScope, QuantityExpr, QuantityRef, ReturnResultId, SharedQuality, SharedQualityRelation,
+    SiblingCondition, StaticCondition, SubAbilityLink, TapStateChange, TargetFilter, TypedFilter,
 };
 use crate::types::game_state::TargetSelectionConstraint;
 use crate::types::zones::Zone;
@@ -48,8 +48,7 @@ use super::lower::{
     consolidate_die_and_coin_defs, definition_targets_self_source,
     effect_publishes_revealed_subject, ensure_remember_card_after_object_choice,
     extract_bounded_target_multi_target, extract_exact_target_multi_target,
-    extract_optional_target_multi_target, extract_verb_up_to_multi_target,
-    fold_copy_spell_gains_haste_and_quoted_grant,
+    extract_verb_up_to_multi_target, fold_copy_spell_gains_haste_and_quoted_grant,
     fold_deal_damage_then_prevent_into_computed_amount, fold_enters_this_way_counter_rider,
     fold_exile_resolving_rider, fold_search_choose_type_conditional_destination,
     fold_token_it_has_grants_into_token_statics, gate_other_revealed_card_on_multiplayer_reveal,
@@ -1169,6 +1168,7 @@ impl AssemblyEnv {
         guard: Option<BindGuard>,
         on_miss: OnMiss,
     ) -> Option<usize> {
+        let _binding = tracing::debug_span!(target: "engine::parser::binding", "binding", ?selector, ?guard, ?on_miss).entered();
         debug_assert!(
             !matches!(selector, AntecedentSelector::AllWithRole(_)),
             "`AllWithRole` is a FAN-OUT selector — bind it with `resolve_all`. Taking one \
@@ -1176,6 +1176,17 @@ impl AssemblyEnv {
              CR 707.10c defect the selector exists to fix."
         );
         let hit = self.point_hit(defs, selector, guard);
+        if tracing::enabled!(target: "engine::parser::binding", tracing::Level::DEBUG) {
+            let selected = hit.map(|index| {
+                let node = self.arena.order[index];
+                (
+                    node,
+                    self.arena.node(node).prov,
+                    effect_variant_name(&defs[index].effect),
+                )
+            });
+            tracing::debug!(target: "engine::parser::binding", hit = hit.is_some(), ?selected, "binding result");
+        }
         match hit {
             Some(i) => Some(i),
             None => match on_miss {
@@ -1200,10 +1211,25 @@ impl AssemblyEnv {
         guard: Option<BindGuard>,
         on_miss: OnMiss,
     ) -> Vec<usize> {
+        let _binding = tracing::debug_span!(target: "engine::parser::binding", "binding", ?selector, ?guard, ?on_miss).entered();
         let hits: Vec<usize> = match selector {
             AntecedentSelector::AllWithRole(role) => self.role_members(defs, role, guard),
             point => self.point_hit(defs, point, guard).into_iter().collect(),
         };
+        if tracing::enabled!(target: "engine::parser::binding", tracing::Level::DEBUG) {
+            let selected: Vec<_> = hits
+                .iter()
+                .map(|&index| {
+                    let node = self.arena.order[index];
+                    (
+                        node,
+                        self.arena.node(node).prov,
+                        effect_variant_name(&defs[index].effect),
+                    )
+                })
+                .collect();
+            tracing::debug!(target: "engine::parser::binding", hit = !hits.is_empty(), ?selected, "binding result");
+        }
         if hits.is_empty() {
             return match on_miss {
                 OnMiss::Ignore => Vec::new(),
@@ -1220,7 +1246,7 @@ impl AssemblyEnv {
         index: usize,
         guard: Option<BindGuard>,
     ) -> bool {
-        match guard {
+        let passed = match guard {
             None => true,
             Some(BindGuard::NoSubAbility) => defs[index].sub_ability.is_none(),
             Some(BindGuard::EffectShape(EffectClass::PermanentCreator)) => matches!(
@@ -1251,7 +1277,12 @@ impl AssemblyEnv {
                         Effect::Sacrifice { .. } | Effect::PayCost { .. }
                     )
             }
+        };
+        if tracing::enabled!(target: "engine::parser::binding", tracing::Level::DEBUG) {
+            let node = self.arena.order[index];
+            tracing::debug!(target: "engine::parser::binding", ?node, provenance = ?self.arena.node(node).prov, effect_kind = ?effect_variant_name(&defs[index].effect), passed, "binding candidate");
         }
+        passed
     }
 
     /// EVERY index carrying `role` whose guard also holds, in emission order.
@@ -1317,6 +1348,9 @@ impl AssemblyEnv {
                 // Walk FORWARD over emission order from the anchor and take the
                 // FIRST qualifying node. Reads `order` only — never the output tree.
                 let anchor_pos = self.arena.order.iter().position(|id| *id == anchor);
+                if anchor_pos.is_none() {
+                    tracing::debug!(target: "engine::parser::binding", ?anchor, "binding anchor missing");
+                }
                 anchor_pos.and_then(|a| ((a + 1)..defs.len()).find(|i| passes(*i)))
             }
             // "The most recent node with the role" IS the last member of the same
@@ -2087,6 +2121,7 @@ fn mark_independent_mana_spent_gates(defs: &mut [AbilityDefinition]) {
 }
 
 pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
+    let _chain = tracing::debug_span!(target: "engine::parser::binding", "chain", kind = ?ir.kind, clauses = ir.clauses.len()).entered();
     let kind = ir.kind;
     let continuation_kind = ir.continuation_kind.unwrap_or(AbilityKind::Spell);
 
@@ -2112,6 +2147,7 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     let mut previous_clause_start = 0usize;
     let mut this_clause_start = 0usize;
     for clause_ir in &ir.clauses {
+        let _clause = tracing::debug_span!(target: "engine::parser::binding", "clause", clause_id = ?clause_ir.id, fragment = ?clause_ir.source.fragment(), source_span = ?clause_ir.source.span()).entered();
         if defs.len() > this_clause_start {
             previous_clause_start = this_clause_start;
         }
@@ -3249,7 +3285,41 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
             // provably arrives here unstamped. Stated explicitly because the
             // helper no longer refuses a stamped node (it now READS the stamp),
             // so precedence belongs at the writer, not at the classifier.
-            if def.optional_for.is_none() && def.optional_player.is_none() {
+            // CR 115.1 + CR 608.2d: a `"target opponent may draw …"` clause names
+            // the ANNOUNCED target opponent as the actor — the targeted opponent
+            // announces the may. Provenance is the clause's own printed grammar,
+            // never the lowered shape: "you may have target opponent draw a card"
+            // (the CONTROLLER decides) lowers to a byte-identical
+            // `Draw{Typed{Opponent}}, optional:true` node, which is why
+            // `subject_anchored_optional_actor` refuses that slot by design and the
+            // clause provenance picks the actor here instead.
+            //
+            // The stamped ref is the clause's own DECLARED-player reference: the
+            // group this node declares, whose announced player target
+            // `declared_group_player_slot` reads back. `TargetFilter::DeclaredPlayer`
+            // is a context ref, so it claims no target slot of its own and
+            // fail-closes to nobody when that player is illegal (CR 608.2b). The
+            // Draw keeps its announced `Typed{controller: Opponent}` player target,
+            // so the seat that announces the may and the seat that draws are the
+            // same announced opponent WITHOUT rebinding the chain's controller —
+            // `player_scope` would rebind it, and every later "you" in the chain
+            // would then be read from the opponent's seat.
+            let fragment_lower = clause_ir
+                .source
+                .fragment()
+                .unwrap_or_default()
+                .to_lowercase();
+            if super::subject::targeted_opponent_may_player_action(&fragment_lower) {
+                // The clause always carries an explicit player target (the Draw's
+                // `Typed { controller: Opponent }`), so `tag_player_declarations`
+                // stamps the group. `TargetFilter::Opponent` is the fail-soft
+                // spelling if that stamp is ever absent (its resolver also prefers
+                // the announced player).
+                def.optional_player = Some(match def.declares_chosen_group {
+                    Some(group) => TargetFilter::DeclaredPlayer { group },
+                    None => TargetFilter::Opponent,
+                });
+            } else if def.optional_for.is_none() && def.optional_player.is_none() {
                 def.optional_player =
                     subject_anchored_optional_actor(&def, ActorBindingWindow::ThisResolution);
             }
@@ -3392,10 +3462,6 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                 extract_bounded_target_multi_target(clause_ir.source.fragment().unwrap_or_default())
             {
                 def = def.multi_target(spec);
-            } else if let Some(spec) = extract_optional_target_multi_target(
-                clause_ir.source.fragment().unwrap_or_default(),
-            ) {
-                def = def.multi_target(spec);
             } else if let Some(spec) =
                 extract_verb_up_to_multi_target(clause_ir.source.fragment().unwrap_or_default())
             {
@@ -3405,6 +3471,13 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
             } else if let Some(ref spec) = clause_ir.parsed.multi_target {
                 def = def.multi_target(spec.clone());
             }
+        }
+        // CR 115.1 + CR 115.6 + CR 601.2c + CR 602.2b + CR 603.3d: the Attach
+        // host frame's declared zero-target authority (the only writer of this
+        // clause field). OR-only: never clears a flag, and never rescans the
+        // text — the clause detector owns the non-Attach class.
+        if clause_ir.parsed.optional_targeting {
+            def = def.optional_targeting();
         }
         // CR 601.2c + CR 608.2c: A conjugated continuation after an "any
         // number of target players/opponents each" head shares the targets
@@ -3961,7 +4034,7 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     // re-cut this as JSON containers. Re-run if a candidate carries Dig; if the
     // Elemental-Appeal (a)∧(b) consumer probe exceeds one or T-ROW5 reds (the
     // silent-wrong-binding, highest-severity exposure); if CopySpell with
-    // ParentTarget/TrackedSet(0) is nonterminal; if a bare FlipCoin/RollDie and
+    // ParentTarget/TrackedSet(0) is nonterminal; if a bare single-flip FlipCoins/RollDie and
     // its branch share a payload; if ChooseDamageSource/ChosenDamageSource occurs
     // at any depth; or if an antecedent gains else_ability or an instead condition.
     // Record the data md5 for every re-run.
@@ -4140,7 +4213,7 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     fold_cast_copy_of_card_defs(&mut defs);
 
     // CR 706 + CR 705: Consolidate die result table lines into their parent RollDie,
-    // and coin flip conditional branches into their parent FlipCoin.
+    // and coin flip conditional branches into their parent FlipCoins.
     consolidate_die_and_coin_defs(&mut defs, kind);
 
     // CR 609.7a + CR 608.2c: Desperate Gambit — a preceding
@@ -4797,10 +4870,235 @@ mod arena_tests {
     use crate::parser::oracle_ir::ast::parsed_clause;
     use crate::parser::oracle_ir::effect_chain::{ClauseIr, ClauseIrBuilder, InjectedColorChoice};
     use crate::parser::oracle_nom::context::ParseContext;
+    #[cfg(feature = "cli")]
+    use crate::types::ability::OpponentMayScope;
     use crate::types::ability::{DelayedTriggerCondition, ReplacementDefinition};
     use crate::types::phase::Phase;
     use crate::types::replacements::ReplacementEvent;
     use crate::types::zones::EtbTapState;
+
+    #[cfg(feature = "cli")]
+    #[derive(Clone)]
+    struct BindingLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[cfg(feature = "cli")]
+    impl std::io::Write for BindingLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "cli")]
+    fn capture_binding<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = BindingLog(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("engine::parser::binding=debug")
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::ENTER)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        (result, log)
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn binding_diagnostics_report_actual_candidates_and_ordered_results() {
+        let mut env = AssemblyEnv::default();
+        // OptionalHead membership follows optional_for, not the optional flag.
+        let mut defs = vec![AbilityDefinition {
+            optional_for: Some(OpponentMayScope::AnyOpponent),
+            ..shuffle_def().optional()
+        }];
+        env.observe(&defs, Some(ClauseId(0)), NodeRole::Primary);
+        defs.push(AbilityDefinition {
+            optional_for: Some(OpponentMayScope::AnyOpponent),
+            ..shuffle_def().optional().sub_ability(shuffle_def())
+        });
+        env.observe(&defs, Some(ClauseId(1)), NodeRole::Primary);
+        defs.push(shuffle_def());
+        env.observe(&defs, Some(ClauseId(2)), NodeRole::Primary);
+        let (hit, log) = capture_binding(|| {
+            env.resolve(
+                &defs,
+                AntecedentSelector::LastWithRole(AntecedentRole::OptionalHead),
+                Some(BindGuard::NoSubAbility),
+                OnMiss::Ignore,
+            )
+        });
+        assert_eq!(hit, Some(0));
+        assert!(log.contains("selector=LastWithRole(OptionalHead)"), "{log}"); // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+        assert!(log.contains("guard=Some(NoSubAbility)"), "{log}"); // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+        assert!(
+            log.contains("node=NodeId(1)") && log.contains("passed=false"), // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+            "{log}"
+        );
+        assert!(
+            log.contains("selected=Some((NodeId(0), NodeProvenance { origin: Some(ClauseId(0))"), // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+            "{log}"
+        );
+        assert!(log.contains("on_miss=Ignore")); // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+        let (hits, log) = capture_binding(|| {
+            env.resolve_all(
+                &defs,
+                AntecedentSelector::AllWithRole(AntecedentRole::OptionalHead),
+                None,
+                OnMiss::Ignore,
+            )
+        });
+        assert_eq!(hits, vec![0, 1]);
+        let result = log
+            .lines()
+            .find(|line| line.contains("binding result")) // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+            .unwrap();
+        assert!(result.contains("selected=[(NodeId(0)"), "{result}"); // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+        assert!(result.contains("(NodeId(1)"), "{result}"); // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+        assert!(!result.contains("NodeId(2)"), "{result}"); // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn binding_diagnostics_distinguish_empty_rejected_and_missing_anchor() {
+        let mut env = AssemblyEnv::default();
+        let (empty, log) = capture_binding(|| {
+            env.resolve(&[], AntecedentSelector::LastEmitted, None, OnMiss::Ignore)
+        });
+        assert_eq!(empty, None);
+        assert!(log.contains("hit=false")); // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+        assert!(!log.contains("binding candidate")); // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+        let mut defs = vec![shuffle_def()];
+        env.observe(&defs, Some(ClauseId(0)), NodeRole::Primary);
+        let (wrong_shape, log) = capture_binding(|| {
+            env.resolve(
+                &defs,
+                AntecedentSelector::LastEmitted,
+                Some(BindGuard::EffectShape(EffectClass::PermanentCreator)),
+                OnMiss::Ignore,
+            )
+        });
+        assert_eq!(wrong_shape, None);
+        assert!(
+            log.contains("binding candidate") // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+                && log.contains("passed=false") // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+                && log.contains("hit=false") // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+        );
+        assert!(!log.contains("binding anchor missing")); // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+        defs.push(AbilityDefinition::new(
+            AbilityKind::Spell,
+            zone_change(Zone::Battlefield, TargetFilter::Controller),
+        ));
+        env.observe(&defs, Some(ClauseId(1)), NodeRole::Primary);
+        let (positive, log) = capture_binding(|| {
+            env.resolve(
+                &defs,
+                AntecedentSelector::LastEmitted,
+                Some(BindGuard::EffectShape(EffectClass::PermanentCreator)),
+                OnMiss::Ignore,
+            )
+        });
+        assert_eq!(positive, Some(1));
+        assert!(log.contains("passed=true") && log.contains("hit=true")); // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+        let (missing, log) = capture_binding(|| {
+            env.resolve(
+                &defs,
+                AntecedentSelector::Between { anchor: NodeId(99) },
+                None,
+                OnMiss::Ignore,
+            )
+        });
+        assert_eq!(missing, None);
+        assert!(log.contains("binding anchor missing") && log.contains("hit=false")); // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+        assert!(!log.contains("binding candidate")); // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn binding_diagnostics_public_context_is_observational_only() {
+        let text = "At the beginning of your draw step, you may draw two additional cards. If you do, choose two cards in your hand drawn this turn. For each of those cards, pay 4 life or put the card on top of your library.";
+        let types = vec!["Enchantment".to_string()];
+        let plain =
+            tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+                crate::parser::parse_oracle_text(text, "Sylvan Library", &[], &types, &[])
+            });
+        let (logged, log) = capture_binding(|| {
+            crate::parser::parse_oracle_text(text, "Sylvan Library", &[], &types, &[])
+        });
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::to_value(&logged).unwrap()
+        );
+        assert!(log.contains("binding result"), "{log}"); // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+        for field in [
+            "card_name=\"Sylvan Library\"",
+            "stage=\"ir_production\"",
+            "stage=\"ir_lowering\"",
+            "chain{",
+            "clause_id=ClauseId(",
+            "fragment=",
+            "ChainRelative",
+            "pass=\"unseeded\"",
+            "selected_pass=\"unseeded\"",
+        ] {
+            assert!(log.contains(field), "missing {field}: {log}"); // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+        }
+        let (traced, log) = capture_binding(|| {
+            crate::parser::oracle::parse_oracle_text_traced(
+                text,
+                "Sylvan Library",
+                &[],
+                &types,
+                &[],
+            )
+        });
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::to_value(&traced.production_output).unwrap()
+        );
+        assert!(log.contains("binding result") && log.contains("card_name=\"Sylvan Library\"")); // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+        let mut context = ParseContext::default();
+        let ir = parse_effect_chain_ir("You may draw two cards. If you do, choose two cards in your hand drawn this turn. For each of those cards, pay 4 life or put the card on top of your library.", AbilityKind::Spell, &mut context);
+        let (_, log) = capture_binding(|| assemble_effect_chain(&ir));
+        assert!(log.contains("binding result"), "{log}"); // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+        assert!(log.contains("ChainRelative")); // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+        assert!(
+            !log.contains("card_name=") // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+                && !log.contains("selected_pass=") // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+                && !log.contains("assembly_attempt") // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+        );
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn binding_diagnostics_label_both_existing_assembly_attempts() {
+        let mut builder = ClauseIrBuilder::new("shuffle");
+        emitted_clause(&mut builder, "shuffle", shuffle_effect(), None);
+        let mut ir = chain_ir(builder.finish(), AbilityKind::Spell);
+        ir.clauses[0].accepting_player_bindings.push(
+            crate::parser::oracle_ir::effect_chain::AcceptingPlayerBinding {
+                node: 0,
+                unseeded: TargetFilter::Controller,
+                seeded: TargetFilter::Opponent,
+            },
+        );
+        let plain = super::super::lower::lower_effect_chain_ir(&ir);
+        let (logged, log) = capture_binding(|| super::super::lower::lower_effect_chain_ir(&ir));
+        assert_eq!(plain, logged);
+        assert!(
+            log.contains("pass=\"unseeded\"") && log.contains("pass=\"seeded\""), // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+            "{log}"
+        );
+        assert!(
+            log.contains("selected_pass=\"unseeded\"") && log.contains("confined=false"), // allow-noncombinator: captured diagnostic assertion, not Oracle dispatch.
+            "{log}"
+        );
+    }
 
     fn shuffle_def() -> AbilityDefinition {
         AbilityDefinition::new(

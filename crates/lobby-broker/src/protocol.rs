@@ -60,19 +60,139 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
-/// 145 — CR 701.43: `GameEvent::CreatureExerted` gains `origin` (attack cost
+/// 160 — CR 701.43: `GameEvent::CreatureExerted` gains `origin` (attack cost
 ///      or activated-ability cost) and an optional `player` (who exerted),
 ///      carried in `GameState`'s trigger events (a stack trigger's
 ///      `trigger_event`, `pending_attack_trigger_events`). An older peer drops
 ///      both silently: it cannot tell an activated-ability exert from the
 ///      attack exert a "when you do" trigger is linked to, and it never saw
 ///      an exert as a cost at all. Full-game peers and P2P move in lockstep
-///      (wire 127). A pre-145 save holding the event restores with no actor and
+///      (wire 142). A pre-160 save holding the event restores with no actor and
 ///      the attack-cost origin (the only exert it recorded). Exact attack costs
 ///      now carry `attack_permission` receipts and required `ExertChoice.permission`
 ///      bindings, including each typed remaining queue entry. Definitions carry
 ///      `attack_cost_condition` / `SourceExertedThisTurn`; unbound saved prompts
 ///      are refused rather than rebound to current ability occurrences.
+/// 159 — Coin-flip effects are one `Effect::FlipCoins { flips: CoinFlipRun, .. }`.
+///      The `FlipCoin` and `FlipCoinUntilLose` tags are no longer written,
+///      `count` moves into `flips`, and the coin-flip resolution frame's kind
+///      becomes `Exactly`/`UntilLoss` (`RESOLUTION_STATE_WIRE_VERSION` 8). A
+///      v158 or older peer silently reads a multi-flip or until-loss run as one flip.
+///      Full-game peers and P2P move in lockstep (wire 141); no lobby carrier
+///      names it.
+/// 157 — `ChooseFromZoneConstraint::TotalManaValue` extends serialized paused
+///      zone choices and ability state. Old readers cannot decode the new tag;
+///      full-game and P2P (wire 139) refuse them before state delivery.
+/// 156 — `StaticCondition`, `TriggerCondition` and `AbilityCondition` gain
+///      `QuantityQuality { quantity, quality }`, with new `NumberQuality`
+///      (`{"type":"Prime"}` / `{"type":"Parity","value":"Odd"|"Even"}`), carried
+///      in ability definitions inside `GameState` (CR 107.1, CR 603.4). A pre-v156
+///      peer cannot parse the tag. Full-game peers and P2P move in lockstep
+///      (wire 138); no lobby carrier names it.
+///      The same bump adds the optional per-seat `created_tokens` channel (each
+///      seat's pinned creation result) to the private
+///      player-scope tail sidecar that `PendingContinuation` carries under its
+///      existing `player_scope_linked_exile` key (CR 608.2c + CR 608.2f: the
+///      tokens every seat created, for a paused "each player creates … The
+///      tokens …" tail); it is serde-defaulted, so a sidecar without it decodes
+///      as the linked-exile-only sidecar.
+///
+/// 155 — `PendingChangeZoneIteration` members carry their pre-event entry
+///      modifications (CR 603.6a + CR 614.12): `remaining` becomes
+///      `ChangeZoneMemberEntry` records and the raw gate fields are removed; old
+///      peers cannot parse a parked ChangeZone frame. `RESOLUTION_STATE_WIRE_VERSION`
+///      moves from 6 to 7 with it: a v154 peer refuses the version-7 resolution
+///      state. Full-game peers and P2P move in lockstep (wire 137); no lobby
+///      carrier names it.
+///
+/// 154 — `PendingCostMoveResume` gains `CounterCostRemovalPayment`, a
+///      counter-removal cost paused while a replacement choice settles its
+///      current removal (CR 616.1; the settled count is credited to the
+///      activation, CR 118.11), with its `PausedCounterCostRemoval` record
+///      (which carries its `replacement_subtree` boundary);
+///      `ManaAbilityCostCursor` gains the optional `counter_removal` record.
+///      Serialized in `GameState.pending_cost_move_resume`: a v153 peer cannot
+///      parse the new tag. The same version carries the activation-owned
+///      removed-counter count (`SpellContext.cost_removed_counter_amount`,
+///      `ManaAbilityCostCursor.cost_removed_counters`,
+///      `PendingManaAbility.cost_removed_counters`; optional, skipped when
+///      unset), which a v153 peer re-encoding state would drop. Full-game
+///      peers and P2P move in lockstep (wire 136); no lobby carrier names it.
+///
+/// 153 — `ContinuousModification::GrantAllActivatedAbilitiesOf` gains the
+///      optional kind selector `kind: Option<ActivatedAbilityKind>`, and the
+///      loyalty-grant sibling variant is removed (Nicol Bolas,
+///      Dragon-God's loyalty grant is `kind: Some(Loyalty)` on the activated
+///      authority — the same parameterization shape as entry 127's FilterProp
+///      merge). The field rides in `GameState`'s transient continuous effects
+///      with `#[serde(default)]`, and the enum has no `deny_unknown_fields`,
+///      so a v152 peer reading kind-bearing Bolas state drops `kind` SILENTLY
+///      and over-grants every activated ability of every other planeswalker —
+///      the silent-skew class entry 129 refuses to tolerate without a
+///      handshake-refusable bump. The removed tag never shipped (no committed
+///      export names it), so no migration shim exists; branch-era saved states
+///      fail loudly on the unknown variant. P2P moves in lockstep (wire 135);
+///      lobby messages are unchanged.
+///
+/// 152 — `ShortcutDecisionSchema` gains `suggested_declaration` (the offer's
+///      eliminating suggestion) and `leading_aims` (published slots a trigger on
+///      the stack already targets), and `ShortcutProposal` gains `leading_aims`.
+///      A v151 peer drops them. Full-game peers and P2P move in lockstep
+///      (wire 134).
+///
+/// 151: Populated `GameObject.bestow_form` carries removed creature subtypes as
+///      an object instead of the legacy boolean. Old readers cannot decode it;
+///      full-game and P2P (wire 133) refuse them before state delivery.
+/// 150 — The cast-this-way gains rider's serialized payload is reshaped:
+///      `CastingPermission::ExileWithAltCost.enters_with_modifications` becomes a
+///      `PendingEntersModifications` object (a bare `ContinuousModification`
+///      array on a v149 peer) and `Effect::AddPendingEntersModifications` carries
+///      its `rider` object in place of the required `modifications` array (the
+///      compat reader accepts the legacy shapes; a v149 peer cannot parse either
+///      new shape). Full-game peers and P2P move in lockstep (wire 132); no lobby
+///      carrier names it.
+/// 149 — The CR 608.2n final part of a spell's resolution is owed on the
+///      resolution carrier. `GameState::deferred_spell_delivery` (v110: the
+///      destination recorded while a spell paused on its own free-cast window)
+///      is removed, and `GameState` gains `resolving_spell_final_part`
+///      (`{ spell }`, omitted when none): an instant or
+///      sorcery whose instructions paused for a choice (Faithless Looting's
+///      discard, Doomsday's search, a free-cast window) stays on the stack, and
+///      the marker says it still owes its on-resolution hooks, destination and
+///      move. A v148 peer drops the key and would move the spell before its
+///      paused instructions finish, or leave it on the stack in no zone after a
+///      free-cast window, so full-game and P2P refuse the mismatch (wire 131).
+///      A pre-v149 snapshot that carries `deferred_spell_delivery` is refused at
+///      restore: it cannot say which hooks (rebound, paradigm, epic) already
+///      ran, and replaying them would install a second delayed trigger. Lobby
+///      messages are unchanged.
+///
+/// 148 — Timesifter's top-card exile contest. `Effect::ExileTopCardContest`
+///      (with its nested winner `AbilityDefinition`) serializes in ability
+///      definitions inside `GameState`, and a paused contest round parks
+///      `BatchCompletion::TopCardContestRoundComplete` on its resolution frame.
+///      A v147 peer cannot parse either tag. Full-game peers and P2P move in
+///      lockstep; no lobby carrier names it (wire 130).
+/// 147 — Online physical contests (Eye to Eye, Mouth to Mouth). `WaitingFor::
+///      PhysicalContest` (serialized `ContestState` inside `GameState`),
+///      `Effect::PhysicalContest`, `GameEvent::PhysicalContestStarted` /
+///      `PhysicalContestResolved`, `ClientMessage::ContestClick` and
+///      `ServerMessage::ContestProgress`. A v146 peer cannot parse the new
+///      `WaitingFor`/`Effect`/`GameEvent` tags or either message. Full-game
+///      peers and P2P move in lockstep; no lobby carrier names it (wire 129).
+/// 146 — `ConfirmedPeriod` gains `performance` and `counted_by` (`CountedBy::Replay { departures }`, CR
+///      732.2a: the offer's count is the repetitions the counting replay performed,
+///      with the seats that left in each) and `PredictedDeparture` serializes inside
+///      it, carried in `WaitingFor::LoopShortcut` and `ShortcutProposal`; their
+///      `per_cycle` signature may carry `"scope": "OneRepetition"`, and their
+///      `win_kind` becomes optional beside a new optional `win_kind_at`. A v145
+///      peer drops the field and would take such an offer as the threshold
+///      authority's. Full-game peers and P2P move in lockstep (wire 128); no lobby
+///      carrier names it.
+/// 145 — `ParentTargetMissingReason` gains `SearchLibrary` (CR 701.23b),
+///      serialized on `ResolvedAbility.parent_target_missing_reason`; a v144
+///      peer cannot parse the tag. P2P moves in lockstep (wire 127); lobby
+///      messages unchanged.
 ///
 /// 144 — One-time boons (#7495) add serialized `GameState` tags, and the
 ///      perpetual P/T edit is retyped. `Effect::CreateBoon` (with its granted
@@ -1102,7 +1222,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 145;
+pub const PROTOCOL_VERSION: u32 = 160;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2359,12 +2479,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 145);
+        assert_eq!(PROTOCOL_VERSION, 160);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 144);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 159);
     }
 
     #[test]

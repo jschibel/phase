@@ -45,7 +45,9 @@ use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit
 use engine::types::phase::{Phase, PhaseGroup, TurnSegment};
 use engine::types::player::PlayerId;
 use engine::types::proposed_event::ProposedEvent;
-use engine::types::resolution::{ResolutionFrame, ResolutionStateWire};
+use engine::types::resolution::{
+    ResolutionFrame, ResolutionStateWire, RESOLUTION_STATE_WIRE_VERSION,
+};
 use engine::types::resolved_commands::{
     ResolvedObjectStatus, ResolvedRulesCommand, ResolvedTokenBody,
 };
@@ -1222,15 +1224,6 @@ fn croaking_counterpart_copy_exceptions_survive_real_db_restore() {
     let db = shared_card_db().expect("real card fixture is required");
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    scenario.state.all_creature_types = db.creature_type_vocabulary().to_vec();
-    assert!(!scenario.state.all_creature_types.is_empty());
-    for subtype in ["Human", "Warrior", "Frog"] {
-        assert!(scenario
-            .state
-            .all_creature_types
-            .iter()
-            .any(|known| known == subtype));
-    }
     let source = scenario.add_real_card(P0, "Combat Celebrant", Zone::Battlefield, db);
     scenario.add_real_card(P0, "Fervor", Zone::Battlefield, db);
     let counterpart = scenario.add_real_card(P0, "Croaking Counterpart", Zone::Hand, db);
@@ -1238,6 +1231,19 @@ fn croaking_counterpart_copy_exceptions_survive_real_db_restore() {
         scenario.add_basic_land(P0, color);
     }
     let mut runner = scenario.build();
+    // CR 707.9b + CR 205.3m: the copy exception makes the copy a Frog in place of
+    // its other creature types, and layers enumerate those types from the loaded
+    // database's creature-type vocabulary. Seed it from the same real database
+    // before the cast, as a loaded game does.
+    runner.state_mut().all_creature_types = db.creature_type_vocabulary().to_vec();
+    assert!(!runner.state().all_creature_types.is_empty());
+    for subtype in ["Human", "Warrior", "Frog"] {
+        assert!(runner
+            .state()
+            .all_creature_types
+            .iter()
+            .any(|known| known == subtype));
+    }
     assert_eq!(runner.state().objects[&source].power, Some(4));
     assert_eq!(runner.state().objects[&source].color, vec![ManaColor::Red]);
     let outcome = runner.cast(counterpart).target_object(source).resolve();
@@ -1380,7 +1386,7 @@ fn actual_parked_copy_wire_families(state: &GameState) -> Vec<serde_json::Value>
             .all(|frame| !matches!(frame, ResolutionFrame::MultiDraw(_))),
         "no draw-family differences apply"
     );
-    for version in 2..=5 {
+    for version in 2..=RESOLUTION_STATE_WIRE_VERSION {
         let mut wire = current.clone();
         wire["resolution_state_version"] = version.into();
         families.push(wire);

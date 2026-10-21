@@ -1576,7 +1576,7 @@ fn segment_is_back_referential_continuation(segment: &str) -> bool {
 /// inside a quoted granted ability or a mana symbol never ends a sentence. Each
 /// returned segment keeps its terminating period and is trimmed; empty segments
 /// are dropped.
-fn split_static_sentences(text: &str) -> Vec<String> {
+pub(crate) fn split_static_sentences(text: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut brace_depth = 0usize;
@@ -2959,6 +2959,12 @@ fn parse_static_line_multi_dispatch(text: &str) -> Vec<StaticDefinition> {
         ];
     }
 
+    // CR 101.2 + CR 121.3 + CR 119.7: "Players can't draw cards or gain life"
+    // (Mornsong Aria) — CantDraw plus CantGainLife for the same subject.
+    if let Some(defs) = parse_cant_draw_cards_or_gain_life(tp.lower, &stripped) {
+        return defs;
+    }
+
     // CR 104.2b + CR 104.3e + CR 810.8a: "<player-scope> can't lose/win the
     // game and <player-scope> can't win/lose the game" — one game-outcome-lock
     // static per conjunct, each with its own player scope (Platinum Angel
@@ -3569,6 +3575,12 @@ pub(crate) fn rebind_source_object_quantities_to_recipient(
             comparator,
             rhs: rebind_source_object_quantity_expr_to_recipient(rhs),
         },
+        StaticCondition::QuantityQuality { quantity, quality } => {
+            StaticCondition::QuantityQuality {
+                quantity: rebind_source_object_quantity_expr_to_recipient(quantity),
+                quality,
+            }
+        }
         StaticCondition::And { conditions } => StaticCondition::And {
             conditions: conditions
                 .into_iter()

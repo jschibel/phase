@@ -76,14 +76,40 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // `FilterProp::CrewedThisTurn`).
 // v140 adds `AttackSubject::EventAttackers` (the attacked players of a trigger's attack
 // event) to ability player scopes in GameState.
+// v151 carries populated Bestow restoration payloads (object instead of boolean).
 // v141 adds `ExileLinkKind::CastCost` (CR 607.2q cast-cost exile links) to GameState.
 // v142 adds `LinkedExileSnapshot.incarnation` (CR 400.7) to GameState's linked-exile snapshots.
 // v143 retypes GameState's modal no-repeat history keys to `ObjectIncarnationRef` (CR 400.7).
-// v145 adds `GameEvent::CreatureExerted.origin` and `.player` (CR 701.43) to GameState's
+// v144 adds one-time boon tags (CreateBoon, NoteNumber, HasBoon, ChooseTokenHost) and
+// retypes the perpetual P/T edit to QuantityExpr.
+// v146 adds `ConfirmedPeriod.counted_by` (CR 732.2a counted loop offers) and `ConfirmedPeriod.performance` to GameState.
+// v147 reshapes the cast-this-way gains rider's serialized payload: the ExileWithAltCost
+// permission's `enters_with_modifications` becomes a `PendingEntersModifications` object
+// (was a `ContinuousModification` array) and `Effect::AddPendingEntersModifications`
+// carries its `rider` object in place of the required `modifications` array.
+// v154 (after v153, #10006's kind-selected activated grant) adds `PendingCostMoveResume::CounterCostRemovalPayment`
+// (CR 616.1 deferred counter-cost removal) and `ManaAbilityCostCursor.counter_removal` to GameState.
+// v160 adds `GameEvent::CreatureExerted.origin` and `.player` (CR 701.43) to GameState's
 // trigger events, exact attack_permission receipts, required ExertChoice.permission
 // and typed remaining bindings, plus attack_cost_condition / SourceExertedThisTurn.
 // Unbound historical payment prompts are rejected; historical events still load.
 // v134 adds `GameEvent::AbilityActivated.stack_entry` (the activation's stack object).
+// v147 adds the Eye to Eye / Mouth to Mouth physical contest.
+// v148 adds Timesifter's top-card exile contest (`Effect::ExileTopCardContest`,
+// `BatchCompletion::TopCardContestRoundComplete`).
+// v149 moves the CR 608.2n owed final part of a paused spell onto the resolution
+// carrier (`GameState.resolving_spell_final_part`; `deferred_spell_delivery` removed).
+// v152 adds `ShortcutDecisionSchema.suggested_declaration` and `.leading_aims`, and
+// `ShortcutProposal.leading_aims`.
+// v153 adds the optional kind selector to GrantAllActivatedAbilitiesOf and removes the
+// loyalty-grant sibling variant.
+// v155 carries each parked ChangeZone member's pre-event entry modifications
+// (`ChangeZoneMemberEntry`, CR 603.6a + CR 614.12) in GameState.
+// v159 merges the three coin-flip effects into `Effect::FlipCoins { flips: CoinFlipRun, .. }`
+// and reshapes the coin-flip resolution frame's kind.
+// v156 adds QuantityQuality/NumberQuality (CR 107.1, CR 603.4) to GameState ability conditions,
+// and the optional per-seat created_tokens channel (each seat's pinned creation result) on
+// PendingContinuation's player-scope tail sidecar.
 // Keep the measured base so a future merge cannot collapse independent wire
 // changes onto one number.
 const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
@@ -167,8 +193,35 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +63: v134 adds `GameEvent::AbilityActivated.stack_entry` (the activation's stack object).
 // +73: v144 adds one-time boon tags (CreateBoon, NoteNumber, HasBoon,
 // ChooseTokenHost) and retypes the perpetual P/T edit to QuantityExpr.
-// +74: v145 adds exert actor/origin/permission receipts, bound cost queues and payment conditions.
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 74;
+// +74: v145 adds ParentTargetMissingReason::SearchLibrary on parked ResolvedAbility continuations.
+// +76: v147 adds the Eye to Eye / Mouth to Mouth contest (`WaitingFor::PhysicalContest`,
+//      `Effect::PhysicalContest`, two GameEvents, `ClientMessage::ContestClick`,
+//      `ServerMessage::ContestProgress`).
+// +75: v146 adds `ConfirmedPeriod.counted_by` and `.performance` to loop offers in GameState.
+// +77: v148 adds Timesifter's `Effect::ExileTopCardContest` and its parked
+//      `BatchCompletion::TopCardContestRoundComplete`.
+// +78: v149 moves the owed final part of a paused spell onto the resolution carrier
+//      (`GameState.resolving_spell_final_part`; `deferred_spell_delivery` removed).
+// +79: v150 reshapes the cast-this-way gains rider's serialized payload (the permission's
+//      `enters_with_modifications` object and the effect's `rider` key), neither parseable
+//      by a v149 peer.
+// +80: v151 carries populated Bestow restoration payloads.
+// +81: v152 adds `ShortcutDecisionSchema.suggested_declaration` and `.leading_aims`,
+//      and `ShortcutProposal.leading_aims`.
+// +82: v153 adds the optional kind selector to GrantAllActivatedAbilitiesOf
+// and removes the loyalty-grant sibling variant.
+// +83: v154 adds `PendingCostMoveResume::CounterCostRemovalPayment` and
+//      `ManaAbilityCostCursor.counter_removal` to GameState.
+// +84: v155 retypes `PendingChangeZoneIteration.remaining` to `ChangeZoneMemberEntry`
+//      (pre-event entry modifications) and drops the raw gate fields.
+// +85: v156 adds `QuantityQuality` / `NumberQuality` to GameState ability conditions,
+// and the optional per-seat `created_tokens` player-scope sidecar channel (each seat's
+// pinned creation result).
+// +86: v157 adds the `ChooseFromZoneConstraint::TotalManaValue` zone-choice constraint.
+// +88: v159 merges the coin-flip effects into `Effect::FlipCoins { flips, .. }` and reshapes the
+//      coin-flip resolution frame's kind.
+// +89: v160 adds exert actor/origin/permission receipts, bound cost queues and payment conditions.
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 89;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
@@ -265,8 +318,24 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 // +71: wire 125 moves with full-game v143 for incarnation-keyed modal history.
 // +62: wire 116 moves with full-game v134 for `AbilityActivated.stack_entry`.
 // +72: wire 126 moves with full-game v144 for one-time boons.
-// +73: wire 127 moves with full-game v145 for `CreatureExerted.origin`/`.player`.
-const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 73;
+// +73: wire 127 moves with full-game v145 for the SearchLibrary missing-referent tag.
+// +75: wire 129 moves with full-game v147 for the physical contest and its `contest_click` frame.
+// +74: wire 128 moves with full-game v146 for `ConfirmedPeriod.counted_by` and `.performance`.
+// +76: wire 130 moves with full-game v148 for Timesifter's top-card exile contest.
+// +77: wire 131 moves with full-game v149 for the carrier-owned final-part marker.
+// +78: wire 132 moves with full-game v150 for the cast-this-way gains rider's serialized
+//      payload reshape (the permission's `enters_with_modifications` object and the
+//      effect's `rider` key).
+// +79: wire 133 moves with full-game v151 for populated Bestow payloads.
+// +80: wire 134 moves with full-game v152 for the shortcut suggestion fields.
+// +81: wire 135 moves with full-game v153 for the kind-selected activated grant.
+// +82: wire 136 moves with full-game v154 for the deferred counter-cost removal root.
+// +83: wire 137 moves with full-game v155 for the pre-event ChangeZone member entries.
+// +84: wire 138 moves with full-game v156 for QuantityQuality and the per-seat created_tokens sidecar channel.
+// +85: wire 139 moves with full-game v157 for TotalManaValue zone choices.
+// +87: wire 141 moves with full-game v159 for the merged coin-flip effect.
+// +88: wire 142 moves with full-game v160 for `CreatureExerted.origin`/`.player`.
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 88;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse

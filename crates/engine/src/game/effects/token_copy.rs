@@ -1,6 +1,6 @@
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::game_object::{DisplaySource, GameObject};
-use crate::game::layers::{compute_current_copiable_values, remove_subtype_set};
+use crate::game::layers::{compute_current_copiable_values, remove_core_type, remove_subtype_set};
 use crate::game::quantity::resolve_quantity;
 use crate::game::{targeting, zones};
 use crate::types::ability::{
@@ -525,9 +525,16 @@ fn drain_copy_token_resolution(
                 .unwrap_or_default(),
         };
 
+        let window_start = events.len();
         match crate::game::replacement::replace_event(state, proposed, events) {
             crate::game::replacement::ReplacementResult::Execute(event) => {
-                if !super::token::apply_create_token_after_replacement(state, event, events) {
+                let completed =
+                    super::token::apply_create_token_after_replacement(state, event, events);
+                // CR 614.1a + CR 608.2c: this batch's created referent includes
+                // any batch a replacement appended to it. The frame is taken, so
+                // the apply assigned the ledger with this batch's own ids.
+                super::token::publish_replacement_appended_tokens(state, &events[window_start..]);
+                if !completed {
                     pending
                         .created_ids
                         .extend(state.last_created_token_ids.clone());
@@ -1577,10 +1584,13 @@ fn apply_token_modifications(
                     }
                 }
             }
+            // CR 205.1a: removing a card type removes its correlated subtypes too;
+            // applied to both live and base types so the loss is part of the
+            // token's copiable values (CR 707.9b).
             ContinuousModification::RemoveType { core_type } => {
                 if let Some(token) = state.objects.get_mut(&token_id) {
-                    token.card_types.core_types.retain(|t| t != core_type);
-                    token.base_card_types.core_types.retain(|t| t != core_type);
+                    remove_core_type(&mut token.card_types, *core_type);
+                    remove_core_type(&mut token.base_card_types, *core_type);
                 }
             }
             ContinuousModification::AddSubtype { subtype } => {
@@ -1624,17 +1634,11 @@ fn apply_token_modifications(
             // Stamped into both live and base card types so the override is part
             // of the token's copiable values (CR 707.9b).
             ContinuousModification::SetCardTypes { core_types } => {
-                let all_creature_types = &state.all_creature_types;
-                let objects = &mut state.objects;
-                if let Some(token) = objects.get_mut(&token_id) {
+                if let Some(token) = state.objects.get_mut(&token_id) {
                     token.card_types.core_types = core_types.clone();
                     token.base_card_types.core_types = core_types.clone();
                     let keep = |subtype: &String| {
-                        crate::game::layers::subtype_matches_core_types(
-                            subtype,
-                            core_types,
-                            all_creature_types,
-                        )
+                        crate::game::layers::subtype_matches_core_types(subtype, core_types)
                     };
                     token.card_types.subtypes.retain(|s| keep(s));
                     token.base_card_types.subtypes.retain(|s| keep(s));
@@ -1860,9 +1864,10 @@ pub(crate) fn apply_immediate_copy_token_modifications_to_object(
                     token.base_card_types.core_types.push(*core_type);
                 }
             }
+            // CR 205.1a + CR 707.9b: same as the layered `RemoveType` arm.
             ContinuousModification::RemoveType { core_type } => {
-                token.card_types.core_types.retain(|t| t != core_type);
-                token.base_card_types.core_types.retain(|t| t != core_type);
+                remove_core_type(&mut token.card_types, *core_type);
+                remove_core_type(&mut token.base_card_types, *core_type);
             }
             ContinuousModification::AddSubtype { subtype } => {
                 if !token.card_types.subtypes.iter().any(|s| s == subtype) {
@@ -1888,11 +1893,7 @@ pub(crate) fn apply_immediate_copy_token_modifications_to_object(
                 token.card_types.core_types = core_types.clone();
                 token.base_card_types.core_types = core_types.clone();
                 let keep = |subtype: &String| {
-                    crate::game::layers::subtype_matches_core_types(
-                        subtype,
-                        core_types,
-                        all_creature_types,
-                    )
+                    crate::game::layers::subtype_matches_core_types(subtype, core_types)
                 };
                 token.card_types.subtypes.retain(|s| keep(s));
                 token.base_card_types.subtypes.retain(|s| keep(s));
@@ -2171,6 +2172,256 @@ mod tests {
             .base_card_types
             .supertypes
             .contains(&Supertype::Legendary));
+    }
+
+    /// CR 205.1a + CR 707.9b: a baked `RemoveType { Creature }` copy exception
+    /// removes the creature types with the Creature type, in both the live and
+    /// the base (copiable) card types. Kindred keeps the creature set
+    /// (CR 308.2).
+    #[test]
+    fn copy_token_remove_type_creature_drops_creature_types_in_card_and_base_types() {
+        for (core_types, subtypes, expected_core, expected_subtypes) in [
+            (
+                vec![CoreType::Artifact, CoreType::Creature],
+                vec!["Heartwood", "Bear"],
+                vec![CoreType::Artifact],
+                vec!["Heartwood"],
+            ),
+            (
+                vec![CoreType::Artifact, CoreType::Creature],
+                vec!["Vibranium", "Bear"],
+                vec![CoreType::Artifact],
+                vec!["Vibranium"],
+            ),
+            (
+                vec![CoreType::Artifact, CoreType::Creature],
+                vec!["Equipment", "Bear"],
+                vec![CoreType::Artifact],
+                vec!["Equipment"],
+            ),
+            (
+                vec![CoreType::Kindred, CoreType::Creature],
+                vec!["Eldrazi"],
+                vec![CoreType::Kindred],
+                vec!["Eldrazi"],
+            ),
+        ] {
+            let mut state = GameState::new_two_player(42);
+            state.all_creature_types = vec!["Bear".to_string(), "Eldrazi".to_string()];
+            let source_id = create_object(
+                &mut state,
+                CardId(1),
+                PlayerId(0),
+                "Source".to_string(),
+                Zone::Battlefield,
+            );
+            {
+                let source = state.objects.get_mut(&source_id).unwrap();
+                source.base_card_types = CardType {
+                    supertypes: vec![],
+                    core_types: core_types.clone(),
+                    subtypes: subtypes.iter().map(|s| s.to_string()).collect(),
+                };
+                source.card_types = source.base_card_types.clone();
+            }
+
+            let mut events = Vec::new();
+            let ability = ResolvedAbility::new(
+                Effect::CopyTokenOf {
+                    target: TargetFilter::SelfRef,
+                    owner: TargetFilter::Controller,
+                    source_filter: None,
+                    enters_attacking: false,
+                    tapped: false,
+                    count: QuantityExpr::Fixed { value: 1 },
+                    extra_keywords: vec![],
+                    additional_modifications: vec![ContinuousModification::RemoveType {
+                        core_type: CoreType::Creature,
+                    }],
+                },
+                vec![],
+                source_id,
+                PlayerId(0),
+            );
+            resolve(&mut state, &ability, &mut events).unwrap();
+
+            let token = state
+                .objects
+                .get(&ObjectId(state.next_object_id - 1))
+                .unwrap();
+            let expected_subtypes: Vec<String> =
+                expected_subtypes.iter().map(|s| s.to_string()).collect();
+            // Reach guard: the token exists, lost Creature and kept the expected type.
+            assert_eq!(token.card_types.core_types, expected_core);
+            assert_eq!(token.base_card_types.core_types, expected_core);
+            assert_eq!(token.card_types.subtypes, expected_subtypes);
+            assert_eq!(token.base_card_types.subtypes, expected_subtypes);
+        }
+    }
+
+    /// CR 205.1a + CR 707.2 + CR 707.9b: the immediate (liminal token) copy
+    /// exception path removes creature types with the Creature type too.
+    #[test]
+    fn immediate_copy_token_remove_type_creature_drops_creature_types() {
+        for (core_types, subtypes, expected_core, expected_subtypes) in [
+            (
+                vec![CoreType::Artifact, CoreType::Creature],
+                vec!["Heartwood", "Bear"],
+                vec![CoreType::Artifact],
+                vec!["Heartwood"],
+            ),
+            (
+                vec![CoreType::Artifact, CoreType::Creature],
+                vec!["Vibranium", "Bear"],
+                vec![CoreType::Artifact],
+                vec!["Vibranium"],
+            ),
+            (
+                vec![CoreType::Artifact, CoreType::Creature],
+                vec!["Equipment", "Bear"],
+                vec![CoreType::Artifact],
+                vec!["Equipment"],
+            ),
+            (
+                vec![CoreType::Kindred, CoreType::Creature],
+                vec!["Eldrazi"],
+                vec![CoreType::Kindred],
+                vec!["Eldrazi"],
+            ),
+        ] {
+            let mut token = GameObject::new(
+                ObjectId(900),
+                CardId(900),
+                PlayerId(0),
+                "Liminal Token".to_string(),
+                Zone::Battlefield,
+            );
+            token.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: core_types.clone(),
+                subtypes: subtypes.iter().map(|s| s.to_string()).collect(),
+            };
+            token.card_types = token.base_card_types.clone();
+
+            apply_immediate_copy_token_modifications_to_object(
+                &mut token,
+                &[ContinuousModification::RemoveType {
+                    core_type: CoreType::Creature,
+                }],
+                &["Bear".to_string(), "Eldrazi".to_string()],
+            );
+
+            let expected_subtypes: Vec<String> =
+                expected_subtypes.iter().map(|s| s.to_string()).collect();
+            assert_eq!(token.card_types.core_types, expected_core);
+            assert_eq!(token.base_card_types.core_types, expected_core);
+            assert_eq!(token.card_types.subtypes, expected_subtypes);
+            assert_eq!(token.base_card_types.subtypes, expected_subtypes);
+        }
+    }
+
+    #[test]
+    fn copy_token_artifact_subtypes_follow_owner_in_both_baked_paths() {
+        // CR 205.1a/205.3g + CR 707.9b: synthetic copy exceptions test the
+        // shared primitive, without claiming a printed token-animation pair.
+        for subtype in ["Heartwood", "Vibranium"] {
+            for (modification, core, expected_subtype) in [
+                (
+                    ContinuousModification::RemoveType {
+                        core_type: CoreType::Creature,
+                    },
+                    CoreType::Artifact,
+                    subtype,
+                ),
+                (
+                    ContinuousModification::RemoveType {
+                        core_type: CoreType::Artifact,
+                    },
+                    CoreType::Creature,
+                    "Bear",
+                ),
+                (
+                    ContinuousModification::SetCardTypes {
+                        core_types: vec![CoreType::Artifact],
+                    },
+                    CoreType::Artifact,
+                    subtype,
+                ),
+                (
+                    ContinuousModification::SetCardTypes {
+                        core_types: vec![CoreType::Creature],
+                    },
+                    CoreType::Creature,
+                    "Bear",
+                ),
+            ] {
+                let mut state = GameState::new_two_player(42);
+                state.all_creature_types = vec!["Bear".into(), "Elf".into()];
+                let source_id = create_object(
+                    &mut state,
+                    CardId(1),
+                    PlayerId(0),
+                    "Artifact copy source".into(),
+                    Zone::Battlefield,
+                );
+                let source = state.objects.get_mut(&source_id).unwrap();
+                source.base_card_types = CardType {
+                    supertypes: vec![Supertype::Legendary],
+                    core_types: vec![CoreType::Artifact, CoreType::Creature],
+                    subtypes: vec![subtype.into(), "Bear".into()],
+                };
+                source.card_types = source.base_card_types.clone();
+                let mut liminal = source.clone();
+                let ability = ResolvedAbility::new(
+                    Effect::CopyTokenOf {
+                        target: TargetFilter::SelfRef,
+                        owner: TargetFilter::Controller,
+                        source_filter: None,
+                        enters_attacking: false,
+                        tapped: false,
+                        count: QuantityExpr::Fixed { value: 1 },
+                        extra_keywords: vec![],
+                        additional_modifications: vec![modification.clone()],
+                    },
+                    vec![],
+                    source_id,
+                    PlayerId(0),
+                );
+                let mut events = Vec::new();
+                resolve(&mut state, &ability, &mut events).unwrap();
+                let token_id = ObjectId(state.next_object_id - 1);
+                assert_ne!(token_id, source_id);
+                let token = &state.objects[&token_id];
+                assert!(token.is_token, "reach: CopyTokenOf created a token");
+                assert_eq!(token.name, "Artifact copy source");
+                assert_eq!(
+                    state.objects[&source_id].card_types.subtypes,
+                    vec![subtype.to_string(), "Bear".to_string()]
+                );
+                apply_immediate_copy_token_modifications_to_object(
+                    &mut liminal,
+                    &[modification],
+                    &state.all_creature_types,
+                );
+                for object in [token, &liminal] {
+                    assert_eq!(object.card_types.core_types, vec![core]);
+                    assert_eq!(object.base_card_types.core_types, vec![core]);
+                    assert_eq!(
+                        object.card_types.subtypes,
+                        vec![expected_subtype.to_string()]
+                    );
+                    assert_eq!(
+                        object.base_card_types.subtypes,
+                        vec![expected_subtype.to_string()]
+                    );
+                    assert_eq!(object.card_types.supertypes, vec![Supertype::Legendary]);
+                    assert_eq!(
+                        object.base_card_types.supertypes,
+                        vec![Supertype::Legendary]
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -5190,6 +5441,146 @@ mod tests {
             copy_tokens_for(state, p0, "Grizzly Bears"),
             0,
             "P0 (the controller of the exiled permanent) must NOT create a copy"
+        );
+    }
+
+    // ── Chatterfang's appended Squirrels share the created referent ──────────
+    //
+    // Chatterfang ruling: the additional Squirrels "won't have any abilities the
+    // other tokens were created with", but anything else the creating effect
+    // specifies ("That token gains haste", "Exile that token …") applies to both
+    // the original tokens and the Squirrels.
+
+    const CHATTERFANG: &str = "Forestwalk (This creature can't be blocked as long as defending player controls a Forest.)\nIf one or more tokens would be created under your control, those tokens plus that many 1/1 green Squirrel creature tokens are created instead.\n{B}, Sacrifice X Squirrels: Target creature gets +X/-X until end of turn.";
+    const COGWORK_ASSEMBLER: &str = "{7}: Create a token that's a copy of target artifact. That token gains haste. Exile it at the beginning of the next end step.";
+    const HEAT_SHIMMER: &str = "Create a token that's a copy of target creature, except it has haste and \"At the beginning of the end step, exile this token.\"";
+
+    /// Every battlefield token named `name`.
+    fn battlefield_tokens(state: &GameState, name: &str) -> Vec<ObjectId> {
+        state
+            .battlefield
+            .iter()
+            .copied()
+            .filter(|id| state.objects[id].is_token && state.objects[id].name == name)
+            .collect()
+    }
+
+    /// The one battlefield token named `name`.
+    fn the_battlefield_token(state: &GameState, name: &str) -> ObjectId {
+        let found = battlefield_tokens(state, name);
+        assert_eq!(found.len(), 1, "exactly one {name} token: {found:?}");
+        found[0]
+    }
+
+    /// Advance to the end step with no attackers and let its triggers resolve.
+    fn finish_at_end_step(runner: &mut crate::game::scenario::GameRunner) {
+        use crate::types::phase::Phase;
+
+        runner.advance_to_end_step();
+        if matches!(
+            runner.state().waiting_for,
+            WaitingFor::DeclareAttackers { .. }
+        ) {
+            runner
+                .declare_attackers(&[])
+                .expect("declaring no attackers is legal");
+            runner.advance_to_end_step();
+        }
+        assert_eq!(runner.state().phase, Phase::End);
+        runner.advance_until_stack_empty();
+    }
+
+    /// CR 707.2 + CR 614.1a + CR 608.2c: Cogwork Assembler with Chatterfang out,
+    /// on the copy route: one copy and one Squirrel, both hasty and both in the
+    /// created referent (the copy first); at the next end step "Exile it" exiles
+    /// both.
+    #[test]
+    fn chatterfang_squirrel_shares_copy_token_exile_rider() {
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::types::mana::{ManaType, ManaUnit};
+        use crate::types::phase::Phase;
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let assembler = scenario
+            .add_artifact_from_oracle(P0, "Cogwork Assembler", COGWORK_ASSEMBLER)
+            .id();
+        scenario.add_creature_from_oracle(P0, "Chatterfang, Squirrel General", 3, 3, CHATTERFANG);
+        scenario.with_mana_pool(
+            P0,
+            (0..7)
+                .map(|_| ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]))
+                .collect(),
+        );
+        let mut runner = scenario.build();
+        let index = runner.state().objects[&assembler]
+            .abilities
+            .iter()
+            .position(|ability| matches!(ability.kind, AbilityKind::Activated))
+            .expect("Cogwork Assembler's activated ability");
+        runner
+            .activate(assembler, index)
+            .target_object(assembler)
+            .resolve();
+        assert!(runner.state().stack.is_empty(), "the activation resolved");
+
+        let state = runner.state();
+        // Reach-guards: the copy exists and Chatterfang's replacement applied.
+        let copy = the_battlefield_token(state, "Cogwork Assembler");
+        let squirrel = the_battlefield_token(state, "Squirrel");
+        assert!(state.objects[&copy].has_keyword(&Keyword::Haste));
+        // CR 702.10a: "That token gains haste" reaches the Squirrel too.
+        assert!(
+            state.objects[&squirrel].has_keyword(&Keyword::Haste),
+            "the Squirrel gains haste"
+        );
+        assert_eq!(state.last_created_token_ids, vec![copy, squirrel]);
+
+        // CR 603.7c: the delayed "Exile it" affects both tokens.
+        finish_at_end_step(&mut runner);
+        let state = runner.state();
+        assert!(!state.battlefield.contains(&copy), "the copy is exiled");
+        assert!(
+            !state.battlefield.contains(&squirrel),
+            "the Squirrel is exiled"
+        );
+    }
+
+    /// Negative sibling (Chatterfang ruling: the Squirrels "won't have any
+    /// abilities the other tokens were created with"): Heat Shimmer's haste and
+    /// end-step exile are copy exceptions (CR 707.9a), so they belong to the copy
+    /// only. The Squirrel is not hasty and survives the end step.
+    #[test]
+    fn heat_shimmer_copy_exceptions_do_not_reach_chatterfang_squirrel() {
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::types::phase::Phase;
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.add_creature_from_oracle(P0, "Chatterfang, Squirrel General", 3, 3, CHATTERFANG);
+        let bears = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+        let shimmer = scenario
+            .add_spell_to_hand_from_oracle(P0, "Heat Shimmer", false, HEAT_SHIMMER)
+            .id();
+        let mut runner = scenario.build();
+        runner.cast(shimmer).target_object(bears).resolve();
+
+        let state = runner.state();
+        let copy = the_battlefield_token(state, "Grizzly Bears");
+        let squirrel = the_battlefield_token(state, "Squirrel");
+        assert!(state.objects[&copy].has_keyword(&Keyword::Haste));
+        assert!(
+            !state.objects[&squirrel].has_keyword(&Keyword::Haste),
+            "the Squirrel does not get the copy's haste"
+        );
+
+        finish_at_end_step(&mut runner);
+        let state = runner.state();
+        // Reach-guard: the copy's own end-step trigger exiled it.
+        assert!(!state.battlefield.contains(&copy), "the copy is exiled");
+        assert!(
+            state.battlefield.contains(&squirrel),
+            "the Squirrel survives the end step"
         );
     }
 }
