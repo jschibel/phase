@@ -2306,24 +2306,44 @@ fn manual_hex_parasite_life_intent_without_the_life_is_refused_at_payment() {
 
 /// Whether the priority legal actions offer `source`'s ability `ability_index`.
 fn ability_offered(runner: &GameRunner, source: ObjectId, ability_index: usize) -> bool {
-    let (_, _, grouped) = legal_actions_full(runner.state());
-    grouped.get(&source).into_iter().flatten().any(|action| {
-        matches!(
-            action,
-            GameAction::ActivateAbility { ability_index: index, .. } if *index == ability_index
-        )
-    })
+    !offered_payment_modes(runner, source, ability_index).is_empty()
 }
 
-/// B3 class remainder — CR 601.2g + CR 601.2h + CR 119.3 + CR 119.4: the offer
-/// judges life the way it judges mana. At ONE life with two untapped Pristine
-/// Talismans and no black source, Hex Parasite is offered — its {B/P} can be
-/// paid with 2 life once the Talismans' mana abilities have gained that life
-/// during the window, exactly as the mana the Talismans can produce counts
-/// before they are tapped — and so is its manual sibling. On the same board
-/// with a Wastes instead, nothing can supply the {B} or the life, and nothing is
-/// offered. The offered activation completes: X = 1, life announced, the
-/// Talismans activated in the window, one counter removed and +1/+0.
+/// The payment modes of the priority legal actions' offers of `source`'s
+/// ability `ability_index`.
+fn offered_payment_modes(
+    runner: &GameRunner,
+    source: ObjectId,
+    ability_index: usize,
+) -> Vec<CastPaymentMode> {
+    let (_, _, grouped) = legal_actions_full(runner.state());
+    grouped
+        .get(&source)
+        .into_iter()
+        .flatten()
+        .filter_map(|action| match action {
+            GameAction::ActivateAbility {
+                ability_index: index,
+                payment_mode,
+                ..
+            } if *index == ability_index => Some(*payment_mode),
+            _ => None,
+        })
+        .collect()
+}
+
+/// B3 class remainder — CR 601.2g + CR 601.2h + CR 119.3 + CR 119.4: a manual
+/// offer judges life the way it judges mana. At ONE life with two untapped
+/// Pristine Talismans and no black source, Hex Parasite is offered for a manual
+/// payment — its {B/P} can be paid with 2 life once the player has activated
+/// the Talismans' mana abilities during the window, exactly as the mana the
+/// Talismans can produce counts before they are tapped. It is NOT offered for
+/// an automatic payment: the automatic payer never activates a mana ability for
+/// its life, so it would refuse the 2 life at one life. On the same board with
+/// a Wastes instead, nothing can supply the {B} or the life, and nothing is
+/// offered in any mode. The offered activation completes: X = 1, life
+/// announced, the Talismans activated in the window, one counter removed and
+/// +1/+0.
 #[test]
 fn manual_hex_parasite_is_offered_at_one_life_when_mana_abilities_can_supply_the_life() {
     for talismans in [true, false] {
@@ -2350,9 +2370,22 @@ fn manual_hex_parasite_is_offered_at_one_life_when_mana_abilities_can_supply_the
             "talismans {talismans}: offered iff the window can supply the life"
         );
         assert_eq!(
+            offered_payment_modes(&runner, hex, 0),
+            if talismans {
+                vec![CastPaymentMode::Manual]
+            } else {
+                Vec::new()
+            },
+            "talismans {talismans}: offered for a manual payment only, never Auto"
+        );
+        assert_eq!(
             !offered_surfaces(&runner, &activation(hex, 0, CastPaymentMode::Manual)).is_empty(),
             talismans,
-            "talismans {talismans}: the manual sibling follows the offer"
+            "talismans {talismans}: the manual offer follows the window"
+        );
+        assert!(
+            offered_surfaces(&runner, &activation(hex, 0, CastPaymentMode::Auto)).is_empty(),
+            "talismans {talismans}: no automatic offer at one life"
         );
         if !talismans {
             continue;
@@ -2377,10 +2410,13 @@ fn manual_hex_parasite_is_offered_at_one_life_when_mana_abilities_can_supply_the
 
 /// The printed "Pay N life" sibling of the row above. Greed ("{B}, Pay 2 life:
 /// Draw a card.") at ONE life with a Swamp and two untapped Pristine Talismans
-/// is offered: its total includes the {B}, so the window opens before the life
-/// is paid (CR 601.2g), and the Talismans can raise the life to 3 in it. The
-/// manual activation completes, pays {B} and exactly 2 life, and draws. With no
-/// Talisman the same board offers nothing: one life cannot pay 2.
+/// is offered for a manual payment: its total includes the {B}, so the window
+/// opens before the life is paid (CR 601.2g), and the Talismans can raise the
+/// life to 3 in it. It is not offered for an automatic payment, whose payer
+/// taps the Swamp for the {B} and then cannot pay 2 life at one life
+/// (CR 119.4). The manual activation completes, pays {B} and exactly 2 life,
+/// and draws. With no Talisman the same board offers nothing: one life cannot
+/// pay 2.
 #[test]
 fn manual_greed_is_offered_at_one_life_when_mana_abilities_can_supply_the_life() {
     for talismans in [true, false] {
@@ -2404,6 +2440,25 @@ fn manual_greed_is_offered_at_one_life_when_mana_abilities_can_supply_the_life()
             ability_offered(&runner, greed, index),
             talismans,
             "talismans {talismans}: offered iff the window can supply the life"
+        );
+        assert_eq!(
+            offered_payment_modes(&runner, greed, index),
+            if talismans {
+                vec![CastPaymentMode::Manual]
+            } else {
+                Vec::new()
+            },
+            "talismans {talismans}: offered for a manual payment only, never Auto"
+        );
+        assert_eq!(
+            !offered_surfaces(&runner, &activation(greed, index, CastPaymentMode::Manual))
+                .is_empty(),
+            talismans,
+            "talismans {talismans}: the manual offer follows the window"
+        );
+        assert!(
+            offered_surfaces(&runner, &activation(greed, index, CastPaymentMode::Auto)).is_empty(),
+            "talismans {talismans}: no automatic offer at one life"
         );
         if !talismans {
             continue;
@@ -2435,6 +2490,112 @@ fn manual_greed_is_offered_at_one_life_when_mana_abilities_can_supply_the_life()
         }
         assert_eq!(hand_size(&runner, P0), hand_before + 1, "Greed drew a card");
     }
+}
+
+/// CR 601.2g + CR 118.13a + CR 119.4: a manual offer's window must belong to a
+/// route that can be played. Immolating Souleater ("{R/P}: This creature gets
+/// +1/+0 until end of turn.") has no mana but its {R/P}. Announced
+/// as 2 life, its total is only life, so no mana-ability opportunity precedes
+/// the payment and one life cannot pay it; announced as {R}, two Pristine
+/// Talismans only add {C}. At one life with the Talismans and no red source it
+/// is offered in no mode. The same ability is offered on the boards that can
+/// pay it now — at three life (2 life) and at one life with a Mountain ({R}) —
+/// which proves each fixture reaches the offer.
+#[test]
+fn a_phyrexian_only_activation_with_no_window_route_is_not_offered_at_one_life() {
+    for (life_total, mountain, offered) in [
+        (1, false, Vec::new()),
+        (3, false, vec![CastPaymentMode::Auto]),
+        (1, true, vec![CastPaymentMode::Auto]),
+    ] {
+        let mut scenario = scenario_at_main();
+        scenario.with_life(P0, life_total);
+        let souleater = add(&mut scenario, P0, "Immolating Souleater", Zone::Battlefield);
+        add(&mut scenario, P0, "Pristine Talisman", Zone::Battlefield);
+        add(&mut scenario, P0, "Pristine Talisman", Zone::Battlefield);
+        if mountain {
+            add(&mut scenario, P0, "Mountain", Zone::Battlefield);
+        }
+        let runner = build(scenario);
+        let index = ability_index_of(&runner, souleater, "+1/+0");
+
+        assert_eq!(
+            offered_payment_modes(&runner, souleater, index),
+            offered,
+            "life {life_total}, mountain {mountain}"
+        );
+        if offered.is_empty() {
+            assert!(
+                offered_surfaces(
+                    &runner,
+                    &activation(souleater, index, CastPaymentMode::Manual)
+                )
+                .is_empty(),
+                "CR 601.2g: no manual route has a window that can supply the life"
+            );
+        }
+    }
+}
+
+/// The K'rrik sibling of the row above keeps its offer: Pestilent Souleater
+/// ("{B/P}: This creature gains infect until end of turn.") under K'rrik, Son
+/// of Yawgmoth ("For each {B} in a cost, you may pay 2 life rather than pay
+/// that mana."), at one life with two Pristine Talismans and no black source.
+/// Announced as {B} (CR 118.13a), the total includes a mana payment, so the
+/// window opens (CR 601.2g); the Talismans raise the life to 3 in it, and the
+/// {B} is then paid with 2 life (CR 601.2h + CR 119.4). It is offered for a
+/// manual payment only, and the manual activation completes that way.
+#[test]
+fn a_phyrexian_only_activation_under_krrik_keeps_its_window_route_at_one_life() {
+    let mut scenario = scenario_at_main();
+    scenario.with_life(P0, 1);
+    let souleater = add(&mut scenario, P0, "Pestilent Souleater", Zone::Battlefield);
+    add(
+        &mut scenario,
+        P0,
+        "K'rrik, Son of Yawgmoth",
+        Zone::Battlefield,
+    );
+    let talismans = [
+        add(&mut scenario, P0, "Pristine Talisman", Zone::Battlefield),
+        add(&mut scenario, P0, "Pristine Talisman", Zone::Battlefield),
+    ];
+    let mut runner = build(scenario);
+    let index = ability_index_of(&runner, souleater, "infect");
+
+    assert_eq!(
+        offered_payment_modes(&runner, souleater, index),
+        vec![CastPaymentMode::Manual],
+        "offered for a manual payment only"
+    );
+
+    let waiting_for = activate_index(&mut runner, souleater, index, CastPaymentMode::Manual);
+    assert_announcement(&waiting_for, 1);
+    let waiting_for = submit_phyrexian(&mut runner, &[ShardChoice::PayMana]);
+    assert!(
+        is_mana_payment(&waiting_for),
+        "CR 601.2g: the {{B}} opens the window: {waiting_for:?}"
+    );
+    assert_eq!(life(&runner, P0), 1, "nothing is paid before the window");
+    for talisman in talismans {
+        activate_mana_ability(&mut runner, talisman);
+    }
+    assert_eq!(life(&runner, P0), 3, "each Talisman gained 1 life");
+    let waiting_for = pass(&mut runner);
+    let WaitingFor::PhyrexianPayment { shards, .. } = &waiting_for else {
+        panic!("K'rrik's permission is offered when the {{B}} is paid: {waiting_for:?}");
+    };
+    assert_eq!(shards.len(), 1, "{shards:?}");
+    assert_ne!(shards[0].options, ShardOptions::ManaOnly, "life is offered");
+    let waiting_for = submit_phyrexian(&mut runner, &[ShardChoice::PayLife]);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert_eq!(
+        life(&runner, P0),
+        1,
+        "the {{B}} was paid with exactly 2 life"
+    );
+    assert_eq!(pool_total(&runner), 2, "{{C}}{{C}} float");
+    assert_eq!(runner.state().stack.len(), 1, "placed once");
 }
 
 /// CR 733.1: the announcement prompt can be cancelled — nothing was paid — and

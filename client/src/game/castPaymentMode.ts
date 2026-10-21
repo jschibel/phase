@@ -54,6 +54,10 @@ export function applySpellPaymentPreference(action: GameAction): GameAction {
         data: { ...action.data, payment_mode: mode },
       };
     case "ActivateAbility":
+      // The engine offers an activation only a manual payment can complete as
+      // Manual already; Manual dominates, so a saved automatic preference
+      // never replaces it.
+      if (action.data.payment_mode?.type === "Manual") return action;
       return {
         ...action,
         data: { ...action.data, payment_mode: mode },

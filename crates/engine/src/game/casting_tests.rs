@@ -29615,7 +29615,8 @@ fn can_pay_sacrifice_cost_with_eligible() {
         PlayerId(0),
         source,
         &cost,
-        Some(0)
+        Some(0),
+        &ActivationLifeWindow::Current,
     ));
 }
 
@@ -29641,7 +29642,8 @@ fn cannot_pay_sacrifice_cost_no_eligible() {
         PlayerId(0),
         source,
         &cost,
-        Some(0)
+        Some(0),
+        &ActivationLifeWindow::Current,
     ));
 }
 
@@ -37960,7 +37962,14 @@ mod remove_counter_cost {
             "cost must be unpayable when the source has no +1/+1 counters"
         );
         assert!(
-            !can_pay_ability_cost_now(&state, PlayerId(0), source, &cost, Some(0)),
+            !can_pay_ability_cost_now(
+                &state,
+                PlayerId(0),
+                source,
+                &cost,
+                Some(0),
+                &ActivationLifeWindow::Current,
+            ),
             "can_pay_ability_cost_now must reject an unpayable remove-counter cost"
         );
     }
@@ -61738,6 +61747,7 @@ fn activation_cost_visitor_finds_a_non_empty_witness_and_stops_at_its_budget() {
         &base,
         &independent,
         &mut unlimited,
+        &ActivationLifeWindow::Current,
     );
     assert_eq!(verdict, ActivationCostFeasibility::Payable);
     let witness = witness.expect("a payable walk has a witness");
@@ -61756,6 +61766,7 @@ fn activation_cost_visitor_finds_a_non_empty_witness_and_stops_at_its_budget() {
         &base,
         &independent,
         &mut tiny,
+        &ActivationLifeWindow::Current,
     );
     assert_eq!(verdict, ActivationCostFeasibility::Undecided);
     assert_eq!(tiny.charged_total(), 3, "charged == budget");

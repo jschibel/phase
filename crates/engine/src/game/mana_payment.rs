@@ -731,6 +731,26 @@ pub(crate) fn is_native_phyrexian_shard(shard: ManaCostShard) -> bool {
     )
 }
 
+/// CR 107.4f + CR 119.4: whether some symbol of `cost` can be paid with life —
+/// a printed Phyrexian symbol, or a symbol a payment permission (K'rrik, Son of
+/// Yawgmoth: "For each {B} in a cost, you may pay 2 life rather than pay that
+/// mana.") promotes under `life_colors`, read through the same
+/// `effective_shard_requirement` the payer uses.
+pub(crate) fn cost_has_life_payable_shard(
+    cost: &ManaCost,
+    life_colors: crate::types::mana::LifePaymentColors,
+) -> bool {
+    let ManaCost::Cost { shards, .. } = cost else {
+        return false;
+    };
+    shards.iter().any(|shard| {
+        is_phyrexian_requirement(&effective_shard_requirement(
+            shard_to_mana_type(*shard),
+            life_colors,
+        ))
+    })
+}
+
 /// CR 107.4f + CR 118.13a + CR 601.2b: the canonical identities — index and raw
 /// symbol — of the printed Phyrexian symbols in `cost`, in printed order. These
 /// are exactly the symbols whose payment is announced as an ability is proposed.

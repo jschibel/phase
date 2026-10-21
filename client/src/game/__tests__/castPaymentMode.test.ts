@@ -123,6 +123,18 @@ describe("applySpellPaymentPreference for ability activations", () => {
     expect(result.data.payment_mode).toEqual({ type: "AutoExceptSacrificialMana" });
   });
 
+  it("keeps an engine-offered Manual activation Manual under every preference", () => {
+    const manualOffer: GameAction = {
+      type: "ActivateAbility",
+      data: { source_id: 7, ability_index: 1, payment_mode: { type: "Manual" } },
+    };
+    for (const spellPaymentMode of ["auto", "autoExceptSacrificialMana", "manual"] as const) {
+      usePreferencesStore.setState({ spellPaymentMode });
+      const result = applySpellPaymentPreference(manualOffer) as ActivateAbilityAction;
+      expect(result.data.payment_mode).toEqual({ type: "Manual" });
+    }
+  });
+
   it("still leaves non-payment actions untouched under a manual preference", () => {
     usePreferencesStore.setState({ spellPaymentMode: "manual" });
     const pass: GameAction = { type: "PassPriority" };

@@ -202,6 +202,7 @@ pub(in crate::game) struct PriorityCastFreeAnnouncement {
 pub(in crate::game) struct PriorityActivateAbilityAnnouncement {
     source_id: ObjectId,
     ability_index: usize,
+    payment_mode: CastPaymentMode,
 }
 
 /// An engine-authored Sneak cast announcement for Priority preflight. The hand
@@ -306,11 +307,19 @@ impl PrioritySneakAnnouncement {
 }
 
 impl PriorityActivateAbilityAnnouncement {
-    fn new(source_id: ObjectId, ability_index: usize) -> Self {
+    fn new(source_id: ObjectId, ability_index: usize, payment_mode: CastPaymentMode) -> Self {
         Self {
             source_id,
             ability_index,
+            payment_mode,
         }
+    }
+
+    pub(in crate::game) fn payment_mode(
+        &self,
+        _access: &PriorityAnnouncementFacadeAccess,
+    ) -> CastPaymentMode {
+        self.payment_mode
     }
 
     pub(in crate::game) fn source_id(
@@ -2193,6 +2202,8 @@ pub(in crate::game) fn priority_activate_ability_announcements(
     principal: &PriorityPrincipal,
 ) -> Vec<PriorityActivateAbilityAnnouncement> {
     let player = principal.semantic_holder();
+    let gates = restrictions::ActivationRestrictionStaticGates::compute(state);
+    let gates = &gates;
     state
         .objects
         .iter()
@@ -2200,9 +2211,19 @@ pub(in crate::game) fn priority_activate_ability_announcements(
             activated_ability_definitions(state, source_id)
                 .into_iter()
                 .filter_map(move |(ability_index, ability)| {
-                    (ability.kind == AbilityKind::Activated
-                        && can_activate_ability_now(state, player, source_id, ability_index))
-                    .then(|| PriorityActivateAbilityAnnouncement::new(source_id, ability_index))
+                    if ability.kind != AbilityKind::Activated {
+                        return None;
+                    }
+                    // CR 602.2b + CR 601.2g: announced in the payment mode the
+                    // priority offer carries, so preflight and the offer agree.
+                    activation_offer_payment_mode(state, player, source_id, ability_index, gates)
+                        .map(|payment_mode| {
+                            PriorityActivateAbilityAnnouncement::new(
+                                source_id,
+                                ability_index,
+                                payment_mode,
+                            )
+                        })
                 })
         })
         .collect()
@@ -24584,7 +24605,8 @@ pub(super) fn find_one_of_cost(cost: &AbilityCost) -> Option<&Vec<AbilityCost>> 
 
 /// CR 601.2h + CR 602.2b: Filter disjunctive activation-cost branches through the
 /// same affordability authority used by `can_activate_ability_now` and
-/// `handle_activate_ability`, each judged inside its `enclosing` total cost.
+/// `handle_activate_ability`, each judged inside its `enclosing` total cost and
+/// in the activation's `payment_mode` (one life window shared by every branch).
 pub(crate) fn payable_one_of_activation_branches(
     state: &GameState,
     player: PlayerId,
@@ -24592,7 +24614,9 @@ pub(crate) fn payable_one_of_activation_branches(
     enclosing: &AbilityCost,
     costs: &[AbilityCost],
     ability_index: usize,
+    payment_mode: CastPaymentMode,
 ) -> Vec<AbilityCost> {
+    let life = ActivationLifeWindow::for_payment_mode(player, source_id, payment_mode);
     costs
         .iter()
         .filter(|branch| {
@@ -24603,6 +24627,7 @@ pub(crate) fn payable_one_of_activation_branches(
                 enclosing,
                 branch,
                 Some(ability_index),
+                &life,
             )
         })
         .cloned()
@@ -24619,16 +24644,17 @@ pub(crate) fn one_of_branch_payable_in(
     enclosing: &AbilityCost,
     branch: &AbilityCost,
     ability_index: Option<usize>,
+    life: &ActivationLifeWindow,
 ) -> bool {
     enclosing
         .resolve_first_one_of(branch)
         .is_some_and(|resolved| {
-            can_pay_ability_cost_now(state, player, source_id, &resolved, ability_index)
+            can_pay_ability_cost_now(state, player, source_id, &resolved, ability_index, life)
         })
 }
 
 /// CR 601.2h: branch payability for a pending activation, judged against its
-/// current total cost.
+/// current total cost in its payment mode.
 pub(crate) fn activation_one_of_branch_payable(
     state: &GameState,
     player: PlayerId,
@@ -24643,6 +24669,11 @@ pub(crate) fn activation_one_of_branch_payable(
             cost,
             branch,
             pending.activation_ability_index,
+            &ActivationLifeWindow::for_payment_mode(
+                player,
+                pending.object_id,
+                pending.payment_mode,
+            ),
         )
     })
 }
@@ -24657,15 +24688,24 @@ fn activation_cost_passes_early_affordability_gate(
     source_id: ObjectId,
     cost: &AbilityCost,
     ability_index: usize,
+    payment_mode: CastPaymentMode,
 ) -> bool {
+    let life = ActivationLifeWindow::for_payment_mode(player, source_id, payment_mode);
     if let Some(locked) =
         super::costs::lock_half_life_activation_cost(state, player, source_id, cost)
     {
         // CR 601.2f + CR 602.2b: Refuse an unaffordable locked cost before
         // target prompts or mana abilities can mutate the activation state.
-        can_pay_ability_cost_now(state, player, source_id, &locked, Some(ability_index))
+        can_pay_ability_cost_now(
+            state,
+            player,
+            source_id,
+            &locked,
+            Some(ability_index),
+            &life,
+        )
     } else if find_one_of_cost(cost).is_some() {
-        can_pay_ability_cost_now(state, player, source_id, cost, Some(ability_index))
+        can_pay_ability_cost_now(state, player, source_id, cost, Some(ability_index), &life)
     } else {
         // CR 106.6: the tag reaches the payability gate for the same reason it
         // reaches `can_pay_ability_cost_now` above — tag-scoped mana
@@ -24674,9 +24714,16 @@ fn activation_cost_passes_early_affordability_gate(
         // activations the payment step would have allowed.
         // CR 601.2g + CR 119.4: a printed "Pay N life" is judged by the life the
         // player can have when it is paid, as `can_pay_ability_cost_now` is.
-        payable_with_mana_ability_window_life(state, player, source_id, cost, |state| {
-            cost.is_payable_for_activation(state, player, source_id, Some(ability_index))
-        })
+        payable_with_mana_ability_window_life(
+            state,
+            player,
+            source_id,
+            cost,
+            &life,
+            |state, cost| {
+                cost.is_payable_for_activation(state, player, source_id, Some(ability_index))
+            },
+        )
     }
 }
 
@@ -25577,7 +25624,9 @@ pub fn find_eligible_sacrifice_targets(
 /// including the Waterbend auto-tap mana check) with a clone-and-dry-run of the
 /// payment authority. This keeps legal-action generation in sync with
 /// `handle_activate_ability`, so the AI never proposes an activation the submit
-/// path would reject.
+/// path would reject. `life` says how the life the cost pays is judged: on the
+/// current total for an automatic payment, after the CR 601.2g opportunity for
+/// a manual one ([`payable_with_mana_ability_window_life`]).
 ///
 /// The bespoke non-self-Sacrifice / PayLife / TapCreatures pre-checks that used
 /// to live here were deleted in Phase 5 — each duplicated logic already in
@@ -25590,9 +25639,10 @@ pub(crate) fn can_pay_ability_cost_now(
     source_id: ObjectId,
     cost: &AbilityCost,
     ability_index: Option<usize>,
+    life: &ActivationLifeWindow,
 ) -> bool {
     let excluded_sources = ability_mana_payment_excluded_sources(cost, source_id);
-    payable_with_mana_ability_window_life(state, player, source_id, cost, |state| {
+    payable_with_mana_ability_window_life(state, player, source_id, cost, life, |state, cost| {
         super::costs::can_pay(
             state,
             player,
@@ -25606,65 +25656,189 @@ pub(crate) fn can_pay_ability_cost_now(
     })
 }
 
-/// CR 601.2g + CR 601.2h + CR 119.4: life follows the same structural rule as
-/// mana in an activation's pre-payment checks. An activation's mana is judged
-/// by what the player's mana abilities can produce during the CR 601.2g
+/// CR 601.2g + CR 119.3 + CR 119.4: how one legality pass judges the life an
+/// activation's cost pays, which is paid only in CR 601.2h.
+pub(crate) enum ActivationLifeWindow {
+    /// The life the player has now. The automatic payer activates mana
+    /// abilities only for the mana a cost needs, never for the life one also
+    /// gains, so an automatic activation is judged on the current total and is
+    /// never offered at a life its payer then refuses.
+    Current,
+    /// A manual payment: the life the player can have once they have activated,
+    /// during the CR 601.2g opportunity, the mana abilities that gain them life.
+    /// `witness` memoizes that board for the pass — it depends only on the
+    /// activator and the activation's source
+    /// ([`mana_ability_window_life_witness`]), so every gate, probe and target
+    /// completion of one verdict shares one build.
+    ManaAbilityWindow {
+        player: PlayerId,
+        source_id: ObjectId,
+        witness: OnceCell<Option<Box<GameState>>>,
+    },
+}
+
+impl ActivationLifeWindow {
+    /// CR 602.2b + CR 601.2g: the life judgement of an activation by `player`
+    /// of an ability of `source_id`, paid in `payment_mode`.
+    pub(crate) fn for_payment_mode(
+        player: PlayerId,
+        source_id: ObjectId,
+        payment_mode: CastPaymentMode,
+    ) -> Self {
+        if payment_mode_pays_mana_manually(payment_mode) {
+            ActivationLifeWindow::ManaAbilityWindow {
+                player,
+                source_id,
+                witness: OnceCell::new(),
+            }
+        } else {
+            ActivationLifeWindow::Current
+        }
+    }
+}
+
+/// CR 601.2g + CR 601.2h + CR 119.3 + CR 119.4: a manually paid activation's
+/// life follows the same structural rule as its mana. Its mana is judged by
+/// what the player's mana abilities can produce during the CR 601.2g
 /// opportunity, not by the current pool; its life — a printed "Pay N life", a
-/// Phyrexian symbol paid with 2 life, or a {B} paid with life under a
-/// payment permission (K'rrik, Son of Yawgmoth) — is paid only in CR 601.2h, so
-/// it is judged by the life total the player can have by then. A mana ability
-/// that also gains its controller life (Pristine Talisman: "{T}: Add {C}. You
-/// gain 1 life.") changes that total during the opportunity (CR 119.3), so a
-/// check `payable` refuses on the current board is retried once on a witness
-/// board where every such ability the player can activate has been activated
-/// (see [`mana_ability_window_life_witness`]). The opportunity exists only when
-/// `cost`'s total includes a mana payment (CR 601.2g); a cost that is only life
-/// is paid at once, with the life the player has now. The witness only ever
-/// ADDS an offer, and only one the player can actually complete; the payment
-/// itself still checks the life the player has when paying (CR 119.4 +
-/// CR 118.3).
+/// Phyrexian symbol paid with 2 life, or a {B} paid with life under a payment
+/// permission (K'rrik, Son of Yawgmoth) — is paid only in CR 601.2h, so it is
+/// judged by the life total the player can have by then. A mana ability that
+/// also gains its controller life (Pristine Talisman: "{T}: Add {C}. You gain 1
+/// life.") changes that total during the opportunity (CR 119.3), so a cost
+/// `payable` refuses on the current board is retried once on the pass's witness
+/// board (see [`mana_ability_window_life_witness`]), only when all of these
+/// hold:
+///
+/// * `life` is a manual payment's window. An automatic payment keeps the
+///   current-total verdict.
+/// * the route judged has a CR 601.2g opportunity: its total includes a mana
+///   payment. When paying every printed Phyrexian symbol with 2 life would leave
+///   no mana and no X (Spellskite's lone {U/P}), only the announcement that pays
+///   those symbols with mana opens one (CR 118.13a), so that route — each symbol
+///   as the colored mana it stands for — is what is judged. A total that is only
+///   life is paid at once, with the life the player has now.
+/// * that route pays life. A mana-only total cannot change its verdict: the
+///   current-board check already counts the mana a life-gaining ability adds.
+///
+/// The retry only ever adds an offer; the payment itself still checks the life
+/// the player has when paying (CR 119.4 + CR 118.3).
 pub(crate) fn payable_with_mana_ability_window_life(
     state: &GameState,
     player: PlayerId,
     source_id: ObjectId,
     cost: &AbilityCost,
-    payable: impl Fn(&GameState) -> bool,
+    life: &ActivationLifeWindow,
+    payable: impl Fn(&GameState, &AbilityCost) -> bool,
 ) -> bool {
-    if payable(state) {
+    if payable(state, cost) {
         return true;
     }
-    let mana = activation_mana_component(cost);
-    if mana.mana_value() == 0 && !casting_costs::cost_has_x(&mana) {
+    let ActivationLifeWindow::ManaAbilityWindow {
+        player: window_player,
+        source_id: window_source,
+        witness,
+    } = life
+    else {
+        return false;
+    };
+    // The memo belongs to one activator and source; any other activation is
+    // refused the retry rather than judged on a board built for another.
+    debug_assert_eq!(
+        (*window_player, *window_source),
+        (player, source_id),
+        "an activation life window is scoped to one activator and source"
+    );
+    if (*window_player, *window_source) != (player, source_id) {
         return false;
     }
-    let excluded_sources = ability_mana_payment_excluded_sources(cost, source_id);
-    mana_ability_window_life_witness(state, player, source_id, &excluded_sources)
-        .is_some_and(|witness| payable(&witness))
+    let Some(route) = mana_ability_window_route(cost) else {
+        return false;
+    };
+    let life_colors = super::static_abilities::player_life_payment_colors(state, player);
+    if !activation_cost_pays_life(&route, life_colors) {
+        return false;
+    }
+    witness
+        .get_or_init(|| mana_ability_window_life_witness(state, player, source_id).map(Box::new))
+        .as_deref()
+        .is_some_and(|witness| payable(witness, &route))
 }
 
-/// CR 601.2g + CR 605.3b + CR 119.3: a witness board for
-/// [`payable_with_mana_ability_window_life`]: a clone on which `player` has
-/// activated, through the real mana-ability authority, every mana ability of a
-/// permanent they control that gains its controller life and costs no more than
-/// tapping or untapping its source. Each resolves at once (CR 605.3b), adding
-/// its mana to the pool — still available to the payment, so activating it
-/// first never takes mana away — and its life to the total. Sources the
-/// activation itself needs untapped (`excluded_sources`, and the activation's
-/// own source) are left alone; an ability that would stop for a choice (a mana
-/// color) is skipped. `None` when no activated ability gained any life, i.e.
-/// when the witness could not change any life-based verdict.
-fn mana_ability_window_life_witness(
+/// CR 601.2g + CR 118.13a: the route of `cost` whose total includes a mana
+/// payment, and so has a mana-ability opportunity before its life is paid:
+/// `cost` itself when paying every printed Phyrexian symbol with 2 life still
+/// leaves mana or an X to pay; otherwise `cost` with every printed Phyrexian
+/// symbol announced as the colored mana it stands for (CR 107.4f) — the same
+/// all-life residual the manual X cap reads. `None` when no route has a mana
+/// payment at all.
+fn mana_ability_window_route(cost: &AbilityCost) -> Option<std::borrow::Cow<'_, AbilityCost>> {
+    let has_mana_payment =
+        |mana: &ManaCost| mana.mana_value() > 0 || casting_costs::cost_has_x(mana);
+    let mana = activation_mana_component(cost);
+    if !has_mana_payment(&mana) {
+        return None;
+    }
+    let printed_phyrexian = mana_payment::native_phyrexian_shards(&mana);
+    let announce_each = |choice: ShardChoice| -> Vec<ActivationShardChoice> {
+        printed_phyrexian
+            .iter()
+            .map(|&(shard_index, shard)| ActivationShardChoice {
+                shard_index,
+                shard,
+                choice,
+            })
+            .collect()
+    };
+    let all_life_residual =
+        mana_payment::native_selected_mana(&mana, &announce_each(ShardChoice::PayLife));
+    if has_mana_payment(&all_life_residual) {
+        return Some(std::borrow::Cow::Borrowed(cost));
+    }
+    Some(std::borrow::Cow::Owned(
+        selected_activation_cost_for_payability(
+            cost,
+            Some(announce_each(ShardChoice::PayMana).as_slice()),
+        ),
+    ))
+}
+
+/// CR 119.4 + CR 107.4f: whether paying `cost` can pay life — a "Pay N life"
+/// leg, or a mana symbol that can be paid with 2 life under `life_colors`.
+fn activation_cost_pays_life(
+    cost: &AbilityCost,
+    life_colors: crate::types::mana::LifePaymentColors,
+) -> bool {
+    let mut pays_life = false;
+    cost.for_each_cost_node(&mut |node| {
+        pays_life |= match node {
+            AbilityCost::PayLife { .. } => true,
+            AbilityCost::Mana { cost } => {
+                mana_payment::cost_has_life_payable_shard(cost, life_colors)
+            }
+            _ => false,
+        };
+    });
+    pays_life
+}
+
+/// CR 601.2g + CR 119.3: the mana abilities [`mana_ability_window_life_witness`]
+/// activates: each mana ability of a permanent `player` controls, other than
+/// `source_id`, that gains its controller life and costs no more than tapping
+/// or untapping its source. The activation's own source is the only object an
+/// activation cost can need untapped (`ability_mana_payment_excluded_sources`),
+/// so it is always left alone.
+fn mana_ability_window_life_sources(
     state: &GameState,
     player: PlayerId,
     source_id: ObjectId,
-    excluded_sources: &HashSet<ObjectId>,
-) -> Option<GameState> {
-    let candidates: Vec<(ObjectId, usize)> = state
+) -> impl Iterator<Item = (ObjectId, usize)> + '_ {
+    state
         .battlefield
         .iter()
-        .filter(|id| **id != source_id && !excluded_sources.contains(*id))
-        .filter_map(|id| state.objects.get(id))
-        .filter(|obj| obj.controller == player)
+        .filter(move |id| **id != source_id)
+        .filter_map(move |id| state.objects.get(id))
+        .filter(move |obj| obj.controller == player)
         .flat_map(|obj| {
             obj.abilities
                 .iter()
@@ -25676,7 +25850,24 @@ fn mana_ability_window_life_witness(
                 })
                 .map(move |(index, _)| (obj.id, index))
         })
-        .collect();
+}
+
+/// CR 601.2g + CR 605.3b + CR 119.3: a witness board for
+/// [`payable_with_mana_ability_window_life`]: a clone on which `player` has
+/// activated, through the real mana-ability authority, every mana ability
+/// [`mana_ability_window_life_sources`] names. Each resolves at once
+/// (CR 605.3b), adding its mana to the pool — still available to the payment,
+/// so activating it first never takes mana away — and its life to the total.
+/// An ability that would stop for a choice (a mana color) is skipped. `None`
+/// when no activated ability gained any life, i.e. when the witness could not
+/// change any life-based verdict. Every clone it makes is counted.
+fn mana_ability_window_life_witness(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+) -> Option<GameState> {
+    let candidates: Vec<(ObjectId, usize)> =
+        mana_ability_window_life_sources(state, player, source_id).collect();
     if candidates.is_empty() {
         return None;
     }
@@ -25702,6 +25893,7 @@ fn mana_ability_window_life_witness(
         ) {
             continue;
         }
+        crate::game::perf_counters::record_state_clone_for_legality();
         let mut next = witness.clone();
         let resolved = super::mana_abilities::activate_mana_ability(
             &mut next,
@@ -25962,7 +26154,8 @@ pub fn can_activate_ability_now(
 
 /// CR 602.5: enforcement shim over [`activation_verdict`]. The verdict core is
 /// the single activation-legality authority; this preserves the shipped `bool`
-/// signature for its six call sites so display and enforcement can never drift.
+/// signature for its call sites so display and enforcement can never drift.
+/// It answers for an automatic payment (`CastPaymentMode::Auto`).
 pub fn can_activate_ability_now_with_restriction_gates(
     state: &GameState,
     player: PlayerId,
@@ -25978,15 +26171,121 @@ pub fn can_activate_ability_now_with_restriction_gates(
             ability_index,
             restriction_gates,
             ActivationQuery::Legality,
+            CastPaymentMode::Auto,
         ),
         ActivationVerdict::Legal
     )
+}
+
+/// CR 602.2b + CR 601.2g: whether `player` may activate the ability now, paid
+/// in `payment_mode` — the verdict a submitted `GameAction::ActivateAbility`
+/// carrying that mode is judged by.
+pub fn can_activate_ability_now_with_payment_mode(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    ability_index: usize,
+    payment_mode: CastPaymentMode,
+) -> bool {
+    let gates = restrictions::ActivationRestrictionStaticGates::compute(state);
+    matches!(
+        activation_verdict(
+            state,
+            player,
+            source_id,
+            ability_index,
+            &gates,
+            ActivationQuery::Legality,
+            payment_mode,
+        ),
+        ActivationVerdict::Legal
+    )
+}
+
+/// CR 602.2b + CR 601.2g: the payment mode a priority offer of the ability
+/// carries — the mode the reducer honours, as
+/// [`castable_spell_payment_mode_with_probe`] picks one for a spell. `Auto` when
+/// the automatic payer can complete the activation. Otherwise `Manual` when
+/// only a manual payment can: its life is judged after the CR 601.2g
+/// opportunity, in which the player may first activate mana abilities that gain
+/// them life ([`payable_with_mana_ability_window_life`]). `None` when neither
+/// can. The manual verdict runs only for a cost whose window route pays life
+/// while the player controls such a mana ability.
+pub(crate) fn activation_offer_payment_mode(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    ability_index: usize,
+    restriction_gates: &restrictions::ActivationRestrictionStaticGates,
+) -> Option<CastPaymentMode> {
+    if can_activate_ability_now_with_restriction_gates(
+        state,
+        player,
+        source_id,
+        ability_index,
+        restriction_gates,
+    ) {
+        return Some(CastPaymentMode::Auto);
+    }
+    (manual_activation_life_retry_possible(state, player, source_id, ability_index)
+        && matches!(
+            activation_verdict(
+                state,
+                player,
+                source_id,
+                ability_index,
+                restriction_gates,
+                ActivationQuery::Legality,
+                CastPaymentMode::Manual,
+            ),
+            ActivationVerdict::Legal
+        ))
+    .then_some(CastPaymentMode::Manual)
+}
+
+/// CR 601.2g + CR 119.4: a manual activation's verdict can differ from the
+/// automatic one only through [`payable_with_mana_ability_window_life`]'s
+/// retry: the ability's cost has a window route that pays life, and the player
+/// controls a mana ability that would gain them life in that window.
+fn manual_activation_life_retry_possible(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    ability_index: usize,
+) -> bool {
+    // Cheapest first: with no mana ability that gains the player life, the
+    // window cannot change any life the activation pays.
+    if mana_ability_window_life_sources(state, player, source_id)
+        .next()
+        .is_none()
+    {
+        return false;
+    }
+    let Some(def) = activation_ability_definition(state, source_id, ability_index) else {
+        return false;
+    };
+    // CR 605.3a: a mana ability is activated during a payment, not paid for by
+    // hand, so it has no manual payment to relax.
+    if super::mana_abilities::is_mana_ability(&def) {
+        return false;
+    }
+    let Some(cost) = def
+        .cost
+        .map(|cost| activation_cost_for_affordability(cost, def.ability_tag))
+    else {
+        return false;
+    };
+    let life_colors = super::static_abilities::player_life_payment_colors(state, player);
+    mana_ability_window_route(&cost)
+        .is_some_and(|route| activation_cost_pays_life(&route, life_colors))
 }
 
 /// CR 602.5 + CR 118.3: the one activation-legality evaluation, shared by
 /// enforcement (`ActivationQuery::Legality`) and the display read-out
 /// (`ActivationQuery::BlockReason`). See [`ActivationQuery`] for what the two
 /// modes do differently and why `Legal` is meaningless under `BlockReason`.
+/// `payment_mode` decides how the cost's life is judged (one
+/// [`ActivationLifeWindow`] for the whole evaluation).
 pub(crate) fn activation_verdict(
     state: &GameState,
     player: PlayerId,
@@ -25994,6 +26293,7 @@ pub(crate) fn activation_verdict(
     ability_index: usize,
     restriction_gates: &restrictions::ActivationRestrictionStaticGates,
     query: ActivationQuery,
+    payment_mode: CastPaymentMode,
 ) -> ActivationVerdict {
     crate::game::perf_counters::record_activation_verdict_pass();
     let Some(obj) = state.objects.get(&source_id) else {
@@ -26100,12 +26400,14 @@ pub(crate) fn activation_verdict(
     // CR 601.2f: Apply self-referential cost reduction before affordability check.
     // CR 601.2c + CR 602.2b: a cost that may depend on the targets is judged
     // over the legal assignments; `proved_unpayable` means none is affordable.
+    let life = ActivationLifeWindow::for_payment_mode(player, source_id, payment_mode);
     let proved_unpayable = fold_activation_cost_for_feasibility(
         state,
         &mut ability_def,
         player,
         source_id,
         ability_index,
+        &life,
     );
     let affordability_cost = ability_def
         .cost
@@ -26136,7 +26438,7 @@ pub(crate) fn activation_verdict(
     // CR 118.3: the resource-availability gate — the ONE evaluation.
     let cost_not_payable = proved_unpayable
         || affordability_cost.as_ref().is_some_and(|cost| {
-            !can_pay_ability_cost_now(state, player, source_id, cost, Some(ability_index))
+            !can_pay_ability_cost_now(state, player, source_id, cost, Some(ability_index), &life)
         });
     if cost_not_payable && query == ActivationQuery::Legality {
         return ActivationVerdict::Illegal;
@@ -27246,10 +27548,23 @@ fn ensure_x_locked_activation_payable(
     let mana_obligation = selected_mana_obligation(pending, &pending.cost);
     let whole_cost = activation_x_whole_cost(pending);
     // CR 601.2g + CR 119.4: life in the locked total is judged by the life the
-    // player can have when it is paid, exactly as the offer judged it.
-    let payable = |state: &GameState| {
-        (mana_obligation.mana_value() == 0
-            || can_feasibly_pay_mana_cost(state, player, Some(pending.object_id), &mana_obligation))
+    // player can have when it is paid, exactly as the offer judged it. The mana
+    // leg judged is the X leg of the route being judged: the selected total's,
+    // or — when X is locked before the Phyrexian announcement and every printed
+    // symbol announced as life would leave no mana — the route that announces
+    // them as mana (CR 118.13a), the only one with a CR 601.2g opportunity.
+    // `activation_x_whole_cost` puts that leg first, and the route keeps it there.
+    let payable = |state: &GameState, route: &AbilityCost| {
+        let route_x_leg = match route {
+            AbilityCost::Composite { costs } => costs.first(),
+            other => Some(other),
+        };
+        let obligation = match route_x_leg {
+            Some(AbilityCost::Mana { cost }) => cost,
+            _ => &mana_obligation,
+        };
+        (obligation.mana_value() == 0
+            || can_feasibly_pay_mana_cost(state, player, Some(pending.object_id), obligation))
             && whole_cost.is_payable_for_activation(
                 state,
                 player,
@@ -27264,6 +27579,7 @@ fn ensure_x_locked_activation_payable(
         player,
         pending.object_id,
         &selected_cost,
+        &ActivationLifeWindow::for_payment_mode(player, pending.object_id, pending.payment_mode),
         payable,
     ) {
         Ok(())
@@ -27604,6 +27920,7 @@ fn activate_with_cost_carrier(
             source_id,
             cost,
             ability_index,
+            payment_mode,
         ) {
             return Err(EngineError::ActionNotAllowed(
                 "Cannot pay activation cost".to_string(),
@@ -27684,6 +28001,7 @@ fn activate_with_cost_carrier(
                         &base_cost,
                         costs,
                         ability_index,
+                        payment_mode,
                     );
                     if payable.is_empty() {
                         return Err(EngineError::ActionNotAllowed(
@@ -28379,6 +28697,7 @@ fn activate_with_cost_carrier(
                     cost,
                     costs,
                     ability_index,
+                    payment_mode,
                 );
                 if payable.is_empty() {
                     return Err(EngineError::ActionNotAllowed(
@@ -30572,6 +30891,7 @@ fn fold_activation_cost_for_feasibility(
     player: PlayerId,
     source_id: ObjectId,
     ability_index: usize,
+    life: &ActivationLifeWindow,
 ) -> bool {
     if !may_gain_target_gated_modifiers(state, ability_def, player, source_id) {
         apply_cost_reduction(state, ability_def, player, source_id);
@@ -30615,6 +30935,7 @@ fn fold_activation_cost_for_feasibility(
             source_id,
             &activation_cost_for_affordability(cost.clone(), ability_def.ability_tag),
             Some(ability_index),
+            life,
         )
     };
     if let Some(worst) = worst.filter(|worst| payable(worst)) {
@@ -30637,6 +30958,7 @@ fn fold_activation_cost_for_feasibility(
         &base,
         &independent,
         &mut budget,
+        life,
     );
     ability_def.cost = Some(best);
     verdict == ActivationCostFeasibility::Unpayable
@@ -30657,6 +30979,7 @@ pub(crate) fn activation_cost_feasibility_search(
     base: &AbilityCost,
     independent: &ActivationCostModifiers,
     budget: &mut super::ability_utils::WorkBudget,
+    life: &ActivationLifeWindow,
 ) -> ActivationCostFeasibility {
     activation_cost_feasibility_search_with_witness(
         state,
@@ -30667,6 +30990,7 @@ pub(crate) fn activation_cost_feasibility_search(
         base,
         independent,
         budget,
+        life,
     )
     .0
 }
@@ -30683,6 +31007,7 @@ pub(crate) fn activation_cost_feasibility_search_with_witness(
     base: &AbilityCost,
     independent: &ActivationCostModifiers,
     budget: &mut super::ability_utils::WorkBudget,
+    life: &ActivationLifeWindow,
 ) -> (ActivationCostFeasibility, Option<Vec<Option<TargetRef>>>) {
     if ability_def.modal.is_some() {
         return (ActivationCostFeasibility::Undecided, None);
@@ -30704,6 +31029,7 @@ pub(crate) fn activation_cost_feasibility_search_with_witness(
         ability: &ability,
         priced: Vec::new(),
         witness: None,
+        life,
     };
     let verdict = match super::ability_utils::walk_target_completions(
         state,
@@ -30735,6 +31061,8 @@ struct ActivationCostVisitor<'a> {
     ability: &'a ResolvedAbility,
     priced: Vec<(AbilityCost, bool)>,
     witness: Option<Vec<Option<TargetRef>>>,
+    /// The pass's life judgement, shared with the verdict that started the walk.
+    life: &'a ActivationLifeWindow,
 }
 
 impl super::ability_utils::CompletionVisitor for ActivationCostVisitor<'_> {
@@ -30773,6 +31101,7 @@ impl super::ability_utils::CompletionVisitor for ActivationCostVisitor<'_> {
                     self.source_id,
                     &activation_cost_for_affordability(cost.clone(), self.ability_def.ability_tag),
                     Some(self.ability_index),
+                    self.life,
                 );
                 self.priced.push((cost, payable));
                 payable
@@ -31050,7 +31379,15 @@ fn lock_activation_cost_at_settlement(
     // (CR 733.2 allows a fresh, legal activation instead). Nothing was accepted
     // before this lock, so the action boundary's typed reversal restores the
     // state before the action and returns priority.
-    if !can_pay_ability_cost_now(state, player, source_id, &cheapest, Some(ability_index)) {
+    let life = ActivationLifeWindow::for_payment_mode(player, source_id, pending.payment_mode);
+    if !can_pay_ability_cost_now(
+        state,
+        player,
+        source_id,
+        &cheapest,
+        Some(ability_index),
+        &life,
+    ) {
         return Err(EngineError::ActivationReversed { player });
     }
     let native = pending
@@ -32853,6 +33190,8 @@ pub(crate) fn activation_cost_block_reason(
 ) -> Option<AbilityBlockReason> {
     // Exhaustive, no wildcard: a future `ActivationVerdict` arm must be
     // classified deliberately rather than silently falling into "no read-out".
+    // CR 601.2g: judged for a manual payment, the most permissive mode — an
+    // ability offered for a manual payment is not withheld for its cost.
     match activation_verdict(
         state,
         player,
@@ -32860,6 +33199,7 @@ pub(crate) fn activation_cost_block_reason(
         ability_index,
         restriction_gates,
         ActivationQuery::BlockReason,
+        CastPaymentMode::Manual,
     ) {
         ActivationVerdict::CostNotPayableNow => Some(AbilityBlockReason {
             sources: Vec::new(),
@@ -33103,6 +33443,7 @@ mod tests;
 mod half_life_activation_verdict_tests {
     use super::{activation_verdict, restrictions, ActivationQuery, ActivationVerdict};
     use crate::game::scenario::{GameScenario, P0, P1};
+    use crate::types::game_state::CastPaymentMode;
     use crate::types::phase::Phase;
 
     #[test]
@@ -33137,6 +33478,8 @@ mod half_life_activation_verdict_tests {
                     0,
                     &gates,
                     ActivationQuery::BlockReason,
+                    // As `activation_cost_block_reason` judges it.
+                    CastPaymentMode::Manual,
                 ),
                 if has_target {
                     ActivationVerdict::CostNotPayableNow
@@ -33853,6 +34196,152 @@ mod castable_zone_authority_tests {
             admitted_lands.is_empty(),
             "CR 305.9: these routes admitted a CoreType::Land object: {admitted_lands:?}"
         );
+    }
+}
+
+/// CR 601.2g + CR 119.3 + CR 119.4: the manual life window's gate on the
+/// payability authority — which payments it serves, which costs it is built
+/// for, and that one window builds its witness once and counts every clone.
+#[cfg(test)]
+mod mana_ability_window_life_tests {
+    use super::{activation_ability_definition, can_pay_ability_cost_now, ActivationLifeWindow};
+    use crate::game::perf_counters;
+    use crate::game::scenario::{GameRunner, GameScenario, P0};
+    use crate::types::ability::AbilityCost;
+    use crate::types::game_state::CastPaymentMode;
+    use crate::types::identifiers::ObjectId;
+    use crate::types::mana::ManaColor;
+    use crate::types::phase::Phase;
+
+    const GREED: &str = "{B}, Pay 2 life: Draw a card.";
+    const IMMOLATING_SOULEATER: &str = "{R/P}: This creature gets +1/+0 until end of turn. ({R/P} can be paid with either {R} or 2 life.)";
+    const ARCANE_ENCYCLOPEDIA: &str = "{3}, {T}: Draw a card.";
+
+    #[derive(Clone, Copy)]
+    enum Source {
+        Greed,
+        ImmolatingSouleater,
+        ArcaneEncyclopedia,
+    }
+
+    /// `source` at `life`, with two Pristine Talismans ("{T}: Add {C}. You gain
+    /// 1 life.") and the listed basic lands.
+    fn board(life: i32, source: Source, lands: &[ManaColor]) -> (GameRunner, ObjectId) {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain).with_life(P0, life);
+        let source = match source {
+            Source::Greed => scenario
+                .add_enchantment_from_oracle(P0, "Greed", GREED)
+                .id(),
+            Source::ImmolatingSouleater => scenario
+                .add_creature_from_oracle(P0, "Immolating Souleater", 1, 1, IMMOLATING_SOULEATER)
+                .id(),
+            Source::ArcaneEncyclopedia => scenario
+                .add_artifact_from_oracle(P0, "Arcane Encyclopedia", ARCANE_ENCYCLOPEDIA)
+                .id(),
+        };
+        for _ in 0..2 {
+            scenario.add_artifact_from_oracle(
+                P0,
+                "Pristine Talisman",
+                "{T}: Add {C}. You gain 1 life.",
+            );
+        }
+        for &color in lands {
+            scenario.add_basic_land(P0, color);
+        }
+        (scenario.build(), source)
+    }
+
+    fn printed_cost(runner: &GameRunner, source: ObjectId) -> AbilityCost {
+        activation_ability_definition(runner.state(), source, 0)
+            .and_then(|def| def.cost)
+            .expect("the ability has a cost")
+    }
+
+    fn payable(runner: &GameRunner, source: ObjectId, life: &ActivationLifeWindow) -> bool {
+        let cost = printed_cost(runner, source);
+        can_pay_ability_cost_now(runner.state(), P0, source, &cost, Some(0), life)
+    }
+
+    fn manual(source: ObjectId) -> ActivationLifeWindow {
+        ActivationLifeWindow::for_payment_mode(P0, source, CastPaymentMode::Manual)
+    }
+
+    /// Greed at one life with a Swamp and two Talismans is payable in the
+    /// manual window only; the automatic modes keep the current-total verdict.
+    /// At three life every judgement pays it now.
+    #[test]
+    fn only_a_manual_payment_judges_life_after_the_window() {
+        let (runner, greed) = board(1, Source::Greed, &[ManaColor::Black]);
+        assert!(payable(&runner, greed, &manual(greed)));
+        for mode in [
+            CastPaymentMode::Auto,
+            CastPaymentMode::AutoExceptSacrificialMana,
+        ] {
+            assert!(
+                !payable(
+                    &runner,
+                    greed,
+                    &ActivationLifeWindow::for_payment_mode(P0, greed, mode),
+                ),
+                "{mode:?} judges the life the player has now"
+            );
+        }
+
+        let (runner, greed) = board(3, Source::Greed, &[ManaColor::Black]);
+        assert!(payable(&runner, greed, &ActivationLifeWindow::Current));
+    }
+
+    /// One window builds its witness once: a second check on the same window
+    /// makes only the payment dry run's clones, and the first made exactly
+    /// three more — the witness board and one per Talisman activation.
+    #[test]
+    fn one_window_builds_its_witness_once_and_counts_every_clone() {
+        let (runner, greed) = board(1, Source::Greed, &[ManaColor::Black]);
+        let window = manual(greed);
+
+        perf_counters::reset();
+        assert!(payable(&runner, greed, &window));
+        let first = perf_counters::snapshot().state_clone_for_legality;
+        perf_counters::reset();
+        assert!(payable(&runner, greed, &window));
+        let second = perf_counters::snapshot().state_clone_for_legality;
+
+        assert_eq!(
+            first - second,
+            3,
+            "the witness board plus one clone per Talisman activation, built once"
+        );
+    }
+
+    /// No witness is built for a cost the window cannot change: an unaffordable
+    /// mana-only cost (Arcane Encyclopedia's {3}, two Talismans and no land),
+    /// and a Phyrexian-only cost whose only route with a window pays mana the
+    /// board cannot make (Immolating Souleater's {R/P}, no red source, one
+    /// life). Both are refused with no clone beyond the current-total check's.
+    /// Reach guards: the {R/P} is paid with 2 life at three life, and the {3}
+    /// once a Swamp is added.
+    #[test]
+    fn no_witness_is_built_for_a_cost_the_window_cannot_change() {
+        for source in [Source::ArcaneEncyclopedia, Source::ImmolatingSouleater] {
+            let (runner, id) = board(1, source, &[]);
+            perf_counters::reset();
+            assert!(!payable(&runner, id, &ActivationLifeWindow::Current));
+            let current = perf_counters::snapshot().state_clone_for_legality;
+            perf_counters::reset();
+            assert!(!payable(&runner, id, &manual(id)));
+            assert_eq!(
+                perf_counters::snapshot().state_clone_for_legality,
+                current,
+                "refused with no clone beyond the current-total check's: no witness"
+            );
+        }
+
+        let (runner, souleater) = board(3, Source::ImmolatingSouleater, &[]);
+        assert!(payable(&runner, souleater, &ActivationLifeWindow::Current));
+        let (runner, encyclopedia) = board(1, Source::ArcaneEncyclopedia, &[ManaColor::Black]);
+        assert!(payable(&runner, encyclopedia, &manual(encyclopedia)));
     }
 }
 

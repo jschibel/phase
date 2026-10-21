@@ -390,7 +390,7 @@ fn priority_announcement_to_action(announcement: PriorityAnnouncement) -> GameAc
         PriorityAnnouncement::ActivateAbility(announcement) => GameAction::ActivateAbility {
             source_id: announcement.source_id(&_access),
             ability_index: announcement.ability_index(&_access),
-            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+            payment_mode: announcement.payment_mode(&_access),
         },
         PriorityAnnouncement::UnlockRoomDoor(announcement) => GameAction::UnlockRoomDoor {
             object_id: announcement.object_id(&_access),
@@ -20885,6 +20885,75 @@ mod priority_principal_tests {
 
         assert!(apply_actionless_priority_pass_for_prospective(&mut state).is_err());
         assert_eq!(state, before);
+    }
+
+    /// CR 602.2b + CR 601.2g: the Priority preflight announces an activation in
+    /// the payment mode its offer carries. Greed ("{B}, Pay 2 life: Draw a
+    /// card.") at one life with a Swamp and two Pristine Talismans ("{T}: Add
+    /// {C}. You gain 1 life.") can be completed only by a manual payment, so its
+    /// announcement reconstructs a Manual activation, which the reducer opens
+    /// into the mana-payment window; at three life the same announcement is
+    /// automatic and the activation is put on the stack.
+    #[test]
+    fn activate_ability_announcement_carries_the_offered_payment_mode() {
+        use crate::types::actions::GameAction;
+        use crate::types::game_state::CastPaymentMode;
+
+        for (life, expected) in [(1, CastPaymentMode::Manual), (3, CastPaymentMode::Auto)] {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PreCombatMain).with_life(P0, life);
+            let greed = scenario
+                .add_enchantment_from_oracle(P0, "Greed", "{B}, Pay 2 life: Draw a card.")
+                .id();
+            scenario.add_basic_land(P0, ManaColor::Black);
+            for _ in 0..2 {
+                scenario.add_artifact_from_oracle(
+                    P0,
+                    "Pristine Talisman",
+                    "{T}: Add {C}. You gain 1 life.",
+                );
+            }
+            let runner = scenario.build();
+            let state = runner.state();
+            let principal =
+                priority_principal_for_preflight(state).expect("a synchronized priority window");
+
+            let announced: Vec<GameAction> = priority_preflight_candidates(state, &principal)
+                .into_iter()
+                .filter_map(|candidate| match candidate {
+                    PriorityPreflightCandidate::Announcement(announcement) => {
+                        Some(priority_announcement_to_action(announcement))
+                    }
+                    PriorityPreflightCandidate::Indeterminate { .. } => None,
+                })
+                .filter(|action| {
+                    matches!(action, GameAction::ActivateAbility { source_id, .. } if *source_id == greed)
+                })
+                .collect();
+            assert_eq!(
+                announced,
+                vec![GameAction::ActivateAbility {
+                    source_id: greed,
+                    ability_index: 0,
+                    payment_mode: expected,
+                }],
+                "life {life}"
+            );
+
+            let mut projected = state.clone();
+            super::apply_as_current(&mut projected, announced[0].clone())
+                .expect("the announced activation reduces");
+            match expected {
+                CastPaymentMode::Manual => assert!(
+                    matches!(projected.waiting_for, WaitingFor::ManaPayment { .. }),
+                    "CR 601.2g: the manual activation opens the window: {:?}",
+                    projected.waiting_for
+                ),
+                CastPaymentMode::Auto | CastPaymentMode::AutoExceptSacrificialMana => {
+                    assert_eq!(projected.stack.len(), 1, "the activation is on the stack")
+                }
+            }
+        }
     }
 }
 

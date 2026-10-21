@@ -6377,6 +6377,7 @@ fn route_manual_activation_mana_first(
             &cost,
             costs,
             ability_index,
+            pending.payment_mode,
         );
         if payable.is_empty() {
             return Err(EngineError::ActionNotAllowed(
@@ -6632,6 +6633,7 @@ fn surface_next_interactive_activation_cost_leg(
             pending
                 .activation_ability_index
                 .expect("activation cost dispatcher requires an ability index"),
+            pending.payment_mode,
         );
         if payable.is_empty() {
             return Err(EngineError::ActionNotAllowed(
