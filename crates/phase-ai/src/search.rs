@@ -14241,7 +14241,7 @@ mod tests {
                 .add_spell_to_hand(P0, "Rancor", false)
                 .as_enchantment()
                 .with_subtypes(vec!["Aura"])
-                .from_oracle_text(RANCOR)
+                .from_oracle_text_with_keywords(&["Enchant"], RANCOR)
                 .id();
             scenario.add_enchantment_from_oracle(P0, "Leyline of Anticipation", LEYLINE);
             let word = scenario

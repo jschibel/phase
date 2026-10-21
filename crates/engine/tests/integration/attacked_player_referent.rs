@@ -794,7 +794,7 @@ fn damage_authority_board(observer: bool, thrasta: bool, loyalty: u32) -> Author
         .add_spell_to_hand(P0, "Rancor", false)
         .as_enchantment()
         .with_subtypes(vec!["Aura"])
-        .from_oracle_text(RANCOR)
+        .from_oracle_text_with_keywords(&["Enchant"], RANCOR)
         .id();
     let mut r = sc.build();
     control_by_p1(&mut r, walker);
@@ -1225,7 +1225,7 @@ fn departed_player_is_no_recipient_and_cannot_supply_lifelink() {
             .add_spell_to_hand(P0, "Lifelink", false)
             .as_enchantment()
             .with_subtypes(vec!["Aura"])
-            .from_oracle_text(LIFELINK)
+            .from_oracle_text_with_keywords(&["Enchant"], LIFELINK)
             .id();
         sc.add_enchantment_from_oracle(P1, "Leyline of Sanctity",
             "If this card is in your opening hand, you may begin the game with it on the battlefield.\nYou have hexproof. (You can't be the target of spells or abilities your opponents control.)");
@@ -1288,7 +1288,7 @@ fn hellrider_observers_offer_both_orders_when_the_first_removes_the_recipient() 
             .add_spell_to_hand(P0, "Lifelink", false)
             .as_enchantment()
             .with_subtypes(vec!["Aura"])
-            .from_oracle_text(LIFELINK)
+            .from_oracle_text_with_keywords(&["Enchant"], LIFELINK)
             .id();
         let mut r = sc.build();
         control_by_p1(&mut r, walker);
@@ -1327,10 +1327,14 @@ fn hellrider_observers_offer_both_orders_when_the_first_removes_the_recipient() 
         for source in riders {
             assert_untargeted_triggers(&r, source, 1);
         }
+        // Both copies differ only in their own source identity: the trigger reference
+        // and the per-source optional-trigger origin. Clear both before comparing.
         let mut normalized = stack_abilities(&r, riders[0])[0].clone();
         normalized.clear_trigger_identity_recursive();
+        normalized.may_trigger_origin = None;
         let mut other = stack_abilities(&r, riders[1])[0].clone();
         other.clear_trigger_identity_recursive();
+        other.may_trigger_origin = None;
         assert_eq!(
             normalized, other,
             "granted lifelink is outside the normalized AST"
