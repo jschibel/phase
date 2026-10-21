@@ -3473,14 +3473,6 @@ mod tests {
         }
     }
 
-    /// v160: `TargetFilter` gains `AttackedPlayerOrPlaneswalker`, carried in the
-    /// ability definitions inside `GameState`; a v159 peer cannot parse the tag,
-    /// so it must be refused before it receives v160 state. `ZoneChangeCombatStatus`
-    /// gains `attack_target` (`Option<AttackTarget>`, the attacker's last-known
-    /// declared attack target) in zone-change records and trigger-source contexts
-    /// of `GameState`, and exact active attack relations, departure recipient pins
-    /// and complete combat-removal receipts cross `GameState`.
-    ///
     /// v159: coin-flip effects are one `Effect::FlipCoins { flips: CoinFlipRun, .. }`
     /// and the coin-flip resolution frame's kind becomes `Exactly`/`UntilLoss`.
     /// A v158 or older peer silently reads a multi-flip or until-loss run as one flip, so
@@ -3765,13 +3757,9 @@ mod tests {
     /// The preceding v88 bump gave `WaitingFor::DeclareBlockers` its
     /// `block_capacities` (CR 509.1a + CR 101.1).
     ///
-    /// The name embeds the numeral deliberately: `assert_eq!(PROTOCOL_VERSION,
-    /// <n>)` under a function named for `<n-1>` is green, so
-    /// `check-protocol-version.mjs` requires the current numeral in this name
-    /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_160_for_exact_attack_authority() {
-        assert_eq!(PROTOCOL_VERSION, 160);
+    fn protocol_version_is_owned_by_broker() {
+        assert_eq!(PROTOCOL_VERSION, lobby_broker::PROTOCOL_VERSION);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3782,7 +3770,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_160_for_exact_attack_authority` stays
+    /// `protocol_version_is_owned_by_broker` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

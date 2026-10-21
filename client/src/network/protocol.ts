@@ -1,3 +1,4 @@
+import { WIRE_PROTOCOL_VERSION } from "../generated/protocol-versions";
 import type {
   AbilityBlockEntry,
   EndContinuousEffectOffer,
@@ -105,13 +106,8 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * first-contact gate rejects a missing or unequal value before it allocates a
  * seat or adopts reconnect state.
  *
- * Bumps to date:
- *  142 — game_setup and state_update carry GameState whose ability definitions may hold
- *       TargetFilter AttackedPlayerOrPlaneswalker; ZoneChangeCombatStatus gains
- *       `attack_target` (Option<AttackTarget>, the attacker's last-known declared attack
- *       target) in zone-change records and trigger-source contexts of GameState; and
- *       GameState carries exact active attack relations, departure recipient pins and
- *       complete combat-removal receipts. Bumped in lockstep with full-game protocol 160.
+ * Record incompatible changes: `node scripts/protocol-versions.mjs bump game --reason "description"`.
+ * Historical introductions:
  *  141 — game_setup and state_update carry GameState whose effects carry
  *       Effect::FlipCoins { flips, .. } in place of FlipCoin, FlipCoins { count }
  *       and FlipCoinUntilLose, and whose coin-flip resolution frame kind is
@@ -751,7 +747,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 142 as const;
+export { WIRE_PROTOCOL_VERSION };
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

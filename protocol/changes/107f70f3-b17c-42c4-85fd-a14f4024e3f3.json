@@ -1,0 +1,7 @@
+{
+  "surfaces": [
+    "full",
+    "wire"
+  ],
+  "reason": "'The player or planeswalker it's attacking' resolves through a new TargetFilter attacked-player/planeswalker reference; zone-change combat status gains attack fields and CombatState tracks attacked permanents. Older peers cannot deserialize the new variant/fields and would lose the attack referent."
+}

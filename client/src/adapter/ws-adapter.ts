@@ -1,3 +1,4 @@
+import { PROTOCOL_VERSION, LOBBY_PROTOCOL_VERSION, MIN_SUPPORTED_LOBBY_PROTOCOL as MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL } from "../generated/protocol-versions";
 import { initializeLanCapabilities, isLanEndpoint } from "../services/lan";
 import { observeSocketDiagnostics, type SocketDiagnosticObserver } from "../services/socketDiagnostics";
 import { completeSocketDiagnostics, DIAGNOSTIC_HISTORY_LIMIT, type SocketReconnectOutcome } from "../services/troubleshooting";
@@ -212,18 +213,10 @@ export class NativeEngineVersionMismatchError extends Error {
 
 /**
  * Wire-protocol version the client speaks. Must match `PROTOCOL_VERSION` in
- * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
- * adds, removes, renames, or changes the type of a protocol variant field.
+ * `crates/server-core/src/protocol.rs`. Record incompatible changes with
+ * `node scripts/protocol-versions.mjs bump game --reason "description"`.
+ * The entries below are historical introduction versions.
  *
- * 160 — TargetFilter gains AttackedPlayerOrPlaneswalker (the player or planeswalker an
- *      attacking creature is attacking, CR 506.3 + CR 115.10a), serialized in the
- *      ability definitions of GameState; ZoneChangeCombatStatus gains `attack_target`
- *      (Option<AttackTarget>, the attacker's last-known declared attack target) in
- *      zone-change records and trigger-source contexts of GameState; and GameState
- *      carries exact active attack relations, departure recipient pins and complete
- *      combat-removal receipts. A v159 peer cannot deserialize the tag; the
- *      exact-match handshake refuses the pairing. Wire 142 moves with it; lobby
- *      messages are unchanged.
  * 159 — Coin-flip effects are one Effect::FlipCoins { flips, .. } (the FlipCoin and
  *       FlipCoinUntilLose tags are no longer written, count moves into flips) and
  *       the coin-flip resolution frame's kind becomes Exactly or UntilLoss — see
@@ -977,7 +970,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 160;
+export { PROTOCOL_VERSION };
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
@@ -1148,7 +1141,7 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  * 1 — Initial lobby-owned version, covering the lobby variant set unchanged
  *     since #1880.
  */
-export const LOBBY_PROTOCOL_VERSION = 16;
+export { LOBBY_PROTOCOL_VERSION };
 
 /**
  * Lowest broker LOBBY_PROTOCOL_VERSION this client accepts.
@@ -1160,7 +1153,7 @@ export const LOBBY_PROTOCOL_VERSION = 16;
  * new variant it may never need — which is precisely how a protocol-bumping
  * release used to strand every older desktop build.
  */
-export const MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL = 2;
+export { MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL };
 
 /**
  * Lowest broker LOBBY_PROTOCOL_VERSION that can answer a gated tournament
