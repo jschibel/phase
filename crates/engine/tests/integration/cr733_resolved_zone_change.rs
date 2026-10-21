@@ -19,6 +19,11 @@ use engine::types::resolved_commands::{
 use engine::types::stickers::{AppliedSticker, StickerKind, StickerLocator};
 use engine::types::zones::Zone;
 
+/// A labeled mutation of a recorded zone-change command.
+type StructuralCase = (&'static str, fn(&mut ResolvedZoneChangeCommand));
+/// A labeled mutation of the live prestate a command replays against.
+type PrestateCase = (&'static str, fn(&mut GameState, ObjectId));
+
 fn recorded_zone_change(
     state: &GameState,
     from: Zone,
@@ -445,7 +450,7 @@ fn retained_sticker_metadata_rejects_malformed_journals_and_live_operands_before
         .expect("positive operand reaches the shared structural validator");
     apply_resolved_zone_change(&mut before.clone(), &valid)
         .expect("the valid command replays against its prestate");
-    let structural: [(&str, fn(&mut ResolvedZoneChangeCommand)); 11] = [
+    let structural: [StructuralCase; 11] = [
         ("duplicate locator", |c| {
             let rows = c.retained_sticker_timestamps.as_mut().unwrap();
             rows[1].locator = rows[0].locator.clone();
@@ -517,7 +522,7 @@ fn retained_sticker_metadata_rejects_malformed_journals_and_live_operands_before
         ));
     }
     // Live prestate mismatches against the valid command.
-    let prestate: [(&str, fn(&mut GameState, ObjectId)); 6] = [
+    let prestate: [PrestateCase; 6] = [
         ("missing sticker", |s, id| {
             s.objects.get_mut(&id).unwrap().stickers.pop();
         }),

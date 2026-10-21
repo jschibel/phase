@@ -1191,152 +1191,68 @@ fn legacy_optional_repeat_carriers_restore_and_resume() {
         Some(ResolutionFrame::OptionalEffect(_))
     ));
     for trusted in [false, true] {
-        for historical in [
-            None,
-            Some(serde_json::json!(false)),
-            Some(serde_json::json!(true)),
-            Some(serde_json::json!("Optional")),
-        ] {
-            for accept in [false, true] {
-                let mut value = saved_repeat_state(&original, trusted);
-                let game = if trusted {
-                    &mut value["state"]
-                } else {
-                    &mut value
-                };
-                let frames = game["resolution_frames"]["frames"].as_array_mut().unwrap();
-                let owner_index = frames
-                    .iter()
-                    .position(|frame| frame["type"] == "RepeatUntil")
-                    .expect("live loop owner");
-                let template = frames[owner_index]["data"]["ability"].clone();
-                let carrier = &mut frames
-                    .iter_mut()
-                    .find(|frame| frame["type"] == "OptionalEffect")
-                    .unwrap()["data"]["ability"];
-                // The historical optional frame carried the full loop above its
-                // parked owner, which alone drives progression (CR 608.2c);
-                // retain the live engine-issued source origin and object targets.
-                carrier["repeat_until"] = template["repeat_until"].clone();
-                let context = carrier["context"].as_object_mut().unwrap();
-                context.remove("loop_root_kind");
-                match &historical {
-                    None => {}
-                    Some(serde_json::Value::Bool(value)) => {
-                        context.insert("loop_root_was_optional".into(), serde_json::json!(value));
-                    }
-                    Some(value) => {
-                        context.insert("loop_root_kind".into(), value.clone());
-                    }
-                }
-                let mut restored = restore_repeat_state(value);
-                assert_eq!(colossus_prompt_key(&restored, source), origin);
-                restored
-                    .act(GameAction::DecideOptionalEffect { accept })
-                    .unwrap();
-                if accept {
-                    match &restored.state().waiting_for {
-                        WaitingFor::EffectZoneChoice { player, cards, .. } => {
-                            assert_eq!(*player, P0);
-                            assert!(hand.iter().all(|id| cards.contains(id)));
-                        }
-                        other => {
-                            panic!("restored accept must reach the real inner choice: {other:?}")
-                        }
-                    }
-                    restored
-                        .act(GameAction::SelectCards {
-                            cards: vec![hand[0]],
-                        })
-                        .unwrap();
-                    assert_eq!(colossus_prompt_key(&restored, source), origin);
-                    restored
-                        .act(GameAction::DecideOptionalEffect { accept: false })
-                        .unwrap();
-                }
-                assert_eq!(
-                    restored.state().players[0].cards_drawn_this_turn,
-                    u32::from(accept)
-                );
-                assert_eq!(
-                    restored.state().players[0].library.len(),
-                    library.len() - usize::from(accept)
-                );
-                assert_eq!(
-                    restored.state().objects[&hand[0]].zone,
-                    if accept {
-                        Zone::Battlefield
-                    } else {
-                        Zone::Hand
-                    }
-                );
-                assert_repeat_idle(&restored);
-            }
-        }
-    }
-}
-
-#[test]
-fn legacy_accepted_repeat_until_inner_choice_restores_and_rearms_next_pass() {
-    let (scenario, source, hand, library) = colossus_scenario(2, &["Shock", "Lightning Bolt"]);
-    let mut original = scenario.build();
-    engine::game::rehydrate_game_from_card_db(original.state_mut(), shared_card_db().unwrap());
-    cast_colossus_etb(&mut original, source);
-    let origin = colossus_prompt_key(&original, source);
-    original
-        .act(GameAction::DecideOptionalEffect { accept: true })
-        .unwrap();
-    assert!(matches!(
-        original.state().waiting_for,
-        WaitingFor::EffectZoneChoice { player: P0, .. }
-    ));
-    for trusted in [false, true] {
-        for historical in [true, false] {
+        for accept in [false, true] {
             let mut value = saved_repeat_state(&original, trusted);
             let game = if trusted {
                 &mut value["state"]
             } else {
                 &mut value
             };
-            let owner = &mut game["resolution_frames"]["frames"]
-                .as_array_mut()
-                .unwrap()
+            let frames = game["resolution_frames"]["frames"].as_array_mut().unwrap();
+            let owner_index = frames
+                .iter()
+                .position(|frame| frame["type"] == "RepeatUntil")
+                .expect("live loop owner");
+            let template = frames[owner_index]["data"]["ability"].clone();
+            let carrier = &mut frames
                 .iter_mut()
-                .find(|frame| frame["type"] == "RepeatUntil")
+                .find(|frame| frame["type"] == "OptionalEffect")
                 .unwrap()["data"]["ability"];
-            owner["optional"] = serde_json::json!(false);
-            owner["context"]["optional_effect_performed"] = serde_json::json!(true);
-            if historical {
-                owner["context"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("loop_root_kind");
-                owner["context"]["loop_root_was_optional"] = serde_json::json!(true);
-            }
+            // The historical optional frame carried the full loop above its
+            // parked owner, which alone drives progression (CR 608.2c);
+            // retain the live engine-issued source origin and object targets.
+            carrier["repeat_until"] = template["repeat_until"].clone();
             let mut restored = restore_repeat_state(value);
-            match &restored.state().waiting_for {
-                WaitingFor::EffectZoneChoice { player, cards, .. } => {
-                    assert_eq!(*player, P0);
-                    assert!(hand.iter().all(|id| cards.contains(id)));
-                }
-                other => panic!("saved inner choice survives restore: {other:?}"),
-            }
-            restored
-                .act(GameAction::SelectCards {
-                    cards: vec![hand[0]],
-                })
-                .unwrap();
             assert_eq!(colossus_prompt_key(&restored, source), origin);
+            restored
+                .act(GameAction::DecideOptionalEffect { accept })
+                .unwrap();
+            if accept {
+                match &restored.state().waiting_for {
+                    WaitingFor::EffectZoneChoice { player, cards, .. } => {
+                        assert_eq!(*player, P0);
+                        assert!(hand.iter().all(|id| cards.contains(id)));
+                    }
+                    other => {
+                        panic!("restored accept must reach the real inner choice: {other:?}")
+                    }
+                }
+                restored
+                    .act(GameAction::SelectCards {
+                        cards: vec![hand[0]],
+                    })
+                    .unwrap();
+                assert_eq!(colossus_prompt_key(&restored, source), origin);
+                restored
+                    .act(GameAction::DecideOptionalEffect { accept: false })
+                    .unwrap();
+            }
             assert_eq!(
                 restored.state().players[0].cards_drawn_this_turn,
-                1,
-                "the accepted current pass finishes exactly once before the next gate"
+                u32::from(accept)
             );
-            restored
-                .act(GameAction::DecideOptionalEffect { accept: false })
-                .unwrap();
-            assert_eq!(restored.state().players[0].library.len(), library.len() - 1);
-            assert_eq!(restored.state().objects[&hand[0]].zone, Zone::Battlefield);
+            assert_eq!(
+                restored.state().players[0].library.len(),
+                library.len() - usize::from(accept)
+            );
+            assert_eq!(
+                restored.state().objects[&hand[0]].zone,
+                if accept {
+                    Zone::Battlefield
+                } else {
+                    Zone::Hand
+                }
+            );
             assert_repeat_idle(&restored);
         }
     }

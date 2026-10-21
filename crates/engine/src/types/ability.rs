@@ -29698,36 +29698,6 @@ pub enum RepeatContinuation {
     },
 }
 
-/// CR 608.2c + CR 608.2d: whether a repeated root instruction offers a
-/// fresh optional decision on each pass, independently of that pass's outcome.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LoopRootKind {
-    #[default]
-    Mandatory,
-    Optional,
-}
-
-impl LoopRootKind {
-    fn is_mandatory(&self) -> bool {
-        matches!(self, Self::Mandatory)
-    }
-}
-
-fn deserialize_loop_root_kind_compat<'de, D>(d: D) -> Result<LoopRootKind, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let raw = serde_json::Value::deserialize(d)?;
-    if let serde_json::Value::Bool(optional) = raw {
-        return Ok(if optional {
-            LoopRootKind::Optional
-        } else {
-            LoopRootKind::Mandatory
-        });
-    }
-    serde_json::from_value(raw).map_err(de::Error::custom)
-}
-
 /// CR 608.2c + CR 122.1: tags a `ChooseOneOf` branch whose effect must be
 /// rebound to the current counter-kind iteration before resolving. Used when a
 /// `repeat_for: DistinctCounterKindsAmong` loop drives a "put your choice of a
@@ -31645,16 +31615,6 @@ pub struct SpellContext {
     /// Used by AbilityCondition::effect_performed() to gate dependent sub_abilities.
     #[serde(default)]
     pub optional_effect_performed: bool,
-    /// CR 608.2c + CR 608.2d: instruction-local lifecycle of a `WhileCondition`
-    /// root. Each pass re-follows its "you may", separately from whether the
-    /// current pass's optional effect was performed.
-    #[serde(
-        default,
-        alias = "loop_root_was_optional",
-        deserialize_with = "deserialize_loop_root_kind_compat",
-        skip_serializing_if = "LoopRootKind::is_mandatory"
-    )]
-    pub loop_root_kind: LoopRootKind,
     /// CR 118.12: A mandatory instruction of this run ("sacrifice it and attach …")
     /// that did nothing, so a later member's "if you do" is false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40012,68 +39972,6 @@ mod tests {
             serde_json::from_value::<SpellContext>(wire).expect("attachment bindings round-trip"),
             populated
         );
-    }
-
-    #[test]
-    fn loop_root_kind_wire_compatibility() {
-        let default_wire = serde_json::to_value(SpellContext::default()).unwrap();
-        assert!(default_wire.get("loop_root_kind").is_none());
-        assert!(default_wire.get("loop_root_was_optional").is_none());
-        for (key, value, expected) in [
-            (
-                "loop_root_was_optional",
-                serde_json::json!(true),
-                LoopRootKind::Optional,
-            ),
-            (
-                "loop_root_was_optional",
-                serde_json::json!(false),
-                LoopRootKind::Mandatory,
-            ),
-            (
-                "loop_root_kind",
-                serde_json::json!("Optional"),
-                LoopRootKind::Optional,
-            ),
-            (
-                "loop_root_kind",
-                serde_json::json!("Mandatory"),
-                LoopRootKind::Mandatory,
-            ),
-        ] {
-            let mut wire = default_wire.clone();
-            wire[key] = value;
-            let context: SpellContext = serde_json::from_value(wire).unwrap();
-            assert_eq!(context.loop_root_kind, expected);
-            let canonical = serde_json::to_value(context).unwrap();
-            assert!(canonical.get("loop_root_was_optional").is_none());
-            match expected {
-                LoopRootKind::Mandatory => assert!(canonical.get("loop_root_kind").is_none()),
-                LoopRootKind::Optional => assert_eq!(canonical["loop_root_kind"], "Optional"),
-            }
-        }
-        let absent: SpellContext = serde_json::from_value(default_wire.clone()).unwrap();
-        assert_eq!(absent.loop_root_kind, LoopRootKind::Mandatory);
-        for value in [
-            serde_json::json!(1),
-            serde_json::Value::Null,
-            serde_json::json!([]),
-            serde_json::json!("Unknown"),
-        ] {
-            for key in ["loop_root_kind", "loop_root_was_optional"] {
-                let mut wire = default_wire.clone();
-                wire[key] = value.clone();
-                assert!(serde_json::from_value::<SpellContext>(wire).is_err());
-            }
-        }
-        let mut duplicate = default_wire;
-        duplicate["loop_root_kind"] = serde_json::json!("Optional");
-        duplicate["loop_root_was_optional"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<SpellContext>(duplicate).is_err());
-        assert!(serde_json::from_str::<SpellContext>(
-            r#"{"loop_root_kind":"Optional","loop_root_kind":"Mandatory"}"#
-        )
-        .is_err());
     }
 
     #[test]
