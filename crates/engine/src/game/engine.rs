@@ -14933,7 +14933,12 @@ fn apply_non_priority_pass_action(
             }
             engine_combat::validate_attack_exert_permission(state, *player, *attacker, permission)?;
             if exert {
-                engine_combat::apply_attack_exert(state, *attacker, permission.clone(), &mut events);
+                engine_combat::apply_attack_exert(
+                    state,
+                    *attacker,
+                    permission.clone(),
+                    &mut events,
+                );
             }
             if let Some((next, rest)) = remaining.split_first() {
                 WaitingFor::ExertChoice {

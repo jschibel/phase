@@ -2875,12 +2875,12 @@ fn evaluate_condition_inner(
         StaticCondition::RingLevelAtLeast { level } => {
             state.ring_level.get(&controller).copied().unwrap_or(0) >= *level
         }
+        // CR 701.43b: Untapping does not erase an exert from this turn.
+        StaticCondition::SourceExertedThisTurn => state.exerted_this_turn.contains(&source_id),
         // CR 611.2b + CR 110.5d: require battlefield — cards not on the battlefield are
         // neither tapped nor untapped. A source that has left the battlefield (e.g.
         // Callous Oppressor dying while tapped) fails this predicate and any
         // `ForAsLongAs { SourceIsTapped }` continuous effect (gain-control, etc.) ends.
-        // CR 701.43b: Untapping does not erase an exert from this turn.
-        StaticCondition::SourceExertedThisTurn => state.exerted_this_turn.contains(&source_id),
         StaticCondition::SourceIsTapped => eval_source_is_tapped_on_battlefield(state, source_id),
         // CR 311.2 / CR 901.7 / CR 701.31b: the source plane/phenomenon is face up
         // iff it is the active plane in the command zone. Planeswalking away turns
