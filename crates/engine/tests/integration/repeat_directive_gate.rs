@@ -1209,12 +1209,13 @@ fn legacy_optional_repeat_carriers_restore_and_resume() {
                     .iter()
                     .position(|frame| frame["type"] == "RepeatUntil")
                     .expect("live loop owner");
-                let template = frames.remove(owner_index)["data"]["ability"].clone();
+                let template = frames[owner_index]["data"]["ability"].clone();
                 let carrier = &mut frames
                     .iter_mut()
                     .find(|frame| frame["type"] == "OptionalEffect")
                     .unwrap()["data"]["ability"];
-                // The historical optional frame itself carried the full loop;
+                // The historical optional frame carried the full loop above its
+                // parked owner, which alone drives progression (CR 608.2c);
                 // retain the live engine-issued source origin and object targets.
                 carrier["repeat_until"] = template["repeat_until"].clone();
                 let context = carrier["context"].as_object_mut().unwrap();

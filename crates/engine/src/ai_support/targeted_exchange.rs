@@ -939,11 +939,12 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::parser::oracle::parse_oracle_text;
     use crate::types::ability::{
-        AbilityCost, AbilityDefinition, AbilityKind, ChooseOneOfKind, ContinuousModification,
-        ControllerRef, CopiableValues, CounterSourceRider, DelayedTriggerCondition,
-        DieResultBranch, Duration, PileSource, PlayerFilter, PlayerScope, PtValue, QuantityExpr,
-        ReplacementDefinition, ReplacementMode, StaticDefinition, TriggerDefinition, TypeFilter,
-        TypedFilter, UnlessPayModifier, VoteSubject, VoteTally, VoteVisibility, VoterScope,
+        AbilityCost, AbilityDefinition, AbilityKind, ChooseOneOfKind, CoinFlipRun,
+        ContinuousModification, ControllerRef, CopiableValues, CounterSourceRider,
+        DelayedTriggerCondition, DieResultBranch, Duration, PileSource, PlayerFilter, PlayerScope,
+        PtValue, QuantityExpr, ReplacementDefinition, ReplacementMode, StaticDefinition,
+        TriggerDefinition, TypeFilter, TypedFilter, UnlessPayModifier, VoteSubject, VoteTally,
+        VoteVisibility, VoterScope,
     };
     use crate::types::card::CleaveVariant;
     use crate::types::card_type::CoreType;
@@ -1604,10 +1605,11 @@ mod tests {
             ),
         ));
         cases.push((
-            "FlipCoin::win_effect",
+            "FlipCoins(single)::win_effect",
             AbilityDefinition::new(
                 AbilityKind::Spell,
-                Effect::FlipCoin {
+                Effect::FlipCoins {
+                    flips: CoinFlipRun::single(),
                     win_effect: Some(Box::new(fight_def())),
                     lose_effect: None,
                     flipper: TargetFilter::Controller,
@@ -1615,10 +1617,11 @@ mod tests {
             ),
         ));
         cases.push((
-            "FlipCoin::lose_effect",
+            "FlipCoins(single)::lose_effect",
             AbilityDefinition::new(
                 AbilityKind::Spell,
-                Effect::FlipCoin {
+                Effect::FlipCoins {
+                    flips: CoinFlipRun::single(),
                     win_effect: None,
                     lose_effect: Some(Box::new(fight_def())),
                     flipper: TargetFilter::Controller,
@@ -1626,11 +1629,13 @@ mod tests {
             ),
         ));
         cases.push((
-            "FlipCoins::win_effect",
+            "FlipCoins(Exactly 2)::win_effect",
             AbilityDefinition::new(
                 AbilityKind::Spell,
                 Effect::FlipCoins {
-                    count: QuantityExpr::Fixed { value: 2 },
+                    flips: CoinFlipRun::Exactly {
+                        count: QuantityExpr::Fixed { value: 2 },
+                    },
                     win_effect: Some(Box::new(fight_def())),
                     lose_effect: None,
                     flipper: TargetFilter::Controller,
@@ -1638,11 +1643,13 @@ mod tests {
             ),
         ));
         cases.push((
-            "FlipCoins::lose_effect",
+            "FlipCoins(Exactly 2)::lose_effect",
             AbilityDefinition::new(
                 AbilityKind::Spell,
                 Effect::FlipCoins {
-                    count: QuantityExpr::Fixed { value: 2 },
+                    flips: CoinFlipRun::Exactly {
+                        count: QuantityExpr::Fixed { value: 2 },
+                    },
                     win_effect: None,
                     lose_effect: Some(Box::new(fight_def())),
                     flipper: TargetFilter::Controller,
@@ -1650,11 +1657,35 @@ mod tests {
             ),
         ));
         cases.push((
-            "FlipCoinUntilLose::win_effect",
+            "FlipCoins(UntilLoss)::win_effect",
             AbilityDefinition::new(
                 AbilityKind::Spell,
-                Effect::FlipCoinUntilLose {
-                    win_effect: Box::new(fight_def()),
+                Effect::FlipCoins {
+                    flips: CoinFlipRun::UntilLoss,
+                    win_effect: Some(Box::new(fight_def())),
+                    lose_effect: None,
+                    flipper: TargetFilter::Controller,
+                },
+            ),
+        ));
+        cases.push((
+            "FlipCoins(UntilLoss)::lose_effect",
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::FlipCoins {
+                    flips: CoinFlipRun::UntilLoss,
+                    win_effect: None,
+                    lose_effect: Some(Box::new(fight_def())),
+                    flipper: TargetFilter::Controller,
+                },
+            ),
+        ));
+        cases.push((
+            "ExileTopCardContest::winner_effect",
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::ExileTopCardContest {
+                    winner_effect: Box::new(fight_def()),
                 },
             ),
         ));

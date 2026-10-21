@@ -649,9 +649,15 @@ pub(crate) fn resolve_with_host_override(
             .unwrap_or_default(),
     };
 
+    let window_start = events.len();
     match replacement::replace_event(state, proposed, events) {
         ReplacementResult::Execute(event) => {
-            if !apply_create_token_after_replacement(state, event, events) {
+            let completed = apply_create_token_after_replacement(state, event, events);
+            // CR 614.1a + CR 608.2c: the created referent includes any batch a
+            // replacement appended to this event. Published before a pause too:
+            // the counter-pause resume continues from this ledger.
+            publish_replacement_appended_tokens(state, &events[window_start..]);
+            if !completed {
                 return Ok(());
             }
         }
@@ -2441,6 +2447,46 @@ pub(crate) fn record_last_created_copy_batch_token(state: &mut GameState, object
     }
 }
 
+/// CR 614.1a + CR 608.2c + CR 400.7: the tokens a replacement appended to one
+/// CreateToken event ("those tokens plus …": Chatterfang, Xorn; Academy
+/// Manufactor's "one of each") inside `window`, the event's span, that `own`
+/// (the ids the event's own batch already published) lacks, in event order.
+/// Membership is the window, as in `created_token_union_from_events`, so only
+/// tokens still on the battlefield count (CR 400.7).
+pub(crate) fn replacement_appended_token_ids(
+    state: &GameState,
+    window: &[GameEvent],
+    own: &[ObjectId],
+) -> Vec<ObjectId> {
+    super::created_token_union_from_events(state, window)
+        .into_iter()
+        .map(|pin| pin.object_id)
+        .filter(|id| !own.contains(id))
+        .collect()
+}
+
+/// CR 614.1a + CR 608.2c + CR 111.1: publish one CreateToken event's whole created
+/// referent — its own batch, then [`replacement_appended_token_ids`] — into
+/// `last_created_token_ids`. A replacement's appended batch is applied inside the
+/// replacement pipeline before the event's own batch, and each apply assigns the
+/// ledger, so without this the event's own batch overwrites it. Chatterfang's
+/// ruling: anything else the creating effect specifies ("that token gains haste",
+/// "exile that token") applies to the original tokens and the appended ones alike.
+/// The own batch stays first, so a singular "it" reader keeps the instruction's own
+/// token. A bulk republish, assigned like the apply's own tail.
+pub(crate) fn publish_replacement_appended_tokens(state: &mut GameState, window: &[GameEvent]) {
+    let appended = replacement_appended_token_ids(state, window, &state.last_created_token_ids);
+    if appended.is_empty() {
+        return;
+    }
+    state.last_created_token_ids = state
+        .last_created_token_ids
+        .iter()
+        .copied()
+        .chain(appended)
+        .collect();
+}
+
 /// CR 400.7 + CR 608.2i + CR 614.12a: realize a postponed token battlefield entry — record it
 /// through `record_zone_change` and emit its entry pair — at the first instant the object IS the
 /// thing that entered. Record and emit are ONE indivisible operation over ONE owned value, so no
@@ -2694,6 +2740,10 @@ fn condition_invariant_for_token(
         AbilityCondition::QuantityCheck { lhs, rhs, .. } => {
             quantity_is_invariant(lhs) && quantity_is_invariant(rhs)
         }
+        AbilityCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => quantity_is_invariant(quantity),
         _ => false,
     }
 }
@@ -3871,29 +3921,6 @@ fn blood_ability() -> AbilityDefinition {
     })
 }
 
-/// CR 106.1 + CR 701.21a: Eldrazi Spawn — "Sacrifice this token: Add {C}."
-/// Modern Eldrazi Spawn printings (from Rise of the Eldrazi onward) use this
-/// no-tap sacrifice mana ability. Applied by subtype lookup so every token
-/// with subtype "Spawn" gains the ability without per-card registration.
-fn spawn_ability() -> AbilityDefinition {
-    AbilityDefinition::new(
-        AbilityKind::Activated,
-        Effect::Mana {
-            produced: ManaProduction::Colorless {
-                count: QuantityExpr::Fixed { value: 1 },
-            },
-            restrictions: vec![],
-            grants: vec![],
-            expiry: None,
-            target: None,
-        },
-    )
-    .cost(AbilityCost::Sacrifice(SacrificeCost::count(
-        TargetFilter::SelfRef,
-        1,
-    )))
-}
-
 /// CR 111.10h: Powerstone — "{T}: Add {C}. This mana can't be spent to cast a nonartifact spell."
 fn powerstone_ability() -> AbilityDefinition {
     use crate::types::ability::ManaSpendRestriction;
@@ -4235,7 +4262,6 @@ pub fn predefined_token_abilities(subtype: &str) -> Vec<AbilityDefinition> {
         "Blood" => vec![blood_ability()],
         "Powerstone" => vec![powerstone_ability()],
         "Map" => vec![map_ability()],
-        "Spawn" => vec![spawn_ability()],
         "Lander" => vec![lander_ability()],
         "Mutagen" => vec![mutagen_ability()],
         "Junk" => vec![junk_ability()],
@@ -4569,7 +4595,7 @@ fn refresh_token_art_descriptor(
 ///
 /// Two dispatch paths:
 /// - **Subtype** (CR 111.10): Treasure, Food, Clue, Blood, Powerstone,
-///   Map, Spawn — each subtype contributes a single activated ability
+///   Map — each subtype contributes a single activated ability
 ///   (`predefined_token_abilities`).
 /// - **Name** (CR 111.10): Role tokens. All seven Roles share the `Role`
 ///   subtype, so dispatch is by display name via `predefined_role_token_spec`.
@@ -6212,24 +6238,6 @@ mod tests {
     }
 
     #[test]
-    fn predefined_spawn_has_colorless_sacrifice_mana_ability() {
-        // CR 106.1 + CR 701.21a: Eldrazi Spawn tokens produced by Writhing
-        // Chrysalis, Awakening Zone, etc. share a single sacrifice-for-{C}
-        // mana ability, injected by subtype.
-        let abilities = predefined_token_abilities("Spawn");
-        assert_eq!(abilities.len(), 1);
-        assert!(matches!(*abilities[0].effect, Effect::Mana { .. }));
-        assert!({
-            if let Some(AbilityCost::Sacrifice(sc)) = &abilities[0].cost {
-                matches!(sc.target, TargetFilter::SelfRef)
-                    && sc.requirement == crate::types::ability::SacrificeRequirement::count(1)
-            } else {
-                false
-            }
-        });
-    }
-
-    #[test]
     fn focused_writhing_chrysalis_spawn_token_sacrifice_adds_mana_and_triggers_counter() {
         let parsed = crate::parser::parse_oracle_text(
             "Devoid (This card has no color.)\n\
@@ -6272,8 +6280,8 @@ mod tests {
         }
 
         // Focused runtime coverage: start from the parsed cast-trigger execute
-        // ability so this test isolates token resolution, injected token mana
-        // abilities, mana-ability cost payment, and sacrifice-trigger handling.
+        // ability so this test isolates token resolution, the mana ability the
+        // creating effect gives the token, its cost payment, and sacrifice-trigger handling.
         // Full casting would add unrelated hand/mana/priority setup.
         let create_spawn = parsed.triggers[0]
             .execute
@@ -6283,6 +6291,7 @@ mod tests {
         let mut events = Vec::new();
         super::super::resolve_ability_chain(&mut state, &ability, &mut events, 0)
             .expect("Spawn token creation should resolve");
+        crate::game::layers::flush_layers(&mut state);
 
         let spawn = state
             .battlefield
@@ -6299,6 +6308,7 @@ mod tests {
             })
             .expect("Writhing Chrysalis should create an Eldrazi Spawn token");
 
+        assert_eq!(state.objects[&spawn].abilities.len(), 1);
         assert!(
             matches!(
                 *state.objects[&spawn].abilities[0].effect,

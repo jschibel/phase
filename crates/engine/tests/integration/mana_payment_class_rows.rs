@@ -631,7 +631,7 @@ const NESTED_SUB_COST: &[Row] = &[
     ("m/Wizards' School (2)", "Wizards' School", "{2}, {T}: Add {W} or {B}.", &[("Wastes", B, 'p'), ("Wastes", B, 'p')], &[], "Metallic Sliver", true, "tt/BF"),
     ("m/Wooded Bastion", "Wooded Bastion", "{G/W}, {T}: Add {G}{G}, {G}{W}, or {W}{W}.", &[("Forest", B, 'p')], &[], "Metallic Sliver", true, "tt/BF"),
     ("m/Yurlok of Scorch Thrash", "Yurlok of Scorch Thrash", "{1}, {T}: Each player adds {B}{R}{G}.", &[("Wastes", B, 'p')], &[], "Metallic Sliver", true, "tt/BF"),
-    ("m/Codie, Vociferous Codex (2)", "Codie, Vociferous Codex", "{4}, {T}: Add {W}{U}{B}{R}{G}. When you next cast a spell this turn, exile cards from the top of your library until you exile an instant or sorcery card with lesser mana value. Until end of turn, you may cast that card without paying its mana cost. Put each other card exiled this way on the bottom of your library in a random order.", &[("Wastes", B, 'p'), ("Wastes", B, 'p'), ("Wastes", B, 'p'), ("Wastes", B, 'p')], &[], "Opt", true, "tt/GY"),
+    ("m/Codie, Vociferous Codex (2)", "Codie, Vociferous Codex", "{4}, {T}: Add {W}{U}{B}{R}{G}. When you next cast a spell this turn, exile cards from the top of your library until you exile an instant or sorcery card with lesser mana value. Until end of turn, you may cast that card without paying its mana cost. Put each other card exiled this way on the bottom of your library in a random order.", &[("Wastes", B, 'p'), ("Wastes", B, 'p'), ("Wastes", B, 'p'), ("Wastes", B, 'p')], &[], "Opt", true, "tt/stk"),
     ("m/Azorius Signet (2)", "Azorius Signet", "{1}, {T}: Add {W}{U}.", &[("Wastes", B, 'p')], &[], "Fugitive Wizard", true, "tt/BF"),
 ];
 
@@ -886,7 +886,11 @@ const UNCHANGED: &[Row] = &[
     ("e/Fíli and Kíli, Joyous", "Fíli and Kíli, Joyous", "{T}: Add {R}{R}. Spend this mana only to cast Dwarf, Equipment, and Saga spells.", &[("Ashnod's Altar", B, 'a'), ("Grizzly Bears", B, 'f')], &[], "Dwarven Driller", false, "ff/H"),
     ("e/Grinning Ignus", "Grinning Ignus", "{R}, Return ~ to its owner's hand: Add {C}{C}{R}. Activate only as a sorcery.", &[("Mountain", B, 'p'), ("Ashnod's Altar", B, 'a'), ("Grizzly Bears", B, 'f')], &[], "Bonebreaker Giant", true, "tt/H"),
     ("e/Lavinia, Foil to Conspiracy", "Lavinia, Foil to Conspiracy", "{T}: Add {C}{C}. Activate only during an opponent's turn.", &[("Phyrexian Altar", B, 'a'), ("Grizzly Bears", B, 'f')], &[], "Glaring Fleshraker", false, "ff/H"),
-    ("e/Mage-Ring Network", "Mage-Ring Network", "{T}, Remove any number of storage counters from ~: Add {C} for each storage counter removed this way.", &[("Phyrexian Altar", B, 'a'), ("Grizzly Bears", B, 'f')], &[("member", "storage", 2)], "Glaring Fleshraker", false, "ff/H"),
+    // CR 605.3b + CR 602.2b + CR 601.2h: removing both storage counters yields {C}{C}
+    // (the yield reads the counters its cost removed), so with Phyrexian Altar's one
+    // mana the reach guard can cast Glaring Fleshraker; the listed reading stays with the
+    // Rasputin row's (amount-choice sources in the payment step, outside this change).
+    ("e/Mage-Ring Network", "Mage-Ring Network", "{T}, Remove any number of storage counters from ~: Add {C} for each storage counter removed this way.", &[("Phyrexian Altar", B, 'a'), ("Grizzly Bears", B, 'f')], &[("member", "storage", 2)], "Glaring Fleshraker", true, "ff/H"),
     ("e/Muraganda Raceway#speed4", "Muraganda Raceway", "Max speed — {T}: Add {C}{C}.", &[("Phyrexian Altar", B, 'a'), ("Grizzly Bears", B, 'f')], &[], "Glaring Fleshraker", true, "tt/BF"),
     ("e/Orochi Merge-Keeper", "Orochi Merge-Keeper", "{T}: Add {G}{G}.", &[("Ashnod's Altar", B, 'a'), ("Grizzly Bears", B, 'f')], &[("member", "P1P1", 1)], "Axebane Beast", true, "tt/BF"),
     ("e/Quinjet Technician", "Quinjet Technician", "{T}: Add {R}{R}. Spend this mana only to activate power-up abilities.", &[("Ashnod's Altar", B, 'a'), ("Grizzly Bears", B, 'f')], &[], "Barbarian Horde", false, "ff/H"),

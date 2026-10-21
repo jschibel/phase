@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use crate::types::ability::{
-    AbilityCost, AbilityDefinition, CastingPermission, ChoiceType, CombatDamageScope,
+    AbilityCost, AbilityDefinition, CastingPermission, ChoiceType, CoinFlipRun, CombatDamageScope,
     ControllerRef, DamageModification, DamageRedirectTarget, DamageTargetFilter,
     DamageTargetPlayerScope, DrawReplacementScope, Duration, Effect, EffectScope,
     ManaSpendPermission, PermissionGrantee, PostReplacementContinuation, PreventionAmount,
@@ -4142,8 +4142,8 @@ fn coin_flip_applier(
         return ApplyResult::Modified(event);
     };
 
-    // CR 614.1a: "instead flip two coins" — double the flip count via the
-    // replacement definition's `FlipCoins { count: Multiply { factor: 2, .. } }`.
+    // CR 614.1a: "instead flip two coins" — double the flip count via the replacement
+    // definition's `FlipCoins { flips: Exactly { count: Multiply { factor: 2, .. } } }`.
     let execute = state
         .objects
         .get(&rid.source)
@@ -4152,7 +4152,13 @@ fn coin_flip_applier(
 
     let new_count = match execute {
         Some(ability) if ability.sub_ability.is_none() => match &*ability.effect {
-            Effect::FlipCoins { count: qty, .. } => resolve_event_replacement_quantity(qty, count)
+            // Only a counted multi-flip execute rescales the event; a single flip or an
+            // `UntilLoss` run is not a "flip N coins instead" count, so both fall to the
+            // unchanged `_ => count`.
+            Effect::FlipCoins {
+                flips: flips @ CoinFlipRun::Exactly { count: qty },
+                ..
+            } if !flips.is_single_flip() => resolve_event_replacement_quantity(qty, count)
                 .map(|resolved| resolved.max(0) as u32)
                 .unwrap_or(count),
             _ => count,
@@ -9359,19 +9365,28 @@ impl EventModifiers {
     /// True if this single effect (ignoring sub_ability chain) is purely a
     /// ProposedEvent modifier with no additional resolution work.
     fn is_event_modifier_effect(effect: &Effect) -> bool {
-        matches!(
-            effect,
+        match effect {
             // CR 701.26a/b: a SelfRef single tap/untap is purely an enters-tapped
             // event modifier (either polarity).
             Effect::SetTapState {
                 target: TargetFilter::SelfRef,
                 scope: EffectScope::Single,
                 ..
-            } | Effect::PutCounter {
+            }
+            | Effect::ChangeZone { .. } => true,
+            // CR 400.7d + CR 608.2k: a self counter placement whose count reads the
+            // cost paid to cast the spell ("where X is the discarded card's mana
+            // value") needs the `ResolvedAbility` that carries that referent. The
+            // event fold resolves counts without one and would read 0, so the
+            // placement stays post-replacement work, where the continuation is
+            // stamped with the entering permanent's cast-cost-paid object.
+            Effect::PutCounter {
                 target: TargetFilter::SelfRef,
+                count,
                 ..
-            } | Effect::ChangeZone { .. }
-        )
+            } => !count.references_cost_paid_object(),
+            _ => false,
+        }
     }
 
     /// True if this ability has any effect on the ProposedEvent beyond the event-modifier

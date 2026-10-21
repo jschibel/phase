@@ -365,6 +365,7 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
         | Effect::Dig { .. }
         | Effect::Discard { .. }
         | Effect::Discover { .. }
+        | Effect::PhysicalContest { .. }
         | Effect::Double { .. }
         | Effect::DraftFromSpellbook { .. }
         | Effect::EachDealsDamageEqualToPower { .. }
@@ -384,9 +385,7 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
         | Effect::ExileFaceDownPile { .. }
         | Effect::Exploit { .. }
         | Effect::ExploreAll { .. }
-        | Effect::FlipCoin { .. }
         | Effect::FlipCoins { .. }
-        | Effect::FlipCoinUntilLose { .. }
         | Effect::Forage
         | Effect::CompletePlayerAction { .. }
         | Effect::ForceAttack { .. }
@@ -466,6 +465,7 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
         | Effect::SearchOutsideGame { .. }
         | Effect::Seek { .. }
         | Effect::SeparateIntoPiles { .. }
+        | Effect::ExileTopCardContest { .. }
         | Effect::SetClassLevel { .. }
         | Effect::SetDayNight { .. }
         | Effect::SetLifeTotal { .. }
