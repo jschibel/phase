@@ -211,6 +211,8 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 148 — Exact retained sticker timestamp operands in resolved zone-change
+ *       commands. Wire 130 moves with it.
  * 147 — Untargeted sticker recipients bind a parked PutSticker head on
  *       SelectCards during resolution. Older reducers treat that answer as a
  *       partition and can overwrite following targets. Wire 129 moves with it.
@@ -891,7 +893,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 147;
+export const PROTOCOL_VERSION = 148;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

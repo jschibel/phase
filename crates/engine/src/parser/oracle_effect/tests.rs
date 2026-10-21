@@ -1,8 +1,9 @@
+use super::assembly::bind_repeat_directives;
 use super::gap_diagnosis::diagnose_clause_gap;
 use super::lower::{
     rewrite_parent_target_to_last_created, target_filter_is_explicit_target_player_graveyard_card,
 };
-use super::sequence::split_clause_sequence;
+use super::sequence::{split_clause_sequence, starts_bare_and_clause};
 use super::*;
 use crate::game::coverage::card_face_has_unimplemented_parts;
 use crate::game::triggers::extract_target_filter_from_effect;
@@ -81753,7 +81754,6 @@ fn repeat_process_directive_conditional_or_uncapped_is_not_a_counted_repeat() {
 /// open-ended / "for <X>" tails are not newly split into their own clause.
 #[test]
 fn bare_and_splitter_cuts_only_the_terminal_repeat_directive() {
-    use super::sequence::starts_bare_and_clause;
     assert!(
         starts_bare_and_clause("draw a card"),
         "reach guard: the splitter works"
@@ -81938,7 +81938,6 @@ fn repeat_directive_without_a_gate_or_with_successors_is_removed() {
         "{gated:?}"
     );
 
-    use super::assembly::bind_repeat_directives;
     let directive = || {
         AbilityDefinition::new(
             AbilityKind::Spell,

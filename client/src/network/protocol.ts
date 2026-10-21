@@ -106,6 +106,8 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  130 — Exact retained sticker timestamp operands in resolved zone-change
+ *        commands. Bumped with full-game protocol 148.
  *  129 — Untargeted sticker recipients bind a parked PutSticker head on
  *        SelectCards at resolution. A wire 128 reducer treats it as a partition.
  *        Bumped with full-game protocol 147.
@@ -696,7 +698,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 129 as const;
+export const WIRE_PROTOCOL_VERSION = 130 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

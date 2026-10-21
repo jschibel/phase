@@ -11,7 +11,7 @@ use crate::types::resolved_commands::{
     ResolvedControllerOverrideCommand, ResolvedControllerOverrideReplayInvariantError,
     ResolvedEntryProvenanceCommand, ResolvedEntryProvenanceReplayInvariantError,
     ResolvedObjectCeaseCommand, ResolvedObjectCeaseReplayInvariantError, ResolvedZoneChangeCommand,
-    ResolvedZoneChangeReplayInvariantError,
+    ResolvedZoneChangeReplayInvariantError, RetainedStickerTimestamp,
 };
 use crate::types::statics::StaticMode;
 use crate::types::zones::Zone;
@@ -628,10 +628,7 @@ pub(crate) fn apply_zone_exit_cleanup(
         if !preserve_counters {
             obj_mut.counters.clear();
         }
-        if !crate::game::stickers::zone_retains_stickers(to) && !obj_mut.stickers.is_empty() {
-            obj_mut.stickers.clear();
-            obj_mut.revert_layered_characteristics_to_base();
-        }
+        clear_stickers_for_hidden_destination(obj_mut, to);
     }
 
     if let Some(object) = state.objects.get_mut(&object_id) {
@@ -958,9 +955,133 @@ fn destination_position_after_removal(
     }
 }
 
+/// The timestamp operands one zone transition draws: the object's entry
+/// timestamp and, when it carries stickers into a zone that retains them, one
+/// renewed timestamp per retained sticker.
+struct ZoneTimestamps {
+    entry: Option<u64>,
+    retained: Option<Vec<RetainedStickerTimestamp>>,
+}
+
+/// CR 613.7d + CR 613.7k: draw the object's entry timestamp first, then renew
+/// every retained sticker in its prior relative order (CR 123.5 / CR 400.7m
+/// retention follows the destination). The object's sticker vector is not
+/// reordered; rows bind by locator. An unstickered nonbattlefield move draws
+/// nothing.
+fn resolve_zone_timestamps(
+    state: &mut GameState,
+    object_id: ObjectId,
+    from: Zone,
+    to: Zone,
+) -> ZoneTimestamps {
+    let mut retained: Vec<_> = state
+        .objects
+        .get(&object_id)
+        .filter(|_| from != to && super::stickers::zone_retains_stickers(to))
+        .map(|object| {
+            object
+                .stickers
+                .iter()
+                .map(|sticker| (sticker.locator().clone(), sticker.timestamp()))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Stable: equal prior stamps keep their vector order.
+    retained.sort_by_key(|(_, prior_timestamp)| *prior_timestamp);
+    let entry = (to == Zone::Battlefield || !retained.is_empty()).then(|| state.next_timestamp());
+    let retained = (!retained.is_empty()).then(|| {
+        retained
+            .into_iter()
+            .map(|(locator, prior_timestamp)| RetainedStickerTimestamp {
+                locator,
+                prior_timestamp,
+                timestamp: state.next_timestamp(),
+            })
+            .collect()
+    });
+    ZoneTimestamps { entry, retained }
+}
+
+/// CR 123.5: hidden destinations discard stickers and their characteristic
+/// changes. Returns whether stickers were cleared.
+fn clear_stickers_for_hidden_destination(object: &mut GameObject, to: Zone) -> bool {
+    if super::stickers::zone_retains_stickers(to) || object.stickers.is_empty() {
+        return false;
+    }
+    object.stickers.clear();
+    object.revert_layered_characteristics_to_base();
+    true
+}
+
+/// CR 613.7d + CR 613.7k: replay installs the recorded stamps and only adopts
+/// the allocator past them. The single installer for the ordinary path, its
+/// replay and the special Stack/Command branch; it never draws a timestamp.
+fn install_zone_timestamps(
+    state: &mut GameState,
+    object_id: ObjectId,
+    timestamps: &ZoneTimestamps,
+) {
+    let object = state
+        .objects
+        .get_mut(&object_id)
+        .expect("zone transition object remains live");
+    if let Some(entry) = timestamps.entry {
+        object.timestamp = entry;
+    }
+    let rows = timestamps.retained.as_deref().unwrap_or_default();
+    for row in rows {
+        object
+            .stickers
+            .iter_mut()
+            .find(|sticker| sticker.locator() == &row.locator)
+            .expect("validated retained sticker row names a carried sticker")
+            .set_timestamp(row.timestamp);
+    }
+    if let Some(entry) = timestamps.entry {
+        state.adopt_replayed_timestamp(entry);
+    }
+    if let Some(last) = rows.iter().map(|row| row.timestamp).max() {
+        state.adopt_replayed_timestamp(last);
+        // CR 613.7k: renewed sticker timestamps reorder layer-7b setters.
+        state.layers_dirty.mark_full();
+    }
+}
+
+/// CR 613.7k: binds the recorded retained rows to the live source before any
+/// mutation. Rows are required exactly when a stickered object really moves
+/// into a zone that retains stickers, and then must match every carried
+/// sticker one-to-one by locator and prior timestamp.
+fn retained_prestate_matches(object: &GameObject, command: &ResolvedZoneChangeCommand) -> bool {
+    let requires_retention = retained_rows_required(object, command);
+    match &command.retained_sticker_timestamps {
+        Some(rows) => {
+            requires_retention
+                && rows.len() == object.stickers.len()
+                && rows.iter().all(|row| {
+                    object
+                        .stickers
+                        .iter()
+                        .filter(|sticker| {
+                            sticker.locator() == &row.locator
+                                && sticker.timestamp() == row.prior_timestamp
+                        })
+                        .count()
+                        == 1
+                })
+        }
+        None => !requires_retention,
+    }
+}
+
+fn retained_rows_required(object: &GameObject, command: &ResolvedZoneChangeCommand) -> bool {
+    command.from != command.to
+        && super::stickers::zone_retains_stickers(command.to)
+        && !object.stickers.is_empty()
+}
+
 /// Resolves, applies, and journals the transition core of one ordinary zone move.
 ///
-/// CR 400.7 + CR 613.7d: the ordinary path consumes its timestamp, captures the
+/// CR 400.7 + CR 613.7d + CR 613.7k: the ordinary path consumes its timestamps, captures the
 /// resulting incarnation and destination position, then delegates the exact
 /// installation to [`apply_resolved_zone_change`]. Replay never allocates a
 /// timestamp or a new object identity.
@@ -993,7 +1114,7 @@ pub fn resolve_and_apply_zone_change(
         });
     }
 
-    let entry_timestamp = (to == Zone::Battlefield).then(|| state.next_timestamp());
+    let timestamps = resolve_zone_timestamps(state, object_id, from, to);
     let resulting_incarnation = if to == Zone::Battlefield || from != to {
         occurrence.incarnation + 1
     } else {
@@ -1021,7 +1142,8 @@ pub fn resolve_and_apply_zone_change(
         destination_position,
         owner: installed_owner,
         rebound_from,
-        entry_timestamp,
+        entry_timestamp: timestamps.entry,
+        retained_sticker_timestamps: timestamps.retained,
         turn_zone_change_index,
         zone_change_record,
         cause: state.current_or_begin_rules_execution_node(),
@@ -1187,10 +1309,20 @@ pub fn apply_resolved_zone_change(
             found: object.zone,
         });
     }
-    if command.to == Zone::Battlefield && command.entry_timestamp.is_none() {
-        return Err(ResolvedZoneChangeReplayInvariantError::MissingBattlefieldEntryTimestamp);
+    command.validate_timestamp_operands()?;
+    // CR 613.7k: bind the complete recorded locator set and prior stamps to
+    // this exact source occurrence before changing any state or allocator.
+    if !retained_prestate_matches(object, command) {
+        return Err(
+            ResolvedZoneChangeReplayInvariantError::RetainedStickerMetadataMismatch {
+                recorded: command.retained_sticker_timestamps.clone(),
+            },
+        );
     }
-    if command.to != Zone::Battlefield && command.entry_timestamp.is_some() {
+    if !retained_rows_required(object, command)
+        && command.to != Zone::Battlefield
+        && command.entry_timestamp.is_some()
+    {
         return Err(ResolvedZoneChangeReplayInvariantError::UnexpectedNonbattlefieldTimestamp);
     }
     if command.turn_zone_change_index != state.zone_changes_this_turn.len() {
@@ -1313,15 +1445,29 @@ pub fn apply_resolved_zone_change(
     if retire_prototype_form_on_zone_change(object, command.from, command.to) {
         state.layers_dirty.mark_full();
     }
-
-    // CR 613.7d: the battlefield entry drew this timestamp during the original
-    // execution, so replay installs it rather than drawing a fresh one — and
-    // must carry the allocator past it or a later draw reissues it. A move to
-    // any other zone drew none, which is why this is bound to the recorded
-    // `Option` rather than applied to every zone change.
-    if let Some(entry_timestamp) = command.entry_timestamp {
-        state.adopt_replayed_timestamp(entry_timestamp);
+    // CR 123.5: replay bypasses `apply_zone_exit_cleanup`, so it reproduces
+    // that cleanup's hidden-destination sticker clear through the same helper.
+    // A no-op on the live path, whose cleanup already ran.
+    let object = state
+        .objects
+        .get_mut(&command.object.object_id)
+        .expect("validated zone command object remains live");
+    if clear_stickers_for_hidden_destination(object, command.to) {
+        state.layers_dirty.mark_full();
     }
+
+    // CR 613.7d + CR 613.7k: the original execution drew the entry and
+    // retained-sticker timestamps, so replay installs them rather than drawing
+    // fresh ones — and carries the allocator past them so a later draw cannot
+    // reissue them. A move that drew none records none.
+    install_zone_timestamps(
+        state,
+        command.object.object_id,
+        &ZoneTimestamps {
+            entry: command.entry_timestamp,
+            retained: command.retained_sticker_timestamps.clone(),
+        },
+    );
 
     let mut zone_change_record = command.zone_change_record.clone();
     let turn_zone_change_index =
@@ -1616,6 +1762,9 @@ pub(crate) fn move_to_zone_with_entry_flags(
     let (pre_bump_incarnation, new_incarnation, transition_recorded) =
         if matches!(from, Zone::Command | Zone::Stack) || matches!(to, Zone::Command | Zone::Stack)
         {
+            // CR 613.7d + CR 613.7k: the same allocator and installer as the
+            // ordinary branch, drawn on this occurrence before the containers move.
+            let timestamps = resolve_zone_timestamps(state, object_id, from, to);
             remove_from_zone(state, object_id, from, owner);
             if redirect_attraction_to_command {
                 // CR 717.6a: Cards redirected this way are kept in the command-zone
@@ -1628,15 +1777,15 @@ pub(crate) fn move_to_zone_with_entry_flags(
             }
             add_to_zone(state, object_id, to, owner);
 
-            // CR 613.7d: An object receives a timestamp when it enters a zone.
-            let entry_timestamp = (to == Zone::Battlefield).then(|| state.next_timestamp());
             let obj_mut = state.objects.get_mut(&object_id).expect("object exists");
             let pre_bump_incarnation = obj_mut.incarnation;
             obj_mut.zone = to;
             if to == Zone::Battlefield {
                 obj_mut.reset_for_battlefield_entry(
                     state.turn_number,
-                    entry_timestamp.expect("battlefield entry draws a timestamp"),
+                    timestamps
+                        .entry
+                        .expect("battlefield entry draws a timestamp"),
                 );
                 zone_change_record.entered_incarnation = Some(obj_mut.incarnation);
             } else if from != to {
@@ -1649,7 +1798,9 @@ pub(crate) fn move_to_zone_with_entry_flags(
                 install_rebound_owner(obj_mut, new_owner);
                 zone_change_record.install_rebound_arrival(new_owner);
             }
-            (pre_bump_incarnation, obj_mut.incarnation, false)
+            let new_incarnation = obj_mut.incarnation;
+            install_zone_timestamps(state, object_id, &timestamps);
+            (pre_bump_incarnation, new_incarnation, false)
         } else {
             let resolved_zone_change = resolve_and_apply_zone_change(
                 state,

@@ -1089,7 +1089,6 @@ fn bind_anaphoric_counters(expr: &mut QuantityExpr, bound: ObjectScope) {
 /// expression (`SourceInZone` under `And`/`Or`/`Not`) has a derivable
 /// complement; a negation that also tests anything else contributes no zone.
 pub(crate) fn populate_active_zones_from_condition(def: &mut StaticDefinition) {
-    use crate::types::zones::Zone;
     let mut zones: Vec<Zone> = Vec::new();
     if let Some(cond) = def.condition.as_ref() {
         collect_source_in_zones(cond, &mut zones);
@@ -1146,7 +1145,6 @@ pub(crate) fn collect_source_in_zones(
 /// `And` intersects (identity: every zone), `Or` unions, `Not` complements against
 /// `Zone::ALL` (CR 400.1).
 fn pure_source_zone_set(cond: &StaticCondition) -> Option<Vec<crate::types::zones::Zone>> {
-    use crate::types::zones::Zone;
     // The wildcard arm is the definition of "pure": any other node is not a zone test.
     match cond {
         StaticCondition::SourceInZone { zone } => Some(vec![*zone]),

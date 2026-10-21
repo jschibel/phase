@@ -7,7 +7,9 @@ use crate::database::synthesis::{
     merge_extracted_keywords, parse_oracle_with_cleave_brackets, synthesize_all,
 };
 use crate::game::game_object::GameObject;
-use crate::types::ability::{ContinuousModification, TargetFilter};
+use crate::types::ability::{
+    ContinuousModification, FilterProp, TargetFilter, TypeFilter, TypedFilter,
+};
 use crate::types::card::CardFace;
 use crate::types::card_type::CardType;
 use crate::types::events::GameEvent;
@@ -87,11 +89,10 @@ pub fn set_player_sticker_sheets(state: &mut GameState, player: PlayerId, names:
     }
 }
 
+/// CR 123.5 + CR 400.2: an object keeps its stickers in the public zones and
+/// loses them in the hidden ones; the single zone predicate is `Zone::is_public`.
 pub fn zone_retains_stickers(zone: Zone) -> bool {
-    matches!(
-        zone,
-        Zone::Battlefield | Zone::Graveyard | Zone::Exile | Zone::Stack | Zone::Command
-    )
+    zone.is_public()
 }
 
 pub fn object_is_stickered(obj: &GameObject) -> bool {
@@ -113,7 +114,6 @@ pub fn rebuild_public_zone_stickers(obj: &mut GameObject) {
     obj.revert_layered_characteristics_to_base();
     apply_name_stickers_from_base(obj);
     apply_ability_stickers(obj);
-    apply_power_toughness_stickers(obj);
 }
 
 pub fn apply_battlefield_name_and_ability_stickers(
@@ -135,7 +135,35 @@ pub fn apply_battlefield_name_and_ability_stickers(
     has_ability_sticker
 }
 
-pub fn append_battlefield_pt_sticker_effects(
+/// The one enumeration of objects carrying a sticker of `kind` in a zone that
+/// retains stickers: the zone's actual population (`zone_object_ids`, so
+/// phased-out permanents, phantom stack objects and Attraction/Contraption deck
+/// objects are excluded) whose `zone` agrees with the container.
+pub(crate) fn public_zone_sticker_carriers(
+    state: &GameState,
+    kind: StickerKind,
+) -> impl Iterator<Item = (Zone, ObjectId)> + '_ {
+    Zone::ALL
+        .into_iter()
+        .filter(|zone| zone_retains_stickers(*zone))
+        .flat_map(move |zone| {
+            crate::game::targeting::zone_object_ids(state, zone)
+                .into_iter()
+                .map(move |id| (zone, id))
+        })
+        .filter(move |(zone, id)| {
+            state
+                .objects
+                .get(id)
+                .is_some_and(|obj| obj.zone == *zone && object_has_sticker_kind(obj, kind))
+        })
+}
+
+/// CR 123.8 + CR 613.4b + CR 112.1: P/T stickers set P/T in layer 7b for
+/// creatures on the battlefield and creature or Vehicle cards (including
+/// creature spells) in other public zones; eligibility is read after layer 4
+/// (CR 613.1d). Each sticker is a setter with its own timestamp (CR 613.7k).
+pub fn append_public_zone_pt_sticker_effects(
     state: &GameState,
     effects: &mut [(Layer, Vec<ActiveContinuousEffect>)],
 ) {
@@ -143,9 +171,26 @@ pub fn append_battlefield_pt_sticker_effects(
         return;
     };
 
-    for id in state.battlefield_phased_in_ids() {
+    for (zone, id) in public_zone_sticker_carriers(state, StickerKind::PowerToughness) {
         let Some(obj) = state.objects.get(&id) else {
             continue;
+        };
+        let (type_filter, properties) = if zone == Zone::Battlefield {
+            (TypeFilter::Creature, vec![FilterProp::InZone { zone }])
+        } else {
+            (
+                TypeFilter::AnyOf(vec![
+                    TypeFilter::Creature,
+                    TypeFilter::Subtype("Vehicle".to_string()),
+                ]),
+                vec![FilterProp::InZone { zone }, FilterProp::RepresentedByCard],
+            )
+        };
+        let affected_filter = TargetFilter::And {
+            filters: vec![
+                TargetFilter::SpecificObject { id },
+                TargetFilter::Typed(TypedFilter::new(type_filter).properties(properties)),
+            ],
         };
         for sticker in &obj.stickers {
             let AppliedSticker::PowerToughness {
@@ -169,7 +214,7 @@ pub fn append_battlefield_pt_sticker_effects(
                 layer: Layer::SetPT,
                 timestamp: *timestamp,
                 modification: ContinuousModification::SetPower { value: *power },
-                affected_filter: TargetFilter::SpecificObject { id },
+                affected_filter: affected_filter.clone(),
                 condition: None,
                 mode: crate::types::statics::StaticMode::Continuous,
                 characteristic_defining: false,
@@ -186,7 +231,7 @@ pub fn append_battlefield_pt_sticker_effects(
                 layer: Layer::SetPT,
                 timestamp: *timestamp,
                 modification: ContinuousModification::SetToughness { value: *toughness },
-                affected_filter: TargetFilter::SpecificObject { id },
+                affected_filter: affected_filter.clone(),
                 condition: None,
                 mode: crate::types::statics::StaticMode::Continuous,
                 characteristic_defining: false,
@@ -407,31 +452,21 @@ pub fn apply_selected_sticker(
         }
     }
 
-    let timestamp = state.next_timestamp();
-    match &mut sticker {
-        AppliedSticker::Name {
-            timestamp: slot, ..
-        }
-        | AppliedSticker::Ability {
-            timestamp: slot, ..
-        }
-        | AppliedSticker::PowerToughness {
-            timestamp: slot, ..
-        }
-        | AppliedSticker::Art {
-            timestamp: slot, ..
-        } => *slot = timestamp,
-    }
+    // CR 613.7k: a sticker receives a new timestamp each time it's put on an object.
+    sticker.set_timestamp(state.next_timestamp());
 
     let Some(obj) = state.objects.get_mut(&target_id) else {
         return;
     };
     obj.stickers.push(sticker.clone());
 
-    if obj.zone == Zone::Battlefield {
-        state.layers_dirty.mark_full();
-    } else if zone_retains_stickers(obj.zone) {
+    // CR 123.8 + CR 613.4b: every public-zone recipient is re-settled by the
+    // ordered layer pass; off the battlefield the name/ability rebuild runs first.
+    if obj.zone != Zone::Battlefield && zone_retains_stickers(obj.zone) {
         rebuild_public_zone_stickers(obj);
+    }
+    if zone_retains_stickers(obj.zone) {
+        state.layers_dirty.mark_full();
     }
     // CR 608.2c: latch "that sticker" for the rest of this resolution.
     state.placed_sticker_this_resolution = Some(sticker.clone());
@@ -523,19 +558,6 @@ fn apply_ability_stickers(obj: &mut GameObject) {
         for static_ability in parsed.static_abilities {
             obj.static_definitions.push(static_ability);
         }
-    }
-}
-
-pub(crate) fn apply_power_toughness_stickers(obj: &mut GameObject) {
-    for sticker in &obj.stickers {
-        let AppliedSticker::PowerToughness {
-            power, toughness, ..
-        } = sticker
-        else {
-            continue;
-        };
-        obj.power = Some(*power);
-        obj.toughness = Some(*toughness);
     }
 }
 

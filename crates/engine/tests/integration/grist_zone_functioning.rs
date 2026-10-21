@@ -19,6 +19,9 @@ use engine::game::printed_cards::{
 };
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::scenario_db::GameScenarioDbExt;
+use engine::game::stickers::{
+    apply_selected_sticker, available_sticker_candidates, set_player_sticker_sheets,
+};
 use engine::game::zones::{apply_resolved_zone_change, move_to_zone};
 use engine::types::ability::{
     ChosenAttribute, Effect, ManaSpendRestriction, ResolvedAbility, StaticCondition,
@@ -28,19 +31,22 @@ use engine::types::actions::GameAction;
 use engine::types::card_type::{CoreType, Supertype};
 use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
+use engine::types::format::FormatConfig;
 use engine::types::game_state::{
     CastPaymentMode, CastingVariant, GameState, LayersDirty, ManaChoice, ManaChoicePrompt,
     PersistedGameState, PersistedRestoreFinalization, StackEntryKind, WaitingFor,
 };
 use engine::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef};
+use engine::types::layers::Layer;
 use engine::types::mana::{
     ManaColor, ManaCost, ManaCostShard, ManaRestriction, ManaSourceOutput, ManaSpellGrant,
     ManaType, ManaUnit, SpellMeta,
 };
 use engine::types::phase::Phase;
-use engine::types::player::PlayerId;
+use engine::types::player::{PlayerCounterKind, PlayerId};
 use engine::types::resolved_commands::{ResolvedRulesCommand, ResolvedZoneChangeCommand};
 use engine::types::statics::StaticMode;
+use engine::types::stickers::{AppliedSticker, StickerKind};
 use engine::types::zones::Zone;
 use std::sync::Arc;
 
@@ -169,6 +175,18 @@ fn cast_prohibition_restore(state: &GameState, trusted: bool) -> GameState {
 }
 
 fn cast_prohibition_paid_proxy(prototype: bool) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    let (runner, cavern, proxy, counterspell, _) = cast_prohibition_paid_proxy_with(prototype, &[]);
+    (runner, cavern, proxy, counterspell)
+}
+
+type PaidProxy = (GameRunner, ObjectId, ObjectId, ObjectId, Vec<ObjectId>);
+
+/// The accepted paid Cavern/Proxy route, with `extra` real cards added to the
+/// scenario before it is built (returned in order).
+fn cast_prohibition_paid_proxy_with(
+    prototype: bool,
+    extra: &[(PlayerId, &str, Zone)],
+) -> PaidProxy {
     let db = shared_card_db().expect("paid Cavern test requires the integration CardDB");
     let mut scenario = main_phase();
     let cavern = scenario.add_real_card(P0, "Cavern of Souls", Zone::Hand, db);
@@ -176,6 +194,10 @@ fn cast_prohibition_paid_proxy(prototype: bool) -> (GameRunner, ObjectId, Object
     let counterspell = scenario.add_real_card(P1, "Counterspell", Zone::Hand, db);
     scenario.add_real_card(P1, "Unsummon", Zone::Hand, db);
     scenario.add_real_card(P1, "Unsubstantiate", Zone::Hand, db);
+    let extra: Vec<ObjectId> = extra
+        .iter()
+        .map(|&(player, name, zone)| scenario.add_real_card(player, name, zone, db))
+        .collect();
     let mut runner = scenario.build();
     let card_id = runner.state().objects[&cavern].card_id;
     runner
@@ -348,7 +370,7 @@ fn cast_prohibition_paid_proxy(prototype: bool) -> (GameRunner, ObjectId, Object
         runner.state().players[0].graveyard.is_empty(),
         "Proxy ETB has no eligible own graveyard card"
     );
-    (runner, cavern, proxy, counterspell)
+    (runner, cavern, proxy, counterspell, extra)
 }
 
 fn cast_prohibition_counter(
@@ -1802,5 +1824,975 @@ fn prototype_cast_spell_keeps_its_prototype_characteristics_under_painters_serva
             (Some(2), Some(1)),
             "pass {pass}"
         );
+    }
+}
+
+// Sticker rows. Every CardDB consumer below (Raise Dead included) requires the
+// canonical gzip fixture regenerated with scripts/gen-test-fixture.py from the
+// production export; the regenerated JSON must be re-gzipped.
+fn sticker_sheet(runner: &mut GameRunner) {
+    set_player_sticker_sheets(
+        runner.state_mut(),
+        P0,
+        &["Playable Delusionary Hydra".to_string()],
+    );
+    runner.state_mut().players[0].add_player_counters(&PlayerCounterKind::Ticket, 10);
+}
+
+fn tickets(state: &GameState) -> u32 {
+    state.players[0].player_counter(&PlayerCounterKind::Ticket)
+}
+
+fn pt(state: &GameState, id: ObjectId) -> (Option<i32>, Option<i32>) {
+    (state.objects[&id].power, state.objects[&id].toughness)
+}
+
+/// card-test completion: Priority, empty stack and resolution stack, and no
+/// pending or deferred trigger.
+fn assert_sticker_idle(state: &GameState) {
+    assert!(
+        matches!(state.waiting_for, WaitingFor::Priority { .. }),
+        "{:?}",
+        state.waiting_for
+    );
+    assert!(state.stack.is_empty());
+    assert!(state.resolution_stack.is_empty());
+    assert!(state.pending_trigger.is_none());
+    assert!(state.pending_trigger_entry.is_none());
+    assert!(state.deferred_triggers.is_empty());
+}
+
+fn is_hydra_one_five(sticker: &AppliedSticker) -> bool {
+    matches!(sticker, AppliedSticker::PowerToughness { locator, ticket_cost: 2, power: 1, toughness: 5, .. }
+        if locator.sheet == "Playable Delusionary Hydra" && locator.index == 8)
+}
+
+/// Settles a real "you get {TK}, then you may put a sticker on ..." ETB through
+/// its public prompts, choosing `target` and the cost-2 1/5 P/T sticker. Returns
+/// (optional prompts, branch prompts, recipient options offered).
+fn settle_sticker_etb(
+    runner: &mut GameRunner,
+    source: ObjectId,
+    target: Option<ObjectId>,
+    accept: bool,
+) -> (usize, usize, Vec<ObjectId>) {
+    let mut trigger_seen = false;
+    let mut optional_seen = 0;
+    let mut branch_seen = 0;
+    let mut placed = 0;
+    let mut offered = Vec::new();
+    for _ in 0..64 {
+        trigger_seen |= runner.state().stack.iter().any(|entry| {
+            entry.source_id == source
+                && matches!(entry.kind, StackEntryKind::TriggeredAbility { .. })
+        });
+        if runner.state().objects[&source].zone == Zone::Battlefield
+            && runner.state().stack.is_empty()
+            && matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
+        {
+            break;
+        }
+        let action = match runner.state().waiting_for.clone() {
+            WaitingFor::Priority { .. } => GameAction::PassPriority,
+            WaitingFor::ChooseFromZoneChoice {
+                player,
+                cards,
+                count,
+                up_to,
+                ..
+            } => {
+                assert_eq!(player, P0);
+                assert_eq!(count, 1);
+                assert!(!up_to);
+                assert!(offered.is_empty(), "exactly one recipient prompt");
+                offered = cards.clone();
+                let selected = target.expect("recipient choice requires an actual recipient");
+                assert!(cards.contains(&selected));
+                GameAction::SelectCards {
+                    cards: vec![selected],
+                }
+            }
+            WaitingFor::OptionalEffectChoice {
+                player, source_id, ..
+            } => {
+                assert_eq!(player, P0);
+                assert_eq!(source_id, source);
+                // CR 608.2c: the ticket instruction precedes the optional placement.
+                assert_eq!(tickets(runner.state()), 11);
+                optional_seen += 1;
+                GameAction::DecideOptionalEffect { accept }
+            }
+            WaitingFor::ChooseOneOfBranch {
+                player, branches, ..
+            } => {
+                assert_eq!(player, P0);
+                branch_seen += 1;
+                let index = branches
+                    .iter()
+                    .position(|branch| matches!(branch.effect.as_ref(),
+                        Effect::ApplySticker { sticker, pay_ticket: true, .. } if is_hydra_one_five(sticker)))
+                    .expect("the real cost-2 1/5 P/T sticker must be offered");
+                GameAction::ChooseBranch { index }
+            }
+            other => panic!("unexpected real sticker ETB prompt: {other:?}"),
+        };
+        let outcome = runner
+            .act(action)
+            .expect("real sticker ETB answer is legal");
+        placed += outcome
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(event,
+            GameEvent::StickerPlaced { object_id, player_id: P0, .. } if Some(*object_id) == target)
+            })
+            .count();
+    }
+    assert!(trigger_seen, "the real sticker ETB must reach the stack");
+    assert_eq!(runner.state().objects[&source].zone, Zone::Battlefield);
+    assert_sticker_idle(runner.state());
+    assert_eq!(placed, branch_seen);
+    (optional_seen, branch_seen, offered)
+}
+
+fn sorted(mut ids: Vec<ObjectId>) -> Vec<ObjectId> {
+    ids.sort();
+    ids
+}
+
+type ScampireScenario = (
+    GameRunner,
+    ObjectId,
+    Option<ObjectId>,
+    ObjectId,
+    Option<ObjectId>,
+);
+
+fn scampire_scenario(with_target: bool, sheets: bool) -> ScampireScenario {
+    let db = shared_card_db().expect("production sticker fixture loads");
+    let mut scenario = main_phase();
+    let source = scenario.add_real_card(P0, "Scampire", Zone::Hand, db);
+    let target = with_target
+        .then(|| scenario.add_real_card(P0, "Grist, the Hunger Tide", Zone::Graveyard, db));
+    let owned_bears =
+        with_target.then(|| scenario.add_real_card(P0, "Grizzly Bears", Zone::Graveyard, db));
+    let other_owner = scenario.add_real_card(P1, "Grizzly Bears", Zone::Graveyard, db);
+    scenario.with_mana_pool(
+        P0,
+        mana(&[ManaType::Black, ManaType::Colorless, ManaType::Colorless]),
+    );
+    let mut runner = scenario.build();
+    if sheets {
+        sticker_sheet(&mut runner);
+    } else {
+        runner.state_mut().players[0].add_player_counters(&PlayerCounterKind::Ticket, 10);
+    }
+    runner.cast(source).commit();
+    (runner, source, target, other_owner, owned_bears)
+}
+
+/// P1 - CR 123.8 + CR 613.4b + CR 613.7a + CR 613.7k: Scampire's real ETB puts
+/// the 1/5 P/T sticker on a graveyard Grist. Grist's own 1/1 static has Grist's
+/// object timestamp; the sticker's later placement timestamp wins in layer 7b.
+#[test]
+fn scampire_real_etb_orders_graveyard_sticker_after_grist_static_and_restores() {
+    let (mut runner, source, target, other_owner, owned_bears) = scampire_scenario(true, true);
+    let (target, owned_bears) = (target.unwrap(), owned_bears.unwrap());
+    let (optional, branches, offered) = settle_sticker_etb(&mut runner, source, Some(target), true);
+    assert_eq!((optional, branches), (1, 1));
+    // CR 123.3b: only the owner's creature cards are offered.
+    assert_eq!(sorted(offered), sorted(vec![target, owned_bears]));
+    assert_eq!(tickets(runner.state()), 9);
+    assert!(runner.state().objects[&other_owner].stickers.is_empty());
+    assert!(runner.state().objects[&owned_bears].stickers.is_empty());
+    let grist = &runner.state().objects[&target];
+    assert_eq!(grist.zone, Zone::Graveyard);
+    assert_eq!(grist.stickers.len(), 1);
+    assert!(is_hydra_one_five(&grist.stickers[0]));
+    assert!(grist.card_types.core_types.contains(&CoreType::Creature));
+    assert!(grist.card_types.subtypes.iter().any(|s| s == "Insect"));
+    assert_eq!(pt(runner.state(), target), (Some(1), Some(5)));
+    for _ in 0..2 {
+        flush_layers_full(&mut runner);
+        assert_eq!(
+            pt(runner.state(), target),
+            (Some(1), Some(5)),
+            "the newer sticker wins over the older declared-zone 1/1 static"
+        );
+        assert!(runner.state().objects[&target]
+            .card_types
+            .core_types
+            .contains(&CoreType::Creature));
+    }
+    for trusted in [false, true] {
+        // Production restore finalization settles the sticker without a forced pass.
+        let restored = cast_prohibition_restore(runner.state(), trusted);
+        assert_eq!(
+            pt(&restored, target),
+            (Some(1), Some(5)),
+            "trusted={trusted}"
+        );
+        assert_sticker_idle(&restored);
+        let mut restored = GameRunner::from_state(restored);
+        flush_layers_full(&mut restored);
+        assert_eq!(pt(restored.state(), target), (Some(1), Some(5)));
+        assert_sticker_idle(restored.state());
+    }
+}
+
+fn add_mana_and_resolve_on(
+    runner: &mut GameRunner,
+    spell: ObjectId,
+    target: ObjectId,
+    payment: &[ManaType],
+) -> Vec<GameEvent> {
+    add_mana(runner, 0, payment);
+    let events = runner
+        .cast(spell)
+        .target_object(target)
+        .resolve()
+        .events()
+        .to_vec();
+    assert_sticker_idle(runner.state());
+    assert_eq!(runner.state().objects[&spell].zone, Zone::Graveyard);
+    events
+}
+
+/// P2b - CR 123.8 + CR 123.5 + CR 400.7m + CR 613.7d + CR 613.7k: Carnival
+/// Carnivore's real ETB puts the 1/5 P/T sticker on battlefield Grist. On the
+/// battlefield Grist is only a planeswalker, so the sticker sets nothing; in the
+/// graveyard it is a creature card and the retained, renewed sticker wins over
+/// Grist's own static after each death, including after a Zombify round trip.
+#[test]
+fn carnival_sticker_on_battlefield_grist_survives_death_zombify_and_second_death() {
+    let db = shared_card_db().expect("production sticker fixture loads");
+    let mut scenario = main_phase();
+    let grist = scenario.add_real_card(P0, "Grist, the Hunger Tide", Zone::Battlefield, db);
+    let carnival = scenario.add_real_card(P0, "Carnival Carnivore", Zone::Hand, db);
+    let first_downfall = scenario.add_real_card(P0, "Hero's Downfall", Zone::Hand, db);
+    let zombify = scenario.add_real_card(P0, "Zombify", Zone::Hand, db);
+    let second_downfall = scenario.add_real_card(P0, "Hero's Downfall", Zone::Hand, db);
+    let mut runner = scenario.build();
+    sticker_sheet(&mut runner);
+    assert_only_a_planeswalker(runner.state(), grist);
+
+    add_mana(
+        &mut runner,
+        0,
+        &[
+            ManaType::Black,
+            ManaType::Colorless,
+            ManaType::Colorless,
+            ManaType::Colorless,
+            ManaType::Colorless,
+            ManaType::Colorless,
+        ],
+    );
+    runner.cast(carnival).commit();
+    let (optional, branches, offered) =
+        settle_sticker_etb(&mut runner, carnival, Some(grist), true);
+    assert_eq!((optional, branches), (1, 1));
+    // CR 123.3b: the owned nonland permanents are Carnival itself and Grist.
+    assert_eq!(sorted(offered), sorted(vec![carnival, grist]));
+    assert_eq!(tickets(runner.state()), 9);
+    assert_eq!(runner.state().objects[&grist].stickers.len(), 1);
+    assert!(is_hydra_one_five(
+        &runner.state().objects[&grist].stickers[0]
+    ));
+    assert!(runner.state().objects[&carnival].stickers.is_empty());
+    // CR 123.8: battlefield Grist is not a creature, so the sticker sets no P/T.
+    assert_only_a_planeswalker(runner.state(), grist);
+
+    let death = [ManaType::Black, ManaType::Black, ManaType::Colorless];
+    let reanimate = [
+        ManaType::Black,
+        ManaType::Colorless,
+        ManaType::Colorless,
+        ManaType::Colorless,
+    ];
+    for (step, spell, payment, destination) in [
+        ("first death", first_downfall, &death[..], Zone::Graveyard),
+        ("zombify", zombify, &reanimate[..], Zone::Battlefield),
+        ("second death", second_downfall, &death[..], Zone::Graveyard),
+    ] {
+        let previous = runner.state().objects[&grist].stickers[0].clone();
+        let incarnation = runner.state().objects[&grist].incarnation;
+        let events = add_mana_and_resolve_on(&mut runner, spell, grist, payment);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, GameEvent::StickerPlaced { .. })));
+        let object = &runner.state().objects[&grist];
+        assert_eq!(object.zone, destination, "{step}");
+        assert!(is_hydra_one_five(&object.stickers[0]), "{step}");
+        // CR 613.7k: renewed immediately after the new object's timestamp.
+        assert_renewed_after_move(runner.state(), grist, &previous, incarnation);
+        if destination == Zone::Battlefield {
+            assert_only_a_planeswalker(runner.state(), grist);
+        } else {
+            assert!(runner.state().players[0].graveyard.contains(&grist));
+            assert!(object.card_types.core_types.contains(&CoreType::Creature));
+            assert_eq!(pt(runner.state(), grist), (Some(1), Some(5)), "{step}");
+        }
+    }
+}
+
+/// CR 613.7d + CR 613.7k: after a real move the single retained sticker keeps
+/// its locator and is renewed immediately after the new object's timestamp.
+fn assert_renewed_after_move(
+    state: &GameState,
+    id: ObjectId,
+    previous: &AppliedSticker,
+    incarnation: u64,
+) {
+    let object = &state.objects[&id];
+    assert!(object.incarnation > incarnation);
+    assert_eq!(object.stickers.len(), 1);
+    assert_eq!(object.stickers[0].locator(), previous.locator());
+    let mut expected = previous.clone();
+    expected.set_timestamp(object.stickers[0].timestamp());
+    assert_eq!(object.stickers[0], expected, "kind and payload survive");
+    assert_eq!(object.stickers[0].timestamp(), object.timestamp + 1);
+    assert!(object.stickers[0].timestamp() > previous.timestamp());
+}
+
+/// CR 613.7d + CR 613.7k: every retained sticker keeps its payload and is
+/// renewed after the new object's timestamp in its prior relative order.
+fn assert_mixed_renewed(
+    state: &GameState,
+    id: ObjectId,
+    previous: &[AppliedSticker],
+    incarnation: u64,
+) {
+    let object = &state.objects[&id];
+    assert!(object.incarnation > incarnation);
+    assert_eq!(previous.len(), 5);
+    assert_eq!(object.stickers.len(), previous.len());
+    let mut ordered = previous.to_vec();
+    ordered.sort_by_key(AppliedSticker::timestamp);
+    for (offset, prior) in ordered.iter().enumerate() {
+        let current = object
+            .stickers
+            .iter()
+            .find(|sticker| sticker.locator() == prior.locator())
+            .expect("the retained sticker is still carried");
+        let mut expected = prior.clone();
+        expected.set_timestamp(current.timestamp());
+        assert_eq!(current, &expected, "locator, kind and full payload survive");
+        assert_eq!(current.timestamp(), object.timestamp + offset as u64 + 1);
+        assert!(current.timestamp() > prior.timestamp());
+    }
+}
+
+/// Supplementary staging (labeled): places the registry's cost-2 1/5 P/T
+/// sticker through the placement owner. The printed placement routes are the
+/// Scampire and Carnival rows above.
+fn stage_real_pt_sticker(runner: &mut GameRunner, target: ObjectId) {
+    sticker_sheet(runner);
+    let candidate = available_sticker_candidates(
+        runner.state(),
+        P0,
+        Some(StickerKind::PowerToughness),
+        Some(2),
+        false,
+    )
+    .into_iter()
+    .next()
+    .expect("the cost-2 P/T sticker exists");
+    assert!(is_hydra_one_five(&candidate.sticker));
+    apply_selected_sticker(
+        runner.state_mut(),
+        P0,
+        target,
+        candidate.sticker,
+        candidate.pay_ticket,
+        &mut Vec::new(),
+    );
+    flush_layers_full(runner);
+}
+
+/// Supplementary staging (labeled): one registry sticker of every kind plus a
+/// second P/T sticker, placed through the placement owner, then stored in
+/// reverse timestamp order.
+fn stage_mixed_stickers(runner: &mut GameRunner, target: ObjectId) {
+    sticker_sheet(runner);
+    let candidates = available_sticker_candidates(runner.state(), P0, None, None, false);
+    for (kind, index) in [
+        (StickerKind::Name, 0),
+        (StickerKind::Ability, 6),
+        (StickerKind::PowerToughness, 9),
+        (StickerKind::Art, 3),
+        (StickerKind::PowerToughness, 8),
+    ] {
+        let candidate = candidates
+            .iter()
+            .find(|candidate| {
+                candidate.sticker.kind() == kind && candidate.sticker.locator().index == index
+            })
+            .expect("the registry supplies every retained sticker kind")
+            .clone();
+        let locator = candidate.sticker.locator().clone();
+        let mut events = Vec::new();
+        apply_selected_sticker(
+            runner.state_mut(),
+            P0,
+            target,
+            candidate.sticker,
+            candidate.pay_ticket,
+            &mut events,
+        );
+        assert_eq!(
+            runner.state().objects[&target]
+                .stickers
+                .last()
+                .unwrap()
+                .locator(),
+            &locator
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, GameEvent::StickerPlaced { object_id, .. } if *object_id == target))
+                .count(),
+            1
+        );
+    }
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&target)
+        .unwrap()
+        .stickers
+        .reverse();
+    flush_layers_full(runner);
+}
+
+/// P1d - CR 608.2c + CR 123.3b: the {TK} instruction always completes; the
+/// optional placement is declined, has no sticker sheet, or has no recipient.
+#[test]
+fn scampire_real_etb_decline_no_sheet_and_empty_graveyard_complete() {
+    for (with_target, sheets, accept) in [
+        (true, true, false),
+        (true, false, true),
+        (false, true, true),
+    ] {
+        let (mut runner, source, target, _, _) = scampire_scenario(with_target, sheets);
+        let (_, branches, _) = settle_sticker_etb(&mut runner, source, target, accept);
+        assert_eq!(branches, 0);
+        assert_eq!(
+            tickets(runner.state()),
+            11,
+            "{with_target} {sheets} {accept}"
+        );
+        assert!(runner
+            .state()
+            .objects
+            .values()
+            .all(|object| object.stickers.is_empty()));
+    }
+}
+
+/// P2 - CR 123.8 + CR 613.4b: Carnival Carnivore's real ETB puts the chosen
+/// P/T sticker on a battlefield creature.
+#[test]
+fn carnival_real_etb_places_battlefield_pt_sticker() {
+    let db = shared_card_db().expect("production sticker fixture loads");
+    let mut scenario = main_phase();
+    let source = scenario.add_real_card(P0, "Carnival Carnivore", Zone::Hand, db);
+    let target = scenario.add_real_card(P0, "Grizzly Bears", Zone::Battlefield, db);
+    scenario.with_mana_pool(
+        P0,
+        mana(&[
+            ManaType::Black,
+            ManaType::Colorless,
+            ManaType::Colorless,
+            ManaType::Colorless,
+            ManaType::Colorless,
+            ManaType::Colorless,
+        ]),
+    );
+    let mut runner = scenario.build();
+    sticker_sheet(&mut runner);
+    runner.cast(source).commit();
+    let (optional, branches, offered) = settle_sticker_etb(&mut runner, source, Some(target), true);
+    assert_eq!((optional, branches), (1, 1));
+    // Carnival itself is an owned nonland permanent too.
+    assert_eq!(sorted(offered), sorted(vec![source, target]));
+    assert!(is_hydra_one_five(
+        &runner.state().objects[&target].stickers[0]
+    ));
+    assert_eq!(pt(runner.state(), target), (Some(1), Some(5)));
+    assert_eq!(tickets(runner.state()), 9);
+}
+
+/// T1 - CR 123.5 + CR 400.7m + CR 613.7k: real public moves keep and renew
+/// Grist's retained sticker; Raise Dead's hidden destination discards it.
+#[test]
+fn real_public_spells_renew_grist_stickers_and_raise_dead_discards_them() {
+    let db = shared_card_db().expect("production sticker fixture loads");
+    for (spell_name, origin, destination) in [
+        ("Hero's Downfall", Zone::Battlefield, Zone::Graveyard),
+        ("Cremate", Zone::Graveyard, Zone::Exile),
+        ("Zombify", Zone::Graveyard, Zone::Battlefield),
+        ("Raise Dead", Zone::Graveyard, Zone::Hand),
+    ] {
+        let mut scenario = main_phase();
+        let grist = scenario.add_real_card(P0, "Grist, the Hunger Tide", origin, db);
+        let spell = scenario.add_real_card(P0, spell_name, Zone::Hand, db);
+        scenario.with_library_top(P0, &["Draw fodder"]);
+        scenario.with_mana_pool(
+            P0,
+            mana(&[
+                ManaType::Black,
+                ManaType::Black,
+                ManaType::Colorless,
+                ManaType::Colorless,
+            ]),
+        );
+        let mut runner = scenario.build();
+        stage_real_pt_sticker(&mut runner, grist);
+        let previous = runner.state().objects[&grist].stickers[0].clone();
+        let incarnation = runner.state().objects[&grist].incarnation;
+        let library_before = runner.state().players[0].library.len();
+        add_mana_and_resolve_on(&mut runner, spell, grist, &[]);
+        if spell_name == "Cremate" {
+            assert_eq!(runner.state().players[0].library.len(), library_before - 1);
+            assert!(runner.state().players[0]
+                .hand
+                .iter()
+                .any(|id| runner.state().objects[id].name == "Draw fodder"));
+        }
+        let object = &runner.state().objects[&grist];
+        assert_eq!(object.zone, destination, "{spell_name}");
+        if destination == Zone::Hand {
+            assert!(object.stickers.is_empty());
+            assert_eq!(
+                pt(runner.state(), grist),
+                (Some(1), Some(1)),
+                "Grist's static still functions in hand after the sticker is lost"
+            );
+        } else {
+            assert_renewed_after_move(runner.state(), grist, &previous, incarnation);
+            if destination == Zone::Battlefield {
+                assert_only_a_planeswalker(runner.state(), grist);
+            } else {
+                assert_eq!(
+                    pt(runner.state(), grist),
+                    (Some(1), Some(5)),
+                    "{spell_name}"
+                );
+            }
+        }
+    }
+}
+
+/// T3 - CR 903.8 + CR 903.9a + CR 112.1 + CR 613.7d + CR 613.7k: a commander
+/// Grist's retained stickers are renewed through the shared Stack/Command
+/// timestamp owner on its cast, resolution, return to the command zone and
+/// taxed recast; an unrelated carrier is never renewed.
+#[test]
+fn real_commander_cast_death_choice_and_recast_share_retained_timestamp_owner() {
+    let db = shared_card_db().expect("production sticker fixture loads");
+    let mut scenario = GameScenario::new_with_format(FormatConfig::commander(), 2, 0x9968);
+    scenario.at_phase(Phase::PreCombatMain);
+    let grist = scenario.add_real_card(P0, "Grist, the Hunger Tide", Zone::Hand, db);
+    scenario.with_commander(grist);
+    let downfall = scenario.add_real_card(P1, "Hero's Downfall", Zone::Hand, db);
+    let unrelated = scenario.add_real_card(P1, "Grizzly Bears", Zone::Graveyard, db);
+    scenario.with_mana_pool(
+        P0,
+        mana(&[ManaType::Black, ManaType::Green, ManaType::Colorless]),
+    );
+    let mut runner = scenario.build();
+    assert!(runner.state().command_zone.contains(&grist));
+    stage_mixed_stickers(&mut runner, grist);
+    let mut remote_sticker = runner.state().objects[&grist].stickers[0].clone();
+    remote_sticker.set_timestamp(runner.state_mut().next_timestamp());
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&unrelated)
+        .unwrap()
+        .stickers
+        .push(remote_sticker);
+    let unrelated_stickers = runner.state().objects[&unrelated].stickers.clone();
+    let unrelated_stamp = runner.state().objects[&unrelated].timestamp;
+    let assert_unrelated = |state: &GameState| {
+        assert_eq!(state.objects[&unrelated].stickers, unrelated_stickers);
+        assert_eq!(state.objects[&unrelated].timestamp, unrelated_stamp);
+    };
+
+    let previous = runner.state().objects[&grist].stickers.clone();
+    let incarnation = runner.state().objects[&grist].incarnation;
+    runner.cast(grist).commit();
+    assert!(runner.state().stack.iter().any(
+        |entry| entry.source_id == grist && matches!(entry.kind, StackEntryKind::Spell { .. })
+    ));
+    assert_eq!(
+        runner.state().objects[&grist].cast_from_zone,
+        Some(Zone::Command)
+    );
+    assert_eq!(runner.state().commander_cast_count.get(&grist), Some(&1));
+    assert_eq!(runner.state().players[0].mana_pool.units().count(), 0);
+    assert!(!runner.state().command_zone.contains(&grist));
+    assert_mixed_renewed(runner.state(), grist, &previous, incarnation);
+    assert_unrelated(runner.state());
+    // CR 112.1 + CR 123.8: a creature spell; the newest P/T sticker wins.
+    assert_eq!(pt(runner.state(), grist), (Some(1), Some(5)));
+
+    let previous = runner.state().objects[&grist].stickers.clone();
+    let incarnation = runner.state().objects[&grist].incarnation;
+    runner.pass_both_players();
+    assert_sticker_idle(runner.state());
+    assert_eq!(runner.state().objects[&grist].zone, Zone::Battlefield);
+    assert_mixed_renewed(runner.state(), grist, &previous, incarnation);
+    assert_unrelated(runner.state());
+    assert_eq!(pt(runner.state(), grist), (None, None));
+
+    add_mana(
+        &mut runner,
+        1,
+        &[ManaType::Black, ManaType::Black, ManaType::Colorless],
+    );
+    runner.act(GameAction::PassPriority).unwrap();
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { player: P1 }
+    ));
+    let previous = runner.state().objects[&grist].stickers.clone();
+    let incarnation = runner.state().objects[&grist].incarnation;
+    runner.cast(downfall).target_object(grist).resolve();
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::CommanderZoneChoice { player: P0, commander_id, current_zone: Zone::Graveyard } if commander_id == grist),
+        "{:?}",
+        runner.state().waiting_for
+    );
+    assert_mixed_renewed(runner.state(), grist, &previous, incarnation);
+    assert_unrelated(runner.state());
+
+    let previous = runner.state().objects[&grist].stickers.clone();
+    let incarnation = runner.state().objects[&grist].incarnation;
+    let mut declined = GameRunner::from_state(runner.state().clone());
+    declined
+        .act(GameAction::DecideOptionalEffect { accept: false })
+        .expect("owner declines the command-zone move");
+    assert_eq!(declined.state().objects[&grist].zone, Zone::Graveyard);
+    assert!(!declined.state().command_zone.contains(&grist));
+    assert_eq!(declined.state().objects[&grist].stickers, previous);
+    assert_eq!(pt(declined.state(), grist), (Some(1), Some(5)));
+    assert_sticker_idle(declined.state());
+    assert_unrelated(declined.state());
+
+    runner
+        .act(GameAction::DecideOptionalEffect { accept: true })
+        .expect("owner accepts the command-zone move");
+    assert!(runner.state().command_zone.contains(&grist));
+    assert_mixed_renewed(runner.state(), grist, &previous, incarnation);
+    assert_eq!(pt(runner.state(), grist), (Some(1), Some(5)));
+    assert_sticker_idle(runner.state());
+    assert_unrelated(runner.state());
+
+    // CR 903.8: the recast pays the commander tax.
+    add_mana(
+        &mut runner,
+        0,
+        &[
+            ManaType::Black,
+            ManaType::Green,
+            ManaType::Colorless,
+            ManaType::Colorless,
+            ManaType::Colorless,
+        ],
+    );
+    let previous = runner.state().objects[&grist].stickers.clone();
+    let incarnation = runner.state().objects[&grist].incarnation;
+    runner.cast(grist).commit();
+    assert_eq!(runner.state().commander_cast_count.get(&grist), Some(&2));
+    assert_eq!(runner.state().players[0].mana_pool.units().count(), 0);
+    assert!(!runner.state().command_zone.contains(&grist));
+    assert!(runner
+        .state()
+        .stack
+        .iter()
+        .any(|entry| entry.source_id == grist));
+    assert_eq!(
+        runner.state().objects[&grist].cast_from_zone,
+        Some(Zone::Command)
+    );
+    assert_mixed_renewed(runner.state(), grist, &previous, incarnation);
+    assert_eq!(pt(runner.state(), grist), (Some(1), Some(5)));
+    assert_unrelated(runner.state());
+
+    let previous = runner.state().objects[&grist].stickers.clone();
+    let incarnation = runner.state().objects[&grist].incarnation;
+    runner.pass_both_players();
+    assert_sticker_idle(runner.state());
+    assert_eq!(runner.state().objects[&grist].zone, Zone::Battlefield);
+    assert_mixed_renewed(runner.state(), grist, &previous, incarnation);
+    assert_eq!(pt(runner.state(), grist), (None, None));
+    assert_unrelated(runner.state());
+}
+
+/// Same Stack spell occurrence with an actual Spell entry, written inline
+/// because the Phase 3 helpers also assert the pre-sticker contract.
+fn assert_same_stack_spell(state: &GameState, id: ObjectId, occurrence: ObjectIncarnationRef) {
+    let object = &state.objects[&id];
+    assert_eq!(object.zone, Zone::Stack);
+    assert_eq!(ObjectIncarnationRef::from_object(object), occurrence);
+    assert!(state.stack.iter().any(|entry| entry.id == id
+        && entry.source_id == id
+        && matches!(entry.kind, StackEntryKind::Spell { card_id, .. } if card_id == object.card_id)));
+}
+
+/// P9 - CR 718.3b + CR 123.8 + CR 112.1 + CR 611.2c + CR 701.6a: a prototype
+/// spell cast with Cavern's Wizard mana uses its prototype P/T as the baseline
+/// beneath a newer P/T sticker, keeps the cast-bound prohibition, and returns
+/// to the prototype 2/1 once it stops being a creature.
+#[test]
+fn real_prototype_spell_uses_prototype_pt_baseline_under_newer_sticker() {
+    let db = shared_card_db().expect("prototype sticker row requires CardDB");
+    let (mut runner, _, proxy, counterspell, extra) = cast_prohibition_paid_proxy_with(
+        true,
+        &[
+            (P0, "Painter's Servant", Zone::Exile),
+            (P0, "Arcane Proxy", Zone::Exile),
+        ],
+    );
+    let (painter, normal) = (extra[0], extra[1]);
+    let occurrence = ObjectIncarnationRef::from_object(&runner.state().objects[&proxy]);
+    // CR 718.4: the normal card elsewhere has its normal characteristics.
+    assert_eq!(pt(runner.state(), normal), (Some(4), Some(3)));
+
+    // Fixture staging of Painter's chosen colour; Painter's own enters-choice
+    // is not under test.
+    move_to_zone(
+        runner.state_mut(),
+        painter,
+        Zone::Battlefield,
+        &mut Vec::new(),
+    );
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&painter)
+        .unwrap()
+        .chosen_attributes
+        .push(ChosenAttribute::Color(ManaColor::Green));
+    assert_eq!(runner.state().objects[&painter].zone, Zone::Battlefield);
+    // One settled Painter pass before the sticker exists.
+    flush_layers_full(&mut runner);
+    cast_prohibition_assert_spell(runner.state(), proxy, occurrence);
+    assert_eq!(pt(runner.state(), proxy), (Some(2), Some(1)));
+    assert!(runner.state().objects[&proxy]
+        .color
+        .contains(&ManaColor::Blue));
+    assert!(runner.state().objects[&proxy]
+        .color
+        .contains(&ManaColor::Green));
+    assert_eq!(cast_prohibition_count(runner.state(), proxy), 1);
+    assert!(
+        runner.state().attribution[&proxy]
+            .by_layer
+            .contains_key(&Layer::Color),
+        "reach guard: Painter's colour effect reached the Stack Proxy"
+    );
+
+    // Registry-derived Stack sticker fixture: the only printed Stack placer
+    // (sticker kicker, Wicker Picker) is Unimplemented; apply_selected_sticker's
+    // off-zone rebuild is not exercised on a Stack spell. No ticket payment or
+    // StickerPlaced event is claimed.
+    sticker_sheet(&mut runner);
+    let candidate = available_sticker_candidates(
+        runner.state(),
+        P0,
+        Some(StickerKind::PowerToughness),
+        Some(2),
+        false,
+    )
+    .into_iter()
+    .next()
+    .expect("the cost-2 P/T sticker exists");
+    assert!(is_hydra_one_five(&candidate.sticker));
+    let mut sticker = candidate.sticker;
+    sticker.set_timestamp(runner.state_mut().next_timestamp());
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&proxy)
+        .unwrap()
+        .stickers
+        .push(sticker);
+    runner.state_mut().layers_dirty.mark_full();
+    for pass in 0..3 {
+        flush_layers_full(&mut runner);
+        assert_same_stack_spell(runner.state(), proxy, occurrence);
+        assert_eq!(pt(runner.state(), proxy), (Some(1), Some(5)), "pass {pass}");
+        let color = &runner.state().objects[&proxy].color;
+        assert!(color.contains(&ManaColor::Blue) && color.contains(&ManaColor::Green));
+        assert_eq!(cast_prohibition_count(runner.state(), proxy), 1);
+    }
+
+    for trusted in [false, true] {
+        let persisted = if trusted {
+            PersistedGameState::capture(runner.state().clone())
+        } else {
+            PersistedGameState::Raw(Box::new(runner.state().clone()))
+        };
+        let restored =
+            serde_json::from_value::<PersistedGameState>(serde_json::to_value(persisted).unwrap())
+                .unwrap()
+                .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+                .unwrap()
+                .finalize_after_rehydration(|state| {
+                    rehydrate_game_from_card_db_with_finalization(
+                        state,
+                        db,
+                        CardDbRehydrationFinalization::Defer,
+                    );
+                    assert!(!state.attribution[&proxy].by_layer.is_empty());
+                    // Painter's effect ends before the first restored settle.
+                    move_to_zone(state, painter, Zone::Graveyard, &mut Vec::new());
+                    state.layers_dirty.mark_full();
+                    Ok(())
+                })
+                .unwrap();
+        assert_same_stack_spell(&restored, proxy, occurrence);
+        assert_eq!(
+            pt(&restored, proxy),
+            (Some(1), Some(5)),
+            "trusted={trusted}"
+        );
+        assert_eq!(restored.objects[&proxy].color, vec![ManaColor::Blue]);
+        assert_eq!(cast_prohibition_count(&restored, proxy), 1);
+        let mut countered = GameRunner::from_state(restored.clone());
+
+        // Labeled type-loss fixture: the spell stops being a creature.
+        let mut restored = GameRunner::from_state(restored);
+        restored
+            .state_mut()
+            .objects
+            .get_mut(&proxy)
+            .unwrap()
+            .card_types
+            .core_types
+            .retain(|core_type| *core_type != CoreType::Creature);
+        flush_layers_full(&mut restored);
+        assert_eq!(
+            pt(restored.state(), proxy),
+            (Some(2), Some(1)),
+            "the prototype 2/1, not the normal 4/3 or the sticker's 1/5"
+        );
+        assert_eq!(cast_prohibition_count(restored.state(), proxy), 1);
+
+        let events = cast_prohibition_counter(&mut countered, proxy, counterspell);
+        assert_same_stack_spell(countered.state(), proxy, occurrence);
+        assert_eq!(cast_prohibition_count(countered.state(), proxy), 1);
+        assert!(!events.iter().any(
+            |event| matches!(event, GameEvent::SpellCountered { object_id, .. } if *object_id == proxy)
+        ));
+    }
+    assert_eq!(pt(runner.state(), normal), (Some(4), Some(3)));
+}
+
+/// P9f - CR 702.102b + CR 709.4d: expiring a genuine remote colour effect
+/// restores both fused halves' combined characteristics, live and after restore.
+#[test]
+fn real_fused_spell_restores_combined_characteristics_after_painter_expiry_and_restore() {
+    let db = shared_card_db().expect("fused row requires CardDB");
+    let mut scenario = main_phase();
+    let painter = scenario.add_real_card(P0, "Painter's Servant", Zone::Battlefield, db);
+    let breaking = scenario.add_real_card(P0, "Breaking", Zone::Hand, db);
+    let creature = scenario.add_real_card(P1, "Grizzly Bears", Zone::Graveyard, db);
+    scenario.with_mana_pool(
+        P0,
+        mana(&[
+            ManaType::Blue,
+            ManaType::Black,
+            ManaType::Black,
+            ManaType::Red,
+            ManaType::Colorless,
+            ManaType::Colorless,
+            ManaType::Colorless,
+            ManaType::Colorless,
+        ]),
+    );
+    let mut runner = scenario.build();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&painter)
+        .unwrap()
+        .chosen_attributes
+        .push(ChosenAttribute::Color(ManaColor::Green));
+    engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
+    runner
+        .cast(breaking)
+        .casting_variant(CastingVariant::Fuse)
+        .target_player(P1)
+        .target_object(creature)
+        .commit();
+    for _ in 0..2 {
+        flush_layers_full(&mut runner);
+    }
+    let spell = &runner.state().objects[&breaking];
+    assert!(spell.fused_split_spell);
+    assert!(runner.state().stack.iter().any(|e| e.source_id == breaking));
+    assert_eq!(spell.effective_mana_value(), 8);
+    for color in [
+        ManaColor::Blue,
+        ManaColor::Black,
+        ManaColor::Red,
+        ManaColor::Green,
+    ] {
+        assert!(spell.color.contains(&color));
+    }
+    assert!(!runner.state().attribution[&breaking].by_layer.is_empty());
+    let painted = runner.state().clone();
+    for trusted in [false, true] {
+        let saved = if trusted {
+            PersistedGameState::capture(painted.clone())
+        } else {
+            PersistedGameState::Raw(Box::new(painted.clone()))
+        };
+        let restored =
+            serde_json::from_value::<PersistedGameState>(serde_json::to_value(saved).unwrap())
+                .unwrap()
+                .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+                .unwrap()
+                .finalize_after_rehydration(|state| {
+                    assert!(!state.attribution[&breaking].by_layer.is_empty());
+                    rehydrate_game_from_card_db_with_finalization(
+                        state,
+                        db,
+                        CardDbRehydrationFinalization::Defer,
+                    );
+                    move_to_zone(state, painter, Zone::Graveyard, &mut Vec::new());
+                    state.layers_dirty.mark_full();
+                    Ok(())
+                })
+                .unwrap();
+        let spell = &restored.objects[&breaking];
+        assert!(spell.fused_split_spell);
+        assert_eq!(spell.zone, Zone::Stack);
+        assert!(restored.stack.iter().any(|e| e.source_id == breaking));
+        assert_eq!(spell.effective_mana_value(), 8);
+        assert_eq!(spell.color.len(), 3);
+        for color in [ManaColor::Blue, ManaColor::Black, ManaColor::Red] {
+            assert!(spell.color.contains(&color));
+        }
+    }
+    let painter_incarnation = runner.state().objects[&painter].incarnation;
+    move_to_zone(
+        runner.state_mut(),
+        painter,
+        Zone::Graveyard,
+        &mut Vec::new(),
+    );
+    flush_layers_full(&mut runner);
+    assert!(runner.state().objects[&painter].incarnation > painter_incarnation);
+    let spell = &runner.state().objects[&breaking];
+    assert_eq!(spell.effective_mana_value(), 8);
+    assert_eq!(spell.color.len(), 3);
+    for color in [ManaColor::Blue, ManaColor::Black, ManaColor::Red] {
+        assert!(spell.color.contains(&color));
     }
 }

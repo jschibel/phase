@@ -348,10 +348,19 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
-  it("accepts the literal Full v147 resolution sticker recipient protocol", async () => {
+  it("rejects Full v147 before it can receive retained sticker timestamp operands", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
     ws.deliverMessage(helloFrame({ protocol_version: 147 }));
+
+    await expect(promise).rejects.toMatchObject({ kind: "protocol_mismatch" });
+    expect(ws.close).toHaveBeenCalled();
+  });
+
+  it("accepts the literal Full v148 retained sticker timestamp protocol", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: 148 }));
 
     await expect(promise).resolves.toBeDefined();
     expect(ws.close).not.toHaveBeenCalled();
