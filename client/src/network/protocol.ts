@@ -106,6 +106,47 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  141 — game_setup and state_update carry GameState whose effects carry
+ *       Effect::FlipCoins { flips, .. } in place of FlipCoin, FlipCoins { count }
+ *       and FlipCoinUntilLose, and whose coin-flip resolution frame kind is
+ *       Exactly or UntilLoss. A v140 or older peer reads a multi-flip or until-loss run
+ *       as one flip, so first contact rejects the skew. Bumped in lockstep with
+ *       full-game protocol 159.
+ *  139 — ChooseFromZoneConstraint.TotalManaValue extends serialized paused zone
+ *       choices and ability state; full-game protocol 157.
+ *  138 — game_setup and state_update carry GameState whose ability conditions
+ *       may carry QuantityQuality/NumberQuality. Bumped in lockstep with
+ *       full-game protocol 156, which also adds the optional per-seat
+ *       created_tokens channel (each seat's pinned creation result) on the
+ *       player-scope tail sidecar inside paused resolution frames.
+ *  137 — game_setup and state_update carry GameState whose parked ChangeZone
+ *       frame stores each remaining member with its pre-event entry
+ *       modifications (CR 603.6a + CR 614.12) and whose resolution state moves
+ *       from version 6 to 7; a v136 peer cannot parse it. Bumped in lockstep
+ *       with full-game protocol 155.
+ *  136 — game_setup and state_update carry GameState whose
+ *       pending_cost_move_resume may hold PendingCostMoveResume
+ *       CounterCostRemovalPayment (a counter-removal cost paused on a CR 616.1
+ *       replacement choice) and whose mana cost cursor may hold
+ *       counter_removal. A v135 peer cannot parse the new tag, so first
+ *       contact rejects the skew. Bumped in lockstep with full-game protocol
+ *       154; PausedCounterCostRemoval carries its replacement_subtree
+ *       boundary.
+ *  135 — game_setup and state_update carry GameState, whose activated grants
+ *       carry an optional kind selector (Nicol Bolas, Dragon-God's loyalty
+ *       subset). A v134 peer drops the defaulted field silently and
+ *       over-grants, so first contact rejects the skew. Bumped in
+ *       lockstep with full-game protocol 153.
+ *  134 — game_setup and state_update carry GameState whose loop offers may carry
+ *       ShortcutDecisionSchema suggested_declaration and leading_aims, and
+ *       ShortcutProposal leading_aims. Bumped in lockstep with full-game protocol 152.
+ *  133: Populated GameObject.bestow_form carries removed creature subtypes
+ *       as an object instead of the legacy boolean; full-game protocol 151.
+ *  132 — game_setup and state_update carry GameState whose casting permissions may
+ *       carry the reshaped cast-this-way gains rider (the permission's
+ *       enters_with_modifications object and Effect.AddPendingEntersModifications.rider).
+ *       A wire 131 peer cannot parse either shape. Bumped in lockstep with
+ *       full-game protocol 150.
  *  131 — GameState.deferred_spell_delivery is removed and GameState.resolving_spell_final_part
  *       ({ spell }) marks the CR 608.2n final part a paused instant or sorcery still owes,
  *       in game_setup and state_update; a v130 peer drops the key and would move the spell
@@ -704,7 +745,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 131 as const;
+export const WIRE_PROTOCOL_VERSION = 141 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

@@ -5596,12 +5596,23 @@ describe("P2P wire-protocol version gate", () => {
     vi.useRealTimers();
   });
 
+  const bestowState = (): GameState => ({
+    ...remoteState("bestowed setup"),
+    objects: {
+      "42": {
+        id: 42, name: "Springheart Nantuko", owner: 0, controller: 0,
+        zone: "Battlefield", attached_to: { type: "Object", data: 43 },
+        bestow_form: { removed_creature_subtypes: ["Insect", "Monk"] },
+      },
+    },
+  } as unknown as GameState);
+
   const setupFrameAt = (wireProtocolVersion: number) => ({
     type: "game_setup" as const,
     wireProtocolVersion,
     assignedPlayerId: 1,
     playerToken: "seat-token",
-    state: remoteState("setup"),
+    state: bestowState(),
     events: [],
     legalActions: [],
     autoPassRecommended: false,
@@ -5639,7 +5650,7 @@ describe("P2P wire-protocol version gate", () => {
   // check back into the transport would surface here as the refusing half
   // never emitting.
   //
-  it.each([115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126])("refuses independent earlier wire history v%s", async (version) => {
+  it.each([115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138])("refuses independent earlier wire history v%s", async (version) => {
     const refusing = makeGuest();
     await refusing.adapter.initialize();
     await refusing.conn.simulateData(setupFrameAt(version));
@@ -5656,19 +5667,21 @@ describe("P2P wire-protocol version gate", () => {
   // Both halves stamp LITERALS. A frame built from WIRE_PROTOCOL_VERSION
   // cannot tell a bumped client from an unbumped one, which is why every
   // other handshake fixture in the suite is useless as an instrument for a
-  // bump. Reverting WIRE_PROTOCOL_VERSION itself (131 → 130) breaks both
-  // halves' premise: the v130 frame now equals the reverted constant and is
+  // bump. Reverting WIRE_PROTOCOL_VERSION itself (141 → 140) breaks both
+  // halves' premise: the v140 frame now equals the reverted constant and is
+  // bump. Reverting WIRE_PROTOCOL_VERSION itself (139 → 138) breaks both
+  // halves' premise: the v138 frame now equals the reverted constant and is
   // admitted instead of refused — this test would fail at that first
-  // assertion ("promise resolved … instead of rejecting") — and the v131
+  // assertion ("promise resolved … instead of rejecting") — and the v139
   // frame no longer equals it and would be refused instead of admitted,
   // though this single synchronous test body never reaches that second
   // assertion once the first has thrown. The admitting half is still the
-  // reach-guard — without it "refuses v130" is also satisfied by a client
+  // reach-guard — without it "refuses v140" is also satisfied by a client
   // that refuses everything.
-  it("refuses the previous wire protocol (v130) and admits its own (v131)", async () => {
+  it("refuses the previous wire protocol (v140) and admits its own (v141)", async () => {
     const refusing = makeGuest();
     await refusing.adapter.initialize();
-    await refusing.conn.simulateData(setupFrameAt(130));
+    await refusing.conn.simulateData(setupFrameAt(140));
 
     await expect(refusing.adapter.initializeGame()).rejects.toMatchObject({
       code: "P2P_REJECTED",
@@ -5680,12 +5693,79 @@ describe("P2P wire-protocol version gate", () => {
 
     const admitting = makeGuest();
     await admitting.adapter.initialize();
-    await admitting.conn.simulateData(setupFrameAt(131));
+    await admitting.conn.simulateData(setupFrameAt(141));
 
     await expect(admitting.adapter.initializeGame()).resolves.toBeDefined();
+    expect((await admitting.adapter.getState()).objects["42"]).toMatchObject({
+      id: 42, bestow_form: { removed_creature_subtypes: ["Insect", "Monk"] },
+    });
+    expect(refusing.emitted).not.toHaveBeenCalledWith(expect.objectContaining({ type: "stateChanged" }));
+    expect(refusing.emitted).not.toHaveBeenCalledWith(expect.objectContaining({ type: "playerIdentity" }));
+    await expect(refusing.adapter.getState()).rejects.toThrow("No game state available");
     expect(admitting.emitted).not.toHaveBeenCalledWith(
       expect.objectContaining({ type: "reconnectFailed" }),
     );
+  });
+
+  it.each([132, 133, 134, 135, 136, 137, 138, 139, 140])("refuses old reconnect acknowledgement v%s before adopting populated Bestow state", async (version) => {
+    const refusing = makeGuest(new FakeDataConnection(), undefined, "prior-token");
+    await refusing.adapter.initialize();
+    await refusing.conn.simulateData({ ...setupFrameAt(version), type: "reconnect_ack" });
+    await expect(refusing.adapter.initializeGame()).rejects.toMatchObject({
+      code: "P2P_REJECTED", message: expect.stringContaining("Wire protocol mismatch"),
+    });
+    expect(refusing.emitted).not.toHaveBeenCalledWith(expect.objectContaining({ type: "stateChanged" }));
+    expect(refusing.emitted).not.toHaveBeenCalledWith(expect.objectContaining({ type: "playerIdentity" }));
+    await expect(refusing.adapter.getState()).rejects.toThrow("No game state available");
+
+    const admitting = makeGuest(new FakeDataConnection(), undefined, "prior-token");
+    await admitting.adapter.initialize();
+    await admitting.conn.simulateData({ ...setupFrameAt(141), type: "reconnect_ack" });
+    await expect(admitting.adapter.initializeGame()).resolves.toBeDefined();
+    expect((await admitting.adapter.getState()).objects["42"]).toMatchObject({
+      id: 42, bestow_form: { removed_creature_subtypes: ["Insect", "Monk"] },
+    });
+    expect(admitting.emitted).toHaveBeenCalledWith(expect.objectContaining({ type: "stateChanged" }));
+    refusing.adapter.dispose();
+    admitting.adapter.dispose();
+  });
+
+  it.each([132, 133, 134, 135, 136, 137, 138, 139, 140])("host rejects previous peers v%s before seat or reconnect adoption", async (version) => {
+    const { adapter, emitConnection } = makeHost(2);
+    await adapter.initialize();
+    const oldJoin = await joinGuest(emitConnection, {
+      type: "guest_deck", deckData: { player: { main_deck: [], sideboard: [] } },
+      wireProtocolVersion: version,
+    });
+    expect(await sentOfType(oldJoin, "reconnect_rejected")).toBeDefined();
+    expect(oldJoin.open).toBe(false);
+    expect(await sentOfType(oldJoin, "game_setup")).toBeUndefined();
+
+    const current = await joinGuest(emitConnection, {
+      type: "guest_deck", deckData: { player: { main_deck: [], sideboard: [] } },
+      wireProtocolVersion: 141,
+    });
+    await adapter.initializeGame();
+    const setup = (await current.getSentMessages()).find(
+      (message): message is { type: "game_setup"; playerToken: string; assignedPlayerId: number } =>
+        typeof message === "object" && message !== null && (message as { type?: string }).type === "game_setup",
+    );
+    expect(setup).toBeDefined();
+    expect(setup!.assignedPlayerId).toBe(1);
+    expect(await sentOfType(current, "reconnect_rejected")).toBeUndefined();
+    current.simulateClose();
+    const oldReconnect = await joinGuest(emitConnection, {
+      type: "reconnect", playerToken: setup!.playerToken, wireProtocolVersion: version,
+    });
+    expect(await sentOfType(oldReconnect, "reconnect_rejected")).toBeDefined();
+    expect(oldReconnect.open).toBe(false);
+    expect(await sentOfType(oldReconnect, "reconnect_ack")).toBeUndefined();
+    const currentReconnect = await joinGuest(emitConnection, {
+      type: "reconnect", playerToken: setup!.playerToken, wireProtocolVersion: 141,
+    });
+    expect(await sentOfType(currentReconnect, "reconnect_ack")).toBeDefined();
+    expect(await sentOfType(currentReconnect, "reconnect_rejected")).toBeUndefined();
+    adapter.dispose();
   });
 
   it("rejects a malformed present authority before bootstrap adoption", async () => {

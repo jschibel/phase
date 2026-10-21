@@ -1221,6 +1221,9 @@ fn destination_matches_constraint(zone: Zone, constraint: &DestinationConstraint
 /// CR 603.6 + CR 603.6c: Tests whether one zone-change event satisfies a single
 /// origin/destination/valid_card clause. Shared by both the scalar
 /// `match_changes_zone` path and the disjunctive `zone_change_clauses` path.
+/// CR 603.10 + CR 611.3c: an enters observer's subject filter reads the entrant as it existed
+/// immediately after its entry event, continuous effects in force at that time applied
+/// (`filter::matches_target_filter_on_entry_observation`).
 #[allow(clippy::too_many_arguments)]
 fn zone_change_clause_matches(
     origin: &OriginConstraint,
@@ -1251,14 +1254,20 @@ fn zone_change_clause_matches(
     }
     if let Some(filter) = valid_card {
         let ctx = super::filter::FilterContext::from_trigger_source(source_context);
-        let live_entrant =
-            *to == Zone::Battlefield && state.objects.contains_key(&record.object_id);
         let departed = named_origin_zone(origin, record.from_zone);
-        let matches = match (live_entrant, departed) {
-            // CR 603.6a: an enters trigger reads the permanent as it exists on the battlefield,
-            // so a named battlefield destination leaves the pile unlicensed.
-            (true, Some(from))
-                if !destination_constraint_names(destination, destination_constraint, *to) =>
+        // CR 603.6a + CR 603.10: an enters observer (destination battlefield, and either no named
+        // origin or a named battlefield destination) reads the entrant as it existed immediately
+        // after its entry event. A named-origin clause without a named battlefield destination is
+        // a leaves-a-zone observer (CR 603.10a) and keeps the departure reading.
+        let enters_observer = *to == Zone::Battlefield
+            && (departed.is_none()
+                || destination_constraint_names(destination, destination_constraint, *to));
+        let matches = match (enters_observer, departed) {
+            (true, _) => super::filter::matches_target_filter_on_entry_observation(
+                state, record, departed, filter, &ctx,
+            ),
+            (false, Some(from))
+                if *to == Zone::Battlefield && state.objects.contains_key(&record.object_id) =>
             {
                 super::filter::matches_target_filter_on_departure(
                     state,
@@ -1268,14 +1277,9 @@ fn zone_change_clause_matches(
                     &ctx,
                 )
             }
-            (true, _) => {
-                super::filter::matches_target_filter(state, record.object_id, filter, &ctx)
-            }
-            (false, departed) => {
-                super::filter::matches_target_filter_on_zone_change_record_licensed(
-                    state, record, departed, filter, &ctx,
-                )
-            }
+            (false, _) => super::filter::matches_target_filter_on_zone_change_record_licensed(
+                state, record, departed, filter, &ctx,
+            ),
         };
         if !matches {
             return false;
@@ -1946,7 +1950,6 @@ pub(super) fn matching_attack_events(
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> Vec<GameEvent> {
-    let source_id = source_event_subject_id(source_context);
     if let GameEvent::AttackersDeclared {
         attacker_ids,
         defending_player,
@@ -2013,22 +2016,7 @@ pub(super) fn matching_attack_events(
         }
 
         // Find which attacker(s) satisfy the creature / attacking-player filter.
-        let attacker_matches = |id: &ObjectId| -> bool {
-            if trigger.valid_card.is_some() {
-                valid_card_matches(trigger, state, *id, source_context)
-            } else if trigger.valid_source.is_some() {
-                valid_source_matches(trigger, state, *id, source_context)
-            } else if trigger.valid_target.is_some() {
-                // CR 508.3b: "Whenever [player] is attacked" — no attacker
-                // filter, any creature attacking that player satisfies the
-                // trigger. The defending-player restriction is enforced by
-                // `attack_target_matches` below.
-                true
-            } else {
-                *id == source_id
-            }
-        };
-
+        //
         // CR 508.3b: "Whenever [player] is attacked" triggers once per
         // attacked player, not once per attacking creature. Deduplicate when
         // the trigger has valid_target set but no valid_card/valid_source
@@ -2041,7 +2029,7 @@ pub(super) fn matching_attack_events(
         attacker_ids
             .iter()
             .filter_map(|id| {
-                if !attacker_matches(id) {
+                if !attack_declaration_attacker_matches(trigger, state, *id, source_context) {
                     return None;
                 }
                 let target = attacks
@@ -2077,6 +2065,105 @@ pub(super) fn matching_attack_events(
     } else {
         Vec::new()
     }
+}
+
+/// CR 508.1 + CR 508.3b + CR 508.3d: whether one declared attacker satisfies
+/// the trigger's attacker-side filter. A `valid_target`-only trigger
+/// ("Whenever [player] is attacked") filters on the ATTACK TARGET instead, so
+/// every declared attacker matches here and `attack_target_matches` supplies
+/// the restriction.
+fn attack_declaration_attacker_matches(
+    trigger: &TriggerDefinition,
+    state: &GameState,
+    id: ObjectId,
+    source_context: &TriggerSourceContext,
+) -> bool {
+    if trigger.valid_card.is_some() {
+        valid_card_matches(trigger, state, id, source_context)
+    } else if trigger.valid_source.is_some() {
+        valid_source_matches(trigger, state, id, source_context)
+    } else if trigger.valid_target.is_some() {
+        true
+    } else {
+        id == source_event_subject_id(source_context)
+    }
+}
+
+/// CR 508.3d + CR 508.5a: expand one `AttackersDeclared` event into one
+/// narrowed context per ATTACKED player, each carrying that player's complete
+/// matching attacker set — the antecedent of the followed clause's "those
+/// creatures" and the referent of "defending player" / "that player"
+/// ("Whenever one or more creatures attack one of your opponents, if any of
+/// those creatures have power or toughness equal to the chosen number, Squall
+/// deals damage equal to its power to defending player."). Wizards' Neyali,
+/// the Plumecrest release note states the same occurrence grammar for
+/// "attack <player>" ("triggers for each player you are attacking with one or
+/// more tokens"): the attacked player is the grouping axis, so one declaration
+/// against two opponents is TWO occurrences, each with its own attacker set —
+/// never one combined set answered by the first defender. An attacked player
+/// with no matching attacker produces no group. The player-subject branch of
+/// [`matching_attack_events`] already narrows one context per attacked player
+/// (the subject there is the attacking player), so it is reused as-is.
+pub(super) fn matching_attack_events_by_defending_player(
+    event: &GameEvent,
+    trigger: &TriggerDefinition,
+    source_context: &TriggerSourceContext,
+    state: &GameState,
+) -> Vec<GameEvent> {
+    let GameEvent::AttackersDeclared {
+        attacker_ids,
+        defending_player,
+        attacks,
+        ..
+    } = event
+    else {
+        return Vec::new();
+    };
+    if trigger
+        .valid_source
+        .as_ref()
+        .is_some_and(|filter| filter.is_player_scope())
+    {
+        return matching_attack_events(event, trigger, source_context, state);
+    }
+    let mut groups: Vec<(PlayerId, Vec<(ObjectId, crate::game::combat::AttackTarget)>)> =
+        Vec::new();
+    for id in attacker_ids {
+        if !attack_declaration_attacker_matches(trigger, state, *id, source_context) {
+            continue;
+        }
+        let target = attacks
+            .iter()
+            .find_map(|(attacker_id, target)| (*attacker_id == *id).then_some(*target))
+            .unwrap_or(crate::game::combat::AttackTarget::Player(*defending_player));
+        if !attack_target_matches(trigger, state, target, *defending_player, source_context) {
+            continue;
+        }
+        let event_defending_player =
+            crate::game::combat::defending_player_for_target_or(state, target, *defending_player);
+        match groups
+            .iter_mut()
+            .find(|(player, _)| *player == event_defending_player)
+        {
+            Some((_, members)) => members.push((*id, target)),
+            None => groups.push((event_defending_player, vec![(*id, target)])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(event_defending_player, members)| {
+            let attacker_ids: Vec<ObjectId> = members.iter().map(|(id, _)| *id).collect();
+            GameEvent::AttackersDeclared {
+                declaration_records: super::triggers::declaration_records_for_attackers(
+                    event,
+                    &attacker_ids,
+                ),
+                attacker_ids,
+                defending_player: event_defending_player,
+                attacks: members,
+            }
+        })
+        .collect()
 }
 
 fn attack_target_matches(

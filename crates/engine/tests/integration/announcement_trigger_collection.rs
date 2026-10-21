@@ -1581,13 +1581,12 @@ fn guard_mana_ability_sacrifice_is_not_an_announcement() {
 //
 // CR 602.2b + CR 601.2g: a Manual activation stops in `ManaPayment` for its
 // mana leg. Every row below has its Auto reference on the same board, derived
-// from the card text: the prompts and the trigger set are the same, and the
-// window is the only difference. The cards are all printed cards. Where the
-// window falls follows the engine's order for the announcement: a non-self
-// sacrifice is removed LAST (CR 601.2g puts mana first), so its window comes
-// before the sacrifice prompt and a cancel there is accepted; a discard is paid
-// FIRST, so its window comes after the discard prompt and a cancel there is
-// refused (a paid cost is committed; see the cancel rows above).
+// from the card text: the trigger set is the same, and the window is the only
+// difference. The cards are all printed cards. CR 601.2g: "Mana abilities must
+// be activated before costs are paid", so the window comes BEFORE every non-mana
+// cost of a Manual activation — a sacrifice, a discard, a tap of the source —
+// and nothing is paid at it: a cancel there is accepted and leaves nothing
+// behind (CR 733.1). The non-mana costs are paid after the window (CR 601.2h).
 
 fn real_activate(r: &mut GameRunner, source: ObjectId, mode: CastPaymentMode) -> WaitingFor {
     let (_, _, grouped) = engine::ai_support::legal_actions_full(r.state());
@@ -1981,34 +1980,42 @@ fn m_d1_auto_reference_untargeted_discard_batch() {
     assert_eq!(b.r.state().stack.len(), 3);
 }
 
-/// M-D1, Manual: the discard is paid BEFORE the window (the engine's order for
-/// a discard, as for a spell, V25), so the window follows the discard prompt,
-/// the cost is committed and the cancel is refused with the prompt kept and
-/// Drake Haven's trigger still staged.
+/// M-D1, Manual (CR 601.2g + CR 601.2h): the window comes FIRST — the card is
+/// still in hand and nothing is on the stack — then, once the Island has paid
+/// the {1}, the discard is prompted and paid, and its batch is the Auto
+/// reference's, each trigger once.
 #[test]
-fn m_d1_manual_untargeted_discard_is_paid_before_the_window() {
+fn m_d1_manual_untargeted_discard_window_comes_first() {
     use engine::types::game_state::PayCostKind;
     let mut b = automaton_board();
-    let wf = real_activate(&mut b.r, b.automaton, CastPaymentMode::Manual);
-    assert!(is_cost_prompt(&wf, PayCostKind::Discard), "{wf:?}");
-    let window = select_cards(&mut b.r, vec![b.bears]);
-    assert!(is_window(&window), "{window:?}");
+    let window = real_activate(&mut b.r, b.automaton, CastPaymentMode::Manual);
+    assert!(
+        is_window(&window),
+        "the payment window is the first prompt: {window:?}"
+    );
+    assert!(
+        in_zone(&b.r, b.bears, Zone::Hand),
+        "no cost is paid before the window"
+    );
+    assert!(b.r.state().stack.is_empty());
+    assert!(!is_tapped(&b.r, b.islands[0]) && !is_tapped(&b.r, b.islands[1]));
+
+    tap_land(&mut b.r, b.islands[1]);
+    let wf = act(&mut b.r, GameAction::PassPriority);
+    assert!(
+        is_cost_prompt(&wf, PayCostKind::Discard),
+        "the discard follows the window: {wf:?}"
+    );
+    assert!(in_zone(&b.r, b.bears, Zone::Hand), "selected, not yet paid");
+    let wf = select_cards(&mut b.r, vec![b.bears]);
     assert!(
         in_zone(&b.r, b.bears, Zone::Graveyard),
         "the discard is paid"
     );
-    assert!(b.r.state().stack.is_empty());
-
-    let refused = b.r.act(GameAction::CancelCast);
-    assert!(refused.is_err(), "a paid cost is committed: cancel refused");
-    assert_eq!(b.r.state().waiting_for, window, "the prompt is preserved");
-
-    tap_land(&mut b.r, b.islands[1]);
-    let wf = act(&mut b.r, GameAction::PassPriority);
     assert_eq!(
         prompt_sources(&wf, P0),
         sorted(vec![b.haven, b.construct]),
-        "Haven's staged trigger joined the batch; Zulaport is absent"
+        "Haven and Construct in one batch; Zulaport is absent (nothing died)"
     );
     order_in_listed_order(&mut b.r);
     assert_eq!(stack(&b.r)[0], (Kind::Activated, b.automaton, P0));
@@ -2021,6 +2028,47 @@ fn m_d1_manual_untargeted_discard_is_paid_before_the_window() {
     assert_eq!(stack_triggers_from(&b.r, b.construct), 1);
     assert_eq!(stack_triggers_from(&b.r, b.zulaport), 0);
     assert!(!is_tapped(&b.r, b.islands[0]) && is_tapped(&b.r, b.islands[1]));
+}
+
+/// M-D1c (CR 733.1): nothing was paid at the window, so the cancel is accepted:
+/// the card stays in hand, nothing is on the stack and no trigger is left
+/// behind. Doing it again fires each observer once.
+#[test]
+fn m_d1_manual_cancel_at_the_window_is_accepted_and_triggers_nothing() {
+    use engine::types::game_state::PayCostKind;
+    let mut b = automaton_board();
+    let window = real_activate(&mut b.r, b.automaton, CastPaymentMode::Manual);
+    assert!(
+        is_window(&window),
+        "reach guard: the window opened: {window:?}"
+    );
+
+    let wf = act(&mut b.r, GameAction::CancelCast);
+    assert!(matches!(wf, WaitingFor::Priority { .. }), "{wf:?}");
+    assert!(
+        in_zone(&b.r, b.bears, Zone::Hand),
+        "the card was never discarded"
+    );
+    assert!(b.r.state().stack.is_empty(), "no activation and no trigger");
+    assert!(b.r.state().pending_cast.is_none());
+    assert_eq!(
+        valiant_counters(&b.r, b.automaton),
+        2,
+        "no counter was added"
+    );
+    b.r.advance_until_stack_empty();
+    assert_eq!(valiant_counters(&b.r, b.automaton), 2);
+
+    real_activate(&mut b.r, b.automaton, CastPaymentMode::Manual);
+    tap_land(&mut b.r, b.islands[0]);
+    let wf = act(&mut b.r, GameAction::PassPriority);
+    assert!(is_cost_prompt(&wf, PayCostKind::Discard), "{wf:?}");
+    let wf = select_cards(&mut b.r, vec![b.bears]);
+    assert_eq!(
+        prompt_sources(&wf, P0),
+        sorted(vec![b.haven, b.construct]),
+        "each observer fires once after the undone attempt"
+    );
 }
 
 /// Deepwood Drummer ("{G}, {T}, Discard a card: Target creature gets +2/+2
@@ -2077,32 +2125,39 @@ fn m_d2_auto_reference_targeted_discard_batch() {
     assert_eq!(b.r.state().stack.len(), 4);
 }
 
-/// M-D2, Manual: target, discard, then the window with Drummer still untapped
-/// ({T} is paid with the mana), a refused cancel keeping all three staged
-/// triggers, and the batch {valiant, Haven, Construct} once each.
+/// M-D2, Manual (CR 601.2c + CR 601.2g + CR 601.2h): the target, then the window
+/// with the card still in hand and Drummer untapped, then the discard; the batch
+/// is {valiant, Haven, Construct}, each once.
 #[test]
-fn m_d2_manual_targeted_discard_is_paid_before_the_window() {
+fn m_d2_manual_targeted_discard_window_comes_first() {
     use engine::types::game_state::PayCostKind;
     let mut b = drummer_board();
-    real_activate(&mut b.r, b.drummer, CastPaymentMode::Manual);
-    let wf = aim_at(&mut b.r, b.hero);
-    assert!(is_cost_prompt(&wf, PayCostKind::Discard), "{wf:?}");
-    let window = select_cards(&mut b.r, vec![b.bears]);
-    assert!(is_window(&window), "{window:?}");
-    assert!(in_zone(&b.r, b.bears, Zone::Graveyard));
+    let wf = real_activate(&mut b.r, b.drummer, CastPaymentMode::Manual);
+    assert!(matches!(wf, WaitingFor::TargetSelection { .. }), "{wf:?}");
+    let window = aim_at(&mut b.r, b.hero);
+    assert!(
+        is_window(&window),
+        "the window follows the target: {window:?}"
+    );
+    assert!(
+        in_zone(&b.r, b.bears, Zone::Hand),
+        "no cost is paid before the window"
+    );
     assert!(
         !is_tapped(&b.r, b.drummer),
         "Drummer is untapped at the window"
     );
     assert!(!is_tapped(&b.r, b.forest));
-    assert!(b.r.state().stack.is_empty());
-
-    let refused = b.r.act(GameAction::CancelCast);
-    assert!(refused.is_err(), "a paid cost is committed: cancel refused");
-    assert_eq!(b.r.state().waiting_for, window, "the prompt is preserved");
+    assert!(b.r.state().stack.is_empty(), "CR 603.3");
 
     tap_land(&mut b.r, b.forest);
     let wf = act(&mut b.r, GameAction::PassPriority);
+    assert!(
+        is_cost_prompt(&wf, PayCostKind::Discard),
+        "the discard follows the window: {wf:?}"
+    );
+    let wf = select_cards(&mut b.r, vec![b.bears]);
+    assert!(in_zone(&b.r, b.bears, Zone::Graveyard));
     assert_eq!(
         prompt_sources(&wf, P0),
         sorted(vec![b.hero, b.haven, b.construct]),
@@ -2122,5 +2177,127 @@ fn m_d2_manual_targeted_discard_is_paid_before_the_window() {
     assert!(
         is_tapped(&b.r, b.drummer),
         "{{T}} was paid after the window"
+    );
+}
+
+/// M-D2c (CR 733.1): the cancel at the window is accepted — the card stays in
+/// hand, Drummer stays untapped, and the staged valiant trigger goes with the
+/// activation. The redone activation fires valiant once.
+#[test]
+fn m_d2_manual_cancel_at_the_window_is_accepted_and_triggers_nothing() {
+    use engine::types::game_state::PayCostKind;
+    let mut b = drummer_board();
+    real_activate(&mut b.r, b.drummer, CastPaymentMode::Manual);
+    let window = aim_at(&mut b.r, b.hero);
+    assert!(
+        is_window(&window),
+        "reach guard: the window opened: {window:?}"
+    );
+
+    let wf = act(&mut b.r, GameAction::CancelCast);
+    assert!(matches!(wf, WaitingFor::Priority { .. }), "{wf:?}");
+    assert!(in_zone(&b.r, b.bears, Zone::Hand));
+    assert!(!is_tapped(&b.r, b.drummer) && !is_tapped(&b.r, b.forest));
+    assert!(b.r.state().stack.is_empty());
+    b.r.advance_until_stack_empty();
+    assert_eq!(
+        valiant_counters(&b.r, b.hero),
+        0,
+        "no trigger was left behind"
+    );
+
+    real_activate(&mut b.r, b.drummer, CastPaymentMode::Manual);
+    aim_at(&mut b.r, b.hero);
+    tap_land(&mut b.r, b.forest);
+    let wf = act(&mut b.r, GameAction::PassPriority);
+    assert!(is_cost_prompt(&wf, PayCostKind::Discard), "{wf:?}");
+    let wf = select_cards(&mut b.r, vec![b.bears]);
+    assert_eq!(
+        prompt_sources(&wf, P0),
+        sorted(vec![b.hero, b.haven, b.construct]),
+        "valiant fires once after the undone attempt"
+    );
+}
+
+/// M-D3 (CR 605.3a + CR 605.3b + CR 601.2g): a costed mana ability activated in
+/// the Manual window — Ashnod's Altar ("Sacrifice a creature: Add {C}{C}.")
+/// sacrificing a second Grizzly Bears — resolves at once and pays Mindless
+/// Automaton's {1}; the parent's discard follows the window. Zulaport sees the
+/// sacrifice, Haven the discard and Construct the parent activation — each
+/// exactly once, and Construct never for the Altar (a mana ability).
+#[test]
+fn m_d3_manual_window_funded_by_a_costed_mana_ability_triggers_each_observer_once() {
+    use engine::types::game_state::PayCostKind;
+    let mut scenario = board(2);
+    let automaton = add_card(&mut scenario, P0, "Mindless Automaton", Zone::Battlefield);
+    let card = add_card(&mut scenario, P0, "Grizzly Bears", Zone::Hand);
+    let fodder = add_card(&mut scenario, P0, "Grizzly Bears", Zone::Battlefield);
+    let altar = add_card(&mut scenario, P0, "Ashnod's Altar", Zone::Battlefield);
+    let haven = add_card(&mut scenario, P0, "Drake Haven", Zone::Battlefield);
+    let construct = add_card(&mut scenario, P0, "Crackdown Construct", Zone::Battlefield);
+    let zulaport = add_card(&mut scenario, P0, "Zulaport Cutthroat", Zone::Battlefield);
+    let mut r = build(scenario);
+
+    let window = real_activate(&mut r, automaton, CastPaymentMode::Manual);
+    assert!(is_window(&window), "{window:?}");
+    assert!(in_zone(&r, card, Zone::Hand));
+
+    let altar_index = r.state().objects[&altar]
+        .abilities
+        .iter()
+        .position(engine::game::mana_abilities::is_mana_ability)
+        .expect("Ashnod's Altar's mana ability");
+    let wf = act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: altar,
+            ability_index: altar_index,
+            payment_mode: CastPaymentMode::Auto,
+        },
+    );
+    assert!(
+        matches!(wf, WaitingFor::PayCost { .. }),
+        "the Altar's sacrifice is chosen inside the window: {wf:?}"
+    );
+    let wf = select_cards(&mut r, vec![fodder]);
+    assert!(
+        in_zone(&r, fodder, Zone::Graveyard),
+        "the mana ability resolved"
+    );
+    assert!(
+        is_window(&wf),
+        "the parent's window is resumed, not replaced: {wf:?}"
+    );
+    assert!(
+        in_zone(&r, card, Zone::Hand),
+        "the parent's discard is still unpaid"
+    );
+    assert!(
+        stack(&r).is_empty(),
+        "CR 603.3: no trigger is put on the stack mid-activation"
+    );
+
+    let wf = act(&mut r, GameAction::PassPriority);
+    assert!(is_cost_prompt(&wf, PayCostKind::Discard), "{wf:?}");
+    select_cards(&mut r, vec![card]);
+    assert!(in_zone(&r, card, Zone::Graveyard));
+    while matches!(r.state().waiting_for, WaitingFor::OrderTriggers { .. }) {
+        order_in_listed_order(&mut r);
+    }
+    assert!(
+        stack(&r).contains(&(Kind::Activated, automaton, P0)),
+        "the parent activation is on the stack"
+    );
+    assert_eq!(stack_triggers_from(&r, zulaport), 1, "Zulaport once");
+    assert_eq!(stack_triggers_from(&r, haven), 1, "Haven once");
+    assert_eq!(
+        stack_triggers_from(&r, construct),
+        1,
+        "Construct once, for the parent and not for the Altar"
+    );
+    assert_eq!(
+        r.state().players[0].mana_pool.total(),
+        1,
+        "the Altar's second {{C}} floats"
     );
 }

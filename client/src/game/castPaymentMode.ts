@@ -9,8 +9,11 @@ const AUTO_EXCEPT_SACRIFICIAL_MANA_PAYMENT_MODE: CastPaymentMode = {
 
 export function applySpellPaymentPreference(action: GameAction): GameAction {
   // Manual is the per-game escape hatch and deliberately dominates the saved
-  // preference. Otherwise stamp every cast-family action with the exact engine
-  // mode so all alternate casting routes share the same payment semantics.
+  // preference. Otherwise stamp every cast-family action, and every ability
+  // activation, with the exact engine mode so all casting and activation routes
+  // share the same payment semantics. The engine decides whether the activated
+  // ability pays mana at all (a mana ability or a mana-free cost has no window),
+  // so the mode is forwarded unconditionally.
   const preference = usePreferencesStore.getState().spellPaymentMode;
   const mode = useUiStore.getState().manualManaOverride || preference === "manual"
     ? MANUAL_CAST_PAYMENT_MODE
@@ -46,6 +49,11 @@ export function applySpellPaymentPreference(action: GameAction): GameAction {
         data: { ...action.data, payment_mode: mode },
       };
     case "CastSpellAsWebSlinging":
+      return {
+        ...action,
+        data: { ...action.data, payment_mode: mode },
+      };
+    case "ActivateAbility":
       return {
         ...action,
         data: { ...action.data, payment_mode: mode },

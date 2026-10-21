@@ -1525,7 +1525,8 @@ export interface SerializedAbility {
 }
 
 export type ChooseFromZoneConstraint =
-  | { type: "DistinctCardTypes"; categories: string[] };
+  | { type: "DistinctCardTypes"; categories: string[] }
+  | { type: "TotalManaValue"; comparator: string; value: number };
 
 export type SearchSelectionConstraint =
   | { type: "None" }
@@ -2222,6 +2223,32 @@ export interface PendingCast {
   // `#[serde(default, skip_serializing_if = "Option::is_none")]` — absent for
   // spells and for activations that have not reached their fold.
   activation_cost_snapshot?: ActivationCostSnapshot;
+  // CR 107.4f + CR 118.13a + CR 601.2b + CR 601.2h: a manually paid
+  // activation's Phyrexian announcement and, once selected, its actual
+  // Phyrexian payment. Engine-authored and transported as is; the frontend
+  // derives nothing from it. `#[serde(default, skip_serializing_if =
+  // "Option::is_none")]` — absent for spells, automatic activations and a
+  // manual activation that has not reached its announcement.
+  activation_phyrexian_intent?: ActivationPhyrexianIntent;
+}
+
+/// CR 107.4f + CR 118.13a: how one Phyrexian-shaped symbol of an activation's
+/// mana cost is paid, keyed by its index in the activation's mana component and
+/// the raw printed symbol at that index.
+export interface ActivationShardChoice {
+  shard_index: number;
+  shard: ManaCostShard;
+  choice: ShardChoice;
+}
+
+/// CR 118.13a + CR 601.2b + CR 601.2h: the announcement (`native_choices`, bound
+/// while the activation is proposed) and the actual payment selections
+/// (`payment_choices`, bound when the locked total is paid). No permission is
+/// stored.
+export interface ActivationPhyrexianIntent {
+  native_choices: ActivationShardChoice[];
+  // `#[serde(default, skip_serializing_if = "Option::is_none")]`.
+  payment_choices?: ActivationShardChoice[];
 }
 
 /// CR 601.2f + CR 602.2b: every cost modifier that applied to one activation,
@@ -2467,6 +2494,18 @@ export type SpellStackToGraveyardReplacement =
   | { type: "Library"; position: LibraryPosition }
   | { type: "Hand" };
 
+/**
+ * Mirrors engine `PendingEntersModifications` — the cast-this-way
+ * gains-modifications rider carried on a cast permission/offer: the typed
+ * continuous modifications plus the printed spell-quality predicate ("a
+ * creature spell" in "If you cast a creature spell this way, it gains …").
+ * Each field is omitted when absent.
+ */
+export type PendingEntersModifications = {
+  modifications?: ContinuousModification[];
+  cast_filter?: TargetFilter;
+};
+
 export type CastOfferKind =
   | { type: "Adventure"; object_id: ObjectId; card_id: CardId; payment_mode?: CastPaymentMode }
   | { type: "Miracle"; object_id: ObjectId; cost: ManaCost }
@@ -2489,6 +2528,9 @@ export type CastOfferKind =
       additional_cost?: ManaCost;
       // CR 614.1a + CR 608.2n: optional cast-this-way redirect.
       graveyard_replacement?: SpellStackToGraveyardReplacement;
+      // CR 608.2c + CR 611.2a: optional cast-this-way gains-modifications
+      // rider (Strago and Relm); omitted when empty.
+      enters_with_modifications?: PendingEntersModifications;
       // Frozen resolution authority, including receipts to withdraw if the
       // accepted offer never becomes a cast.
       cleanup: ResolutionCastCleanup;
@@ -2504,7 +2546,13 @@ export type CastOfferKind =
       /** Required bridge carrier; old filter-only windows fail closed. */
       face_policy: ResolutionCastFacePolicy;
       zones: Zone[];
-      exile_instead_of_graveyard?: boolean;
+      // CR 614.1a: optional cast-this-way redirect. The engine's serialized
+      // field is `graveyard_replacement` (the legacy
+      // `exile_instead_of_graveyard` key survives only as a serde alias).
+      graveyard_replacement?: SpellStackToGraveyardReplacement;
+      // CR 608.2c + CR 611.2a: optional cast-this-way gains-modifications
+      // rider; omitted when empty.
+      enters_with_modifications?: PendingEntersModifications;
       // CR 607.2a: THIS resolution's "exiled this way" batch (Plargg and
       // Nassari); omitted when empty (no batch restriction). Display-only
       // pass-through — the modal renders `candidates`.

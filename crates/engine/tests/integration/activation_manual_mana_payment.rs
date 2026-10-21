@@ -12,10 +12,16 @@ use engine::game::mana_abilities::is_mana_ability;
 use engine::game::printed_cards::rehydrate_game_from_card_db;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::scenario_db::GameScenarioDbExt;
-use engine::types::ability::TargetRef;
+use engine::types::ability::{AbilityCost, TargetRef};
 use engine::types::actions::GameAction;
-use engine::types::game_state::{CastPaymentMode, PayCostKind, StackEntryKind, WaitingFor};
+use engine::types::casting_costs::ActivationCostLock;
+use engine::types::counter::CounterType;
+use engine::types::game_state::{
+    CastPaymentMode, PayCostKind, PersistedGameState, PersistedRestoreFinalization, ShardChoice,
+    ShardOptions, StackEntryKind, WaitingFor,
+};
 use engine::types::identifiers::ObjectId;
+use engine::types::mana::{ManaCost, ManaCostShard};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
@@ -1201,4 +1207,1649 @@ fn a_manual_cycling_puts_the_triggers_of_its_discard_on_the_stack_once() {
         opponent_life - 1,
         "Artillerist's trigger resolved once"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The window precedes every non-mana cost (CR 601.2g + CR 601.2h)
+// ---------------------------------------------------------------------------
+//
+// CR 601.2g: "If the total cost includes a mana payment, the player then has a
+// chance to activate mana abilities ... Mana abilities must be activated before
+// costs are paid." So a Manual activation stops in `ManaPayment` before any of
+// its non-mana costs is paid — a counter removal, a random discard, an exile, a
+// sacrifice of its source — and pays them after the window (CR 601.2h). Each row
+// has its Auto reference on the same board.
+
+fn ability_index_of(runner: &GameRunner, source: ObjectId, text_fragment: &str) -> usize {
+    runner.state().objects[&source]
+        .abilities
+        .iter()
+        .position(|ability| {
+            ability
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains(text_fragment))
+        })
+        .unwrap_or_else(|| panic!("{source:?} has an ability reading {text_fragment:?}"))
+}
+
+fn plus_counters(runner: &GameRunner, id: ObjectId) -> u32 {
+    runner.state().objects[&id]
+        .counters
+        .get(&CounterType::Plus1Plus1)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn hand_size(runner: &GameRunner, player: PlayerId) -> usize {
+    runner.state().players[player.0 as usize].hand.len()
+}
+
+fn life(runner: &GameRunner, player: PlayerId) -> i32 {
+    runner.state().players[player.0 as usize].life
+}
+
+fn pool_total(runner: &GameRunner) -> usize {
+    runner.state().players[P0.0 as usize].mana_pool.total()
+}
+
+fn is_cost_prompt(waiting_for: &WaitingFor, matches_kind: impl Fn(&PayCostKind) -> bool) -> bool {
+    matches!(waiting_for, WaitingFor::PayCost { kind, .. } if matches_kind(kind))
+}
+
+/// Ghave, Guru of Spores ("Ghave enters with five +1/+1 counters on it. {1},
+/// Remove a +1/+1 counter from a creature you control: Create a 1/1 green
+/// Saproling creature token."), with a Swamp and an unused Island.
+fn ghave_board() -> (GameRunner, ObjectId, ObjectId, ObjectId, usize) {
+    let mut scenario = scenario_at_main();
+    let ghave = add(
+        &mut scenario,
+        P0,
+        "Ghave, Guru of Spores",
+        Zone::Battlefield,
+    );
+    let swamp = add(&mut scenario, P0, "Swamp", Zone::Battlefield);
+    let island = add(&mut scenario, P0, "Island", Zone::Battlefield);
+    let runner = build(scenario);
+    assert_eq!(
+        plus_counters(&runner, ghave),
+        5,
+        "setup: Ghave enters with five"
+    );
+    let index = ability_index_of(&runner, ghave, "Remove a +1/+1 counter");
+    (runner, ghave, swamp, island, index)
+}
+
+/// Auto reference: the counter-removal choice is the first prompt.
+#[test]
+fn an_auto_counter_removal_activation_chooses_its_counter_first() {
+    let (mut runner, ghave, _, _, index) = ghave_board();
+    let waiting_for = activate_index(&mut runner, ghave, index, CastPaymentMode::Auto);
+    assert!(
+        is_cost_prompt(&waiting_for, |kind| matches!(
+            kind,
+            PayCostKind::RemoveCounter { .. }
+        )),
+        "{waiting_for:?}"
+    );
+}
+
+/// CR 601.2g + CR 601.2h: Manual stops in the window with all five counters on
+/// Ghave; the counter is chosen and removed after the Swamp paid the {1}.
+#[test]
+fn a_manual_counter_removal_activation_opens_the_window_before_removing_the_counter() {
+    let (mut runner, ghave, swamp, island, index) = ghave_board();
+    let waiting_for = activate_index(&mut runner, ghave, index, CastPaymentMode::Manual);
+    assert!(
+        is_mana_payment(&waiting_for),
+        "the window is the first prompt: {waiting_for:?}"
+    );
+    assert_eq!(
+        plus_counters(&runner, ghave),
+        5,
+        "no counter is removed yet"
+    );
+    assert!(runner.state().stack.is_empty());
+
+    tap_land_for_mana(&mut runner, swamp);
+    let waiting_for = pass(&mut runner);
+    assert!(
+        is_cost_prompt(&waiting_for, |kind| matches!(
+            kind,
+            PayCostKind::RemoveCounter { .. }
+        )),
+        "the counter removal follows the window: {waiting_for:?}"
+    );
+    let waiting_for = select_cards(&mut runner, &[ghave]);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert_eq!(
+        plus_counters(&runner, ghave),
+        4,
+        "one counter was removed once"
+    );
+    assert_eq!(runner.state().stack.len(), 1, "the token ability");
+    assert!(tapped(&runner, swamp) && !tapped(&runner, island));
+}
+
+/// Pyromancy ("{3}, Discard a card at random: This enchantment deals damage to
+/// any target equal to the mana value of the discarded card."), three lands and
+/// two cards in hand. CR 601.2c + CR 601.2g + CR 601.2h: target, then the window
+/// with the hand intact, then the random discard — after every nonrandom cost
+/// and with no second window.
+#[test]
+fn a_manual_random_discard_activation_discards_after_its_window() {
+    let mut scenario = scenario_at_main();
+    let pyromancy = add(&mut scenario, P0, "Pyromancy", Zone::Battlefield);
+    let mountains = [
+        add(&mut scenario, P0, "Mountain", Zone::Battlefield),
+        add(&mut scenario, P0, "Mountain", Zone::Battlefield),
+        add(&mut scenario, P0, "Mountain", Zone::Battlefield),
+    ];
+    add(&mut scenario, P0, "Grizzly Bears", Zone::Hand);
+    add(&mut scenario, P0, "Hill Giant", Zone::Hand);
+    let mut runner = build(scenario);
+    let hand_before = hand_size(&runner, P0);
+    let opponent_life = life(&runner, P1);
+
+    let waiting_for = activate(&mut runner, pyromancy, CastPaymentMode::Manual);
+    assert!(
+        matches!(waiting_for, WaitingFor::TargetSelection { .. }),
+        "{waiting_for:?}"
+    );
+    let waiting_for = act(
+        &mut runner,
+        GameAction::SelectTargets {
+            targets: vec![TargetRef::Player(P1)],
+        },
+    );
+    assert!(is_mana_payment(&waiting_for), "{waiting_for:?}");
+    assert_eq!(
+        hand_size(&runner, P0),
+        hand_before,
+        "nothing is discarded yet"
+    );
+
+    for mountain in mountains {
+        tap_land_for_mana(&mut runner, mountain);
+    }
+    let waiting_for = pass(&mut runner);
+    assert!(
+        is_priority(&waiting_for),
+        "the random discard is paid at once, with no second window: {waiting_for:?}"
+    );
+    assert_eq!(
+        hand_size(&runner, P0),
+        hand_before - 1,
+        "one card discarded"
+    );
+    assert_eq!(runner.state().stack.len(), 1);
+    runner.advance_until_stack_empty();
+    let dealt = opponent_life - life(&runner, P1);
+    assert!(
+        dealt == 2 || dealt == 4,
+        "the damage is the discarded card's mana value: {dealt}"
+    );
+}
+
+/// Coin of Fate's "{3}{W}, {T}, Exile two creature cards from your graveyard,
+/// Sacrifice this artifact: ...". CR 601.2g + CR 601.2h: the window comes with
+/// the graveyard and the Coin intact; the exile choice and the Coin's own
+/// sacrifice follow it.
+#[test]
+fn a_manual_multi_component_activation_exiles_and_sacrifices_after_its_window() {
+    let mut scenario = scenario_at_main();
+    let coin = add(&mut scenario, P0, "Coin of Fate", Zone::Battlefield);
+    let first = add(&mut scenario, P0, "Grizzly Bears", Zone::Graveyard);
+    let second = add(&mut scenario, P0, "Hill Giant", Zone::Graveyard);
+    let lands = [
+        add(&mut scenario, P0, "Plains", Zone::Battlefield),
+        add(&mut scenario, P0, "Plains", Zone::Battlefield),
+        add(&mut scenario, P0, "Plains", Zone::Battlefield),
+        add(&mut scenario, P0, "Plains", Zone::Battlefield),
+    ];
+    let mut runner = build(scenario);
+
+    let waiting_for = activate(&mut runner, coin, CastPaymentMode::Manual);
+    assert!(
+        is_mana_payment(&waiting_for),
+        "the window is the first prompt: {waiting_for:?}"
+    );
+    assert!(in_zone(&runner, first, Zone::Graveyard) && in_zone(&runner, second, Zone::Graveyard));
+    assert!(in_zone(&runner, coin, Zone::Battlefield) && !tapped(&runner, coin));
+
+    for land in lands {
+        tap_land_for_mana(&mut runner, land);
+    }
+    let waiting_for = pass(&mut runner);
+    assert!(
+        is_cost_prompt(&waiting_for, |kind| matches!(
+            kind,
+            PayCostKind::ExileFromZone { .. }
+        )),
+        "the exile follows the window: {waiting_for:?}"
+    );
+    let waiting_for = select_cards(&mut runner, &[first, second]);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert!(in_zone(&runner, first, Zone::Exile) && in_zone(&runner, second, Zone::Exile));
+    assert!(
+        in_zone(&runner, coin, Zone::Graveyard),
+        "the Coin was sacrificed once"
+    );
+    assert_eq!(runner.state().stack.len(), 1);
+}
+
+/// Crystal Shard ("{3}, {T} or {U}, {T}: Return target creature to its owner's
+/// hand unless its controller pays {1}."). CR 601.2b + CR 601.2g: the target,
+/// then the cost alternative is announced — nothing is paid — and the window
+/// prices the alternative selected.
+fn shard_board() -> (GameRunner, ObjectId, ObjectId, ObjectId, [ObjectId; 3]) {
+    let mut scenario = scenario_at_main();
+    let shard = add(&mut scenario, P0, "Crystal Shard", Zone::Battlefield);
+    let victim = add(&mut scenario, P1, "Grizzly Bears", Zone::Battlefield);
+    let island = add(&mut scenario, P0, "Island", Zone::Battlefield);
+    let mountains = [
+        add(&mut scenario, P0, "Mountain", Zone::Battlefield),
+        add(&mut scenario, P0, "Mountain", Zone::Battlefield),
+        add(&mut scenario, P0, "Mountain", Zone::Battlefield),
+    ];
+    (build(scenario), shard, victim, island, mountains)
+}
+
+/// The OneOf alternative whose mana component holds `shard`.
+fn alternative_paying(waiting_for: &WaitingFor, wanted: ManaCostShard) -> usize {
+    fn holds(cost: &AbilityCost, wanted: ManaCostShard) -> bool {
+        match cost {
+            AbilityCost::Mana {
+                cost: ManaCost::Cost { shards, .. },
+            } => shards.contains(&wanted),
+            AbilityCost::Composite { costs } => costs.iter().any(|cost| holds(cost, wanted)),
+            _ => false,
+        }
+    }
+    let WaitingFor::ActivationCostOneOfChoice { costs, .. } = waiting_for else {
+        panic!("expected the cost alternative, got {waiting_for:?}");
+    };
+    costs
+        .iter()
+        .position(|cost| holds(cost, wanted))
+        .expect("the alternative is offered")
+}
+
+#[test]
+fn a_manual_alternative_cost_is_announced_before_the_window_that_prices_it() {
+    let (mut runner, shard, victim, island, mountains) = shard_board();
+    let waiting_for = activate(&mut runner, shard, CastPaymentMode::Manual);
+    assert!(
+        matches!(waiting_for, WaitingFor::TargetSelection { .. }),
+        "{waiting_for:?}"
+    );
+    let waiting_for = choose_targets(&mut runner, &[victim]);
+    let index = alternative_paying(&waiting_for, ManaCostShard::Blue);
+    assert!(
+        !tapped(&runner, shard),
+        "announcing the alternative pays nothing"
+    );
+
+    let waiting_for = act(
+        &mut runner,
+        GameAction::ChooseActivationCostBranch { index },
+    );
+    assert!(
+        is_mana_payment(&waiting_for),
+        "the window follows the selected alternative: {waiting_for:?}"
+    );
+    assert!(!tapped(&runner, shard), "{{T}} is paid after the window");
+    tap_land_for_mana(&mut runner, island);
+    let waiting_for = pass(&mut runner);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert!(tapped(&runner, shard));
+    assert!(
+        mountains.iter().all(|mountain| !tapped(&runner, *mountain)),
+        "the {{U}} alternative owed one mana: the Mountains are untouched"
+    );
+    assert_eq!(runner.state().stack.len(), 1);
+}
+
+#[test]
+fn a_manual_generic_alternative_owes_its_own_total() {
+    let (mut runner, shard, victim, island, mountains) = shard_board();
+    activate(&mut runner, shard, CastPaymentMode::Manual);
+    let waiting_for = choose_targets(&mut runner, &[victim]);
+    let index = alternative_paying(&waiting_for, ManaCostShard::Blue);
+    // The other alternative: {3}, {T}.
+    let index = 1 - index;
+    let waiting_for = act(
+        &mut runner,
+        GameAction::ChooseActivationCostBranch { index },
+    );
+    assert!(is_mana_payment(&waiting_for), "{waiting_for:?}");
+    for mountain in mountains {
+        tap_land_for_mana(&mut runner, mountain);
+    }
+    let waiting_for = pass(&mut runner);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert!(tapped(&runner, shard));
+    assert!(
+        !tapped(&runner, island),
+        "the {{3}} alternative did not use the Island"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Formidable Speaker: target, then the window, then the effect (issue #6016)
+// ---------------------------------------------------------------------------
+
+/// Formidable Speaker ("When this creature enters, you may discard a card. If
+/// you do, search your library for a creature card, reveal it, put it into your
+/// hand, then shuffle. / {1}, {T}: Untap another target permanent."), already
+/// on the battlefield (its enters trigger is not replayed), with two tapped
+/// permanents it could untap, a Mountain to pay with and an unused Sol Ring.
+struct SpeakerBoard {
+    runner: GameRunner,
+    speaker: ObjectId,
+    bears: ObjectId,
+    forest: ObjectId,
+    mountain: ObjectId,
+    sol_ring: ObjectId,
+}
+
+fn speaker_board(extra_hand: &[&str]) -> SpeakerBoard {
+    let mut scenario = scenario_at_main();
+    let speaker = add(&mut scenario, P0, "Formidable Speaker", Zone::Battlefield);
+    let bears = add(&mut scenario, P0, "Grizzly Bears", Zone::Battlefield);
+    let forest = add(&mut scenario, P0, "Forest", Zone::Battlefield);
+    let mountain = add(&mut scenario, P0, "Mountain", Zone::Battlefield);
+    let sol_ring = add(&mut scenario, P0, "Sol Ring", Zone::Battlefield);
+    for name in extra_hand {
+        add(&mut scenario, P0, name, Zone::Hand);
+    }
+    let mut runner = build(scenario);
+    assert!(
+        runner.state().stack.is_empty(),
+        "no enters trigger was queued"
+    );
+    // Fixture precondition: the two permanents the ability can untap are tapped.
+    for id in [bears, forest] {
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&id)
+            .expect("object")
+            .tapped = true;
+    }
+    SpeakerBoard {
+        runner,
+        speaker,
+        bears,
+        forest,
+        mountain,
+        sol_ring,
+    }
+}
+
+/// CR 602.2b + CR 601.2c + CR 601.2g: Manual chooses the target first, then
+/// stops in the window with nothing tapped — not the Speaker, not a source —
+/// and once the player taps the Mountain the ability is placed and untaps the
+/// chosen permanent only.
+#[test]
+fn manual_formidable_speaker_targets_then_opens_the_window_and_untaps_the_target() {
+    let SpeakerBoard {
+        mut runner,
+        speaker,
+        bears,
+        forest,
+        mountain,
+        sol_ring,
+    } = speaker_board(&[]);
+
+    let waiting_for = activate(&mut runner, speaker, CastPaymentMode::Manual);
+    assert!(
+        matches!(waiting_for, WaitingFor::TargetSelection { .. }),
+        "CR 601.2c: the target is chosen first: {waiting_for:?}"
+    );
+    let waiting_for = choose_targets(&mut runner, &[bears]);
+    assert!(
+        is_mana_payment(&waiting_for),
+        "CR 601.2g: the window follows the target: {waiting_for:?}"
+    );
+    assert!(!tapped(&runner, speaker), "{{T}} is paid after the window");
+    assert!(!tapped(&runner, mountain) && !tapped(&runner, sol_ring));
+    assert!(runner.state().stack.is_empty());
+
+    tap_land_for_mana(&mut runner, mountain);
+    let waiting_for = pass(&mut runner);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert_eq!(runner.state().stack.len(), 1, "the untap ability");
+    assert!(tapped(&runner, speaker), "{{T}} was paid once");
+    assert!(!tapped(&runner, sol_ring), "Sol Ring was never used");
+
+    runner.advance_until_stack_empty();
+    assert!(!tapped(&runner, bears), "the chosen permanent untaps");
+    assert!(tapped(&runner, forest), "the other permanent stays tapped");
+}
+
+/// The Auto control on the same board: the target is chosen, the {1} is paid
+/// automatically and the ability is placed with no window.
+#[test]
+fn auto_formidable_speaker_pays_itself_after_its_target() {
+    let SpeakerBoard {
+        mut runner,
+        speaker,
+        bears,
+        mountain,
+        sol_ring,
+        ..
+    } = speaker_board(&[]);
+    activate(&mut runner, speaker, CastPaymentMode::Auto);
+    let waiting_for = choose_targets(&mut runner, &[bears]);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert_eq!(runner.state().stack.len(), 1);
+    assert!(tapped(&runner, speaker));
+    assert!(tapped(&runner, mountain) || tapped(&runner, sol_ring));
+    runner.advance_until_stack_empty();
+    assert!(!tapped(&runner, bears));
+}
+
+/// "Another target permanent": the Speaker cannot target itself; a legal other
+/// target on the same prompt proves the prompt was reached.
+#[test]
+fn manual_formidable_speaker_cannot_target_itself() {
+    let SpeakerBoard {
+        mut runner,
+        speaker,
+        bears,
+        ..
+    } = speaker_board(&[]);
+    activate(&mut runner, speaker, CastPaymentMode::Manual);
+    assert!(
+        runner
+            .act(GameAction::SelectTargets {
+                targets: vec![TargetRef::Object(speaker)],
+            })
+            .is_err(),
+        "the Speaker is not another permanent"
+    );
+    let waiting_for = choose_targets(&mut runner, &[bears]);
+    assert!(is_mana_payment(&waiting_for), "{waiting_for:?}");
+}
+
+/// CR 608.2b: the target is checked again on resolution, not chosen again during
+/// payment. A Lightning Bolt cast in response destroys the chosen Grizzly Bears;
+/// the untap ability does nothing, and the Forest — never chosen — stays tapped.
+#[test]
+fn manual_formidable_speaker_does_nothing_when_its_target_is_gone_on_resolution() {
+    let SpeakerBoard {
+        mut runner,
+        speaker,
+        bears,
+        forest,
+        mountain,
+        ..
+    } = speaker_board(&["Lightning Bolt"]);
+    let bolt = runner.state().players[P0.0 as usize]
+        .hand
+        .iter()
+        .copied()
+        .find(|id| runner.state().objects[id].name == "Lightning Bolt")
+        .expect("the Bolt is in hand");
+    activate(&mut runner, speaker, CastPaymentMode::Manual);
+    choose_targets(&mut runner, &[bears]);
+    tap_land_for_mana(&mut runner, mountain);
+    pass(&mut runner);
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "reach guard: the ability is placed"
+    );
+
+    // Fund the response with its own red mana, so the activation's payment is
+    // untouched by it.
+    runner.state_mut().players[P0.0 as usize]
+        .mana_pool
+        .add(engine::types::mana::ManaUnit::new(
+            engine::types::mana::ManaType::Red,
+            ObjectId(0),
+            false,
+            vec![],
+        ));
+    drop(runner.cast(bolt).target_object(bears).commit());
+    runner.advance_until_stack_empty();
+    assert!(
+        in_zone(&runner, bears, Zone::Graveyard),
+        "the Bolt resolved"
+    );
+    assert!(tapped(&runner, forest), "nothing else was untapped");
+    assert!(tapped(&runner, speaker), "the cost stayed paid");
+}
+
+// ---------------------------------------------------------------------------
+// Phyrexian symbols: announced while proposed, paid after the window
+// ---------------------------------------------------------------------------
+//
+// CR 118.13a + CR 601.2b: how a Phyrexian symbol of an activation cost will be
+// paid is announced as the ability is proposed — after its X, before its
+// targets (CR 601.2c) and before its total cost is determined and locked
+// (CR 601.2f). A symbol announced as 2 life is not mana in that total, so a
+// "can't reduce the mana in that cost to less than one mana" floor (Zirda, the
+// Dawnwaker) reads it out (CR 601.2f), and CR 601.2g's window opens only when
+// the selected total still includes mana. The life itself is paid with the
+// total (CR 601.2h), when CR 119.4 + CR 118.3 check it — after the window,
+// whose mana abilities can gain life (Pristine Talisman). A payment-only
+// permission (K'rrik, Son of Yawgmoth: "For each {B} in a cost, you may pay 2
+// life rather than pay that mana.") changes how a locked {B} is paid, never the
+// cost.
+//
+// Hex Parasite: "{X}{B/P}: Remove up to X counters from target permanent. For
+// each counter removed this way, this creature gets +1/+0 until end of turn.
+// ({B/P} can be paid with either {B} or 2 life.)" These rows assert the
+// announcement, the lock, the window and the payment, and that the chosen
+// target is the one on the stack. They do not assert the counter removal: the
+// current card data reads "up to X" as a fixed count of zero (a parser defect
+// outside this payment change), so the effect's outcome is not evidence here.
+
+fn submit_phyrexian(runner: &mut GameRunner, choices: &[ShardChoice]) -> WaitingFor {
+    act(
+        runner,
+        GameAction::SubmitPhyrexianChoices {
+            choices: choices.to_vec(),
+        },
+    )
+}
+
+/// The open proposal root of the pending activation.
+fn proposal(runner: &GameRunner) -> &engine::types::game_state::PendingCast {
+    runner
+        .state()
+        .pending_cast
+        .as_deref()
+        .expect("the activation's root is pending")
+}
+
+fn lock_is_open(runner: &GameRunner) -> bool {
+    matches!(
+        proposal(runner)
+            .activation_cost_snapshot
+            .as_deref()
+            .map(|snapshot| &snapshot.lock),
+        Some(ActivationCostLock::Open { .. })
+    )
+}
+
+/// Asserts `waiting_for` is the STRUCTURAL announcement prompt: one entry per
+/// printed Phyrexian symbol, each offering both payments whatever the current
+/// pool and life total (CR 118.13a + CR 601.2b announce; CR 601.2h pays).
+fn assert_announcement(waiting_for: &WaitingFor, symbols: usize) {
+    let WaitingFor::PhyrexianPayment { shards, .. } = waiting_for else {
+        panic!("expected the Phyrexian announcement, got {waiting_for:?}");
+    };
+    assert_eq!(shards.len(), symbols, "{shards:?}");
+    assert!(
+        shards
+            .iter()
+            .all(|shard| shard.options == ShardOptions::ManaOrLife),
+        "the announcement is structural: {shards:?}"
+    );
+}
+
+/// The targets of `source`'s activation on the stack.
+fn activation_targets(runner: &GameRunner, source: ObjectId) -> Vec<TargetRef> {
+    runner
+        .state()
+        .stack
+        .iter()
+        .find_map(|entry| match &entry.kind {
+            StackEntryKind::ActivatedAbility { source_id, ability } if *source_id == source => {
+                Some(ability.targets.clone())
+            }
+            _ => None,
+        })
+        .expect("the activation is on the stack")
+}
+
+fn activate_mana_ability(runner: &mut GameRunner, source: ObjectId) -> WaitingFor {
+    let index = runner.state().objects[&source]
+        .abilities
+        .iter()
+        .position(is_mana_ability)
+        .expect("a mana ability");
+    act(
+        runner,
+        GameAction::ActivateAbility {
+            source_id: source,
+            ability_index: index,
+            payment_mode: CastPaymentMode::Auto,
+        },
+    )
+}
+
+struct HexBoard {
+    runner: GameRunner,
+    hex: ObjectId,
+    chosen: ObjectId,
+    other: ObjectId,
+    swamp: ObjectId,
+    mountain: ObjectId,
+    wastes: ObjectId,
+}
+
+/// Real Hex Parasite with two distinguishable counter-bearing targets, a Swamp,
+/// a Mountain and an unused Wastes, at `life`, optionally with Zirda and K'rrik.
+fn hex_board(life_total: i32, zirda: bool, krrik: bool) -> HexBoard {
+    let mut scenario = scenario_at_main();
+    scenario.with_life(P0, life_total);
+    let hex = add(&mut scenario, P0, "Hex Parasite", Zone::Battlefield);
+    let chosen = add(&mut scenario, P1, "Grizzly Bears", Zone::Battlefield);
+    let other = add(&mut scenario, P1, "Grizzly Bears", Zone::Battlefield);
+    scenario.with_counter(chosen, CounterType::Plus1Plus1, 1);
+    scenario.with_counter(other, CounterType::Plus1Plus1, 2);
+    let swamp = add(&mut scenario, P0, "Swamp", Zone::Battlefield);
+    let mountain = add(&mut scenario, P0, "Mountain", Zone::Battlefield);
+    let wastes = add(&mut scenario, P0, "Wastes", Zone::Battlefield);
+    if zirda {
+        add(&mut scenario, P0, "Zirda, the Dawnwaker", Zone::Battlefield);
+    }
+    if krrik {
+        add(
+            &mut scenario,
+            P0,
+            "K'rrik, Son of Yawgmoth",
+            Zone::Battlefield,
+        );
+    }
+    HexBoard {
+        runner: build(scenario),
+        hex,
+        chosen,
+        other,
+        swamp,
+        mountain,
+        wastes,
+    }
+}
+
+/// Manual Hex Parasite: X, then the announcement on the open proposal — no
+/// target declared, nothing paid — then `choice`, then the target.
+fn hex_announce(board: &mut HexBoard, x: u32, choice: ShardChoice) -> WaitingFor {
+    let life_before = life(&board.runner, P0);
+    let waiting_for = activate_index(&mut board.runner, board.hex, 0, CastPaymentMode::Manual);
+    assert!(
+        matches!(waiting_for, WaitingFor::ChooseXValue { .. }),
+        "CR 601.2b: X first: {waiting_for:?}"
+    );
+    let waiting_for = act(&mut board.runner, GameAction::ChooseX { value: x });
+    assert_announcement(&waiting_for, 1);
+    assert!(
+        proposal(&board.runner).ability.targets.is_empty(),
+        "CR 601.2c: no target is declared before the announcement"
+    );
+    assert!(
+        lock_is_open(&board.runner),
+        "CR 601.2f: the cost is not locked yet"
+    );
+    assert_eq!(
+        life(&board.runner, P0),
+        life_before,
+        "nothing is paid by announcing"
+    );
+    assert!(
+        [board.swamp, board.mountain, board.wastes]
+            .iter()
+            .all(|land| !tapped(&board.runner, *land)),
+        "no mana is paid by announcing"
+    );
+    let waiting_for = submit_phyrexian(&mut board.runner, &[choice]);
+    assert!(
+        matches!(waiting_for, WaitingFor::TargetSelection { .. }),
+        "CR 601.2c: the target follows the announcement: {waiting_for:?}"
+    );
+    let waiting_for = choose_targets(&mut board.runner, &[board.chosen]);
+    assert_eq!(
+        proposal_or_stack_targets(&board.runner, board.hex),
+        vec![TargetRef::Object(board.chosen)]
+    );
+    waiting_for
+}
+
+/// The declared target: on the pending root while paying, on the stack after.
+fn proposal_or_stack_targets(runner: &GameRunner, source: ObjectId) -> Vec<TargetRef> {
+    match runner.state().pending_cast.as_deref() {
+        Some(pending) => engine::game::ability_utils::declared_targets_in_chain(&pending.ability),
+        None => activation_targets(runner, source),
+    }
+}
+
+/// CR 118.13a + CR 601.2g: announced as mana, X = 1 owes {1}{B}; the window
+/// opens after the target and the player pays it with the Swamp and the
+/// Mountain. No life is paid.
+#[test]
+fn manual_hex_parasite_phyrexian_intent_precedes_payment() {
+    let mut board = hex_board(20, false, false);
+    let waiting_for = hex_announce(&mut board, 1, ShardChoice::PayMana);
+    assert!(is_mana_payment(&waiting_for), "{waiting_for:?}");
+    assert!(board.runner.state().stack.is_empty());
+
+    tap_land_for_mana(&mut board.runner, board.swamp);
+    tap_land_for_mana(&mut board.runner, board.mountain);
+    let waiting_for = pass(&mut board.runner);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert_eq!(life(&board.runner, P0), 20, "the symbol was paid with mana");
+    assert_eq!(
+        activation_targets(&board.runner, board.hex),
+        vec![TargetRef::Object(board.chosen)]
+    );
+    assert!(
+        !tapped(&board.runner, board.wastes),
+        "the unused source stays untapped"
+    );
+    assert_eq!(board.runner.state().stack.len(), 1, "placed once");
+    assert_eq!(
+        plus_counters(&board.runner, board.other),
+        2,
+        "the other target is untouched"
+    );
+}
+
+/// CR 118.13a + CR 601.2g + CR 601.2h: announced as life, X = 1 still owes {1},
+/// so the window still opens; the Mountain pays the {1} and 2 life pay the
+/// symbol. The Swamp is never used.
+#[test]
+fn manual_hex_parasite_life_intent_keeps_x_mana_opportunity() {
+    let mut board = hex_board(20, false, false);
+    let waiting_for = hex_announce(&mut board, 1, ShardChoice::PayLife);
+    assert!(
+        is_mana_payment(&waiting_for),
+        "the selected total still includes {{1}}: {waiting_for:?}"
+    );
+    assert_eq!(
+        life(&board.runner, P0),
+        20,
+        "the life is paid with the total"
+    );
+
+    tap_land_for_mana(&mut board.runner, board.mountain);
+    let waiting_for = pass(&mut board.runner);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert_eq!(life(&board.runner, P0), 18, "exactly 2 life");
+    assert!(
+        !tapped(&board.runner, board.swamp),
+        "the black mana was not used"
+    );
+    assert_eq!(board.runner.state().stack.len(), 1);
+}
+
+/// CR 601.2g: X = 0 announced as life has no mana in its total, so there is no
+/// window: the 2 life are paid at once and the ability is placed — with and
+/// without Zirda, whose floor cannot raise a zero-mana total to one.
+#[test]
+fn manual_hex_parasite_zero_x_life_intent_needs_no_mana_window() {
+    for zirda in [false, true] {
+        let mut board = hex_board(20, zirda, false);
+        let waiting_for = hex_announce(&mut board, 0, ShardChoice::PayLife);
+        assert!(
+            is_priority(&waiting_for),
+            "zirda {zirda}: no mana, no window: {waiting_for:?}"
+        );
+        assert_eq!(life(&board.runner, P0), 18, "zirda {zirda}");
+        assert!(
+            [board.swamp, board.mountain, board.wastes]
+                .iter()
+                .all(|land| !tapped(&board.runner, *land)),
+            "zirda {zirda}: nothing was tapped"
+        );
+        assert_eq!(board.runner.state().stack.len(), 1, "zirda {zirda}");
+    }
+}
+
+/// Pair of the row above: X = 0 announced as mana owes {B}, so the window opens.
+#[test]
+fn manual_hex_parasite_zero_x_mana_intent_owes_black() {
+    let mut board = hex_board(20, false, false);
+    let waiting_for = hex_announce(&mut board, 0, ShardChoice::PayMana);
+    assert!(is_mana_payment(&waiting_for), "{waiting_for:?}");
+    tap_land_for_mana(&mut board.runner, board.swamp);
+    let waiting_for = pass(&mut board.runner);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert_eq!(life(&board.runner, P0), 20);
+    assert!(!tapped(&board.runner, board.mountain));
+}
+
+/// CR 601.2f + CR 118.13a: under real Zirda, X = 1 announced as life has ONE
+/// mana in its selected total ({1}; the symbol is life), so Zirda's "less than
+/// one mana" floor removes nothing: the lock is {1} plus 2 life and the window
+/// opens for the {1}. Folding the printed {B/P} as mana would have removed the
+/// {1} and skipped the window.
+#[test]
+fn manual_hex_parasite_zirda_selected_life_cost_keeps_one_generic() {
+    let mut board = hex_board(20, true, false);
+    let waiting_for = hex_announce(&mut board, 1, ShardChoice::PayLife);
+    assert!(
+        is_mana_payment(&waiting_for),
+        "the locked total keeps its one generic mana: {waiting_for:?}"
+    );
+    tap_land_for_mana(&mut board.runner, board.mountain);
+    let waiting_for = pass(&mut board.runner);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert_eq!(life(&board.runner, P0), 18);
+    assert!(
+        tapped(&board.runner, board.mountain),
+        "one generic mana was paid"
+    );
+    assert!(!tapped(&board.runner, board.swamp) && !tapped(&board.runner, board.wastes));
+}
+
+/// Its PayMana sibling: {1}{B} has two mana, Zirda reduces it to {B}, which the
+/// Swamp alone pays; no life is paid and the other lands stay untapped.
+#[test]
+fn manual_hex_parasite_zirda_selected_mana_cost_owes_black_alone() {
+    let mut board = hex_board(20, true, false);
+    let waiting_for = hex_announce(&mut board, 1, ShardChoice::PayMana);
+    assert!(is_mana_payment(&waiting_for), "{waiting_for:?}");
+    tap_land_for_mana(&mut board.runner, board.swamp);
+    let waiting_for = pass(&mut board.runner);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert_eq!(life(&board.runner, P0), 20);
+    assert!(!tapped(&board.runner, board.mountain) && !tapped(&board.runner, board.wastes));
+}
+
+/// CR 601.2f + CR 601.2h: K'rrik's permission is payment-only. Under Zirda and
+/// K'rrik, X = 1 announced as MANA locks {B} (Zirda reduced the {1}); the window
+/// opens for it, and only when that {B} is paid does K'rrik offer 2 life for it.
+/// The announcement on the root stays "mana" while the payment pays life.
+#[test]
+fn manual_hex_zirda_krrik_preserves_native_route() {
+    let mut board = hex_board(20, true, true);
+    let waiting_for = hex_announce(&mut board, 1, ShardChoice::PayMana);
+    assert!(
+        is_mana_payment(&waiting_for),
+        "CR 601.2g: the locked {{B}} is a mana payment: {waiting_for:?}"
+    );
+    let waiting_for = pass(&mut board.runner);
+    let WaitingFor::PhyrexianPayment { shards, .. } = &waiting_for else {
+        panic!("K'rrik's permission is offered when the {{B}} is paid: {waiting_for:?}");
+    };
+    assert_eq!(shards.len(), 1, "{shards:?}");
+    assert_ne!(shards[0].options, ShardOptions::ManaOnly, "life is offered");
+    let native = proposal(&board.runner)
+        .activation_phyrexian_intent
+        .clone()
+        .expect("the announcement is bound")
+        .native_choices;
+    assert_eq!(
+        native
+            .iter()
+            .map(|record| record.choice)
+            .collect::<Vec<_>>(),
+        vec![ShardChoice::PayMana],
+        "the native announcement is never rewritten"
+    );
+    let waiting_for = submit_phyrexian(&mut board.runner, &[ShardChoice::PayLife]);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert_eq!(life(&board.runner, P0), 18, "zero mana and exactly 2 life");
+    assert!(
+        [board.swamp, board.mountain, board.wastes]
+            .iter()
+            .all(|land| !tapped(&board.runner, *land)),
+        "no mana was spent"
+    );
+    assert_eq!(board.runner.state().stack.len(), 1);
+}
+
+/// The native-life branch of the same board: the lock is {1} plus 2 life; the
+/// window opens for the {1}; the symbol announced as life is paid with life and
+/// is not offered again, K'rrik or not.
+#[test]
+fn manual_hex_zirda_krrik_native_life_owes_one_generic_and_two_life() {
+    let mut board = hex_board(20, true, true);
+    let waiting_for = hex_announce(&mut board, 1, ShardChoice::PayLife);
+    assert!(is_mana_payment(&waiting_for), "{waiting_for:?}");
+    tap_land_for_mana(&mut board.runner, board.mountain);
+    let waiting_for = pass(&mut board.runner);
+    assert!(
+        is_priority(&waiting_for),
+        "nothing is left to choose: {waiting_for:?}"
+    );
+    assert_eq!(life(&board.runner, P0), 18);
+    assert!(!tapped(&board.runner, board.swamp));
+}
+
+/// B3 — CR 601.2g + CR 601.2h + CR 119.3 + CR 119.4: at ONE life, the
+/// announcement still offers life (it pays nothing), and the player announces
+/// it. After the target and the {1}-plus-2-life lock, the player activates two
+/// real Pristine Talismans ("{T}: Add {C}. You gain 1 life.") in the window:
+/// +2 colorless and +2 life. The payment then spends one colorless and 2 life,
+/// leaving 1 life and one colorless floating.
+#[test]
+fn manual_hex_parasite_life_paid_after_mana_ability_life_gain() {
+    let mut scenario = scenario_at_main();
+    scenario.with_life(P0, 1);
+    let hex = add(&mut scenario, P0, "Hex Parasite", Zone::Battlefield);
+    let chosen = add(&mut scenario, P1, "Grizzly Bears", Zone::Battlefield);
+    let other = add(&mut scenario, P1, "Grizzly Bears", Zone::Battlefield);
+    scenario.with_counter(chosen, CounterType::Plus1Plus1, 1);
+    scenario.with_counter(other, CounterType::Plus1Plus1, 1);
+    let talismans = [
+        add(&mut scenario, P0, "Pristine Talisman", Zone::Battlefield),
+        add(&mut scenario, P0, "Pristine Talisman", Zone::Battlefield),
+    ];
+    let mut runner = build(scenario);
+
+    activate_index(&mut runner, hex, 0, CastPaymentMode::Manual);
+    let waiting_for = act(&mut runner, GameAction::ChooseX { value: 1 });
+    assert_announcement(&waiting_for, 1);
+    let waiting_for = submit_phyrexian(&mut runner, &[ShardChoice::PayLife]);
+    assert!(
+        matches!(waiting_for, WaitingFor::TargetSelection { .. }),
+        "the life announcement is accepted at one life: {waiting_for:?}"
+    );
+    assert_eq!(life(&runner, P0), 1, "nothing was paid");
+    let waiting_for = choose_targets(&mut runner, &[chosen]);
+    assert!(is_mana_payment(&waiting_for), "{waiting_for:?}");
+
+    for talisman in talismans {
+        activate_mana_ability(&mut runner, talisman);
+    }
+    assert_eq!(life(&runner, P0), 3, "each Talisman gained 1 life");
+    assert_eq!(pool_total(&runner), 2, "each Talisman added {{C}}");
+
+    let waiting_for = pass(&mut runner);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert_eq!(life(&runner, P0), 1, "exactly 2 life were paid");
+    assert_eq!(pool_total(&runner), 1, "exactly one generic mana was paid");
+    assert_eq!(
+        activation_targets(&runner, hex),
+        vec![TargetRef::Object(chosen)]
+    );
+    assert_eq!(runner.state().stack.len(), 1, "placed once");
+}
+
+/// B3's negative: the same one-life announcement is accepted, but with no life
+/// gained in the window the payment cannot be made (CR 119.4 + CR 118.3): it is
+/// refused, the window stays and nothing is placed. A three-life sibling pays.
+#[test]
+fn manual_hex_parasite_life_intent_without_the_life_is_refused_at_payment() {
+    for (life_total, payable) in [(1, false), (3, true)] {
+        let mut scenario = scenario_at_main();
+        scenario.with_life(P0, life_total);
+        let hex = add(&mut scenario, P0, "Hex Parasite", Zone::Battlefield);
+        let chosen = add(&mut scenario, P1, "Grizzly Bears", Zone::Battlefield);
+        let wastes = add(&mut scenario, P0, "Wastes", Zone::Battlefield);
+        let mut runner = build(scenario);
+
+        activate_index(&mut runner, hex, 0, CastPaymentMode::Manual);
+        act(&mut runner, GameAction::ChooseX { value: 1 });
+        let waiting_for = submit_phyrexian(&mut runner, &[ShardChoice::PayLife]);
+        assert!(
+            matches!(waiting_for, WaitingFor::TargetSelection { .. }),
+            "life {life_total}: announced: {waiting_for:?}"
+        );
+        let window = choose_targets(&mut runner, &[chosen]);
+        assert!(is_mana_payment(&window), "life {life_total}: {window:?}");
+        tap_land_for_mana(&mut runner, wastes);
+        let result = runner.act(GameAction::PassPriority);
+        if payable {
+            assert!(result.is_ok(), "life {life_total}: {result:?}");
+            assert_eq!(life(&runner, P0), life_total - 2);
+            assert_eq!(runner.state().stack.len(), 1);
+        } else {
+            assert!(
+                result.is_err(),
+                "CR 119.4: the payment is refused at one life"
+            );
+            assert_eq!(runner.state().waiting_for, window, "the window stays");
+            assert_eq!(life(&runner, P0), 1, "no life was paid");
+            assert!(runner.state().stack.is_empty(), "nothing was placed");
+        }
+    }
+}
+
+/// CR 733.1: the announcement prompt can be cancelled — nothing was paid — and
+/// so can the window after it; the redo pays once.
+#[test]
+fn manual_hex_parasite_cancels_from_the_announcement_and_from_the_window() {
+    let mut board = hex_board(20, false, false);
+    activate_index(&mut board.runner, board.hex, 0, CastPaymentMode::Manual);
+    let waiting_for = act(&mut board.runner, GameAction::ChooseX { value: 1 });
+    assert_announcement(&waiting_for, 1);
+    let waiting_for = cancel(&mut board.runner);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert!(board.runner.state().pending_cast.is_none());
+    assert!(board.runner.state().stack.is_empty());
+    assert_eq!(life(&board.runner, P0), 20);
+
+    let waiting_for = hex_announce(&mut board, 1, ShardChoice::PayLife);
+    assert!(is_mana_payment(&waiting_for), "{waiting_for:?}");
+    let waiting_for = cancel(&mut board.runner);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert!(board.runner.state().stack.is_empty());
+    assert_eq!(life(&board.runner, P0), 20, "no life was paid");
+
+    let waiting_for = hex_announce(&mut board, 1, ShardChoice::PayLife);
+    assert!(is_mana_payment(&waiting_for), "{waiting_for:?}");
+    tap_land_for_mana(&mut board.runner, board.mountain);
+    pass(&mut board.runner);
+    assert_eq!(life(&board.runner, P0), 18, "the redo pays once");
+    assert_eq!(board.runner.state().stack.len(), 1);
+}
+
+/// A raw and a trusted save at the window keep the bound announcement, the
+/// target and the locked {1}-plus-2-life total: the restored game pays exactly
+/// that, with no new announcement.
+#[test]
+fn manual_hex_parasite_announcement_survives_raw_and_trusted_restore() {
+    for trusted in [false, true] {
+        let mut board = hex_board(20, true, false);
+        let window = hex_announce(&mut board, 1, ShardChoice::PayLife);
+        assert!(is_mana_payment(&window), "{window:?}");
+        let persisted = if trusted {
+            PersistedGameState::capture(board.runner.state().clone())
+        } else {
+            PersistedGameState::Raw(Box::new(board.runner.state().clone()))
+        };
+        let json = serde_json::to_string(&persisted).expect("the window serializes");
+        let db = shared_card_db().expect("the checked-in fixture contains the cards");
+        let state = serde_json::from_str::<PersistedGameState>(&json)
+            .expect("the save decodes")
+            .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+            .expect("the paused save is admissible")
+            .finalize_after_rehydration(|state| {
+                rehydrate_game_from_card_db(state, db);
+                Ok(())
+            })
+            .expect("the rehydrated save is publishable");
+        board.runner = GameRunner::from_state(state);
+        assert!(is_mana_payment(&board.runner.state().waiting_for));
+        let intent = proposal(&board.runner)
+            .activation_phyrexian_intent
+            .clone()
+            .unwrap_or_else(|| panic!("trusted {trusted}: the announcement survives"));
+        assert_eq!(
+            intent
+                .native_choices
+                .iter()
+                .map(|r| r.choice)
+                .collect::<Vec<_>>(),
+            vec![ShardChoice::PayLife]
+        );
+        tap_land_for_mana(&mut board.runner, board.mountain);
+        let waiting_for = pass(&mut board.runner);
+        assert!(
+            is_priority(&waiting_for),
+            "trusted {trusted}: {waiting_for:?}"
+        );
+        assert_eq!(life(&board.runner, P0), 18, "trusted {trusted}");
+        assert_eq!(
+            activation_targets(&board.runner, board.hex),
+            vec![TargetRef::Object(board.chosen)]
+        );
+    }
+}
+
+/// The Auto sibling, independently derived from the card: an automatic Hex
+/// Parasite with X = 1 and a Swamp available pays {1}{B} with mana or life by
+/// its existing payment-time choice; Manual's announcement does not change it.
+#[test]
+fn auto_hex_parasite_keeps_its_payment_time_phyrexian_choice() {
+    let mut board = hex_board(20, false, false);
+    let waiting_for = activate_index(&mut board.runner, board.hex, 0, CastPaymentMode::Auto);
+    assert!(
+        matches!(waiting_for, WaitingFor::ChooseXValue { .. }),
+        "{waiting_for:?}"
+    );
+    let waiting_for = act(&mut board.runner, GameAction::ChooseX { value: 1 });
+    assert!(
+        matches!(waiting_for, WaitingFor::TargetSelection { .. }),
+        "Auto makes no announcement before its target: {waiting_for:?}"
+    );
+}
+
+/// Birthing Pod ("{1}{G/P}, {T}, Sacrifice a creature: Search your library for
+/// a creature card with mana value equal to 1 plus the sacrificed creature's
+/// mana value, put that card onto the battlefield, then shuffle. Activate only
+/// as a sorcery."): no X and no target, so the announcement is the first
+/// prompt; life still leaves {1} for the window; the tap and the sacrifice come
+/// after it, once, and the search reads the sacrificed creature.
+fn pod_board(zirda: bool) -> (GameRunner, ObjectId, ObjectId, ObjectId, ObjectId, ObjectId) {
+    let mut scenario = scenario_at_main();
+    let pod = add(&mut scenario, P0, "Birthing Pod", Zone::Battlefield);
+    let bears = add(&mut scenario, P0, "Grizzly Bears", Zone::Battlefield);
+    let forest = add(&mut scenario, P0, "Forest", Zone::Battlefield);
+    let wastes = add(&mut scenario, P0, "Wastes", Zone::Battlefield);
+    let courser = add(&mut scenario, P0, "Centaur Courser", Zone::Library);
+    add(&mut scenario, P0, "Hill Giant", Zone::Library);
+    if zirda {
+        add(&mut scenario, P0, "Zirda, the Dawnwaker", Zone::Battlefield);
+    }
+    (build(scenario), pod, bears, forest, wastes, courser)
+}
+
+fn finish_pod(runner: &mut GameRunner, bears: ObjectId, courser: ObjectId) {
+    let waiting_for = runner.state().waiting_for.clone();
+    assert!(
+        matches!(
+            waiting_for,
+            WaitingFor::PayCost {
+                kind: PayCostKind::Sacrifice,
+                ..
+            }
+        ),
+        "the sacrifice follows the window: {waiting_for:?}"
+    );
+    let waiting_for = select_cards(runner, &[bears]);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert!(in_zone(runner, bears, Zone::Graveyard), "sacrificed once");
+    assert_eq!(runner.state().stack.len(), 1);
+    for _ in 0..8 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::SearchChoice { cards, .. } => {
+                assert_eq!(
+                    cards,
+                    vec![courser],
+                    "mana value 3 = 1 + the sacrificed Grizzly Bears' 2"
+                );
+                select_cards(runner, &[courser]);
+            }
+            _ if runner.state().stack.is_empty() => break,
+            _ => {
+                pass(runner);
+            }
+        }
+    }
+    assert!(
+        in_zone(runner, courser, Zone::Battlefield),
+        "the search resolved"
+    );
+}
+
+#[test]
+fn manual_birthing_pod_phyrexian_intent_keeps_generic_opportunity() {
+    let (mut runner, pod, bears, forest, wastes, courser) = pod_board(false);
+    let waiting_for = activate(&mut runner, pod, CastPaymentMode::Manual);
+    assert_announcement(&waiting_for, 1);
+    assert!(lock_is_open(&runner));
+    assert!(!tapped(&runner, pod) && in_zone(&runner, bears, Zone::Battlefield));
+    let waiting_for = submit_phyrexian(&mut runner, &[ShardChoice::PayLife]);
+    assert!(
+        is_mana_payment(&waiting_for),
+        "{{1}} remains a mana payment: {waiting_for:?}"
+    );
+    assert!(!tapped(&runner, pod) && in_zone(&runner, bears, Zone::Battlefield));
+    tap_land_for_mana(&mut runner, wastes);
+    pass(&mut runner);
+    assert_eq!(life(&runner, P0), 18, "2 life for {{G/P}}");
+    assert!(!tapped(&runner, forest), "the green source was not needed");
+    finish_pod(&mut runner, bears, courser);
+    assert!(tapped(&runner, pod), "{{T}} was paid once");
+}
+
+#[test]
+fn manual_birthing_pod_zirda_selected_life_cost_keeps_one_generic() {
+    let (mut runner, pod, bears, forest, wastes, courser) = pod_board(true);
+    activate(&mut runner, pod, CastPaymentMode::Manual);
+    let waiting_for = submit_phyrexian(&mut runner, &[ShardChoice::PayLife]);
+    assert!(
+        is_mana_payment(&waiting_for),
+        "Zirda's floor keeps the one generic mana: {waiting_for:?}"
+    );
+    tap_land_for_mana(&mut runner, wastes);
+    pass(&mut runner);
+    assert_eq!(life(&runner, P0), 18);
+    assert!(!tapped(&runner, forest));
+    finish_pod(&mut runner, bears, courser);
+}
+
+#[test]
+fn manual_birthing_pod_zirda_selected_mana_cost_owes_green_alone() {
+    let (mut runner, pod, bears, forest, wastes, courser) = pod_board(true);
+    activate(&mut runner, pod, CastPaymentMode::Manual);
+    let waiting_for = submit_phyrexian(&mut runner, &[ShardChoice::PayMana]);
+    assert!(is_mana_payment(&waiting_for), "{waiting_for:?}");
+    tap_land_for_mana(&mut runner, forest);
+    pass(&mut runner);
+    assert_eq!(life(&runner, P0), 20, "the symbol was paid with green");
+    assert!(!tapped(&runner, wastes), "Zirda removed the {{1}}");
+    finish_pod(&mut runner, bears, courser);
+}
+
+/// B2 — Phyrexian Reclamation ("{1}{B}, Pay 2 life: Return target creature card
+/// from your graveyard to your hand.") under Zirda and K'rrik. CR 601.2f: Zirda
+/// reduces {1}{B} to {B} (the floor counts the ordinary {B}); the printed 2 life
+/// stays. CR 601.2g: the locked {B} opens the window. CR 601.2h: K'rrik lets the
+/// {B} be paid with 2 life — zero mana and four life in all. The Swamp tapped in
+/// the window keeps its {B} unspent: the opportunity was taken, the permission
+/// was still the player's choice.
+#[test]
+fn manual_reclamation_zirda_krrik_locks_black_then_pays_four_life() {
+    for tap_swamp in [false, true] {
+        let mut scenario = scenario_at_main();
+        let reclamation = add(
+            &mut scenario,
+            P0,
+            "Phyrexian Reclamation",
+            Zone::Battlefield,
+        );
+        add(&mut scenario, P0, "Zirda, the Dawnwaker", Zone::Battlefield);
+        add(
+            &mut scenario,
+            P0,
+            "K'rrik, Son of Yawgmoth",
+            Zone::Battlefield,
+        );
+        let swamp = add(&mut scenario, P0, "Swamp", Zone::Battlefield);
+        let mountain = add(&mut scenario, P0, "Mountain", Zone::Battlefield);
+        let returned = add(&mut scenario, P0, "Grizzly Bears", Zone::Graveyard);
+        let stays = add(&mut scenario, P0, "Hill Giant", Zone::Graveyard);
+        let mut runner = build(scenario);
+
+        let waiting_for = activate(&mut runner, reclamation, CastPaymentMode::Manual);
+        assert!(
+            matches!(waiting_for, WaitingFor::TargetSelection { .. }),
+            "no announcement for an ordinary {{B}}: {waiting_for:?}"
+        );
+        let waiting_for = choose_targets(&mut runner, &[returned]);
+        assert!(
+            is_mana_payment(&waiting_for),
+            "the locked {{B}} opens the window: {waiting_for:?}"
+        );
+        assert_eq!(life(&runner, P0), 20, "nothing is paid at the window");
+        if tap_swamp {
+            tap_land_for_mana(&mut runner, swamp);
+            assert_eq!(pool_total(&runner), 1);
+        }
+        let waiting_for = pass(&mut runner);
+        let WaitingFor::PhyrexianPayment { shards, .. } = &waiting_for else {
+            panic!("K'rrik's permission is offered at payment: {waiting_for:?}");
+        };
+        assert_eq!(
+            shards.len(),
+            1,
+            "one {{B}}: Zirda left no generic: {shards:?}"
+        );
+        let waiting_for = submit_phyrexian(&mut runner, &[ShardChoice::PayLife]);
+        assert!(is_priority(&waiting_for), "{waiting_for:?}");
+        assert_eq!(life(&runner, P0), 16, "tap {tap_swamp}: four life in all");
+        assert_eq!(
+            pool_total(&runner),
+            usize::from(tap_swamp),
+            "tap {tap_swamp}: zero mana was spent"
+        );
+        assert!(!tapped(&runner, mountain), "no generic mana was owed");
+        runner.advance_until_stack_empty();
+        assert!(
+            in_zone(&runner, returned, Zone::Hand),
+            "the chosen card returned"
+        );
+        assert!(in_zone(&runner, stays, Zone::Graveyard), "the other stayed");
+    }
+}
+
+/// The wire shape of the new root field: absent unless bound, an announcement
+/// and a later payment selection round-trip unchanged, and a payload predating
+/// the field reads as none.
+#[test]
+fn the_phyrexian_intent_of_a_pending_activation_is_optional_on_the_wire() {
+    use engine::types::game_state::{
+        ActivationPhyrexianIntent, ActivationShardChoice, PendingCast,
+    };
+    let mut board = hex_board(20, false, false);
+    let window = hex_announce(&mut board, 1, ShardChoice::PayMana);
+    assert!(is_mana_payment(&window));
+    let pending: PendingCast = proposal(&board.runner).clone();
+    let json = serde_json::to_value(&pending).expect("serializes");
+    assert!(json.get("activation_phyrexian_intent").is_some());
+    assert!(
+        json["activation_phyrexian_intent"]
+            .get("payment_choices")
+            .is_none(),
+        "no payment is selected yet: {json}"
+    );
+    let back: PendingCast = serde_json::from_value(json.clone()).expect("decodes");
+    assert_eq!(
+        back.activation_phyrexian_intent,
+        pending.activation_phyrexian_intent
+    );
+    assert_eq!(back.payment_mode, CastPaymentMode::Manual);
+
+    let mut legacy = json.clone();
+    legacy
+        .as_object_mut()
+        .expect("an object")
+        .remove("activation_phyrexian_intent");
+    let legacy: PendingCast = serde_json::from_value(legacy).expect("a legacy root decodes");
+    assert_eq!(legacy.activation_phyrexian_intent, None);
+
+    let mixed = ActivationPhyrexianIntent {
+        native_choices: vec![ActivationShardChoice {
+            shard_index: 0,
+            shard: ManaCostShard::PhyrexianBlack,
+            choice: ShardChoice::PayMana,
+        }],
+        payment_choices: Some(vec![ActivationShardChoice {
+            shard_index: 0,
+            shard: ManaCostShard::PhyrexianBlack,
+            choice: ShardChoice::PayLife,
+        }]),
+    };
+    let grant_only = ActivationPhyrexianIntent {
+        native_choices: Vec::new(),
+        payment_choices: Some(vec![ActivationShardChoice {
+            shard_index: 1,
+            shard: ManaCostShard::Black,
+            choice: ShardChoice::PayLife,
+        }]),
+    };
+    for intent in [mixed, grant_only] {
+        let text = serde_json::to_string(&intent).expect("serializes");
+        assert_eq!(
+            serde_json::from_str::<ActivationPhyrexianIntent>(&text).expect("decodes"),
+            intent
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Typed contracts (parsed definitions, not printed cards)
+// ---------------------------------------------------------------------------
+//
+// No printed activated ability is modal AND carries a Phyrexian symbol, and none
+// mixes a grant-eligible ordinary symbol with repeated Phyrexian ones. These rows
+// use clearly labelled parsed definitions to pin the two routing seams those
+// shapes reach; their prices are derived from the typed costs themselves.
+
+/// TYPED CONTRACT (mixed domain): "{B}{W/P}{W/P}{R}: You gain 1 life." under
+/// K'rrik. The announcement covers exactly the two printed Phyrexian symbols, by
+/// their own indices (1 and 2, the same symbol twice); the payment selection
+/// covers the symbols the live permission makes life-payable on the payment
+/// view — the ordinary {B} (index 0) and the symbol announced as life (index 2,
+/// forced). The two domains differ in length and position and are never zipped.
+#[test]
+fn typed_mixed_phyrexian_domain_keeps_native_and_payment_records_apart() {
+    let mut scenario = scenario_at_main();
+    let contract = scenario
+        .add_creature_from_oracle(
+            P0,
+            "Typed Phyrexian Domain Contract",
+            1,
+            1,
+            "{B}{W/P}{W/P}{R}: You gain 1 life.",
+        )
+        .id();
+    add(
+        &mut scenario,
+        P0,
+        "K'rrik, Son of Yawgmoth",
+        Zone::Battlefield,
+    );
+    let plains = add(&mut scenario, P0, "Plains", Zone::Battlefield);
+    let mountain = add(&mut scenario, P0, "Mountain", Zone::Battlefield);
+    let swamp = add(&mut scenario, P0, "Swamp", Zone::Battlefield);
+    let mut runner = build(scenario);
+
+    let waiting_for = activate_index(&mut runner, contract, 0, CastPaymentMode::Manual);
+    assert_announcement(&waiting_for, 2);
+    let WaitingFor::PhyrexianPayment { shards, .. } = &waiting_for else {
+        panic!("expected the announcement, got {waiting_for:?}");
+    };
+    assert_eq!(
+        shards
+            .iter()
+            .map(|shard| shard.shard_index)
+            .collect::<Vec<_>>(),
+        vec![1, 2],
+        "only the printed Phyrexian symbols are announced; the {{B}} is not"
+    );
+    // Wrong length: refused, nothing bound.
+    assert!(runner
+        .act(GameAction::SubmitPhyrexianChoices {
+            choices: vec![ShardChoice::PayLife],
+        })
+        .is_err());
+    assert!(proposal(&runner).activation_phyrexian_intent.is_none());
+    let waiting_for = submit_phyrexian(&mut runner, &[ShardChoice::PayMana, ShardChoice::PayLife]);
+    assert!(
+        is_mana_payment(&waiting_for),
+        "{{B}}, {{W}} and {{R}} are mana in the selected total: {waiting_for:?}"
+    );
+
+    tap_land_for_mana(&mut runner, plains);
+    tap_land_for_mana(&mut runner, mountain);
+    let waiting_for = pass(&mut runner);
+    let WaitingFor::PhyrexianPayment { shards, .. } = &waiting_for else {
+        panic!("the payment selection is offered: {waiting_for:?}");
+    };
+    assert_eq!(
+        shards
+            .iter()
+            .map(|shard| shard.shard_index)
+            .collect::<Vec<_>>(),
+        vec![0, 2],
+        "the payment view's life-payable symbols: K'rrik's {{B}} and the announced life"
+    );
+    assert_eq!(
+        shards[1].options,
+        ShardOptions::LifeOnly,
+        "the symbol announced as life is forced"
+    );
+    let intent = proposal(&runner)
+        .activation_phyrexian_intent
+        .clone()
+        .expect("the announcement is bound");
+    assert_eq!(
+        intent
+            .native_choices
+            .iter()
+            .map(|record| (record.shard_index, record.shard, record.choice))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, ManaCostShard::PhyrexianWhite, ShardChoice::PayMana),
+            (2, ManaCostShard::PhyrexianWhite, ShardChoice::PayLife),
+        ]
+    );
+    assert_eq!(intent.payment_choices, None, "no payment is selected yet");
+
+    // Paying the announced-life symbol with mana is refused, with the prompt kept.
+    assert!(runner
+        .act(GameAction::SubmitPhyrexianChoices {
+            choices: vec![ShardChoice::PayLife, ShardChoice::PayMana],
+        })
+        .is_err());
+    assert_eq!(runner.state().waiting_for, waiting_for);
+
+    let waiting_for = submit_phyrexian(&mut runner, &[ShardChoice::PayLife, ShardChoice::PayLife]);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert_eq!(
+        life(&runner, P0),
+        16,
+        "2 life for the {{B}} and 2 for the {{W/P}}"
+    );
+    assert!(!tapped(&runner, swamp), "the {{B}} was paid with life");
+    assert_eq!(runner.state().stack.len(), 1);
+}
+
+/// TYPED CONTRACT (modal): "{W/P}: Choose one — • You gain 1 life. • Draw a
+/// card." CR 601.2b + CR 700.2a: the modes are announced first, then the
+/// Phyrexian symbol, then the lock — the mode prompt carries the still-open
+/// cost carrier. Announced as life, the total has no mana: no window.
+#[test]
+fn typed_modal_phyrexian_activation_announces_its_symbol_after_its_modes() {
+    for choice in [ShardChoice::PayLife, ShardChoice::PayMana] {
+        let mut scenario = scenario_at_main();
+        let contract = scenario
+            .add_creature_from_oracle(
+                P0,
+                "Typed Modal Phyrexian Contract",
+                1,
+                1,
+                "{W/P}: Choose one —\n• You gain 1 life.\n• Draw a card.",
+            )
+            .id();
+        let plains = add(&mut scenario, P0, "Plains", Zone::Battlefield);
+        let mut runner = build(scenario);
+
+        let waiting_for = activate_index(&mut runner, contract, 0, CastPaymentMode::Manual);
+        let WaitingFor::AbilityModeChoice {
+            activation_cost_snapshot,
+            ..
+        } = &waiting_for
+        else {
+            panic!("{choice:?}: the modes are announced first: {waiting_for:?}");
+        };
+        assert!(
+            matches!(
+                activation_cost_snapshot
+                    .as_deref()
+                    .map(|snapshot| &snapshot.lock),
+                Some(ActivationCostLock::Open { .. })
+            ),
+            "{choice:?}: the lock waits for the announcement after the modes"
+        );
+        let waiting_for = act(&mut runner, GameAction::SelectModes { indices: vec![0] });
+        assert_announcement(&waiting_for, 1);
+        let waiting_for = submit_phyrexian(&mut runner, &[choice]);
+        match choice {
+            ShardChoice::PayLife => {
+                assert!(
+                    is_priority(&waiting_for),
+                    "no mana, no window: {waiting_for:?}"
+                );
+                assert_eq!(life(&runner, P0), 18);
+                assert!(!tapped(&runner, plains));
+            }
+            ShardChoice::PayMana => {
+                assert!(is_mana_payment(&waiting_for), "{waiting_for:?}");
+                tap_land_for_mana(&mut runner, plains);
+                let waiting_for = pass(&mut runner);
+                assert!(is_priority(&waiting_for), "{waiting_for:?}");
+                assert_eq!(life(&runner, P0), 20);
+            }
+        }
+        assert_eq!(runner.state().stack.len(), 1, "{choice:?}");
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            life(&runner, P0),
+            match choice {
+                ShardChoice::PayLife => 19,
+                ShardChoice::PayMana => 21,
+            },
+            "{choice:?}: mode 0 resolved"
+        );
+    }
+}
+
+/// CR 605.3a + CR 601.2g: the life announcement does not depend on a source the
+/// automatic payer would pick. Hex Parasite with X = 1 announced as life, with
+/// Ashnod's Altar ("Sacrifice a creature: Add {C}{C}.") as the only mana source:
+/// in the window the player activates the Altar, chooses the creature, and the
+/// {1} plus 2 life are paid once from the same root.
+#[test]
+fn manual_hex_parasite_life_intent_funded_by_a_costed_mana_ability() {
+    let mut scenario = scenario_at_main();
+    let hex = add(&mut scenario, P0, "Hex Parasite", Zone::Battlefield);
+    let chosen = add(&mut scenario, P1, "Grizzly Bears", Zone::Battlefield);
+    scenario.with_counter(chosen, CounterType::Plus1Plus1, 1);
+    let altar = add(&mut scenario, P0, "Ashnod's Altar", Zone::Battlefield);
+    let fodder = add(&mut scenario, P0, "Grizzly Bears", Zone::Battlefield);
+    let mut runner = build(scenario);
+
+    activate_index(&mut runner, hex, 0, CastPaymentMode::Manual);
+    let waiting_for = act(&mut runner, GameAction::ChooseX { value: 1 });
+    assert_announcement(&waiting_for, 1);
+    let waiting_for = submit_phyrexian(&mut runner, &[ShardChoice::PayLife]);
+    assert!(
+        matches!(waiting_for, WaitingFor::TargetSelection { .. }),
+        "{waiting_for:?}"
+    );
+    let waiting_for = choose_targets(&mut runner, &[chosen]);
+    assert!(is_mana_payment(&waiting_for), "{waiting_for:?}");
+
+    let waiting_for = activate_mana_ability(&mut runner, altar);
+    assert!(
+        matches!(
+            waiting_for,
+            WaitingFor::PayCost {
+                kind: PayCostKind::Sacrifice,
+                ..
+            }
+        ),
+        "the Altar's sacrifice is chosen in the window: {waiting_for:?}"
+    );
+    let waiting_for = select_cards(&mut runner, &[fodder]);
+    assert!(
+        is_mana_payment(&waiting_for),
+        "the same root's window resumes: {waiting_for:?}"
+    );
+    assert_eq!(pool_total(&runner), 2);
+    let intent = proposal(&runner)
+        .activation_phyrexian_intent
+        .clone()
+        .expect("the announcement survives the source's cost");
+    assert_eq!(
+        intent
+            .native_choices
+            .iter()
+            .map(|record| record.choice)
+            .collect::<Vec<_>>(),
+        vec![ShardChoice::PayLife]
+    );
+
+    let waiting_for = pass(&mut runner);
+    assert!(is_priority(&waiting_for), "{waiting_for:?}");
+    assert_eq!(life(&runner, P0), 18, "2 life, once");
+    assert_eq!(pool_total(&runner), 1, "one generic mana, once");
+    assert_eq!(
+        activation_targets(&runner, hex),
+        vec![TargetRef::Object(chosen)]
+    );
+}
+
+/// A raw and a trusted save of the OPEN announcement — the activation proposed,
+/// its X announced, nothing locked, targeted or paid — restore to the same
+/// prompt, and the restored answer continues the same proposal.
+#[test]
+fn manual_hex_parasite_open_announcement_survives_raw_and_trusted_restore() {
+    for trusted in [false, true] {
+        let mut board = hex_board(20, false, false);
+        activate_index(&mut board.runner, board.hex, 0, CastPaymentMode::Manual);
+        let prompt = act(&mut board.runner, GameAction::ChooseX { value: 1 });
+        assert_announcement(&prompt, 1);
+        let persisted = if trusted {
+            PersistedGameState::capture(board.runner.state().clone())
+        } else {
+            PersistedGameState::Raw(Box::new(board.runner.state().clone()))
+        };
+        let json = serde_json::to_string(&persisted).expect("the prompt serializes");
+        let db = shared_card_db().expect("the checked-in fixture contains the cards");
+        let state = serde_json::from_str::<PersistedGameState>(&json)
+            .expect("the save decodes")
+            .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+            .expect("the open proposal is admissible")
+            .finalize_after_rehydration(|state| {
+                rehydrate_game_from_card_db(state, db);
+                Ok(())
+            })
+            .expect("the rehydrated proposal is publishable");
+        board.runner = GameRunner::from_state(state);
+        assert_eq!(
+            board.runner.state().waiting_for,
+            prompt,
+            "trusted {trusted}"
+        );
+        assert!(lock_is_open(&board.runner), "trusted {trusted}");
+        assert!(proposal(&board.runner)
+            .activation_phyrexian_intent
+            .is_none());
+
+        let waiting_for = submit_phyrexian(&mut board.runner, &[ShardChoice::PayLife]);
+        assert!(
+            matches!(waiting_for, WaitingFor::TargetSelection { .. }),
+            "trusted {trusted}: {waiting_for:?}"
+        );
+        let waiting_for = choose_targets(&mut board.runner, &[board.chosen]);
+        assert!(
+            is_mana_payment(&waiting_for),
+            "trusted {trusted}: {waiting_for:?}"
+        );
+        tap_land_for_mana(&mut board.runner, board.mountain);
+        pass(&mut board.runner);
+        assert_eq!(life(&board.runner, P0), 18, "trusted {trusted}");
+    }
 }

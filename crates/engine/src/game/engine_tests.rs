@@ -9351,6 +9351,7 @@ fn test_mana_ability_during_mana_payment_stays_in_mana_payment() {
         activation_cost_committed: false,
         alt_cost_grant_source: None,
         activation_trigger_collection: None,
+        activation_phyrexian_intent: None,
     }));
     state.waiting_for = WaitingFor::ManaPayment {
         player: PlayerId(0),
@@ -9796,6 +9797,7 @@ fn taps_for_mana_multiplier_fires_once_on_color_choice_mana_payment_resume() {
         activation_cost_committed: false,
         alt_cost_grant_source: None,
         activation_trigger_collection: None,
+        activation_phyrexian_intent: None,
     }));
     state.waiting_for = WaitingFor::ManaPayment {
         player: PlayerId(0),

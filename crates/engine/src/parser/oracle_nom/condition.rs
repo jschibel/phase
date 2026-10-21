@@ -31,10 +31,10 @@ use crate::parser::oracle_util::parse_subtype;
 use crate::types::ability::{
     AbilityCondition, AggregateFunction, AttachmentReferent, AttackedYouScope, CardTypeSetSource,
     CastManaObjectScope, CastManaSpentMetric, CommanderOwnership, Comparator, ControllerRef,
-    CountScope, DamageChannel, DamageGroupKey, DamageKindFilter, FilterProp, ObjectProperty,
-    ObjectScope, PlayerFilter, PlayerRelation, PlayerScope, PropertyAggregate, QuantityExpr,
-    QuantityRef, SharedQuality, SharedQualityRelation, StaticCondition, TargetFilter,
-    TrackedAnaphorSource, TypeFilter, TypedFilter, ZoneRef,
+    CountScope, DamageChannel, DamageGroupKey, DamageKindFilter, FilterProp, NumberQuality,
+    ObjectProperty, ObjectScope, Parity, PlayerFilter, PlayerRelation, PlayerScope,
+    PropertyAggregate, QuantityExpr, QuantityRef, SharedQuality, SharedQualityRelation,
+    StaticCondition, TargetFilter, TrackedAnaphorSource, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::events::PlayerActionKind;
@@ -256,6 +256,12 @@ fn parse_condition_connector(input: &str) -> OracleResult<'_, ConditionConnectiv
 fn parse_single_inner_condition(input: &str) -> OracleResult<'_, StaticCondition> {
     alt((
         parse_you_attacked_with_total_power_this_combat,
+        // CR 500.8 + CR 506.1 + CR 109.5 + CR 608.2c: the first-combat-phase
+        // occurrence gate, scope-composed (non-possessive "the turn" vs
+        // possessive "your turn"). The single shared recognizer for this
+        // game-state condition; the effect parser lowers its typed result via
+        // `static_condition_to_ability_condition`.
+        parse_first_combat_phase_of_turn,
         // CR 601.2h + CR 608.2c: whole-phrase "it wasn't cast or no mana was spent
         // to cast <self>" gate. MUST precede the event-history arm's
         // `parse_was_cast_condition`, which would otherwise claim the bare "it
@@ -268,6 +274,34 @@ fn parse_single_inner_condition(input: &str) -> OracleResult<'_, StaticCondition
         parse_resolution_context_conditions,
     ))
     .parse(input)
+}
+
+/// CR 500.8 + CR 506.1 + CR 109.5 + CR 608.2c: the first-combat-phase
+/// occurrence gate, composed per axis — the common phrase is parsed once and
+/// the scope alternates between the non-possessive "the turn" and the
+/// possessive "your turn" (CR 109.5: "your" = the ability's controller, so the
+/// possessive form composes `And([DuringYourTurn, FirstCombatPhaseOfTurn])`).
+/// Shared by the effect path (bridged to `AbilityCondition`) and the
+/// trigger/static paths (via `parse_inner_condition`).
+fn parse_first_combat_phase_of_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, possessive) = preceded(
+        (parse_it_is, tag(" the first combat phase of ")),
+        alt((value(false, tag("the turn")), value(true, tag("your turn")))),
+    )
+    .parse(input)?;
+    Ok((
+        rest,
+        if possessive {
+            StaticCondition::And {
+                conditions: vec![
+                    StaticCondition::DuringYourTurn,
+                    StaticCondition::FirstCombatPhaseOfTurn,
+                ],
+            }
+        } else {
+            StaticCondition::FirstCombatPhaseOfTurn
+        },
+    ))
 }
 
 /// CR 508.1a + CR 603.4: "you attacked with creatures with total power N or
@@ -406,6 +440,8 @@ fn parse_state_presence_conditions(input: &str) -> OracleResult<'_, StaticCondit
 /// the parent `alt`'s remaining tuple headroom free.
 fn parse_control_presence_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
     alt((
+        // CR 107.1 + CR 603.4: MUST precede every production below that reads the type phrase with the infallible parse_type_phrase_folding (compound/named/you-control-a): those accept "a prime number of lands" as an empty-filter presence with an unconsumed tail, and alt stops at the first Ok.
+        parse_control_count_quality,
         // CR 201.2: Named-control clauses MUST precede the generic compound
         // control combinator so " and " between named cards binds to the
         // names list, not interpreted as a second `you control` clause.
@@ -587,6 +623,7 @@ fn parse_remaining_state_presence_conditions_tail(
         // controller's hand, library, or graveyard. The bounded "cards in your"
         // grammar distinguishes it from the following linked-exile arm.
         parse_no_cards_in_your_zone,
+        parse_no_cards_in_that_graveyard,
         parse_card_exiled_with_source_condition,
         parse_there_are_conditions,
         parse_there_exists_compound_zone_condition,
@@ -4461,7 +4498,9 @@ fn parse_more_life_than_you_comparison(input: &str) -> OracleResult<'_, StaticCo
         StaticCondition::QuantityComparison {
             lhs: QuantityExpr::Ref {
                 qty: QuantityRef::LifeTotal {
-                    player: PlayerScope::ParentObjectTargetController,
+                    player: PlayerScope::ParentObjectTarget {
+                        possession: crate::types::ability::PossessionAxis::Controller,
+                    },
                 },
             },
             comparator: Comparator::GT,
@@ -5143,6 +5182,46 @@ fn parse_control_scope_prefix(input: &str) -> OracleResult<'_, ControllerRef> {
         ),
     ))
     .parse(input)
+}
+
+/// CR 107.1: the arithmetic-quality axis of a count ("prime" / "even" / "odd").
+/// No CR rule defines primality or parity; they are the integers' own properties.
+pub(crate) fn parse_number_quality(input: &str) -> OracleResult<'_, NumberQuality> {
+    alt((
+        value(NumberQuality::Prime, tag("prime")),
+        value(NumberQuality::Parity(Parity::Even), tag("even")),
+        value(NumberQuality::Parity(Parity::Odd), tag("odd")),
+    ))
+    .parse(input)
+}
+
+/// CR 107.1 + CR 603.4: "<you control | your opponents control | defending player controls>
+/// a/an <prime|even|odd> number of <type phrase>" → `QuantityQuality` over the controlled
+/// object count. The type-phrase reader is infallible, so a phrase that consumes nothing is refused.
+fn parse_control_count_quality(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, (ctrl, (), quality, _)) = (
+        parse_control_scope_prefix,
+        parse_article,
+        parse_number_quality,
+        tag(" number of "),
+    )
+        .parse(input)?;
+    let (type_rest, filter) = parse_type_phrase_nonempty(rest)?;
+    // Structural guard: `parse_type_phrase_folding` never fails, so an
+    // unrecognized phrase comes back with nothing consumed.
+    if type_rest.len() == rest.len() {
+        return Err(oracle_err(rest));
+    }
+    let filter = inject_controller(filter, ctrl);
+    Ok((
+        type_rest,
+        StaticCondition::QuantityQuality {
+            quantity: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount { filter },
+            },
+            quality,
+        },
+    ))
 }
 
 /// Canonical combinator: "you control / your opponents control / defending
@@ -7651,7 +7730,8 @@ fn parse_spell_history_condition(input: &str) -> OracleResult<'_, StaticConditio
             make_quantity_comparison(QuantityRef::SpellsCastLastTurn, Comparator::EQ, 0),
             tag("no spells were cast last turn"),
         ),
-        // "two or more spells were cast last turn" / "a player cast two or more spells last turn"
+        // "two or more spells were cast last turn" (table-wide only; the
+        // per-player "a player cast N or more spells last turn" is declined)
         parse_spells_cast_last_turn,
         parse_you_cast_both_spell_kinds_this_turn,
         // CR 702.185c: "a spell was warped this turn" — any player cast a spell
@@ -9209,20 +9289,21 @@ fn strip_spell_history_noun(type_text: &str) -> &str {
     type_text
 }
 
-/// Parse "two or more spells were cast last turn" / "a player cast two or more spells last turn".
+/// CR 603.4: "two or more spells were cast last turn" — the table-wide count
+/// of spells cast during the previous turn (`QuantityRef::SpellsCastLastTurn`).
+///
+/// The per-player wording "a player cast two or more spells last turn" is
+/// deliberately NOT recognized here: it is true only when a single player cast
+/// that many spells, which a table-wide total cannot express (two players
+/// casting one spell each would wrongly satisfy it). Declining leaves that
+/// guard unparsed, so the trigger fails closed as an `unparsed_condition` gap
+/// instead of lowering to the wrong count.
 fn parse_spells_cast_last_turn(input: &str) -> OracleResult<'_, StaticCondition> {
-    // "two or more spells were cast last turn"
-    if let Ok((rest, _)) =
-        tag::<_, _, OracleError<'_>>("two or more spells were cast last turn").parse(input)
-    {
-        return Ok((rest, make_quantity_ge(QuantityRef::SpellsCastLastTurn, 2)));
-    }
-    // "a player cast two or more spells last turn"
-    let (rest, _) = tag("a player cast ").parse(input)?;
-    let (rest, n) = parse_number(rest)?;
-    let rest = rest.trim_start();
-    let (rest, _) = tag("or more spells last turn").parse(rest)?;
-    Ok((rest, make_quantity_ge(QuantityRef::SpellsCastLastTurn, n)))
+    value(
+        make_quantity_ge(QuantityRef::SpellsCastLastTurn, 2),
+        tag("two or more spells were cast last turn"),
+    )
+    .parse(input)
 }
 
 /// Parse "you [put/ve put] [a counter/one or more counters] on a
@@ -9965,6 +10046,47 @@ fn parse_no_cards_in_your_zone(input: &str) -> OracleResult<'_, StaticCondition>
                 card_types: Vec::new(),
                 filter,
                 scope: CountScope::Controller,
+            },
+            Comparator::EQ,
+            0,
+        ),
+    ))
+}
+
+/// CR 108.3 + CR 404.1 + CR 608.2c: Absence of cards in the referenced graveyard
+/// ("no cards are in that graveyard" / "there are no cards in that graveyard").
+///
+/// "That graveyard" refers to the graveyard of the
+/// owner of the parent instruction's object target (e.g. Nezumi Graverobber:
+/// "{1}{B}: Exile target card from an opponent's graveyard. If no cards are in
+/// that graveyard, flip Nezumi Graverobber.").
+fn parse_no_cards_in_that_graveyard(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, is_subject_first) =
+        alt((value(false, tag("there are no ")), value(true, tag("no ")))).parse(input)?;
+    let (rest, type_text) = if is_subject_first {
+        alt((
+            value("", tag("cards are in ")),
+            terminated(take_until(" cards are in "), tag(" cards are in ")),
+        ))
+        .parse(rest)?
+    } else {
+        alt((
+            value("", tag("cards in ")),
+            terminated(take_until(" cards in "), tag(" cards in ")),
+        ))
+        .parse(rest)?
+    };
+    let (rest, _) = tag("that graveyard").parse(rest)?;
+    if !type_text.is_empty() {
+        return Err(oracle_err(input));
+    }
+    Ok((
+        rest,
+        make_quantity_comparison(
+            QuantityRef::GraveyardSize {
+                player: PlayerScope::ParentObjectTarget {
+                    possession: crate::types::ability::PossessionAxis::Owner,
+                },
             },
             Comparator::EQ,
             0,
@@ -14033,6 +14155,37 @@ mod tests {
     /// or more [type]` count authority is parameterized on the controller-scope
     /// axis. Both surface forms flow through `parse_inner_condition` and produce
     /// the same `ObjectCount >= N` shape, differing only in the injected
+    /// CR 500.8 + CR 506.1 + CR 109.5 + CR 608.2c: the first-combat-phase
+    /// occurrence gate is recognized by the SHARED authority, scope-composed
+    /// per axis — the possessive "your turn" form adds `DuringYourTurn`
+    /// (CR 109.5) while the non-possessive "the turn" form stays a single leaf.
+    #[test]
+    fn parse_inner_condition_first_combat_phase_scope_axis() {
+        let (rest, condition) = parse_inner_condition("it's the first combat phase of the turn")
+            .expect("the non-possessive form must parse in the shared authority");
+        assert_eq!(rest, "");
+        assert_eq!(condition, StaticCondition::FirstCombatPhaseOfTurn);
+
+        let (rest, condition) = parse_inner_condition("it's the first combat phase of your turn")
+            .expect("the possessive form must parse in the shared authority");
+        assert_eq!(rest, "");
+        assert_eq!(
+            condition,
+            StaticCondition::And {
+                conditions: vec![
+                    StaticCondition::DuringYourTurn,
+                    StaticCondition::FirstCombatPhaseOfTurn,
+                ],
+            }
+        );
+
+        // Review control: the "it is" expansion is the same condition.
+        let (rest, condition) = parse_inner_condition("it is the first combat phase of the turn")
+            .expect("the 'it is' form must parse in the shared authority");
+        assert_eq!(rest, "");
+        assert_eq!(condition, StaticCondition::FirstCombatPhaseOfTurn);
+    }
+
     /// `ControllerRef`. Self form ("you control three or more creatures") pins
     /// `You`; opponent form (Lashwhip Predator: "your opponents control three or
     /// more creatures") pins `Opponent`.
@@ -16057,6 +16210,46 @@ mod tests {
         assert!(parse_no_cards_in_your_zone("there are no creatures on the battlefield").is_err());
         assert!(parse_no_cards_in_your_zone("there are no cards in").is_err());
         assert!(parse_no_cards_in_your_zone("there are no card in your hand").is_err());
+    }
+
+    #[test]
+    fn test_parse_no_cards_in_that_graveyard() {
+        let cases = [
+            "no cards are in that graveyard",
+            "there are no cards in that graveyard",
+        ];
+        for text in cases {
+            let (rest, condition) = parse_no_cards_in_that_graveyard(text)
+                .unwrap_or_else(|err| panic!("must parse {text:?}: {err:?}"));
+            assert_eq!(rest, "", "remainder for {text:?}");
+            assert_eq!(
+                condition,
+                StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::GraveyardSize {
+                            player: PlayerScope::ParentObjectTarget {
+                                possession: crate::types::ability::PossessionAxis::Owner
+                            },
+                        },
+                    },
+                    comparator: Comparator::EQ,
+                    rhs: QuantityExpr::Fixed { value: 0 },
+                },
+                "expected GraveyardSize(ParentObjectTarget {{ Owner }}) == 0 for {text:?}"
+            );
+
+            // Also verify parse_inner_condition dispatches to it end-to-end
+            let (rest2, condition2) = parse_inner_condition(text)
+                .unwrap_or_else(|err| panic!("parse_inner_condition must parse {text:?}: {err:?}"));
+            assert_eq!(rest2, "");
+            assert_eq!(condition2, condition);
+        }
+
+        assert!(parse_no_cards_in_that_graveyard("there are no cards in your graveyard").is_err());
+        assert!(parse_no_cards_in_that_graveyard("there are no cards in").is_err());
+        assert!(
+            parse_no_cards_in_that_graveyard("no creature cards are in that graveyard").is_err()
+        );
     }
 
     /// Production-path regression for Magmatic Scorchwing: the trigger parser
@@ -18999,7 +19192,7 @@ mod tests {
             StaticCondition::QuantityComparison {
                 lhs: QuantityExpr::Ref {
                     qty: QuantityRef::LifeTotal {
-                        player: PlayerScope::ParentObjectTargetController,
+                        player: PlayerScope::ParentObjectTarget { possession: crate::types::ability::PossessionAxis::Controller },
                     },
                 },
                 comparator: Comparator::GT,
@@ -25697,6 +25890,10 @@ mod tests {
             ("it's your turn", "it\u{2019}s your turn"),
             ("it's not your turn", "it\u{2019}s not your turn"),
             (
+                "it's the first combat phase of the turn",
+                "it\u{2019}s the first combat phase of the turn",
+            ),
+            (
                 "~ hasn't dealt damage yet",
                 "~ hasn\u{2019}t dealt damage yet",
             ),
@@ -25934,6 +26131,179 @@ mod tests {
         assert_eq!(parse_it_is("it's"), Ok(("", "it's")));
         assert_eq!(parse_it_is("it\u{2019}s"), Ok(("", "it\u{2019}s")));
         assert_eq!(parse_it_is("it is"), Ok(("", "it is")));
+    }
+
+    /// `ObjectCount` over `<type>` controlled by `ctrl` on the battlefield.
+    fn controlled_count(type_filter: TypeFilter, ctrl: ControllerRef) -> QuantityExpr {
+        QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(
+                    TypedFilter::new(type_filter)
+                        .controller(ctrl)
+                        .properties(vec![FilterProp::InZone {
+                            zone: Zone::Battlefield,
+                        }]),
+                ),
+            },
+        }
+    }
+
+    fn quality(quantity: QuantityExpr, quality: NumberQuality) -> StaticCondition {
+        StaticCondition::QuantityQuality { quantity, quality }
+    }
+
+    /// CR 107.1 + CR 603.4: the quality axis (prime / even / odd), the article
+    /// axis (a / an) and the controller axis compose into one production.
+    #[test]
+    fn control_count_quality_parses_every_quality_and_controller() {
+        let cases = [
+            (
+                "you control a prime number of lands",
+                quality(
+                    controlled_count(TypeFilter::Land, ControllerRef::You),
+                    NumberQuality::Prime,
+                ),
+            ),
+            (
+                "you control an even number of creatures",
+                quality(
+                    controlled_count(TypeFilter::Creature, ControllerRef::You),
+                    NumberQuality::Parity(Parity::Even),
+                ),
+            ),
+            (
+                "you control an odd number of artifacts",
+                quality(
+                    controlled_count(TypeFilter::Artifact, ControllerRef::You),
+                    NumberQuality::Parity(Parity::Odd),
+                ),
+            ),
+            (
+                "your opponents control an even number of creatures",
+                quality(
+                    controlled_count(TypeFilter::Creature, ControllerRef::Opponent),
+                    NumberQuality::Parity(Parity::Even),
+                ),
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(parse_inner_condition(text), Ok(("", expected)), "{text:?}");
+        }
+        // Malformed heads never produce a fully consumed quality gate.
+        for text in [
+            "you control a number of lands",
+            "you control prime number of lands",
+            "you control a prime lands",
+            "you control a prime number of",
+        ] {
+            assert!(
+                !matches!(
+                    parse_inner_condition(text),
+                    Ok(("", StaticCondition::QuantityQuality { .. }))
+                ),
+                "{text:?}"
+            );
+            assert!(parse_control_count_quality(text).is_err(), "{text:?}");
+        }
+    }
+
+    /// The type phrase stops at the effect boundary and hands the rest back.
+    #[test]
+    fn control_count_quality_returns_the_effect_remainder() {
+        assert_eq!(
+            parse_inner_condition("you control a prime number of lands, draw a card"),
+            Ok((
+                ", draw a card",
+                quality(
+                    controlled_count(TypeFilter::Land, ControllerRef::You),
+                    NumberQuality::Prime,
+                ),
+            ))
+        );
+    }
+
+    /// CR 603.4 + CR 608.2i: Zimone's intervening-if is the look-back entry
+    /// tally AND the prime land count, through the existing `And` connective.
+    #[test]
+    fn control_count_quality_conjoins_with_the_entered_this_turn_tally() {
+        let entered = StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::BattlefieldEntriesThisTurn {
+                    player: PlayerScope::Controller,
+                    filter: TargetFilter::Typed(TypedFilter::land()),
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        };
+        // Reach-guard: the left conjunct alone.
+        assert_eq!(
+            parse_inner_condition("a land entered the battlefield under your control this turn"),
+            Ok(("", entered.clone()))
+        );
+        let (rest, condition) = parse_inner_condition(
+            "a land entered the battlefield under your control this turn and you control a prime number of lands, create primo, the indivisible, a legendary 0/0 green and blue fractal creature token, then put that many +1/+1 counters on it.",
+        )
+        .unwrap();
+        assert_eq!(
+            rest,
+            ", create primo, the indivisible, a legendary 0/0 green and blue fractal creature token, then put that many +1/+1 counters on it."
+        );
+        assert_eq!(
+            condition,
+            StaticCondition::And {
+                conditions: vec![
+                    entered,
+                    quality(
+                        controlled_count(TypeFilter::Land, ControllerRef::You),
+                        NumberQuality::Prime,
+                    ),
+                ],
+            }
+        );
+    }
+
+    /// The negated form is not built: it must not parse as a silent
+    /// `Not(IsPresent)` that drops the quality.
+    #[test]
+    fn negated_control_count_quality_stays_a_gap() {
+        // Reach-guard: `parse_you_dont_control_a` is reached for a plain article.
+        assert_eq!(
+            parse_inner_condition("you don't control a land"),
+            Ok((
+                "",
+                StaticCondition::Not {
+                    condition: Box::new(StaticCondition::IsPresent {
+                        filter: Some(TargetFilter::Typed(
+                            TypedFilter::land()
+                                .controller(ControllerRef::You)
+                                .properties(vec![FilterProp::InZone {
+                                    zone: Zone::Battlefield,
+                                }]),
+                        )),
+                    }),
+                },
+            ))
+        );
+        assert!(!matches!(
+            parse_inner_condition("you don't control a prime number of lands"),
+            Ok(("", _))
+        ));
+    }
+
+    /// Static reach: "as long as" routes through the same production.
+    #[test]
+    fn control_count_quality_reaches_static_conditions() {
+        assert_eq!(
+            parse_condition("as long as you control an odd number of lands"),
+            Ok((
+                "",
+                quality(
+                    controlled_count(TypeFilter::Land, ControllerRef::You),
+                    NumberQuality::Parity(Parity::Odd),
+                ),
+            ))
+        );
     }
 }
 

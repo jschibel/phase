@@ -179,6 +179,7 @@ pub fn activation_may_yield_combat_withdrawal(state: &GameState, action: &GameAc
     let GameAction::ActivateAbility {
         source_id,
         ability_index,
+        ..
     } = action
     else {
         return true;
@@ -674,6 +675,7 @@ mod tests {
         GameAction::ActivateAbility {
             source_id: source,
             ability_index: 0,
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
         }
     }
 
@@ -769,6 +771,7 @@ mod tests {
                 &GameAction::ActivateAbility {
                     source_id: source,
                     ability_index: 1,
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto,
                 },
             ),
             "index past the abilities list"

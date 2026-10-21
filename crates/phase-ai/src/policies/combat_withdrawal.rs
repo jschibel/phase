@@ -446,6 +446,7 @@ mod tests {
         let activation = GameAction::ActivateAbility {
             source_id: source,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         };
 
         let before = priority_simulations();
