@@ -215,15 +215,64 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
- * 153 — GameState carries exact active attack relations, departure recipient pins and
- *      complete combat-removal receipts. P2P wire 135 moves with it.
- * 152 — TargetFilter gains AttackedPlayerOrPlaneswalker (the player or planeswalker an
+ * 160 — TargetFilter gains AttackedPlayerOrPlaneswalker (the player or planeswalker an
  *      attacking creature is attacking, CR 506.3 + CR 115.10a), serialized in the
- *      ability definitions of GameState. A v151 peer cannot deserialize the tag; the
- *      exact-match handshake refuses the pairing. Wire 134 moves with it; lobby
- *      messages are unchanged; ZoneChangeCombatStatus gains `attack_target`
- *      (Option<AttackTarget>, the attacker's last-known declared attack target)
- *      in zone-change records and trigger-source contexts of GameState.
+ *      ability definitions of GameState; ZoneChangeCombatStatus gains `attack_target`
+ *      (Option<AttackTarget>, the attacker's last-known declared attack target) in
+ *      zone-change records and trigger-source contexts of GameState; and GameState
+ *      carries exact active attack relations, departure recipient pins and complete
+ *      combat-removal receipts. A v159 peer cannot deserialize the tag; the
+ *      exact-match handshake refuses the pairing. Wire 142 moves with it; lobby
+ *      messages are unchanged.
+ * 159 — Coin-flip effects are one Effect::FlipCoins { flips, .. } (the FlipCoin and
+ *       FlipCoinUntilLose tags are no longer written, count moves into flips) and
+ *       the coin-flip resolution frame's kind becomes Exactly or UntilLoss — see
+ *       PROTOCOL_VERSION's own `/// 159` entry in
+ *       crates/lobby-broker/src/protocol.rs. A v158 or older peer reads a multi-flip or
+ *       until-loss run as one flip; the exact-match version check at connect
+ *       refuses the pairing. Wire 141 moves with it.
+ * 157 — ChooseFromZoneConstraint.TotalManaValue extends serialized paused zone
+ *      choices and ability state. Old native readers cannot decode the new tag.
+ *      Wire 139 moves with it.
+ * 156 — StaticCondition, TriggerCondition and AbilityCondition gain
+ *      QuantityQuality { quantity, quality } with the new NumberQuality
+ *      ({"type":"Prime"} / {"type":"Parity","value":"Odd"|"Even"}), carried
+ *      in GameState ability definitions (CR 107.1, CR 603.4) — see
+ *      PROTOCOL_VERSION's own `/// 156` entry in
+ *      crates/lobby-broker/src/protocol.rs. A pre-v156 peer cannot parse the
+ *      tag; the exact-match version check at connect refuses the pairing.
+ *      The same bump adds the optional per-seat `created_tokens` channel (each
+ *      seat's pinned creation result) to the private
+ *      player-scope tail sidecar that `PendingContinuation` carries under its
+ *      existing `player_scope_linked_exile` key (CR 608.2c + CR 608.2f: the
+ *      tokens every seat created, for a paused "each player creates … The
+ *      tokens …" tail); it is serde-defaulted, so a sidecar without it decodes
+ *      as the linked-exile-only sidecar. Wire 138 moves with it.
+ * 155 — PendingChangeZoneIteration members carry their pre-event entry modifications
+ *      (ChangeZoneMemberEntry, CR 603.6a + CR 614.12), and the persisted resolution
+ *      state moves from version 6 to 7 — see PROTOCOL_VERSION's own `/// 155` entry
+ *      in crates/lobby-broker/src/protocol.rs. A v154 peer cannot parse a parked
+ *      ChangeZone frame and refuses the version-7 resolution state. Wire 137 moves
+ *      with it.
+ * 154 — PendingCostMoveResume gains CounterCostRemovalPayment (a counter-removal
+ *       cost paused on a CR 616.1 replacement choice; the activation reads the
+ *       settled count, CR 118.11) and ManaAbilityCostCursor gains
+ *       counter_removal, carried in GameState.pending_cost_move_resume — see
+ *       PROTOCOL_VERSION's own `/// 154` entry in
+ *       crates/lobby-broker/src/protocol.rs. A v153 peer cannot parse the tag;
+ *       the exact-match version check at connect refuses the pairing. Wire 136
+ *       moves with it. PausedCounterCostRemoval carries its replacement_subtree
+ *       boundary.
+ * 153 — GrantAllActivatedAbilitiesOf gains the optional kind selector
+ *       (Nicol Bolas, Dragon-God's loyalty grant is kind Loyalty on the
+ *       activated authority; the loyalty-grant sibling variant is
+ *       removed). A v152 peer drops the defaulted field silently and
+ *       over-grants every activated ability of every other planeswalker,
+ *       so the exact-match handshake refuses the pairing. P2P moves in
+ *       lockstep (wire 135).
+ * 152 — ShortcutDecisionSchema gains suggested_declaration and leading_aims, and
+ *      ShortcutProposal gains leading_aims; a v151 peer drops them. Wire 134 moves
+ *      with it.
  * 151: Populated GameObject.bestow_form carries the removed creature subtypes
  *      as an object instead of a boolean. Old native readers cannot decode it.
  *      Wire 133 moves with it.
@@ -928,7 +977,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 153;
+export const PROTOCOL_VERSION = 160;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

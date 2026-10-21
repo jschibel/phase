@@ -3473,15 +3473,63 @@ mod tests {
         }
     }
 
-    /// v153: exact active attack relations, departure recipient pins and complete
-    /// combat-removal receipts cross GameState.
-    /// v152: `TargetFilter` gains
-    /// `AttackedPlayerOrPlaneswalker`, carried in the ability definitions inside
-    /// `GameState`; a v151 peer cannot parse the tag, so it must be refused before
-    /// it receives v152 state; `ZoneChangeCombatStatus` gains `attack_target`
-    /// (`Option<AttackTarget>`, the attacker's last-known declared attack target)
-    /// in zone-change records and trigger-source contexts of `GameState`.
+    /// v160: `TargetFilter` gains `AttackedPlayerOrPlaneswalker`, carried in the
+    /// ability definitions inside `GameState`; a v159 peer cannot parse the tag,
+    /// so it must be refused before it receives v160 state. `ZoneChangeCombatStatus`
+    /// gains `attack_target` (`Option<AttackTarget>`, the attacker's last-known
+    /// declared attack target) in zone-change records and trigger-source contexts
+    /// of `GameState`, and exact active attack relations, departure recipient pins
+    /// and complete combat-removal receipts cross `GameState`.
+    ///
+    /// v159: coin-flip effects are one `Effect::FlipCoins { flips: CoinFlipRun, .. }`
+    /// and the coin-flip resolution frame's kind becomes `Exactly`/`UntilLoss`.
+    /// A v158 or older peer silently reads a multi-flip or until-loss run as one flip, so
+    /// it must be refused before it receives v159 state.
+    /// v157: `ChooseFromZoneConstraint::TotalManaValue` in paused zone choices
+    /// and ability state requires a versioned full-game peer.
+    ///
+    /// v156: `StaticCondition`, `TriggerCondition` and `AbilityCondition` gain
+    /// `QuantityQuality { quantity, quality }` with the new `NumberQuality`
+    /// (CR 107.1, CR 603.4), carried in `GameState` ability definitions; a v155
+    /// peer cannot decode the new tag, so it must be refused before it receives
+    /// v156 state.
+    /// The same bump adds the optional per-seat `created_tokens` channel (each
+    /// seat's pinned creation result) to the private
+    /// player-scope tail sidecar that `PendingContinuation` carries under its
+    /// existing `player_scope_linked_exile` key (CR 608.2c + CR 608.2f: the
+    /// tokens every seat created, for a paused "each player creates … The
+    /// tokens …" tail); it is serde-defaulted, so a sidecar without it decodes
+    /// as the linked-exile-only sidecar.
+    ///
+    /// v155: `PendingChangeZoneIteration.remaining` carries each member's
+    /// pre-event entry modifications (`ChangeZoneMemberEntry`, CR 603.6a +
+    /// CR 614.12) and drops the raw gate fields, and the persisted resolution
+    /// state moves from version 6 to 7; a v154 peer cannot parse a parked
+    /// ChangeZone frame, so it must be refused before it receives v155 state.
+    ///
+    /// v154: `PendingCostMoveResume` gains `CounterCostRemovalPayment` (a
+    /// counter-removal cost paused on a CR 616.1 replacement choice, whose
+    /// settled count the activation reads, CR 118.11) and
+    /// `ManaAbilityCostCursor` gains `counter_removal`, both carried in
+    /// `GameState::pending_cost_move_resume`; a v153 peer cannot parse the new
+    /// tag, so it must be refused before it receives v154 state;
+    /// `PausedCounterCostRemoval` carries its `replacement_subtree` boundary.
+    ///
+    /// v153: `GrantAllActivatedAbilitiesOf` gains the optional `kind` selector
+    /// and the loyalty-grant sibling variant is removed. A v152 peer
+    /// drops the defaulted field silently and over-grants, so it must be
+    /// refused before it receives v153 state.
+    ///
+    /// v152: `ShortcutDecisionSchema` gains `suggested_declaration` and
+    /// `leading_aims`, and `ShortcutProposal` gains `leading_aims`; a v151 peer
+    /// drops them, so it must be refused before it receives v152 state.
     /// v151: populated Bestow form payloads require a versioned full-game peer.
+    /// v150: the cast-this-way gains rider is reshaped —
+    /// `CastingPermission::ExileWithAltCost.enters_with_modifications` becomes a
+    /// `PendingEntersModifications` object and
+    /// `Effect::AddPendingEntersModifications` carries its `rider`; a v149 peer
+    /// cannot parse either new shape, so it must be refused before it receives
+    /// v150 state.
     /// v149: `GameState::deferred_spell_delivery` is gone and
     /// `GameState::resolving_spell_final_part` marks the CR 608.2n final part a
     /// paused instant or sorcery still owes; a v148 peer drops the key and would
@@ -3722,8 +3770,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_153_for_exact_attack_authority() {
-        assert_eq!(PROTOCOL_VERSION, 153);
+    fn protocol_version_is_160_for_exact_attack_authority() {
+        assert_eq!(PROTOCOL_VERSION, 160);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3734,7 +3782,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_153_for_exact_attack_authority` stays
+    /// `protocol_version_is_160_for_exact_attack_authority` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

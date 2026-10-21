@@ -400,6 +400,7 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
+
   it("rejects Full v141 before it can read a linked-exile snapshot's incarnation", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
@@ -422,26 +423,62 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
-  it("rejects Full v151 before it can read the attacked-player referent", async () => {
-    const promise = openPhaseSocket("ws://test");
-    const ws = MockWebSocket.instances[0];
-    ws.deliverMessage(helloFrame({ protocol_version: 151 }));
-    await expect(promise).rejects.toMatchObject({ kind: "protocol_mismatch" });
-    expect(ws.close).toHaveBeenCalled();
-  });
-
-  it("rejects Full v152 before it can lose exact attack authority", async () => {
+  it("rejects Full v152 before it can read a deferred counter-cost removal", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
     ws.deliverMessage(helloFrame({ protocol_version: 152 }));
+
+    await expect(promise).rejects.toMatchObject({
+      kind: "protocol_mismatch",
+    });
+    expect(ws.close).toHaveBeenCalled();
+  });
+
+  it("rejects Full v151 before it can read the shortcut suggestion", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: 151 }));
+
+    await expect(promise).rejects.toMatchObject({
+      kind: "protocol_mismatch",
+    });
+    expect(ws.close).toHaveBeenCalled();
+  });
+
+  it.each([152, 153, 154, 155, 156, 157, 158])("rejects Full v%s before it can read a parked ChangeZone frame's pre-event member entries or a merged coin-flip run", async (version) => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: version }));
+
+    await expect(promise).rejects.toMatchObject({
+      kind: "protocol_mismatch",
+    });
+    expect(ws.close).toHaveBeenCalled();
+  });
+
+  it.each([154, 155, 156])("rejects Full v%s before it can read a TotalManaValue zone choice", async (version) => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: version }));
+
+    await expect(promise).rejects.toMatchObject({
+      kind: "protocol_mismatch",
+    });
+    expect(ws.close).toHaveBeenCalled();
+  });
+
+  it("rejects Full v159 before it can read the attacked-player referent or exact attack authority", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: 159 }));
     await expect(promise).rejects.toMatchObject({ kind: "protocol_mismatch" });
     expect(ws.close).toHaveBeenCalled();
   });
 
-  it("accepts the literal Full v153 exact attack authority protocol", async () => {
+  it("accepts the literal Full v160 exact attack authority, merged coin-flip run, pre-event change-zone entry, deferred counter-cost removal, kind-selected grant, shortcut-suggestion and populated Bestow protocol", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
-    ws.deliverMessage(helloFrame({ protocol_version: 153 }));
+    ws.deliverMessage(helloFrame({ protocol_version: 160 }));
 
     await expect(promise).resolves.toBeDefined();
     expect(ws.close).not.toHaveBeenCalled();
