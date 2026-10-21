@@ -64,11 +64,22 @@ fn add_karn(sc: &mut GameScenario, loyalty: u32) -> ObjectId {
         .add_planeswalker_from_oracle(P2, "Karn Stand-in", "Karn", loyalty, "+1: You gain 1 life.")
         .as_planeswalker_with_loyalty("Karn", loyalty)
         .id();
-    let object = &sc.state.objects[&id];
-    assert_eq!(object.base_loyalty, Some(loyalty));
-    assert_eq!(object.loyalty, Some(loyalty));
-    assert_eq!(object.counters[&CounterType::Loyalty], loyalty);
     id
+}
+
+/// The stand-in every attack test uses enters with its printed loyalty as both its
+/// base value and its loyalty counters (CR 306.5b), so a later loyalty read is real.
+#[test]
+fn karn_stand_in_has_its_printed_loyalty() {
+    for loyalty in [1, 5] {
+        let mut sc = scenario();
+        let id = add_karn(&mut sc, loyalty);
+        let r = sc.build();
+        let object = &r.state().objects[&id];
+        assert_eq!(object.base_loyalty, Some(loyalty));
+        assert_eq!(object.loyalty, Some(loyalty));
+        assert_eq!(object.counters[&CounterType::Loyalty], loyalty);
+    }
 }
 
 /// Owner P2, controller P1: the controller (the defending player CR 508.5 collapses to) differs
