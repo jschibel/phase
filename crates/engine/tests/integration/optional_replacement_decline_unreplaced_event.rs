@@ -11,8 +11,8 @@
 //! These rows drive the real card data through `GameAction`s: cast Raise the
 //! Alarm, answer Jinnie's prompt, and read the battlefield. The accept row is
 //! the reach guard for the decline row: it proves the same prompt really
-//! substitutes the tokens, so the decline row cannot pass by Jinnie never
-//! applying.
+//! applies Jinnie's replacement (it asks for a substitute and no Soldier is
+//! created), so the decline row cannot pass by Jinnie never applying.
 
 use engine::database::card_db::CardDatabase;
 use engine::game::game_object::GameObject;
