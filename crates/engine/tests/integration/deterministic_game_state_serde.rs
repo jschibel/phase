@@ -1445,19 +1445,21 @@ fn build_populated_state(reverse: bool) -> GameState {
         state.objects.insert(object.id, object);
     }
 
-    let mut combat = CombatState::default();
-    combat.attackers = vec![
-        AttackerInfo::new(
-            ObjectId(3),
-            AttackTarget::Planeswalker(ObjectId(5)),
-            PlayerId(1),
-        ),
-        AttackerInfo::new(
-            ObjectId(4),
-            AttackTarget::Planeswalker(ObjectId(6)),
-            PlayerId(1),
-        ),
-    ];
+    let mut combat = CombatState {
+        attackers: vec![
+            AttackerInfo::new(
+                ObjectId(3),
+                AttackTarget::Planeswalker(ObjectId(5)),
+                PlayerId(1),
+            ),
+            AttackerInfo::new(
+                ObjectId(4),
+                AttackTarget::Planeswalker(ObjectId(6)),
+                PlayerId(1),
+            ),
+        ],
+        ..Default::default()
+    };
     let mut pins =
         [(ObjectId(3), ObjectId(5)), (ObjectId(4), ObjectId(6))].map(|(attacker, destination)| {
             let pin = ObjectIncarnationRef::from_object(&state.objects[&destination]);

@@ -3644,6 +3644,7 @@ mod exact_attack_authority_restore_tests {
     use super::*;
     use engine::game::combat::AttackTarget;
     use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+    use engine::game::zone_pipeline::{move_object_for_test, ZoneMoveRequest};
     use engine::game::zones;
     use engine::types::actions::GameAction;
     use engine::types::counter::CounterType;
@@ -3692,8 +3693,7 @@ mod exact_attack_authority_restore_tests {
         if blink {
             // Typed lifecycle fixture; real printed Flicker casting/retirement
             // is covered by the engine integration cases before this boundary.
-            zones::move_to_zone(r.state_mut(), walker, Zone::Exile, &mut Vec::new());
-            zones::move_to_zone(r.state_mut(), walker, Zone::Battlefield, &mut Vec::new());
+            blink_through_zone_pipeline(r.state_mut(), walker);
             assert_ne!(r.state().objects[&walker].incarnation, pin.incarnation);
             assert_eq!(r.state().objects[&walker].base_loyalty, Some(5));
             assert_eq!(r.state().objects[&walker].loyalty, Some(5));
@@ -3737,6 +3737,25 @@ mod exact_attack_authority_restore_tests {
             )
         });
         (r.state().clone(), sphere, walker, myr)
+    }
+
+    /// CR 400.7 + CR 122.2 + CR 306.5b: Exile and return `id` through the
+    /// replacement-aware zone pipeline. The raw zone primitive clears counters
+    /// without applying the intrinsic entry replacement, so only this path gives
+    /// the returned new object loyalty counters equal to its printed loyalty.
+    fn blink_through_zone_pipeline(state: &mut GameState, id: ObjectId) {
+        let mut events = Vec::new();
+        assert!(!move_object_for_test(
+            state,
+            ZoneMoveRequest::effect(id, Zone::Exile, id),
+            &mut events,
+        ));
+        assert!(!move_object_for_test(
+            state,
+            ZoneMoveRequest::effect(id, Zone::Battlefield, id),
+            &mut events,
+        ));
+        assert_eq!(state.objects[&id].zone, Zone::Battlefield);
     }
 
     fn wire(state: &GameState, trusted: bool) -> String {
@@ -3913,8 +3932,7 @@ mod exact_attack_authority_restore_tests {
                     .combat_status;
                 assert_eq!(departure.attack_target_identity.is_none(), timing == 2);
                 if timing == 1 {
-                    zones::move_to_zone(&mut state, walker, Zone::Exile, &mut Vec::new());
-                    zones::move_to_zone(&mut state, walker, Zone::Battlefield, &mut Vec::new());
+                    blink_through_zone_pipeline(&mut state, walker);
                     assert_ne!(
                         state.objects[&walker].incarnation,
                         departure.attack_target_identity.unwrap().incarnation
