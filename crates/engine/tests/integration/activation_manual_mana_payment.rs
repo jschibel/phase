@@ -23,6 +23,7 @@ use engine::types::game_state::{
     PersistedRestoreFinalization, ShardChoice, ShardOptions, StackEntryKind, WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
+use engine::types::keywords::KeywordKind;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
@@ -1444,11 +1445,13 @@ fn a_manual_multi_component_activation_exiles_and_sacrifices_after_its_window() 
 /// Crystal Shard ("{3}, {T} or {U}, {T}: Return target creature to its owner's
 /// hand unless its controller pays {1}."). CR 601.2b + CR 601.2g: the target,
 /// then the cost alternative is announced — nothing is paid — and the window
-/// prices the alternative selected.
+/// prices the alternative selected. A second creature makes the target a real
+/// choice: the engine selects a lone legal target without asking.
 fn shard_board() -> (GameRunner, ObjectId, ObjectId, ObjectId, [ObjectId; 3]) {
     let mut scenario = scenario_at_main();
     let shard = add(&mut scenario, P0, "Crystal Shard", Zone::Battlefield);
     let victim = add(&mut scenario, P1, "Grizzly Bears", Zone::Battlefield);
+    add(&mut scenario, P1, "Grizzly Bears", Zone::Battlefield);
     let island = add(&mut scenario, P0, "Island", Zone::Battlefield);
     let mountains = [
         add(&mut scenario, P0, "Mountain", Zone::Battlefield),
@@ -2598,6 +2601,179 @@ fn a_phyrexian_only_activation_under_krrik_keeps_its_window_route_at_one_life() 
     assert_eq!(runner.state().stack.len(), 1, "placed once");
 }
 
+const ZOPANDREL: &str = "Reach\nAt the beginning of each combat, double the power and toughness of each creature you control until end of turn.\n{G/P}{G/P}, Sacrifice two other creatures: Put an indestructible counter on Zopandrel. ({G/P} can be paid with either {G} or 2 life.)";
+
+/// CR 601.2b + CR 118.13a + CR 601.2g + CR 119.3 + CR 119.4: each printed
+/// Phyrexian symbol's payment is announced on its own, so a cost of two of them
+/// has a route that mixes mana and life. Zopandrel, Hunger Dominus ("{G/P}{G/P},
+/// Sacrifice two other creatures: Put an indestructible counter on Zopandrel.")
+/// at one life with one Forest, two Pristine Talismans and two other creatures:
+/// announced as {G}{G} there is one green source; announced as 4 life the total
+/// is only life, which one life cannot pay; announced as {G} and 2 life, the
+/// total includes a mana payment, the Talismans raise the life to 3 in the
+/// window, the Forest pays the {G}, and the 2 life is then paid. It is offered
+/// for a manual payment only, and completes that way. Reach guards: at five life
+/// the same board is offered for an automatic payment, and at one life without
+/// the Forest no route can be paid, so nothing is offered.
+#[test]
+fn a_mixed_phyrexian_announcement_keeps_its_window_route_at_one_life() {
+    for (life_total, forest, offered) in [
+        (1, true, vec![CastPaymentMode::Manual]),
+        (5, true, vec![CastPaymentMode::Auto]),
+        (1, false, Vec::new()),
+    ] {
+        let mut scenario = scenario_at_main();
+        scenario.with_life(P0, life_total);
+        let zopandrel = scenario
+            .add_creature_from_oracle(P0, "Zopandrel, Hunger Dominus", 4, 6, ZOPANDREL)
+            .id();
+        let bears = [
+            add(&mut scenario, P0, "Grizzly Bears", Zone::Battlefield),
+            add(&mut scenario, P0, "Grizzly Bears", Zone::Battlefield),
+        ];
+        let talismans = [
+            add(&mut scenario, P0, "Pristine Talisman", Zone::Battlefield),
+            add(&mut scenario, P0, "Pristine Talisman", Zone::Battlefield),
+        ];
+        let forest_id = forest.then(|| add(&mut scenario, P0, "Forest", Zone::Battlefield));
+        let mut runner = build(scenario);
+        let index = ability_index_of(&runner, zopandrel, "indestructible counter");
+
+        assert_eq!(
+            offered_payment_modes(&runner, zopandrel, index),
+            offered,
+            "life {life_total}, forest {forest}"
+        );
+        let Some(forest_id) = forest_id.filter(|_| life_total == 1) else {
+            continue;
+        };
+
+        let waiting_for = activate_index(&mut runner, zopandrel, index, CastPaymentMode::Manual);
+        assert_announcement(&waiting_for, 2);
+        let waiting_for =
+            submit_phyrexian(&mut runner, &[ShardChoice::PayMana, ShardChoice::PayLife]);
+        assert!(
+            is_mana_payment(&waiting_for),
+            "CR 601.2g: the announced {{G}} opens the window: {waiting_for:?}"
+        );
+        assert_eq!(life(&runner, P0), 1, "nothing is paid before the window");
+        for talisman in talismans {
+            activate_mana_ability(&mut runner, talisman);
+        }
+        assert_eq!(life(&runner, P0), 3, "each Talisman gained 1 life");
+        tap_land_for_mana(&mut runner, forest_id);
+        let mut waiting_for = pass(&mut runner);
+        if matches!(
+            waiting_for,
+            WaitingFor::PayCost {
+                kind: PayCostKind::Sacrifice,
+                ..
+            }
+        ) {
+            waiting_for = select_cards(&mut runner, &bears);
+        }
+        assert!(is_priority(&waiting_for), "{waiting_for:?}");
+        assert_eq!(life(&runner, P0), 1, "the life symbol was paid with 2 life");
+        assert_eq!(
+            pool_total(&runner),
+            2,
+            "{{C}}{{C}} float; the Forest paid the {{G}}"
+        );
+        assert!(
+            bears
+                .iter()
+                .all(|id| in_zone(&runner, *id, Zone::Graveyard)),
+            "both other creatures were sacrificed"
+        );
+        assert_eq!(runner.state().stack.len(), 1, "placed once");
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            runner.state().objects[&zopandrel]
+                .counters
+                .get(&CounterType::Keyword(KeywordKind::Indestructible))
+                .copied(),
+            Some(1),
+            "the ability resolved once"
+        );
+    }
+}
+
+/// TYPED CONTRACT (Announcement election, manual-only offer). CR 601.2f +
+/// CR 602.2b + CR 601.2g + CR 119.3 + CR 119.4: an activation offered only for a
+/// manual payment, because its life is affordable only after the window, keeps
+/// that offer when it raises the Announcement-point cost election: the
+/// election's legality dry run runs in the activation's own manual mode.
+/// "{3}, Pay 2 life: Draw a card." under a reducer of {2} floored at two mana
+/// and an unfloored {1} reducer locks {1} or {2}, depending on the order. At one
+/// life with two Pristine Talismans the activation is offered for a manual
+/// payment only; activated so, it raises the election, and the elected {1} is
+/// paid from the window with exactly 2 life. Reach guard: at twenty life the
+/// automatic activation raises the same election.
+#[test]
+fn typed_manual_only_activation_raises_its_cost_election() {
+    const TWO_MANA_FLOOR_TWO_LESS: &str = "Activated abilities of creatures you control cost {2} less to activate. This effect can't reduce the mana in that cost to less than two mana.";
+    const CONTRACT: &str = "{3}, Pay 2 life: Draw a card.";
+    for (life_total, mode) in [(20, CastPaymentMode::Auto), (1, CastPaymentMode::Manual)] {
+        let mut scenario = scenario_at_main();
+        scenario.with_life(P0, life_total);
+        for name in ["L1", "L2", "L3"] {
+            scenario.add_card_to_library_top(P0, name);
+        }
+        scenario.add_artifact_from_oracle(
+            P0,
+            "Typed Two-Mana Floor Reducer",
+            TWO_MANA_FLOOR_TWO_LESS,
+        );
+        scenario.add_artifact_from_oracle(P0, "Typed Unfloored Reducer", UNFLOORED_ONE_LESS);
+        let contract = scenario
+            .add_creature_from_oracle(P0, "Typed Manual-Only Election Contract", 1, 1, CONTRACT)
+            .id();
+        let talismans = [
+            add(&mut scenario, P0, "Pristine Talisman", Zone::Battlefield),
+            add(&mut scenario, P0, "Pristine Talisman", Zone::Battlefield),
+        ];
+        let mut runner = build(scenario);
+
+        assert_eq!(
+            offered_payment_modes(&runner, contract, 0),
+            vec![mode],
+            "life {life_total}: the offered mode"
+        );
+        let waiting_for = activate_index(&mut runner, contract, 0, mode);
+        assert_eq!(
+            election_totals_of(&waiting_for),
+            vec![1, 2],
+            "life {life_total}: the two orders lock {{1}} and {{2}}"
+        );
+        assert_eq!(
+            election_lock_point(&waiting_for),
+            Some(ActivationCostLockPoint::Announcement)
+        );
+        if mode != CastPaymentMode::Manual {
+            continue;
+        }
+
+        let hand_before = hand_size(&runner, P0);
+        let waiting_for = elect_locking(&mut runner, 1);
+        assert!(
+            is_mana_payment(&waiting_for),
+            "CR 601.2g: the elected {{1}} opens the window: {waiting_for:?}"
+        );
+        assert_eq!(life(&runner, P0), 1, "nothing is paid before the window");
+        for talisman in talismans {
+            activate_mana_ability(&mut runner, talisman);
+        }
+        assert_eq!(life(&runner, P0), 3, "each Talisman gained 1 life");
+        let waiting_for = pass(&mut runner);
+        assert!(is_priority(&waiting_for), "{waiting_for:?}");
+        assert_eq!(life(&runner, P0), 1, "exactly 2 life were paid");
+        assert_eq!(pool_total(&runner), 1, "exactly the elected {{1}} was paid");
+        assert_eq!(runner.state().stack.len(), 1, "placed once");
+        runner.advance_until_stack_empty();
+        assert_eq!(hand_size(&runner, P0), hand_before + 1, "drew once");
+    }
+}
+
 /// CR 733.1: the announcement prompt can be cancelled — nothing was paid — and
 /// so can the window after it; the redo pays once.
 #[test]
@@ -3276,14 +3452,40 @@ const UNFLOORED_ONE_LESS: &str =
     "Activated abilities of creatures you control cost {1} less to activate.";
 const PROFESSOR_HOJO: &str = "The first activated ability you activate during your turn that targets a creature you control costs {2} less to activate.\nWhenever one or more creatures you control become the target of an activated ability, draw a card. This ability triggers only once each turn.";
 
-/// The distinct locked totals an election prompt offers, by mana value.
+/// The mana an election outcome's locked total demands: its mana value less the
+/// printed Phyrexian symbols the bound announcement pays with 2 life
+/// (CR 118.13a), which stay in the locked total but are not mana.
+fn outcome_mana(
+    pending: &engine::types::game_state::PendingCast,
+    outcome: &engine::types::casting_costs::CostReductionOutcome,
+) -> u32 {
+    let life_symbols = pending
+        .activation_phyrexian_intent
+        .as_ref()
+        .map_or(0, |intent| {
+            intent
+                .native_choices
+                .iter()
+                .filter(|record| record.choice == ShardChoice::PayLife)
+                .count() as u32
+        });
+    outcome.locked_cost.mana_value() - life_symbols
+}
+
+/// The distinct locked totals an election prompt offers, by the mana each
+/// demands.
 fn election_totals_of(waiting_for: &WaitingFor) -> Vec<u32> {
-    let WaitingFor::OrderCostReductions { outcomes, .. } = waiting_for else {
+    let WaitingFor::OrderCostReductions {
+        outcomes,
+        pending_cast,
+        ..
+    } = waiting_for
+    else {
         panic!("expected the cost election, got {waiting_for:?}");
     };
     let mut totals: Vec<u32> = outcomes
         .iter()
-        .map(|outcome| outcome.locked_cost.mana_value())
+        .map(|outcome| outcome_mana(pending_cast, outcome))
         .collect();
     totals.sort_unstable();
     totals
@@ -3306,13 +3508,17 @@ fn election_lock_point(waiting_for: &WaitingFor) -> Option<ActivationCostLockPoi
 
 /// Answers the election with the order that locks a total of `total` mana.
 fn elect_locking(runner: &mut GameRunner, total: u32) -> WaitingFor {
-    let WaitingFor::OrderCostReductions { outcomes, .. } = runner.state().waiting_for.clone()
+    let WaitingFor::OrderCostReductions {
+        outcomes,
+        pending_cast,
+        ..
+    } = runner.state().waiting_for.clone()
     else {
         panic!("expected the cost election");
     };
     let outcome = outcomes
         .iter()
-        .find(|outcome| outcome.locked_cost.mana_value() == total)
+        .find(|outcome| outcome_mana(&pending_cast, outcome) == total)
         .unwrap_or_else(|| panic!("no order locks {total}"));
     act(
         runner,
@@ -3345,10 +3551,14 @@ fn save_and_restore(runner: &GameRunner, trusted: bool) -> GameRunner {
     GameRunner::from_state(state)
 }
 
-/// The announced native choices bound on the pending root.
+/// The announced native choices bound on the activation's root: the election
+/// prompt's carrier while the election is asked, the pending root otherwise.
 fn native_choices(runner: &GameRunner) -> Vec<ShardChoice> {
-    proposal(runner)
-        .activation_phyrexian_intent
+    let root = match &runner.state().waiting_for {
+        WaitingFor::OrderCostReductions { pending_cast, .. } => pending_cast.as_ref(),
+        _ => proposal(runner),
+    };
+    root.activation_phyrexian_intent
         .as_ref()
         .expect("the announcement is bound")
         .native_choices
@@ -3605,6 +3815,9 @@ fn reclamation_board() -> ReclamationBoard {
     add(&mut scenario, P0, "Zirda, the Dawnwaker", Zone::Battlefield);
     let swamp = add(&mut scenario, P0, "Swamp", Zone::Battlefield);
     let returned = add(&mut scenario, P0, "Grizzly Bears", Zone::Graveyard);
+    // A second creature card makes the target a real choice: the engine selects
+    // a lone legal target without asking.
+    add(&mut scenario, P0, "Grizzly Bears", Zone::Graveyard);
     ReclamationBoard {
         scenario,
         reclamation,
@@ -3779,7 +3992,7 @@ fn manual_krrik_permission_gained_in_the_window_is_offered_at_payment() {
         assert!(
             runner.state().objects[&grant]
                 .static_definitions
-                .iter()
+                .iter_unchecked()
                 .any(
                     |def| matches!(def.mode, StaticMode::PayLifeAsColoredMana { .. })
                         && def.condition.is_some()

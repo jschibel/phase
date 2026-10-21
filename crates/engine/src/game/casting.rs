@@ -20950,6 +20950,21 @@ fn can_pay_mana_cost_after_auto_tap_with_context(
 struct AutoTapProbeOptions<'a> {
     source_cache: Option<&'a casting_costs::AutoTapSourceCache>,
     explicit_tap_payment_mode: Option<ConvokeMode>,
+    phyrexian_life_budget: ProbeLifeBudget,
+}
+
+/// CR 107.4f + CR 119.4: the life total an auto-tap probe's Phyrexian life
+/// budget (`CostPermissionContext::max_life`) is read from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ProbeLifeBudget {
+    /// The life after the probe's auto-tap, including any life a tapped mana
+    /// ability gained.
+    #[default]
+    AfterAutoTap,
+    /// The life before the probe taps anything: the budget an automatic
+    /// activation's payer validates its Phyrexian life choices against
+    /// ([`pending_phyrexian_route_is_payable_for`]), before it taps a source.
+    BeforeAutoTap,
 }
 
 fn can_pay_mana_cost_after_auto_tap_with_context_and_cache(
@@ -20961,6 +20976,12 @@ fn can_pay_mana_cost_after_auto_tap_with_context_and_cache(
     excluded_sources: &HashSet<ObjectId>,
     options: AutoTapProbeOptions<'_>,
 ) -> bool {
+    let life_budget_before_tap = match options.phyrexian_life_budget {
+        ProbeLifeBudget::AfterAutoTap => None,
+        ProbeLifeBudget::BeforeAutoTap => Some(super::life_costs::max_phyrexian_life_payments(
+            simulated, player,
+        )),
+    };
     let mut tap_events: Vec<crate::types::events::GameEvent> = Vec::new();
     super::casting_costs::auto_tap_mana_sources_with_context_excluding_cached(
         simulated,
@@ -20996,11 +21017,14 @@ fn can_pay_mana_cost_after_auto_tap_with_context_and_cache(
     // CR 107.4f + CR 118.1 + CR 118.3 + CR 119.8: Bundle the payer's
     // payment-time permissions (`mana_spend_permission`, `max_life`, `life_colors`) so
     // K'rrik-style life-for-{B} grants are visible to the affordability check.
-    let permissions = super::static_abilities::build_cost_permission_context(
+    let mut permissions = super::static_abilities::build_cost_permission_context(
         simulated,
         player,
         mana_spend_permission,
     );
+    if let Some(max_life) = life_budget_before_tap {
+        permissions.max_life = max_life;
+    }
     simulated
         .players
         .iter()
@@ -21519,6 +21543,7 @@ pub fn can_pay_cost_after_auto_tap_with_probe(
         AutoTapProbeOptions {
             source_cache,
             explicit_tap_payment_mode: None,
+            phyrexian_life_budget: ProbeLifeBudget::AfterAutoTap,
         },
     )
 }
@@ -21550,6 +21575,7 @@ pub(crate) fn can_pay_pending_cast_after_auto_tap_in_scratch(
         AutoTapProbeOptions {
             source_cache: None,
             explicit_tap_payment_mode: None,
+            phyrexian_life_budget: ProbeLifeBudget::AfterAutoTap,
         },
     )
 }
@@ -21668,6 +21694,7 @@ fn feasibly_payable_with_tap_payment_mode_in_context(
         AutoTapProbeOptions {
             source_cache: None,
             explicit_tap_payment_mode: Some(tap_payment_mode),
+            phyrexian_life_budget: ProbeLifeBudget::AfterAutoTap,
         },
     ) {
         return true;
@@ -25656,6 +25683,63 @@ pub(crate) fn can_pay_ability_cost_now(
     })
 }
 
+/// CR 107.4f + CR 119.4 + CR 601.2h: whether an automatic payment of `cost`'s
+/// mana can pay its Phyrexian life on the life the player has now. The
+/// automatic payer asks for those symbols' payment and validates every symbol
+/// paid with 2 life against the current total
+/// ([`pending_phyrexian_route_is_payable_for`]) before it taps a source, so the
+/// life a tapped mana ability would then gain (Pristine Talisman: "{T}: Add
+/// {C}. You gain 1 life.") pays none of them. [`can_pay_ability_cost_now`]'s
+/// dry run taps first and reads the life after, so an automatic verdict also
+/// judges the mana on the life budget before the auto-tap. Trivially true when
+/// the mana has no symbol payable with life, or when no mana ability of the
+/// player gains them life: the auto-tap cannot then raise the budget.
+fn automatic_activation_phyrexian_life_payable_now(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    cost: &AbilityCost,
+    ability_index: usize,
+) -> bool {
+    let mana = activation_mana_component(cost);
+    let life_colors = super::static_abilities::player_life_payment_colors(state, player);
+    if !mana_payment::cost_has_life_payable_shard(&mana, life_colors) {
+        return true;
+    }
+    let gains_life_for_mana = state
+        .battlefield
+        .iter()
+        .filter_map(|id| state.objects.get(id))
+        .filter(|obj| obj.controller == player)
+        .flat_map(|obj| obj.abilities.iter())
+        .any(|def| {
+            super::mana_abilities::is_mana_ability(def)
+                && super::mana_sources::mana_ability_gains_controller_life(def)
+        });
+    if !gains_life_for_mana {
+        return true;
+    }
+    let excluded_sources = ability_mana_payment_excluded_sources(cost, source_id);
+    crate::game::perf_counters::record_state_clone_for_legality();
+    let mut simulated = state.clone();
+    super::layers::flush_layers(&mut simulated);
+    let activation_context = activation_payment_context(&simulated, source_id, Some(ability_index));
+    let activation_ctx = activation_context.as_payment_context();
+    can_pay_mana_cost_after_auto_tap_with_context_and_cache(
+        &mut simulated,
+        player,
+        Some(source_id),
+        &mana,
+        Some(&activation_ctx),
+        &excluded_sources,
+        AutoTapProbeOptions {
+            source_cache: None,
+            explicit_tap_payment_mode: None,
+            phyrexian_life_budget: ProbeLifeBudget::BeforeAutoTap,
+        },
+    )
+}
+
 /// CR 601.2g + CR 119.3 + CR 119.4: how one legality pass judges the life an
 /// activation's cost pays, which is paid only in CR 601.2h.
 pub(crate) enum ActivationLifeWindow {
@@ -25712,13 +25796,18 @@ impl ActivationLifeWindow {
 ///
 /// * `life` is a manual payment's window. An automatic payment keeps the
 ///   current-total verdict.
-/// * the route judged has a CR 601.2g opportunity: its total includes a mana
+/// * each route judged has a CR 601.2g opportunity: its total includes a mana
 ///   payment. When paying every printed Phyrexian symbol with 2 life would leave
-///   no mana and no X (Spellskite's lone {U/P}), only the announcement that pays
-///   those symbols with mana opens one (CR 118.13a), so that route — each symbol
-///   as the colored mana it stands for — is what is judged. A total that is only
-///   life is paid at once, with the life the player has now.
-/// * that route pays life. A mana-only total cannot change its verdict: the
+///   no mana and no X (Spellskite's lone {U/P}), that all-life announcement has
+///   no opportunity (CR 118.13a), so the routes judged are the announcements
+///   that pay at least one of those symbols as the colored mana it stands for,
+///   each symbol announced as life kept as a 2-life payment (CR 601.2b: the
+///   choice is made for each symbol). For two or more such symbols (Drivnod,
+///   Carnage Dominus; Zopandrel, Hunger Dominus) an announcement mixing mana and
+///   life is one of them. A total that is only life is paid at once, with the
+///   life the player has now.
+/// * that route pays life, and the retry passes when any such route is
+///   payable on the witness. A mana-only total cannot change its verdict: the
 ///   current-board check already counts the mana a life-gaining ability adds.
 ///
 /// The retry only ever adds an offer; the payment itself still checks the life
@@ -25752,55 +25841,112 @@ pub(crate) fn payable_with_mana_ability_window_life(
     if (*window_player, *window_source) != (player, source_id) {
         return false;
     }
-    let Some(route) = mana_ability_window_route(cost) else {
-        return false;
-    };
     let life_colors = super::static_abilities::player_life_payment_colors(state, player);
-    if !activation_cost_pays_life(&route, life_colors) {
+    let routes: Vec<_> = mana_ability_window_routes(cost)
+        .into_iter()
+        .filter(|route| activation_cost_pays_life(route, life_colors))
+        .collect();
+    if routes.is_empty() {
         return false;
     }
     witness
         .get_or_init(|| mana_ability_window_life_witness(state, player, source_id).map(Box::new))
         .as_deref()
-        .is_some_and(|witness| payable(witness, &route))
+        .is_some_and(|witness| routes.iter().any(|route| payable(witness, route)))
 }
 
-/// CR 601.2g + CR 118.13a: the route of `cost` whose total includes a mana
-/// payment, and so has a mana-ability opportunity before its life is paid:
-/// `cost` itself when paying every printed Phyrexian symbol with 2 life still
-/// leaves mana or an X to pay; otherwise `cost` with every printed Phyrexian
-/// symbol announced as the colored mana it stands for (CR 107.4f) — the same
-/// all-life residual the manual X cap reads. `None` when no route has a mana
-/// payment at all.
-fn mana_ability_window_route(cost: &AbilityCost) -> Option<std::borrow::Cow<'_, AbilityCost>> {
+/// CR 601.2g + CR 601.2b + CR 118.13a: the routes of `cost` this check judges
+/// for a mana-ability opportunity — each a total that includes a mana payment,
+/// and so has the opportunity before its life is paid:
+///
+/// * `cost` itself, alone, when paying every printed Phyrexian symbol with
+///   2 life still leaves mana or an X to pay: every announcement then has the
+///   opportunity, and the payability check already judges each one;
+/// * otherwise one route per distinct announcement that pays at least one
+///   printed Phyrexian symbol as the colored mana it stands for (CR 107.4f),
+///   in [`announced_activation_route`]'s shape. The all-life announcement is
+///   left out: its total is only life.
+///
+/// Empty when no route has a mana payment at all. The announcements are
+/// enumerated per symbol (CR 601.2b); the most printed Phyrexian symbols any
+/// activation cost holds is four (Spike, Tournament Grinder), so at most
+/// fifteen announcements are built, and same-colored symbols collapse to
+/// fewer distinct routes.
+fn mana_ability_window_routes(cost: &AbilityCost) -> Vec<std::borrow::Cow<'_, AbilityCost>> {
     let has_mana_payment =
         |mana: &ManaCost| mana.mana_value() > 0 || casting_costs::cost_has_x(mana);
     let mana = activation_mana_component(cost);
     if !has_mana_payment(&mana) {
-        return None;
+        return Vec::new();
     }
     let printed_phyrexian = mana_payment::native_phyrexian_shards(&mana);
-    let announce_each = |choice: ShardChoice| -> Vec<ActivationShardChoice> {
-        printed_phyrexian
-            .iter()
-            .map(|&(shard_index, shard)| ActivationShardChoice {
-                shard_index,
-                shard,
-                choice,
-            })
-            .collect()
-    };
-    let all_life_residual =
-        mana_payment::native_selected_mana(&mana, &announce_each(ShardChoice::PayLife));
-    if has_mana_payment(&all_life_residual) {
-        return Some(std::borrow::Cow::Borrowed(cost));
+    let all_life = mana_payment::all_life_announcement(&mana);
+    if has_mana_payment(&mana_payment::native_selected_mana(&mana, &all_life)) {
+        return vec![std::borrow::Cow::Borrowed(cost)];
     }
-    Some(std::borrow::Cow::Owned(
-        selected_activation_cost_for_payability(
-            cost,
-            Some(announce_each(ShardChoice::PayMana).as_slice()),
-        ),
-    ))
+    let announcements = printed_phyrexian.iter().fold(
+        vec![Vec::<ActivationShardChoice>::new()],
+        |announcements, &(shard_index, shard)| {
+            announcements
+                .into_iter()
+                .flat_map(|announced| {
+                    [ShardChoice::PayMana, ShardChoice::PayLife].map(|choice| {
+                        let mut next = announced.clone();
+                        next.push(ActivationShardChoice {
+                            shard_index,
+                            shard,
+                            choice,
+                        });
+                        next
+                    })
+                })
+                .collect()
+        },
+    );
+    let mut routes: Vec<std::borrow::Cow<'_, AbilityCost>> = Vec::new();
+    for announcement in announcements
+        .iter()
+        .filter(|announced| **announced != all_life)
+    {
+        let route = announced_activation_route(cost, announcement);
+        if !routes.iter().any(|known| **known == route) {
+            routes.push(std::borrow::Cow::Owned(route));
+        }
+    }
+    routes
+}
+
+/// CR 601.2b + CR 107.4f + CR 119.4: `cost` as `announcement` proposes it: each
+/// printed Phyrexian symbol announced as mana is the colored mana it stands for
+/// ([`selected_activation_cost_for_payability`]), and the symbols announced as
+/// life are one "Pay N life" leg of 2 life each, appended last so the first leg
+/// stays the cost's first mana leg.
+fn announced_activation_route(
+    cost: &AbilityCost,
+    announcement: &[ActivationShardChoice],
+) -> AbilityCost {
+    let selected = selected_activation_cost_for_payability(cost, Some(announcement));
+    let life_symbols = announcement
+        .iter()
+        .filter(|record| record.choice == ShardChoice::PayLife)
+        .count();
+    if life_symbols == 0 {
+        return selected;
+    }
+    let life = AbilityCost::PayLife {
+        amount: QuantityExpr::Fixed {
+            value: 2 * life_symbols as i32,
+        },
+    };
+    match selected {
+        AbilityCost::Composite { mut costs } => {
+            costs.push(life);
+            AbilityCost::Composite { costs }
+        }
+        other => AbilityCost::Composite {
+            costs: vec![other, life],
+        },
+    }
 }
 
 /// CR 119.4 + CR 107.4f: whether paying `cost` can pay life — a "Pay N life"
@@ -26276,8 +26422,9 @@ fn manual_activation_life_retry_possible(
         return false;
     };
     let life_colors = super::static_abilities::player_life_payment_colors(state, player);
-    mana_ability_window_route(&cost)
-        .is_some_and(|route| activation_cost_pays_life(&route, life_colors))
+    mana_ability_window_routes(&cost)
+        .iter()
+        .any(|route| activation_cost_pays_life(route, life_colors))
 }
 
 /// CR 602.5 + CR 118.3: the one activation-legality evaluation, shared by
@@ -26436,9 +26583,19 @@ pub(crate) fn activation_verdict(
         return ActivationVerdict::Illegal;
     }
     // CR 118.3: the resource-availability gate — the ONE evaluation.
+    // CR 107.4f + CR 119.4: an automatic payment's Phyrexian life is also
+    // judged in its payer's order, before any mana source is tapped.
     let cost_not_payable = proved_unpayable
         || affordability_cost.as_ref().is_some_and(|cost| {
             !can_pay_ability_cost_now(state, player, source_id, cost, Some(ability_index), &life)
+                || (matches!(life, ActivationLifeWindow::Current)
+                    && !automatic_activation_phyrexian_life_payable_now(
+                        state,
+                        player,
+                        source_id,
+                        cost,
+                        ability_index,
+                    ))
         });
     if cost_not_payable && query == ActivationQuery::Legality {
         return ActivationVerdict::Illegal;
@@ -27551,9 +27708,10 @@ fn ensure_x_locked_activation_payable(
     // player can have when it is paid, exactly as the offer judged it. The mana
     // leg judged is the X leg of the route being judged: the selected total's,
     // or — when X is locked before the Phyrexian announcement and every printed
-    // symbol announced as life would leave no mana — the route that announces
-    // them as mana (CR 118.13a), the only one with a CR 601.2g opportunity.
-    // `activation_x_whole_cost` puts that leg first, and the route keeps it there.
+    // symbol announced as life would leave no mana — each route that announces
+    // at least one of them as mana (CR 118.13a), the ones with a CR 601.2g
+    // opportunity. `activation_x_whole_cost` puts that leg first, and every
+    // route keeps it there.
     let payable = |state: &GameState, route: &AbilityCost| {
         let route_x_leg = match route {
             AbilityCost::Composite { costs } => costs.first(),
@@ -27594,6 +27752,66 @@ fn ensure_x_locked_activation_payable(
 /// activation locks for a candidate X — the per-X authority behind the X cap and
 /// the X previews. `None` unless `pending` is such an activation.
 pub(super) fn deferred_activation_mana_for_x(pending: &PendingCast, x: u32) -> Option<ManaCost> {
+    // An X preview precedes any Phyrexian announcement (CR 601.2b announces X
+    // first), so it is the unselected preview unless one is already bound.
+    deferred_activation_mana_for_x_announcing(pending, x, pending_native_phyrexian(pending))
+}
+
+/// CR 601.2b + CR 118.13a + CR 119.4: the printed Phyrexian symbols of `cost`
+/// the X cap of `pending` takes as announced with 2 life. X is announced before
+/// them — a manual payment announces them next, an automatic one while paying —
+/// so the cap, an upper bound and never a price, admits every symbol the player
+/// may still pay with life: all of them for a manual payment, whose life is
+/// judged after the CR 601.2g opportunity; for an automatic one, as many as the
+/// player's current life can pay. None for a spell, or once an announcement is
+/// bound (it is the selected total then).
+pub(super) fn activation_x_cap_life_announcement(
+    state: &GameState,
+    player: PlayerId,
+    pending: &PendingCast,
+    cost: &ManaCost,
+) -> Vec<ActivationShardChoice> {
+    if pending.activation_ability_index.is_none() || pending.activation_phyrexian_intent.is_some() {
+        return Vec::new();
+    }
+    let all_life = mana_payment::all_life_announcement(cost);
+    if activation_pays_mana_manually(pending) {
+        return all_life;
+    }
+    let payable = super::life_costs::max_phyrexian_life_payments(state, player);
+    all_life
+        .into_iter()
+        .take(usize::try_from(payable).unwrap_or(usize::MAX))
+        .collect()
+}
+
+/// CR 601.2b + CR 601.2f + CR 118.13a: the mana the X cap judges for candidate
+/// `x` of a deferred mana-`{X}` activation: [`deferred_activation_mana_for_x`]
+/// with the symbols [`activation_x_cap_life_announcement`] admits announced as
+/// 2 life — folded under that announcement, so a floor counts only the mana left
+/// (CR 601.2f), and without those symbols.
+pub(super) fn deferred_activation_x_cap_mana(
+    state: &GameState,
+    player: PlayerId,
+    pending: &PendingCast,
+    x: u32,
+) -> Option<ManaCost> {
+    let printed = deferred_activation_mana_for_x(pending, x)?;
+    let life = activation_x_cap_life_announcement(state, player, pending, &printed);
+    if life.is_empty() {
+        return Some(printed);
+    }
+    let total = deferred_activation_mana_for_x_announcing(pending, x, Some(&life))?;
+    Some(mana_payment::native_selected_mana(&total, &life))
+}
+
+/// [`deferred_activation_mana_for_x`] under the Phyrexian announcement `native`
+/// (`None`: unselected), keyed by index in the activation's mana component.
+fn deferred_activation_mana_for_x_announcing(
+    pending: &PendingCast,
+    x: u32,
+    native: Option<&[ActivationShardChoice]>,
+) -> Option<ManaCost> {
     let snapshot = pending.activation_cost_snapshot.as_deref()?;
     if !matches!(
         snapshot.lock,
@@ -27605,14 +27823,12 @@ pub(super) fn deferred_activation_mana_for_x(pending: &PendingCast, x: u32) -> O
     }
     let mut concrete = pending.clone();
     concrete.cost.concretize_x(x);
-    // An X preview precedes any Phyrexian announcement (CR 601.2b announces X
-    // first), so it is the unselected preview unless one is already bound.
     let folded = fold_activation_cost(
         &activation_x_whole_cost(&concrete),
         snapshot.raise_total,
         &snapshot.reductions,
         None,
-        pending_native_phyrexian(pending),
+        native,
     );
     Some(activation_mana_component(&folded))
 }
@@ -28063,9 +28279,13 @@ fn activate_with_cost_carrier(
         // Phyrexian announcement (CR 118.13a), which an automatic dry run would
         // drop and re-decide against the current life total. That route proves
         // its legality the way it is played: it runs manually, with the
-        // announcement, to its first prompt.
+        // announcement, to its first prompt. So does any manual activation: its
+        // life is judged after the CR 601.2g opportunity (CR 119.3 + CR 119.4),
+        // which an automatic dry run would judge against the current total and
+        // refuse an activation the manual offer made.
         let (dry_run_mode, dry_run_intent) = match phyrexian_intent.as_ref() {
             Some(intent) => (payment_mode, Some(intent.clone())),
+            None if payment_mode_pays_mana_manually(payment_mode) => (payment_mode, None),
             None => (CastPaymentMode::Auto, None),
         };
         activate_with_cost_carrier(
@@ -29595,7 +29815,9 @@ fn reduce_generic_in_cost_by(cost: &mut AbilityCost, remaining: &mut u32) {
 }
 
 /// CR 601.2f: Reduce generic mana in an ability cost without taking the total
-/// mana in that cost below `minimum_mana`.
+/// mana in that cost below `minimum_mana` — the unselected preview of
+/// [`reduce_generic_in_selected_cost`], kept for the building-block tests.
+#[cfg(test)]
 fn reduce_generic_in_cost_with_minimum_mana(
     cost: &mut AbilityCost,
     amount: u32,
@@ -29604,9 +29826,10 @@ fn reduce_generic_in_cost_with_minimum_mana(
     reduce_generic_in_selected_cost(cost, amount, minimum_mana, None);
 }
 
-/// CR 601.2f + CR 118.13a: [`reduce_generic_in_cost_with_minimum_mana`] over the
-/// SELECTED total: a Phyrexian symbol the player announced paying with 2 life
-/// (CR 601.2b) is not mana in that cost, so it does not count toward the floor
+/// CR 601.2f + CR 118.13a: Reduce generic mana in an ability cost without taking
+/// the mana in its SELECTED total below `minimum_mana`: a Phyrexian symbol the
+/// player announced paying with 2 life (CR 601.2b) is not mana in that cost, so
+/// it does not count toward the floor
 /// ("can't reduce the mana in that cost to less than one mana"). `None` is an
 /// unselected preview, which counts every printed symbol.
 fn reduce_generic_in_selected_cost(
@@ -29645,7 +29868,7 @@ fn selected_mana_in_cost(cost: &AbilityCost, native: Option<&[ActivationShardCho
 /// CR 601.2f + CR 118.7a: how much generic mana a reduction of `amount` removes
 /// from a cost holding `generic` generic mana out of `total` mana, when it
 /// "can't reduce the mana in that cost to less than `minimum_mana`". The single
-/// scalar authority: [`reduce_generic_in_cost_with_minimum_mana`] applies it to a
+/// scalar authority: [`reduce_generic_in_selected_cost`] applies it to a
 /// cost, and the activation election searches reachable totals with it.
 fn floored_generic_reduction(generic: u32, total: u32, amount: u32, minimum_mana: u32) -> u32 {
     amount.min(total.saturating_sub(minimum_mana).min(generic))
@@ -34204,13 +34427,16 @@ mod castable_zone_authority_tests {
 /// for, and that one window builds its witness once and counts every clone.
 #[cfg(test)]
 mod mana_ability_window_life_tests {
-    use super::{activation_ability_definition, can_pay_ability_cost_now, ActivationLifeWindow};
+    use super::{
+        activation_ability_definition, can_pay_ability_cost_now, mana_ability_window_routes,
+        ActivationLifeWindow,
+    };
     use crate::game::perf_counters;
     use crate::game::scenario::{GameRunner, GameScenario, P0};
-    use crate::types::ability::AbilityCost;
+    use crate::types::ability::{AbilityCost, QuantityExpr};
     use crate::types::game_state::CastPaymentMode;
     use crate::types::identifiers::ObjectId;
-    use crate::types::mana::ManaColor;
+    use crate::types::mana::{ManaColor, ManaCost, ManaCostShard};
     use crate::types::phase::Phase;
 
     const GREED: &str = "{B}, Pay 2 life: Draw a card.";
@@ -34342,6 +34568,81 @@ mod mana_ability_window_life_tests {
         assert!(payable(&runner, souleater, &ActivationLifeWindow::Current));
         let (runner, encyclopedia) = board(1, Source::ArcaneEncyclopedia, &[ManaColor::Black]);
         assert!(payable(&runner, encyclopedia, &manual(encyclopedia)));
+    }
+
+    fn mana(shards: &[ManaCostShard], generic: u32) -> AbilityCost {
+        AbilityCost::Mana {
+            cost: ManaCost::Cost {
+                shards: shards.to_vec(),
+                generic,
+            },
+        }
+    }
+
+    fn pay_life(value: i32) -> AbilityCost {
+        AbilityCost::PayLife {
+            amount: QuantityExpr::Fixed { value },
+        }
+    }
+
+    fn routes(cost: &AbilityCost) -> Vec<AbilityCost> {
+        mana_ability_window_routes(cost)
+            .into_iter()
+            .map(|route| route.into_owned())
+            .collect()
+    }
+
+    /// CR 601.2b + CR 118.13a + CR 601.2g: the window routes are the
+    /// announcements that leave a mana payment, one per distinct total.
+    /// * A cost whose all-life announcement still leaves mana is its own only
+    ///   route ({2}{B/P}).
+    /// * A lone Phyrexian symbol has only its all-mana route ({U/P} as {U}).
+    /// * Two same-colored symbols ({G/P}{G/P}, Zopandrel's) have the all-mana
+    ///   route and one mixed route — {G} and 2 life, appended after the
+    ///   activation's other legs — whichever symbol is announced as life.
+    /// * Two differently colored symbols have three routes.
+    /// * A cost with no mana payment has none.
+    #[test]
+    fn window_routes_are_the_announcements_that_leave_a_mana_payment() {
+        use ManaCostShard::{
+            Black, Blue, Green, PhyrexianBlack, PhyrexianGreen, PhyrexianRed, Red,
+        };
+
+        let generic_and_phyrexian = mana(&[PhyrexianBlack], 2);
+        assert_eq!(
+            routes(&generic_and_phyrexian),
+            vec![generic_and_phyrexian.clone()]
+        );
+        assert_eq!(
+            routes(&mana(&[ManaCostShard::PhyrexianBlue], 0)),
+            vec![mana(&[Blue], 0)]
+        );
+        assert_eq!(
+            routes(&AbilityCost::Composite {
+                costs: vec![mana(&[PhyrexianGreen, PhyrexianGreen], 0), AbilityCost::Tap],
+            }),
+            vec![
+                AbilityCost::Composite {
+                    costs: vec![mana(&[Green, Green], 0), AbilityCost::Tap],
+                },
+                AbilityCost::Composite {
+                    costs: vec![mana(&[Green], 0), AbilityCost::Tap, pay_life(2)],
+                },
+            ]
+        );
+        assert_eq!(
+            routes(&mana(&[PhyrexianBlack, PhyrexianRed], 0)),
+            vec![
+                mana(&[Black, Red], 0),
+                AbilityCost::Composite {
+                    costs: vec![mana(&[Black], 0), pay_life(2)],
+                },
+                AbilityCost::Composite {
+                    costs: vec![mana(&[Red], 0), pay_life(2)],
+                },
+            ]
+        );
+        assert!(routes(&AbilityCost::Tap).is_empty());
     }
 }
 

@@ -2222,9 +2222,11 @@ fn m_d2_manual_cancel_at_the_window_is_accepted_and_triggers_nothing() {
 /// M-D3 (CR 605.3a + CR 605.3b + CR 601.2g): a costed mana ability activated in
 /// the Manual window — Ashnod's Altar ("Sacrifice a creature: Add {C}{C}.")
 /// sacrificing a second Grizzly Bears — resolves at once and pays Mindless
-/// Automaton's {1}; the parent's discard follows the window. Zulaport sees the
-/// sacrifice, Haven the discard and Construct the parent activation — each
-/// exactly once, and Construct never for the Altar (a mana ability).
+/// Automaton's "{1}, Discard a card" {1}; the parent's discard follows the
+/// window. An untapped Wastes makes that ability offered; it is left untapped,
+/// so the Altar's mana is what pays. Zulaport sees the sacrifice, Haven the
+/// discard and Construct the parent activation — each exactly once, and
+/// Construct never for the Altar (a mana ability).
 #[test]
 fn m_d3_manual_window_funded_by_a_costed_mana_ability_triggers_each_observer_once() {
     use engine::types::game_state::PayCostKind;
@@ -2233,12 +2235,38 @@ fn m_d3_manual_window_funded_by_a_costed_mana_ability_triggers_each_observer_onc
     let card = add_card(&mut scenario, P0, "Grizzly Bears", Zone::Hand);
     let fodder = add_card(&mut scenario, P0, "Grizzly Bears", Zone::Battlefield);
     let altar = add_card(&mut scenario, P0, "Ashnod's Altar", Zone::Battlefield);
+    let wastes = add_card(&mut scenario, P0, "Wastes", Zone::Battlefield);
     let haven = add_card(&mut scenario, P0, "Drake Haven", Zone::Battlefield);
     let construct = add_card(&mut scenario, P0, "Crackdown Construct", Zone::Battlefield);
     let zulaport = add_card(&mut scenario, P0, "Zulaport Cutthroat", Zone::Battlefield);
     let mut r = build(scenario);
 
-    let window = real_activate(&mut r, automaton, CastPaymentMode::Manual);
+    // Mindless Automaton's abilities in printed order: 0 is "{1}, Discard a
+    // card: Put a +1/+1 counter on this creature.", 1 is "Remove two +1/+1
+    // counters from this creature: Draw a card."
+    let (_, _, grouped) = engine::ai_support::legal_actions_full(r.state());
+    assert!(
+        grouped
+            .get(&automaton)
+            .into_iter()
+            .flatten()
+            .any(|action| matches!(
+                action,
+                GameAction::ActivateAbility {
+                    ability_index: 0,
+                    ..
+                }
+            )),
+        "the {{1}}, Discard a card ability is offered with the Wastes untapped"
+    );
+    let window = act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: automaton,
+            ability_index: 0,
+            payment_mode: CastPaymentMode::Manual,
+        },
+    );
     assert!(is_window(&window), "{window:?}");
     assert!(in_zone(&r, card, Zone::Hand));
 
@@ -2299,5 +2327,13 @@ fn m_d3_manual_window_funded_by_a_costed_mana_ability_triggers_each_observer_onc
         r.state().players[0].mana_pool.total(),
         1,
         "the Altar's second {{C}} floats"
+    );
+    assert!(
+        !is_tapped(&r, wastes),
+        "the Altar's mana paid the {{1}}, not the Wastes"
+    );
+    assert!(
+        in_zone(&r, fodder, Zone::Graveyard),
+        "the Altar's sacrifice happened"
     );
 }

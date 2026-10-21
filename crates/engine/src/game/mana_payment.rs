@@ -769,6 +769,19 @@ pub(crate) fn native_phyrexian_shards(cost: &ManaCost) -> Vec<(usize, ManaCostSh
     }
 }
 
+/// CR 601.2b + CR 118.13a + CR 107.4f: the announcement that pays every printed
+/// Phyrexian symbol of `cost` with 2 life, keyed by its index in `cost`.
+pub(crate) fn all_life_announcement(cost: &ManaCost) -> Vec<ActivationShardChoice> {
+    native_phyrexian_shards(cost)
+        .into_iter()
+        .map(|(shard_index, shard)| ActivationShardChoice {
+            shard_index,
+            shard,
+            choice: ShardChoice::PayLife,
+        })
+        .collect()
+}
+
 /// CR 107.4f: the mana a Phyrexian symbol stands for when it is paid with mana —
 /// one mana of its color, or of either color for a hybrid Phyrexian symbol.
 /// `None` for every symbol that is not Phyrexian.

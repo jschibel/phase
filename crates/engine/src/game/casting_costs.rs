@@ -15807,10 +15807,12 @@ pub(super) fn max_x_value_excluding(
     // whose DEFAULT-order total is affordable — the default is the minimum over
     // every order (`fold_activation_cost`), so this is the true ceiling. The
     // per-X total is monotone non-decreasing in X (X adds generic; reductions
-    // subtract a bounded amount; floors are maxima).
+    // subtract a bounded amount; floors are maxima). CR 118.13a: the total is
+    // the one the cap judges, so the unannounced printed Phyrexian symbols the
+    // player may still pay with life are not counted as mana.
     if super::casting::deferred_activation_mana_for_x(pending, 0).is_some() {
         return largest_x_satisfying(formula_max, |x| {
-            super::casting::deferred_activation_mana_for_x(pending, x)
+            super::casting::deferred_activation_x_cap_mana(state, player, pending, x)
                 .is_some_and(|total| total.mana_value() <= available)
         });
     }
@@ -16105,29 +16107,19 @@ pub fn enter_payment_step(
                 })
                 .unwrap_or_default();
             let mana_max = if cost_has_x(&pending.cost) {
-                // CR 601.2b + CR 118.13a: X is announced before a manual
+                // CR 601.2b + CR 118.13a: X is announced before an
                 // activation's printed Phyrexian symbols, so the cap must admit
-                // every symbol the player may still announce as 2 life: an
-                // upper bound, never a price (the locked total is paid later).
-                let x_cap_cost = if pending.activation_ability_index.is_some()
-                    && super::casting::activation_pays_mana_manually(pending)
-                    && pending.activation_phyrexian_intent.is_none()
-                {
-                    let all_life: Vec<crate::types::game_state::ActivationShardChoice> =
-                        mana_payment::native_phyrexian_shards(&pending.cost)
-                            .into_iter()
-                            .map(|(shard_index, shard)| {
-                                crate::types::game_state::ActivationShardChoice {
-                                    shard_index,
-                                    shard,
-                                    choice: crate::types::game_state::ShardChoice::PayLife,
-                                }
-                            })
-                            .collect();
-                    mana_payment::native_selected_mana(&pending.cost, &all_life)
-                } else {
-                    pending.cost.clone()
-                };
+                // every symbol the player may still pay with 2 life: an upper
+                // bound, never a price (the locked total is paid later).
+                let x_cap_cost = mana_payment::native_selected_mana(
+                    &pending.cost,
+                    &super::casting::activation_x_cap_life_announcement(
+                        state,
+                        player,
+                        pending,
+                        &pending.cost,
+                    ),
+                );
                 max_x_value_excluding(
                     state,
                     player,
