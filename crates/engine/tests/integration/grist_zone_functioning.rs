@@ -19,7 +19,7 @@ use engine::game::printed_cards::{
 };
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::scenario_db::GameScenarioDbExt;
-use engine::game::zones::move_to_zone;
+use engine::game::zones::{apply_resolved_zone_change, move_to_zone};
 use engine::types::ability::{
     ChosenAttribute, Effect, ManaSpendRestriction, ResolvedAbility, StaticCondition,
     StaticDefinition, TargetFilter, TargetRef,
@@ -29,8 +29,8 @@ use engine::types::card_type::{CoreType, Supertype};
 use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
 use engine::types::game_state::{
-    CastingVariant, GameState, LayersDirty, ManaChoice, ManaChoicePrompt, PersistedGameState,
-    PersistedRestoreFinalization, StackEntryKind, WaitingFor,
+    CastPaymentMode, CastingVariant, GameState, LayersDirty, ManaChoice, ManaChoicePrompt,
+    PersistedGameState, PersistedRestoreFinalization, StackEntryKind, WaitingFor,
 };
 use engine::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef};
 use engine::types::mana::{
@@ -39,6 +39,7 @@ use engine::types::mana::{
 };
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
+use engine::types::resolved_commands::{ResolvedRulesCommand, ResolvedZoneChangeCommand};
 use engine::types::statics::StaticMode;
 use engine::types::zones::Zone;
 use std::sync::Arc;
@@ -574,6 +575,198 @@ fn cast_prohibition_restore_prototype_characteristics_raw_trusted_immediate_defe
                 flush_layers(&mut restored);
             }
         }
+    }
+}
+
+fn cast_prohibition_recorded_departure(state: &GameState, to: Zone) -> ResolvedZoneChangeCommand {
+    state
+        .resolved_rules_journal
+        .entries()
+        .iter()
+        .rev()
+        .filter_map(|entry| entry.command.as_ref())
+        .find_map(|command| match command {
+            ResolvedRulesCommand::ZoneChange(command)
+                if command.from == Zone::Battlefield && command.to == to =>
+            {
+                Some(command.as_ref().clone())
+            }
+            _ => None,
+        })
+        .expect("ordinary Battlefield departure must journal its resolved command")
+}
+
+#[test]
+fn cast_prohibition_restore_replayed_prototype_departure_has_printed_characteristics() {
+    let db = shared_card_db().expect("prototype departure replay requires CardDB");
+    for to in [Zone::Hand, Zone::Graveyard] {
+        let mut scenario = main_phase();
+        let proxy = scenario.add_real_card(P0, "Arcane Proxy", Zone::Hand, db);
+        scenario.with_mana_pool(
+            P0,
+            mana(&[ManaType::Blue, ManaType::Blue, ManaType::Colorless]),
+        );
+        let mut runner = scenario.build();
+        runner
+            .cast(proxy)
+            .casting_variant(CastingVariant::Prototype)
+            .resolve()
+            .assert_zone(&[proxy], Zone::Battlefield);
+        // CR 718.3b reach guard: the resolved permanent really carries the form.
+        cast_prohibition_assert_proxy(runner.state(), proxy, true);
+        let permanent = ObjectIncarnationRef::from_object(&runner.state().objects[&proxy]);
+        let pre_state = runner.state().clone();
+
+        let mut live = pre_state.clone();
+        move_to_zone(&mut live, proxy, to, &mut Vec::new());
+        assert_eq!(live.objects[&proxy].zone, to);
+        cast_prohibition_assert_proxy(&live, proxy, false);
+        let command = cast_prohibition_recorded_departure(&live, to);
+        assert_eq!(command.object, permanent);
+
+        // The supported prestate/command/replay contract: apply the exact
+        // recorded departure to the state it was recorded from.
+        let mut replay = pre_state.clone();
+        apply_resolved_zone_change(&mut replay, &command)
+            .expect("recorded departure replays against its prestate");
+        let object = &replay.objects[&proxy];
+        assert_eq!(object.zone, to, "reach guard: replay performed the move");
+        assert_eq!(object.incarnation, command.resulting_incarnation);
+        assert!(!replay.battlefield.contains(&proxy));
+        if to == Zone::Hand {
+            assert!(replay.players[0].hand.contains(&proxy));
+        } else {
+            assert!(replay.players[0].graveyard.contains(&proxy));
+        }
+        // CR 718.4 + CR 400.7: the replayed departure ends the form exactly
+        // as the live one did; the new object has only printed values.
+        cast_prohibition_assert_proxy(&replay, proxy, false);
+        assert_eq!(object.prototype_form, live.objects[&proxy].prototype_form);
+
+        for trusted in [false, true] {
+            let mut restored = cast_prohibition_restore(&replay, trusted);
+            for mode in [
+                CardDbRehydrationFinalization::Immediate,
+                CardDbRehydrationFinalization::Defer,
+            ] {
+                assert_eq!(restored.objects[&proxy].zone, to);
+                assert_eq!(
+                    restored.objects[&proxy].incarnation,
+                    command.resulting_incarnation
+                );
+                cast_prohibition_assert_proxy(&restored, proxy, false);
+                rehydrate_game_from_card_db_with_finalization(&mut restored, db, mode);
+                restored.layers_dirty = LayersDirty::Full;
+                flush_layers(&mut restored);
+                cast_prohibition_assert_proxy(&restored, proxy, false);
+            }
+
+            // Bounded legacy-state supplement: a state saved after the
+            // predecessor's replay applier still carries the expired form and
+            // its live values on the departed card. Restoring it must yield
+            // the card's normal characteristics (CR 718.4).
+            let mut legacy = replay.clone();
+            {
+                let departed = legacy.objects.get_mut(&proxy).unwrap();
+                let prestate = &pre_state.objects[&proxy];
+                departed.prototype_form = prestate.prototype_form.clone();
+                departed.mana_cost = prestate.mana_cost.clone();
+                departed.power = prestate.power;
+                departed.toughness = prestate.toughness;
+                departed.color = prestate.color.clone();
+            }
+            assert!(
+                legacy.objects[&proxy].prototype_form.is_some(),
+                "reach guard: the legacy state carries the expired form"
+            );
+            let restored_legacy = cast_prohibition_restore(&legacy, trusted);
+            assert_eq!(restored_legacy.objects[&proxy].zone, to);
+            cast_prohibition_assert_proxy(&restored_legacy, proxy, false);
+
+            if to == Zone::Hand {
+                // CR 718.4: a later normal cast of that card is a normal
+                // spell and permanent; the expired form cannot resurface.
+                let mut later = GameRunner::from_state(restored_legacy);
+                cast_prohibition_priority(&mut later, P0);
+                add_mana(&mut later, 0, &[ManaType::Colorless; 7]);
+                later
+                    .cast(proxy)
+                    .resolve()
+                    .assert_zone(&[proxy], Zone::Battlefield);
+                cast_prohibition_assert_proxy(later.state(), proxy, false);
+            }
+        }
+    }
+}
+
+#[test]
+fn cast_prohibition_restore_paused_prototype_cast_keeps_its_form() {
+    let db = shared_card_db().expect("paused prototype cast requires CardDB");
+    for trusted in [false, true] {
+        let mut scenario = main_phase();
+        let proxy = scenario.add_real_card(P0, "Arcane Proxy", Zone::Hand, db);
+        scenario.with_mana_pool(
+            P0,
+            mana(&[ManaType::Blue, ManaType::Blue, ManaType::Colorless]),
+        );
+        let mut runner = scenario.build();
+        let card_id = runner.state().objects[&proxy].card_id;
+        runner
+            .act(GameAction::CastSpell {
+                object_id: proxy,
+                card_id,
+                targets: vec![],
+                payment_mode: CastPaymentMode::Manual,
+            })
+            .expect("announce actual Proxy cast");
+        for _ in 0..4 {
+            let index = match &runner.state().waiting_for {
+                WaitingFor::ManaPayment { .. } => break,
+                WaitingFor::CastingVariantChoice { options, .. } => options
+                    .iter()
+                    .position(|option| option.variant == CastingVariant::Prototype)
+                    .expect("engine offers the prototyped cast"),
+                other => panic!("unexpected Proxy cast prompt {other:?}"),
+            };
+            runner
+                .act(GameAction::ChooseCastingVariant { index })
+                .expect("choose the prototyped cast");
+        }
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::ManaPayment { .. }
+        ));
+        // CR 601.2a reach guard: the announced spell is still being cast; the
+        // card has not yet left its origin zone and carries its chosen form.
+        let object = &runner.state().objects[&proxy];
+        assert_eq!(object.zone, Zone::Hand);
+        assert!(object.spell_announcement.is_some());
+        assert!(runner.state().stack.iter().any(|entry| entry.id == proxy
+            && matches!(
+                entry.kind,
+                StackEntryKind::Spell {
+                    casting_variant: CastingVariant::Prototype,
+                    ..
+                }
+            )));
+        cast_prohibition_assert_proxy(runner.state(), proxy, true);
+
+        // CR 718.3a + CR 718.3b: the restored paused cast keeps the form.
+        let restored = cast_prohibition_restore(runner.state(), trusted);
+        assert_eq!(restored.objects[&proxy].zone, Zone::Hand);
+        cast_prohibition_assert_proxy(&restored, proxy, true);
+        let mut restored = GameRunner::from_state(restored);
+        restored
+            .act(GameAction::PassPriority)
+            .expect("finish the paused prototype payment");
+        assert!(matches!(
+            restored.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+        assert_eq!(restored.state().players[0].mana_pool.units().count(), 0);
+        let spell = ObjectIncarnationRef::from_object(&restored.state().objects[&proxy]);
+        cast_prohibition_assert_spell(restored.state(), proxy, spell);
+        cast_prohibition_assert_proxy(restored.state(), proxy, true);
     }
 }
 

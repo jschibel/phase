@@ -1828,6 +1828,12 @@ fn reapply_printed_faces_from_card_db(state: &mut GameState, db: &CardDatabase) 
             && !object.base_static_definitions.contains(&canonical))
             .then(|| object.static_definitions.iter_all().find(|definition| **definition == canonical).cloned())
             .flatten();
+        // CR 718.3b + CR 718.4 + CR 601.2a: a saved prototype form is live only
+        // for the spell (including one still being cast, which is on the stack)
+        // and the permanent it becomes; in every other zone the card has only
+        // its normal characteristics.
+        let in_prototype_lifetime = matches!(zone, Zone::Stack | Zone::Battlefield)
+            || crate::game::casting::is_spell_being_cast(state, object_id);
         if let Some(obj) = state.objects.get_mut(&object_id) {
             let is_face_down_battlefield = obj.face_down && obj.zone == Zone::Battlefield;
 
@@ -1853,7 +1859,15 @@ fn reapply_printed_faces_from_card_db(state: &mut GameState, db: &CardDatabase) 
                 obj.base_printed_ref = obj.printed_ref.clone();
             } else {
                 apply_card_face_to_object(obj, &card_face);
-                refreshed_ids.push(object_id);
+                if in_prototype_lifetime {
+                    refreshed_ids.push(object_id);
+                } else if obj.prototype_form.is_some() {
+                    // CR 718.4 + CR 400.7: a form still carried off the stack
+                    // and battlefield (a state saved while replay left it in
+                    // place) is expired; drop it so a later normal cast cannot
+                    // revive it.
+                    crate::game::casting::clear_prototype_form(obj);
+                }
                 // CR 702.103b: Rehydration re-stamps printed characteristics from
                 // card-data.json, which clobbers the synthesized Aura subtype while
                 // `bestow_form` remains set (issue #3253). Re-apply the bestow
@@ -1964,7 +1978,8 @@ fn reapply_printed_faces_from_card_db(state: &mut GameState, db: &CardDatabase) 
     }
 
     // CR 718.3b: Printed base refresh must retain the saved alternative
-    // characteristics of a prototyped spell or the permanent it becomes.
+    // characteristics of a prototyped spell or the permanent it becomes; the
+    // batch holds only objects inside that lifetime (CR 718.4).
     super::layers::apply_prototype_characteristics(state, refreshed_ids);
     (changed_any, changed_battlefield)
 }
@@ -3597,14 +3612,15 @@ mod tests {
         };
         let mut state = GameState::new_two_player(42);
         let mut ids = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..6 {
             ids.push(create_object_from_card_face(
                 &mut state,
                 db.get_face_by_name("Form isolation").unwrap(),
                 PlayerId(0),
             ));
         }
-        let [ordinary, token, face_down, missing_ref, missing_face] = ids.as_slice() else {
+        let [ordinary, token, face_down, missing_ref, missing_face, expired] = ids.as_slice()
+        else {
             unreachable!()
         };
         for id in &ids {
@@ -3613,6 +3629,9 @@ mod tests {
             object.name = "stale display".to_string();
             object.power = Some(77);
         }
+        // CR 718.3b: the ordinary positive is a permanent inside the form's
+        // lifetime; `expired` stays in the library, outside it (CR 718.4).
+        state.objects.get_mut(ordinary).unwrap().zone = Zone::Battlefield;
         {
             let object = state.objects.get_mut(token).unwrap();
             object.is_token = true;
@@ -3656,6 +3675,29 @@ mod tests {
         assert_eq!(state.objects[ordinary].mana_cost, form.mana_cost);
         assert_eq!(state.objects[ordinary].color, form.colors);
         assert_eq!(state.objects[ordinary].base_power, Some(4));
+        assert_eq!(state.objects[ordinary].prototype_form, Some(form.clone()));
+        // CR 718.4: outside the stack and battlefield the refreshed card keeps
+        // only its normal characteristics, and the expired form is dropped.
+        assert_eq!(
+            state.objects[expired].name, "Form isolation",
+            "expired-form card really refreshed"
+        );
+        assert_eq!(
+            (
+                state.objects[expired].power,
+                state.objects[expired].toughness
+            ),
+            (Some(4), Some(3))
+        );
+        assert_eq!(
+            state.objects[expired].mana_cost,
+            ManaCost::Cost {
+                generic: 7,
+                shards: vec![],
+            }
+        );
+        assert!(state.objects[expired].color.is_empty());
+        assert_eq!(state.objects[expired].prototype_form, None);
         assert_eq!(
             (state.objects[token].power, state.objects[token].toughness),
             (Some(6), Some(8))

@@ -604,18 +604,7 @@ pub(crate) fn apply_zone_exit_cleanup(
             super::casting::revert_cleave_text_change(obj_mut);
         }
 
-        // CR 702.160a + CR 400.7: Prototype's alternative characteristics
-        // apply only to the spell/permanent produced by casting it prototyped.
-        // Preserve the marker while the cast becomes a stack spell and while
-        // that spell resolves to the battlefield; clear it for every other
-        // zone change so the new object reverts to printed characteristics.
-        let preserve_prototype_form = match from {
-            _ if to == Zone::Stack => true,
-            Zone::Stack if to == Zone::Battlefield => true,
-            _ => false,
-        };
-        if !preserve_prototype_form && obj_mut.prototype_form.is_some() {
-            super::casting::clear_prototype_form(obj_mut);
+        if retire_prototype_form_on_zone_change(obj_mut, from, to) {
             state.layers_dirty.mark_full();
         }
 
@@ -1135,6 +1124,27 @@ fn install_rebound_owner(object: &mut crate::game::game_object::GameObject, owne
     object.controller = owner;
 }
 
+/// CR 702.160a + CR 718.3b + CR 718.4 + CR 400.7: Prototype's alternative
+/// characteristics belong only to the spell cast prototyped and the permanent
+/// it becomes. Preserve the marker while the cast becomes a stack spell and
+/// while that spell resolves to the battlefield; clear it for every other zone
+/// change so the new object has only its normal characteristics. Shared by the
+/// live exit cleanup and the resolved-zone-change replay applier so a replayed
+/// departure ends the form exactly as the live one did. Returns whether a form
+/// was cleared, so the caller can schedule a full layer pass.
+fn retire_prototype_form_on_zone_change(object: &mut GameObject, from: Zone, to: Zone) -> bool {
+    let preserve_prototype_form = match from {
+        _ if to == Zone::Stack => true,
+        Zone::Stack if to == Zone::Battlefield => true,
+        _ => false,
+    };
+    if preserve_prototype_form || object.prototype_form.is_none() {
+        return false;
+    }
+    super::casting::clear_prototype_form(object);
+    true
+}
+
 /// CR 112.1 + CR 400.7: a cast-bound rules prohibition ends with the spell;
 /// printed intrinsic prohibitions remain part of the new object's base.
 fn retire_cast_counterprohibition_on_stack_exit(object: &mut GameObject, from: Zone, to: Zone) {
@@ -1297,6 +1307,12 @@ pub fn apply_resolved_zone_change(
     }
 
     retire_cast_counterprohibition_on_stack_exit(object, command.from, command.to);
+    // CR 718.4 + CR 400.7: replay bypasses `apply_zone_exit_cleanup`, so it
+    // ends a departing prototype form through the same lifetime authority; a
+    // replayed Battlefield -> Hand/Graveyard move leaves only printed values.
+    if retire_prototype_form_on_zone_change(object, command.from, command.to) {
+        state.layers_dirty.mark_full();
+    }
 
     // CR 613.7d: the battlefield entry drew this timestamp during the original
     // execution, so replay installs it rather than drawing a fresh one — and
