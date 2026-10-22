@@ -479,10 +479,12 @@ fn on_shortcut_byte_identical_to_pre_pr7_golden() {
     all.extend(rest);
 
     // The golden covers event ordering and effect payloads from before SpellCast
-    // gained its optional cast-time snapshot, and before LifeChanged began
-    // reporting the life total it left the player on. Both are orthogonal fields
-    // asserted by their own tests (the Thor quantity tests; `effects::life` and
-    // `combat_damage`), so omit them from this legacy byte-for-byte comparison.
+    // gained its optional cast-time snapshot, before LifeChanged began reporting
+    // the life total it left the player on, and before the prepared designation
+    // joined `LKISnapshot`/`ZoneChangeRecord`. All are orthogonal fields asserted
+    // by their own tests (the Thor quantity tests; `effects::life` and
+    // `combat_damage`; the prepared suites), so omit them from this legacy
+    // byte-for-byte comparison.
     for event in &mut all {
         match event {
             GameEvent::SpellCast {
@@ -513,6 +515,7 @@ fn on_shortcut_byte_identical_to_pre_pr7_golden() {
     let mut event_stream = format!("{all:?}")
         .replace(", cast_mana_value: None", "")
         .replace(", new_total: LifeTotalReading(None)", "")
+        .replace(", was_prepared: false", "")
         // `attack_target` was added to the combat status after the golden was cut;
         // no combat is live in this fixture, so its derived value is None (CR 506.3).
         .replace(", attack_target: None", "")

@@ -314,6 +314,7 @@ fn filter_prop_deps(prop: &FilterProp) -> RetargetDeps {
         | FilterProp::Modal
         | FilterProp::PrepareSpell
         | FilterProp::Suspected
+        | FilterProp::Prepared
         | FilterProp::Renowned
         | FilterProp::Goaded
         | FilterProp::ToughnessGTPower
