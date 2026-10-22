@@ -6819,9 +6819,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                 crate::game::effects::token::apply_copiable_values_to_liminal_object(
                     &mut obj,
                     &copy.values,
-                    copy.display_source,
-                    copy.printed_ref.clone(),
-                    copy.token_image_ref.clone(),
+                    &copy.display,
                 );
                 entry_filter_matches_staged(
                     state,
@@ -24543,10 +24541,10 @@ mod tests {
         {
             *enter_as_copy = Some(Box::new(CopyTokenSpec {
                 values: Box::new(values),
-                display_source: crate::game::game_object::DisplaySource::Token,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: crate::game::game_object::DisplayIdentity {
+                    display_source: crate::game::game_object::DisplaySource::Token,
+                    ..Default::default()
+                },
                 extra_keywords: vec![],
                 additional_modifications: vec![],
                 tapped: false,
