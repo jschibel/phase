@@ -2991,13 +2991,15 @@ pub struct PendingContinuation {
     /// becomes the active frame: the walker's separate park above an unchanged
     /// enclosing owner, and `prepend_to_pending_continuation_with_producer`'s own
     /// park (when no frame is active, or instead of merging into an active one). A
-    /// marked rider never merges into an existing frame. The other park paths
+    /// marked rider never merges into an existing frame, and no chain merges into
+    /// a marked rider. The other park paths
     /// (outside the child stack boundary, outside a post-replacement draw pair,
     /// beneath an active direct-choice child) leave it unset, and so does the
     /// remaining-cost frame of a combined resolution cost
     /// (`prepend_remaining_pay_cost_continuation`). The answer
-    /// (`stamp_paused_payment_rider_x`) stamps only a marked active frame, so the
-    /// value never reaches a continuation the payment did not park.
+    /// (`stamp_paused_payment_rider_x`) stamps only the marked frame, found by
+    /// walking down past any unmarked chain parked above it, so the value never
+    /// reaches a continuation the payment did not park.
     ///
     /// Serde-defaulted: a save taken mid-prompt before this field existed
     /// restores with its rider unmarked, so that one answer binds no X (X reads as
@@ -15598,13 +15600,16 @@ pub struct PendingAttackExert {
 
 // clippy::large_enum_variant: Intentional. `WaitingFor` is stored inline in
 // `GameState`; the stack budget that matters is the `GameState` ceiling in
-// `types/game_state_size.rs`, and this enum's inline size (1,632 B on
-// x86_64-pc-windows-msvc = its largest variant, `NamedChoice`) is already inside
-// that measurement. Boxing the cold `OpponentGuess.owner` brought the enum from
-// 1,760 B to 1,632 B and left `NamedChoice` (1,631 B, dominated by
-// `NamedChoiceSource`, 1,560 B) as the outlier against `ChooseOneOfBranch`
-// (1,258 B). Boxing the next-largest variant only moves the outlier down and puts
-// an allocation on every common prompt without reducing the inline size any
+// `types/game_state_size.rs`, and this enum's inline size is already inside
+// that measurement. Measured on x86_64-pc-windows-msvc at `nightly-2026-04-19`
+// after the exert-as-cost / manual-activation-payment merge: `WaitingFor` is
+// 1,672 B, set by its largest variant `NamedChoice` (dominated by
+// `NamedChoiceSource`, 1,600 B), against roughly 1,456 B for `ChooseOneOfBranch`
+// (each variant measured as a tuple of its fields). These numbers drift with
+// every field change; the `GameState` ceiling is the gate, not this comment.
+// Boxing the cold `OpponentGuess.owner` earlier removed the previous outlier.
+// Boxing the next-largest variant only moves the outlier down and puts an
+// allocation on every common prompt without reducing the inline size any
 // `GameState` pays for. Follows the documented allows on `StackEntryKind`,
 // `Effect` and `CastingPermission`.
 #[allow(clippy::large_enum_variant)]
@@ -25230,6 +25235,9 @@ enum SuspendedChainEvent<'a> {
     Bound(Option<&'a GameEvent>),
     /// CR 601.2 + CR 602.2: still being cast or activated; no trigger event.
     Announcement,
+    /// Resumes under a captured trigger context it carries (a staged payment
+    /// transaction's `resolving_trigger_context`).
+    Context(&'a ResolvingTriggerContext),
 }
 
 type SuspendedChainVisitor<'v, 'a> =
@@ -25291,6 +25299,36 @@ fn visit_mana_cost_cursor_chains<'a>(
         visit_mana_cost_cursor_chains(&parent.cursor, f)?;
     }
     Ok(())
+}
+
+/// CR 106.1a + CR 605.3a: a mana color choice resumes either the mana ability
+/// that is producing (whose resume root can hold a rider) or the resolving effect
+/// that adds the mana.
+fn visit_mana_choice_context_chains<'a>(
+    context: &'a ManaChoiceContext,
+    f: &mut SuspendedChainVisitor<'_, 'a>,
+) -> Result<(), String> {
+    match context {
+        ManaChoiceContext::ManaAbility(pending) => visit_pending_mana_ability_chains(pending, f),
+        ManaChoiceContext::ResolvingEffect(ability) => f(ability, SuspendedChainEvent::Ambient),
+    }
+}
+
+/// CR 605.4a: what a completed triggered-mana fixed point resumes.
+fn visit_mana_trigger_fixed_point_resume_chains<'a>(
+    resume: &'a ManaTriggerFixedPointResume,
+    f: &mut SuspendedChainVisitor<'_, 'a>,
+) -> Result<(), String> {
+    match resume {
+        // A nested child returns to its parent's suspended cursor, walked there.
+        ManaTriggerFixedPointResume::Parent => Ok(()),
+        ManaTriggerFixedPointResume::Root { resume, .. } => {
+            visit_mana_ability_resume_chains(resume, f)
+        }
+        ManaTriggerFixedPointResume::ColorChoice(choice) => {
+            visit_mana_choice_context_chains(&choice.context, f)
+        }
+    }
 }
 
 fn visit_pending_cast_chain<'a>(
@@ -25375,18 +25413,6 @@ fn visit_deferred_life_cost_resume_chains<'a>(
             visit_mana_ability_resume_chains(resume, f)
         }
         DeferredLifeCostResume::PayAmount { .. } => Ok(()),
-    }
-}
-
-fn visit_discard_for_cost_resume_chains<'a>(
-    resume: &'a PendingDiscardForCostResume,
-    f: &mut SuspendedChainVisitor<'_, 'a>,
-) -> Result<(), String> {
-    match resume {
-        PendingDiscardForCostResume::Chosen { pending, .. }
-        | PendingDiscardForCostResume::Random { pending, .. } => {
-            visit_pending_cast_chain(pending, f)
-        }
     }
 }
 
@@ -25634,6 +25660,9 @@ fn validate_restored_attack_authority(
         SuspendedChainEvent::Ambient => check(node, current_event, current_events),
         SuspendedChainEvent::Bound(event) => check(node, event, &[]),
         SuspendedChainEvent::Announcement => check(node, None, &[]),
+        SuspendedChainEvent::Context(context) => {
+            check(node, context.event.as_ref(), &context.events)
+        }
     };
     if let Some(resume) = state.pending_cost_move_resume.as_ref() {
         visit_cost_move_resume_chains(resume, &mut suspended)?;
@@ -25641,9 +25670,8 @@ fn validate_restored_attack_authority(
     if let Some(resume) = state.pending_deferred_life_cost_resume.as_ref() {
         visit_deferred_life_cost_resume_chains(resume, &mut suspended)?;
     }
-    if let Some(resume) = state.pending_discard_for_cost.as_deref() {
-        visit_discard_for_cost_resume_chains(resume, &mut suspended)?;
-    }
+    // `pending_discard_for_cost` is `#[serde(skip)]`: it never reaches a persisted
+    // payload, so a restored state cannot carry it and it needs no walk here.
     if let Some(pending) = state.pending_cast.as_deref() {
         visit_pending_cast_chain(pending, &mut suspended)?;
     }
@@ -25676,6 +25704,30 @@ fn validate_restored_attack_authority(
         suspended(&fan_out.scoped_template, SuspendedChainEvent::Ambient)?;
         suspended(&fan_out.outer, SuspendedChainEvent::Ambient)?;
     }
+    // CR 605.4a: a triggered-mana fixed point holds the triggered mana abilities
+    // it is settling and the outer root it resumes once they are done.
+    if let Some(resume) = state.pending_triggered_mana_resume.as_deref() {
+        for pending in std::iter::once(resume.current.as_ref()).chain(&resume.accepted_tail) {
+            check(
+                &pending.pending.ability,
+                pending.pending.trigger_event.as_ref(),
+                &pending.trigger_events,
+            )?;
+        }
+        visit_mana_trigger_fixed_point_resume_chains(&resume.outer_resume, &mut suspended)?;
+    }
+    // CR 118.12 + CR 608.2c: a staged resolution payment resumes its root's
+    // rider under the trigger context the transaction captured
+    // (`payment_transaction::resolve_root_continuation`), or the ambient one.
+    if let Some(transaction) = state.payment_transaction.as_deref() {
+        suspended(
+            &transaction.root,
+            transaction
+                .resolving_trigger_context
+                .as_ref()
+                .map_or(SuspendedChainEvent::Ambient, SuspendedChainEvent::Context),
+        )?;
+    }
     for frame in state.resolution_stack.iter() {
         match frame {
             ResolutionFrame::OptionalEffect(frame) => check(
@@ -25692,9 +25744,10 @@ fn validate_restored_attack_authority(
                 let event = context.and_then(|context| context.event.as_ref());
                 let events = context.map_or(&[][..], |context| context.events.as_slice());
                 check(&frame.pending.chain, event, events)?;
-                // CR 608.2f + CR 608.2c: the detached "after each player" tail
-                // runs while this frame's trigger context is pushed
-                // (`drain_pending_continuation`), so it reads the same event.
+                // CR 608.2f + CR 608.2c: the detached "after each player" tail is
+                // the rest of the same ability; `drain_pending_continuation` keeps
+                // this frame's trigger context pushed until the tail has run, so it
+                // reads the same event.
                 if let Some(tail) = frame.pending.player_scope_tail.as_ref() {
                     check(&tail.after_scope, event, events)?;
                 }
@@ -25810,6 +25863,9 @@ fn validate_restored_attack_authority(
             }
         }
         WaitingFor::PayCost { resume, .. } => visit_cost_resume_chains(resume, &mut suspended)?,
+        WaitingFor::ChooseManaColor { context, .. } => {
+            visit_mana_choice_context_chains(context, &mut suspended)?
+        }
         WaitingFor::DigRestSplitChoice { completion, .. } => {
             if let Some(completion) = completion.as_deref() {
                 visit_batch_completion_chains(completion, &mut suspended)?;
@@ -25835,10 +25891,11 @@ fn validate_restored_attack_authority(
         // The chains walked above are: the stack and pending triggers; the
         // resolution-stack frames (continuation chains with their player-scope
         // tails, repeat / choice / payment frames, batch-delivery completions);
-        // and the state-level roots (cost-move, deferred-life, discard-for-cost,
-        // pending cast, scoped search and search delivery, player-scope sacrifice
-        // and unless payment, discard fan-out). Listed exhaustively so a new
-        // carrier on a prompt cannot skip this check silently.
+        // and the state-level roots (cost-move, deferred-life, pending cast,
+        // scoped search and search delivery, player-scope sacrifice and unless
+        // payment, discard fan-out, triggered-mana fixed point, staged payment
+        // transaction). Listed exhaustively so a new carrier on a prompt cannot
+        // skip this check silently.
         WaitingFor::ChooseOneOfBranch {
             continuation: None, ..
         }
@@ -25924,7 +25981,6 @@ fn validate_restored_attack_authority(
         | WaitingFor::ChooseDungeon { .. }
         | WaitingFor::ChooseDungeonRoom { .. }
         | WaitingFor::SpecializeColor { .. }
-        | WaitingFor::ChooseManaColor { .. }
         | WaitingFor::RevealUntilKeptChoice { .. }
         | WaitingFor::TopOrBottomChoice { .. }
         | WaitingFor::PopulateChoice { .. }
@@ -52093,8 +52149,12 @@ mod restored_exact_attack_authority_tests {
     /// or an unless-payment's effect; a dig split or a batch-delivery frame holds a
     /// batch-completion ability; state-level roots (`pending_cost_move_resume`,
     /// `pending_player_scope_unless_payment`) hold the effect they resume, and a
-    /// continuation frame holds its player-scope tail. Each is checked through
-    /// both Raw and Trusted restore, wherever the root sits.
+    /// continuation frame holds its player-scope tail. Rows 8-19 cover the mana
+    /// color choice (both contexts), triggered-mana fixed point (root and color
+    /// choice), staged payment transaction, pending cast, deferred life cost,
+    /// scoped search, search delivery, player-scope sacrifice, loyalty activation
+    /// and bound-event unless roots. Each is checked through both Raw and Trusted
+    /// restore, wherever the root sits.
     #[test]
     fn payment_and_batch_roots_validate_their_attacked_referent() {
         use crate::types::ability::{AbilityCost, DigRestSplitScope};
@@ -52143,7 +52203,14 @@ mod restored_exact_attack_authority_tests {
             ability: node.clone(),
             cost: Box::new(AbilityCost::Tap),
         };
-        for carrier in 0..8 {
+        let announced = PendingCast::new(
+            attacker,
+            state.objects[&attacker].card_id,
+            node.as_ref().clone(),
+            ManaCost::default(),
+        );
+        let mut admitted = Vec::new();
+        for carrier in 0..20 {
             let mut state = state.clone();
             state.waiting_for = match carrier {
                 // The rider in the mana ability's own resume root.
@@ -52271,6 +52338,177 @@ mod restored_exact_attack_authority_tests {
                     state.park_ability_continuation(pending);
                     state.waiting_for.clone()
                 }
+                // A mana color choice for a mana ability whose resume root holds
+                // the rider.
+                8 => WaitingFor::ChooseManaColor {
+                    player: P0,
+                    choice: ManaChoicePrompt::SingleColor { options: vec![] },
+                    context: ManaChoiceContext::ManaAbility(Box::new(mana_pending(
+                        effect_pay_cost.clone(),
+                    ))),
+                },
+                // A mana color choice for the resolving effect itself.
+                9 => WaitingFor::ChooseManaColor {
+                    player: P0,
+                    choice: ManaChoicePrompt::SingleColor { options: vec![] },
+                    context: ManaChoiceContext::ResolvingEffect(node.clone()),
+                },
+                // A triggered-mana fixed point whose outer root holds the rider.
+                10 => {
+                    let harmless = ResolvedAbility::new(Effect::NoOp, vec![], attacker, P0);
+                    let pending = crate::game::triggers::PendingTrigger::ordinary(
+                        attacker,
+                        P0,
+                        None,
+                        Box::new(harmless),
+                        1,
+                    );
+                    state.pending_triggered_mana_resume = Some(Box::new(TriggeredManaResume {
+                        current: Box::new(crate::game::triggers::PendingTriggerContext::single(
+                            pending,
+                        )),
+                        current_override: None,
+                        rules_execution_node:
+                            crate::types::resolved_commands::RulesExecutionNodeRef::TriggeredMana(
+                                crate::types::resolved_commands::SettlementNodeOrdinal(5),
+                            ),
+                        accepted_tail: Vec::new(),
+                        collected_batches: Vec::new(),
+                        outer_resume: ManaTriggerFixedPointResume::Root {
+                            player: P0,
+                            resume: Box::new(effect_pay_cost.clone()),
+                        },
+                        stage: TriggeredManaStage::ChoosingModes,
+                    }));
+                    state.waiting_for.clone()
+                }
+                // A staged payment transaction resumes its root under the trigger
+                // context it captured.
+                11 => {
+                    state.payment_transaction = Some(Box::new(ResolutionPaymentTransaction {
+                        wire_version: resolution_payment_transaction_wire_version(),
+                        owner: P0,
+                        root: node.clone(),
+                        transcript: vec![],
+                        base_waiting_for: state.waiting_for.clone(),
+                        resolving_trigger_context: Some(ResolvingTriggerContext {
+                            event: trigger_event.clone(),
+                            events: trigger_event.clone().into_iter().collect(),
+                            match_count: None,
+                            die_result: None,
+                        }),
+                    }));
+                    state.waiting_for.clone()
+                }
+                // A cast or activation still being announced.
+                12 => {
+                    state.pending_cast = Some(Box::new(announced.clone()));
+                    state.waiting_for.clone()
+                }
+                // A deferred life payment of a mana ability whose root holds the rider.
+                13 => {
+                    state.pending_deferred_life_cost_resume =
+                        Some(DeferredLifeCostResume::ManaRoot {
+                            player: P0,
+                            resume: Box::new(effect_pay_cost.clone()),
+                            remaining_life_payments: vec![],
+                            resume_at_resolution_depth: 0,
+                        });
+                    state.waiting_for.clone()
+                }
+                // A triggered-mana fixed point resuming a resolving effect's mana
+                // color choice.
+                14 => {
+                    let harmless = ResolvedAbility::new(Effect::NoOp, vec![], attacker, P0);
+                    let pending = crate::game::triggers::PendingTrigger::ordinary(
+                        attacker,
+                        P0,
+                        None,
+                        Box::new(harmless),
+                        1,
+                    );
+                    state.pending_triggered_mana_resume = Some(Box::new(TriggeredManaResume {
+                        current: Box::new(crate::game::triggers::PendingTriggerContext::single(
+                            pending,
+                        )),
+                        current_override: None,
+                        rules_execution_node:
+                            crate::types::resolved_commands::RulesExecutionNodeRef::TriggeredMana(
+                                crate::types::resolved_commands::SettlementNodeOrdinal(5),
+                            ),
+                        accepted_tail: Vec::new(),
+                        collected_batches: Vec::new(),
+                        outer_resume: ManaTriggerFixedPointResume::ColorChoice(Box::new(
+                            ManaColorChoiceResume {
+                                player: P0,
+                                choice: ManaChoicePrompt::SingleColor { options: vec![] },
+                                context: ManaChoiceContext::ResolvingEffect(node.clone()),
+                            },
+                        )),
+                        stage: TriggeredManaStage::ChoosingModes,
+                    }));
+                    state.waiting_for.clone()
+                }
+                // A scoped library search's own ability.
+                15 => {
+                    state.pending_scoped_library_search = Some(PendingScopedLibrarySearch {
+                        ability: node.clone(),
+                        phase: ScopedLibrarySearchPhase::CollectAcceptance {
+                            remaining_players: vec![],
+                            accepted_players: vec![],
+                            acceptance_authorities: vec![],
+                            current_player: None,
+                        },
+                        after_scope: None,
+                    });
+                    state.waiting_for.clone()
+                }
+                // A scoped search delivery's "after the search" tail.
+                16 => {
+                    state.pending_library_search_delivery =
+                        Some(LibrarySearchDeliveryResume::Scoped {
+                            player: P0,
+                            source_id: attacker,
+                            search_keys: vec![],
+                            grants: vec![],
+                            after_scope: Some(node.clone()),
+                        });
+                    state.waiting_for.clone()
+                }
+                // A player-scope sacrifice choice's ability.
+                17 => {
+                    state.pending_player_scope_sacrifice_choice =
+                        Some(PendingPlayerScopeSacrificeChoice {
+                            ability: node.clone(),
+                            remaining_players: vec![],
+                            selections: vec![],
+                            completion: Default::default(),
+                        });
+                    state.waiting_for.clone()
+                }
+                // A loyalty activation still paying its cost.
+                18 => {
+                    state.pending_cost_move_resume =
+                        Some(PendingCostMoveResume::LoyaltyActivation {
+                            player: P0,
+                            pw_id: attacker,
+                            resolved: node.clone(),
+                            ability_index: 0,
+                        });
+                    state.waiting_for.clone()
+                }
+                // An unless payment with its own bound trigger event.
+                19 => {
+                    state.pending_cost_move_resume =
+                        Some(PendingCostMoveResume::CounterAdditionUnlessPayment {
+                            cost: AbilityCost::Tap,
+                            pending_effect: node.clone(),
+                            trigger_event: trigger_event.clone(),
+                            effect_description: None,
+                            remaining: vec![],
+                        });
+                    state.waiting_for.clone()
+                }
                 _ => unreachable!(),
             };
             for trusted in [false, true] {
@@ -52292,15 +52530,17 @@ mod restored_exact_attack_authority_tests {
                     .as_object_mut()
                     .unwrap()
                     .remove("attack_target_identity");
-                assert!(
-                    serde_json::from_value::<PersistedGameState>(old)
-                        .unwrap_err()
-                        .to_string()
-                        .contains("exact attack authority"),
-                    "payment root {carrier} (trusted: {trusted}) must validate its chain"
-                );
+                let rejected = serde_json::from_value::<PersistedGameState>(old)
+                    .is_err_and(|error| error.to_string().contains("exact attack authority"));
+                if !rejected {
+                    admitted.push((carrier, trusted));
+                }
             }
         }
+        assert!(
+            admitted.is_empty(),
+            "every payment root must validate its chain; admitted (carrier, trusted): {admitted:?}"
+        );
     }
 }
 

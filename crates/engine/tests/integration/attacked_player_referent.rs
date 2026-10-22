@@ -860,6 +860,7 @@ fn remove_with_recon(b: &mut AuthorityBoard) {
     b.r.act(GameAction::ActivateAbility {
         source_id: b.recon,
         ability_index: 0,
+        payment_mode: Default::default(),
     })
     .unwrap();
     if matches!(b.r.state().waiting_for, WaitingFor::TargetSelection { .. }) {
@@ -2102,4 +2103,69 @@ fn setters_filters_and_conditions_do_not_absorb_the_phrase() {
         "reach guard: the trigger parsed: {v}"
     );
     assert!(v.contains("Unimplemented"), "{v}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Player-scope tail of an observer trigger (CR 608.2c + CR 608.2f)
+// ---------------------------------------------------------------------------------------------
+
+/// Observer trigger whose "each player creates" clause leaves a detached tail ("The tokens
+/// ...") that also deals damage to the attacked referent of the triggering attacker.
+const MUSTER: &str = "Whenever a creature you control attacks, each player creates a 1/1 white Warrior creature token. The tokens are goaded for the rest of the game. This enchantment deals 1 damage to the player or planeswalker that creature is attacking.";
+const TAIL_PARALLEL_LIVES: &str = "If an effect would create one or more tokens under your control, it creates twice that many of those tokens instead.";
+const TAIL_HALVING_SEASON: &str = "If an opponent would create one or more tokens, they create half that many of each of those kinds of tokens instead, rounded down.\nIf an opponent would put one or more counters on a permanent or player, they put half that many of each of those kinds of counters on that permanent or player instead, rounded down.";
+
+/// CR 608.2c + CR 608.2f + CR 616.1: the fan-out pauses on P1's replacement choice
+/// (Halving Season and Parallel Lives both apply), and the detached tail resumes after the
+/// last seat. The tail is the rest of the same triggered ability, so it still reads that
+/// trigger's event: the 1 damage goes to Karn, the planeswalker the Goblin is attacking.
+#[test]
+fn observer_player_scope_tail_resumed_after_a_pause_reads_the_trigger_event() {
+    let mut sc = scenario();
+    let muster = sc.add_enchantment_from_oracle(P0, "Muster", MUSTER).id();
+    sc.add_enchantment_from_oracle(P0, "Halving Season", TAIL_HALVING_SEASON);
+    sc.add_enchantment_from_oracle(P1, "Parallel Lives", TAIL_PARALLEL_LIVES);
+    let goblin = sc.add_creature(P0, "Goblin", 1, 1).id();
+    let karn = add_karn(&mut sc, 5);
+    let mut r = sc.build();
+    control_by_p1(&mut r, karn);
+    attack(&mut r, &[(goblin, AttackTarget::Planeswalker(karn))]);
+    assert_untargeted_triggers(&r, muster, 1);
+    let mut events = Vec::new();
+    let mut paused = false;
+    for _ in 0..80 {
+        let result = match r.state().waiting_for.clone() {
+            WaitingFor::ReplacementChoice { player, .. } => {
+                assert_eq!(player, P1, "CR 616.1: the affected player orders them");
+                paused = true;
+                r.act(GameAction::ChooseReplacement { index: 0 })
+            }
+            WaitingFor::Priority { .. } => {
+                if r.state().stack.is_empty() {
+                    break;
+                }
+                r.act(GameAction::PassPriority)
+            }
+            other => panic!("unexpected prompt {other:?}"),
+        };
+        events.extend(result.expect("action applies").events);
+    }
+    assert!(
+        paused,
+        "reach: the fan-out paused mid-scope on P1's replacement choice"
+    );
+    assert!(
+        r.state().stack.is_empty() && matches!(r.state().waiting_for, WaitingFor::Priority { .. })
+    );
+    assert_eq!(
+        deal_damage_resolutions(&events, muster),
+        1,
+        "the tail resolved"
+    );
+    assert_eq!(
+        damage_from(&events, muster),
+        vec![(TargetRef::Object(karn), 1)]
+    );
+    assert_eq!(loyalty(&r, karn), 4);
+    assert_eq!((life(&r, P0), life(&r, P1), life(&r, P2)), (20, 20, 20));
 }

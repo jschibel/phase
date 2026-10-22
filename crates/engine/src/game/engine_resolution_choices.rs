@@ -9557,20 +9557,35 @@ pub(crate) fn paused_payment_x_announcement(
 
 /// CR 107.3f + CR 107.3i + CR 608.2c: X announced by a resolution-time payment (a count of
 /// permanents tapped, an amount paid) is X for the instructions after that payment, and for no
-/// other chain. Stamps `value` on the active frame's chain and every sub/else branch only when
-/// that frame is the rider the paused payment parked (marked with `announcement`, see
-/// `PendingContinuation::x_announcement`), and consumes the mark. A payment with no rider parked
-/// nothing, so an enclosing continuation that happens to be active keeps its own X.
+/// other chain. Finds the rider the paused payment parked (the frame marked with
+/// `announcement`, see `PendingContinuation::x_announcement`, located by
+/// `ResolutionStack::x_announcement_rider_mut` even when an unmarked chain was parked above
+/// it), consumes the mark, and stamps `value` on that rider's chain and every sub/else branch.
+/// No other frame is touched: a payment with no rider parked nothing, so an enclosing
+/// continuation keeps its own X, and a chain parked above the rider keeps its own X.
+///
+/// A paid amount is not stamped onto a rider that opens with its own unannounced-X payment
+/// prompt: that prompt asks for its X itself (the next `PayAmountChoice` accumulates).
 pub(crate) fn stamp_paused_payment_rider_x(
     state: &mut GameState,
     announcement: ContinuationXAnnouncement,
     value: u32,
 ) {
-    if let Some(frame) = state.active_ability_continuation_frame_mut() {
-        if frame.pending.x_announcement == Some(announcement) {
-            frame.pending.x_announcement = None;
-            frame.pending.chain.set_chosen_x_recursive(value);
+    let Some(frame) = state
+        .resolution_stack
+        .x_announcement_rider_mut(announcement)
+    else {
+        return;
+    };
+    frame.pending.x_announcement = None;
+    let asks_for_its_own_x = match announcement {
+        ContinuationXAnnouncement::PaidAmount => {
+            starts_with_pay_amount_prompt(&frame.pending.chain)
         }
+        ContinuationXAnnouncement::TappedCount => false,
+    };
+    if !asks_for_its_own_x {
+        frame.pending.chain.set_chosen_x_recursive(value);
     }
 }
 
@@ -9584,12 +9599,7 @@ pub(crate) fn finish_pay_amount_choice(
     events: &mut Vec<GameEvent>,
 ) -> WaitingFor {
     state.last_effect_count = Some(total as i32);
-    let pending_starts_with_pay_amount = state
-        .active_ability_continuation()
-        .is_some_and(|cont| starts_with_pay_amount_prompt(&cont.chain));
-    if !pending_starts_with_pay_amount {
-        stamp_paused_payment_rider_x(state, ContinuationXAnnouncement::PaidAmount, total);
-    }
+    stamp_paused_payment_rider_x(state, ContinuationXAnnouncement::PaidAmount, total);
     let mut waiting_for = finish_with_continuation(state, player, events);
     if let WaitingFor::PayAmountChoice {
         accumulated: next_accumulated,
