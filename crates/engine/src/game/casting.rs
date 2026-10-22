@@ -25870,8 +25870,8 @@ pub(crate) fn payable_with_mana_ability_window_life(
 /// Empty when no route has a mana payment at all. The announcements are
 /// enumerated per symbol (CR 601.2b); the most printed Phyrexian symbols any
 /// activation cost holds is four (Spike, Tournament Grinder), so at most
-/// fifteen announcements are built, and same-colored symbols collapse to
-/// fewer distinct routes.
+/// sixteen announcements are enumerated and fifteen routes built, and
+/// same-colored symbols collapse to fewer distinct routes.
 fn mana_ability_window_routes(cost: &AbilityCost) -> Vec<std::borrow::Cow<'_, AbilityCost>> {
     let has_mana_payment =
         |mana: &ManaCost| mana.mana_value() > 0 || casting_costs::cost_has_x(mana);

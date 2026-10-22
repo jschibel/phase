@@ -2875,6 +2875,63 @@ fn auto_hex_parasite_keeps_its_payment_time_phyrexian_choice() {
     );
 }
 
+/// The automatic X cap's life budget, on Hex Parasite ("{X}{B/P}: ...") with
+/// a Swamp, a Mountain and a Wastes. CR 601.2b announces X before the {B/P};
+/// CR 107.4f lets the symbol be paid with {B} or 2 life; CR 119.4 lets 2 life
+/// be paid only from a life total of at least 2. At 20 life the symbol can be
+/// life, so the three lands fund X = 3; at 1 life it must be the Swamp's {B},
+/// leaving two lands for X: the cap is 2, X = 3 is refused, and X = 2 is paid
+/// by tapping all three lands with no life paid.
+#[test]
+fn auto_hex_parasite_x_cap_counts_phyrexian_life_only_within_the_life_total() {
+    fn auto_x_max(board: &mut HexBoard) -> u32 {
+        let waiting_for = activate_index(&mut board.runner, board.hex, 0, CastPaymentMode::Auto);
+        let WaitingFor::ChooseXValue { max, .. } = waiting_for else {
+            panic!("CR 601.2b: X is announced first: {waiting_for:?}");
+        };
+        max
+    }
+
+    let mut rich = hex_board(20, false, false);
+    assert_eq!(
+        auto_x_max(&mut rich),
+        3,
+        "at 20 life the {{B/P}} may be 2 life, so every land funds X"
+    );
+
+    let mut board = hex_board(1, false, false);
+    assert_eq!(
+        auto_x_max(&mut board),
+        2,
+        "CR 119.4: 1 life cannot pay the {{B/P}}, so the Swamp's {{B}} is not X"
+    );
+    assert!(
+        board.runner.act(GameAction::ChooseX { value: 3 }).is_err(),
+        "X = 3 exceeds the cap"
+    );
+    let waiting_for = act(&mut board.runner, GameAction::ChooseX { value: 2 });
+    assert!(
+        matches!(waiting_for, WaitingFor::TargetSelection { .. }),
+        "{waiting_for:?}"
+    );
+    let waiting_for = choose_targets(&mut board.runner, &[board.chosen]);
+    assert!(
+        is_priority(&waiting_for),
+        "the automatic payer pays X = 2 and the {{B}}: {waiting_for:?}"
+    );
+    assert_eq!(life(&board.runner, P0), 1, "no life was paid");
+    assert!(
+        [board.swamp, board.mountain, board.wastes]
+            .iter()
+            .all(|land| tapped(&board.runner, *land)),
+        "the Swamp pays the {{B}} and the other two lands pay X = 2"
+    );
+    assert_eq!(
+        activation_targets(&board.runner, board.hex),
+        vec![TargetRef::Object(board.chosen)]
+    );
+}
+
 /// Birthing Pod ("{1}{G/P}, {T}, Sacrifice a creature: Search your library for
 /// a creature card with mana value equal to 1 plus the sacrificed creature's
 /// mana value, put that card onto the battlefield, then shuffle. Activate only
