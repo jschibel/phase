@@ -1968,10 +1968,7 @@ mod tests {
     fn copy_values(values: CopiableValues) -> ContinuousModification {
         ContinuousModification::CopyValues {
             values: Box::new(values),
-            display_source: crate::game::game_object::DisplaySource::default(),
-            printed_ref: None,
-            token_image_ref: None,
-            token_art: None,
+            display: Default::default(),
         }
     }
 

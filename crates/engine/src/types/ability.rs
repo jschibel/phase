@@ -9,7 +9,7 @@ use serde::ser::SerializeStructVariant;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
-use super::card::{PrintedCardRef, PrintedLoyalty, TokenArtDescriptor, TokenImageRef};
+use super::card::{PrintedCardRef, PrintedLoyalty};
 use super::card_type::{CardType, CoreType, SubtypeSet, Supertype};
 use super::counter::{CounterMatch, CounterType};
 use super::events::BendingType;
@@ -33,7 +33,7 @@ use super::stickers::{AppliedSticker, StickerKind};
 use super::triggers::TriggerMode;
 use super::zones::{EtbTapState, Zone};
 use crate::game::filter::FilterContext;
-use crate::game::game_object::{BackFaceData, DisplaySource};
+use crate::game::game_object::{BackFaceData, DisplayIdentity};
 use crate::types::events::{ActivatedAbilityKind, ClashResult, PlayerActionKind};
 
 // ---------------------------------------------------------------------------
@@ -35682,19 +35682,15 @@ pub enum CopiedNameOrigin {
 /// Per CR 707.2c the copiable values a static copy effect grants are determined
 /// only when the effect first starts to apply, and per CR 707.2b later changes
 /// to the chosen object never propagate — so the values are frozen here rather
-/// than re-read live. The display trio (`display_source` / `printed_ref` /
-/// `token_image_ref`) is art routing only (NOT a CR 707.2 copiable value),
-/// carried so the enchanted host renders the chosen creature's art; it mirrors
-/// the identical trio on `ContinuousModification::CopyValues`.
+/// than re-read live. The `display` identity is art routing only (NOT a CR 707.2
+/// copiable value; see [`DisplayIdentity`]), carried so the enchanted host
+/// renders the chosen creature's art; it mirrors the identical identity on
+/// `ContinuousModification::CopyValues`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatchedCopiableSnapshot {
     pub values: CopiableValues,
-    #[serde(default)]
-    pub display_source: DisplaySource,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub printed_ref: Option<PrintedCardRef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_image_ref: Option<TokenImageRef>,
+    #[serde(flatten)]
+    pub display: DisplayIdentity,
 }
 
 /// CR 707.2 + CR 707.2c: Why a `WaitingFor::CopyTargetChoice` was raised, which
@@ -35759,35 +35755,10 @@ pub enum ContinuousModification {
         values: Box<CopiableValues>,
         /// Image-routing identity of the copy source, carried so the copy renders
         /// the source's art and reverts through the same layer pass as the copied
-        /// characteristics. NONE of these three are CR 707.2 copiable values
-        /// (status/art are not copied per CR 707.2) — they are display routing
-        /// only, deliberately kept off `CopiableValues`, and mirror the flat
-        /// `GameObject`/`CopyTokenSpec` storage (`display_source` discriminates:
-        /// `Card` ⇒ read `printed_ref`; `Token` ⇒ read `token_image_ref`).
-        ///
-        /// CR 111.1 + CR 707.2: a permanent that becomes a copy of a *token*
-        /// stays a nontoken (token-ness is created by a token-making effect per
-        /// CR 111.1, and is not among the CR 707.2 copiable values), but its name
-        /// is the token's, which only resolves in the token art database — so the
-        /// source's `display_source = Token` and `token_image_ref` must ride
-        /// along, not just `printed_ref`.
-        #[serde(default)]
-        display_source: DisplaySource,
-        /// Scryfall oracle-id pointer of the source when it is a printed card.
-        /// `None` when the source is a true token (then `token_image_ref` carries
-        /// the routing).
-        #[serde(default)]
-        printed_ref: Option<PrintedCardRef>,
-        /// Exact token-art pointer of the source when it is a true token.
-        /// `None` for printed-card sources.
-        #[serde(default)]
-        token_image_ref: Option<TokenImageRef>,
-        /// Intrinsic token-art body of the source, carried so a copy of a
-        /// token without an exact ref still renders from the source's shape
-        /// rather than the recipient's stale descriptor. `None` for
-        /// printed-card sources and pre-descriptor snapshots.
-        #[serde(default)]
-        token_art: Option<TokenArtDescriptor>,
+        /// characteristics. Display routing only — see [`DisplayIdentity`] for the
+        /// CR 707.2 / CR 111.1 rationale.
+        #[serde(flatten)]
+        display: DisplayIdentity,
     },
     /// CR 707.2c + CR 613.1a: Parse-time MARKER for the static ability
     /// "enchanted creature is a copy of the chosen creature" (Metamorphic

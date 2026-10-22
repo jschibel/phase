@@ -9092,13 +9092,15 @@ fn ward_cost_reads_filter_population(
     use crate::types::keywords::WardCost;
     match cost {
         WardCost::Sacrifice { filter, .. } => filter::filter_operands_contain(filter, leaf),
+        WardCost::Discard { filter, .. } => filter
+            .as_ref()
+            .is_some_and(|f| filter::filter_operands_contain(f, leaf)),
         WardCost::Compound(costs) => costs
             .iter()
             .any(|cost| ward_cost_reads_filter_population(cost, leaf)),
         WardCost::Mana(_)
         | WardCost::PayLife(_)
         | WardCost::PayLifeEqualToPower
-        | WardCost::DiscardCard
         | WardCost::Waterbend(_)
         | WardCost::GetPlayerCounters { .. } => false,
     }
@@ -47947,10 +47949,7 @@ mod tests {
         let copy_values = |values: CopiableValues| {
             generic(granting(ContinuousModification::CopyValues {
                 values: Box::new(values),
-                display_source: Default::default(),
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             }))
         };
         let token = |static_abilities: Vec<StaticDefinition>| Effect::Token {

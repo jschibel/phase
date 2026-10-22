@@ -8363,10 +8363,10 @@ fn seed_representative_fodder(
         count: 1,
         copy: Box::new(crate::types::proposed_event::CopyTokenSpec {
             values: Box::new(profile.clone()),
-            display_source: crate::game::game_object::DisplaySource::Token,
-            printed_ref: None,
-            token_image_ref: None,
-            token_art: None,
+            display: crate::game::game_object::DisplayIdentity {
+                display_source: crate::game::game_object::DisplaySource::Token,
+                ..Default::default()
+            },
             extra_keywords: vec![],
             additional_modifications: vec![],
             tapped,
