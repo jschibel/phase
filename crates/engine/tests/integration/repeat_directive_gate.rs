@@ -23,7 +23,7 @@ use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
 use engine::types::game_state::{
     AutoMayChoice, GameState, MayTriggerAutoChoiceKey, MayTriggerAutoChoiceScope, MayTriggerOrigin,
-    PersistedGameState, PersistedRestoreFinalization, WaitingFor,
+    PersistedGameState, PersistedRestoreFinalization, RepeatProcessRequest, WaitingFor,
 };
 use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::mana::{ManaType, ManaUnit};
@@ -246,6 +246,17 @@ struct BodyRun {
 }
 
 fn body_run(text: &str, name: &str, types: &[&str], subs: &[&str], lib: &[K]) -> BodyRun {
+    body_run_with(text, name, types, subs, lib, |_| {})
+}
+
+fn body_run_with(
+    text: &str,
+    name: &str,
+    types: &[&str],
+    subs: &[&str],
+    lib: &[K],
+    adjust: impl FnOnce(&mut engine::types::ability::AbilityDefinition),
+) -> BodyRun {
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
     let mut runner = sc.build();
@@ -273,10 +284,11 @@ fn body_run(text: &str, name: &str, types: &[&str], subs: &[&str], lib: &[K]) ->
     let t: Vec<String> = types.iter().map(|s| s.to_string()).collect();
     let s: Vec<String> = subs.iter().map(|s| s.to_string()).collect();
     let parsed = parse_oracle_text(text, name, &[], &t, &s);
-    let def = match parsed.triggers.iter().find_map(|t| t.execute.clone()) {
+    let mut def = match parsed.triggers.iter().find_map(|t| t.execute.clone()) {
         Some(d) => *d,
         None => parsed.abilities.first().cloned().expect("an ability body"),
     };
+    adjust(&mut def);
     let ab = build_resolved_from_def(&def, src, P0);
     let mut events = vec![];
     let res = resolve_ability_chain(runner.state_mut(), &ab, &mut events, 0);
@@ -326,6 +338,54 @@ fn countryside_crusher_repeats_while_the_revealed_card_is_a_land() {
     assert_eq!(r.graveyard, 2);
     let r = crusher(&[]);
     assert!(r.resolved && r.idle, "an empty library terminates the loop");
+}
+
+/// Marks the producer whose direct child is the repeat directive as forwarding
+/// its result; true when one was found.
+fn forward_into_repeat_directive(def: &mut engine::types::ability::AbilityDefinition) -> bool {
+    if def
+        .sub_ability
+        .as_ref()
+        .is_some_and(|child| child.effect.is_repeat_directive())
+    {
+        def.forward_result = true;
+        return true;
+    }
+    def.sub_ability
+        .as_deref_mut()
+        .is_some_and(forward_into_repeat_directive)
+        || def
+            .else_ability
+            .as_deref_mut()
+            .is_some_and(forward_into_repeat_directive)
+}
+
+// CR 608.2c: the repeat directive belongs to the process, so a producer that
+// forwards its result to the directive (rebinding a child's source to the moved
+// object) must not detach the request from the process it repeats. Countryside
+// Crusher's put-into-graveyard is marked `forward_result` (a building-block
+// staging: no printed card forwards into its directive today).
+#[test]
+fn a_forwarding_producer_does_not_detach_the_repeat_request() {
+    let mut marked = false;
+    let r = body_run_with(
+        CRUSHER,
+        "Countryside Crusher",
+        &["Creature"],
+        &["Giant", "Warrior"],
+        &[Land, Land, Creature],
+        |def| marked = forward_into_repeat_directive(def),
+    );
+    assert!(
+        marked,
+        "reach guard: the directive's producer forwards its result"
+    );
+    assert!(r.resolved && r.idle);
+    assert_eq!(
+        (r.graveyard, r.library),
+        (2, 1),
+        "both revealed lands are put into the graveyard; the creature stays"
+    );
 }
 
 // G7: The Tale of Tamiyo - the draw and the repeat are gated on the two milled cards
@@ -452,7 +512,9 @@ fn colossus_run(
         ab.set_may_trigger_origin_recursive(origin);
     }
     if stale_slot {
-        runner.state_mut().repeat_process_requested = true;
+        // The stale request names this very process, so only the pass-head
+        // clear (never the source scoping) can keep it from being honoured.
+        runner.state_mut().repeat_process_requested = Some(RepeatProcessRequest { source_id: src });
     }
     let mut events = vec![];
     resolve_ability_chain(runner.state_mut(), &ab, &mut events, 0).expect("the chain resolves");

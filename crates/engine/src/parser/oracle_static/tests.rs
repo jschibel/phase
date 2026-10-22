@@ -40516,13 +40516,73 @@ fn double_negation_declares_the_inner_zone() {
     );
 }
 
-/// Charter contract: a negation that also tests a non-zone leaf contributes no zone.
+/// CR 113.6c: a negation that also tests a non-zone leaf declares every zone the
+/// source's zone alone does not rule out (a conservative superset); the runtime
+/// condition decides each one. A zone-independent negation states no zones.
 #[test]
-fn non_pure_negation_declares_no_zone() {
+fn mixed_negation_declares_every_zone_it_can_hold_in() {
+    // not (in graveyard and P): true in every other zone, and in the graveyard
+    // whenever P is false — so it can hold in every zone.
     let non_pure = negated(StaticCondition::And {
         conditions: vec![in_zone(Zone::Graveyard), non_zone_leaf()],
     });
-    assert_eq!(zones_derived_from(non_pure), Vec::<Zone>::new());
+    assert_eq!(
+        zones_derived_from(non_pure),
+        vec![
+            Zone::Graveyard,
+            Zone::Library,
+            Zone::Hand,
+            Zone::Battlefield,
+            Zone::Stack,
+            Zone::Exile,
+            Zone::Command
+        ]
+    );
+    // not (in graveyard or P): false in the graveyard; elsewhere it holds when
+    // P is false.
+    let negated_disjunction = negated(StaticCondition::Or {
+        conditions: vec![in_zone(Zone::Graveyard), non_zone_leaf()],
+    });
+    assert_eq!(
+        zones_derived_from(negated_disjunction),
+        vec![
+            Zone::Library,
+            Zone::Hand,
+            Zone::Battlefield,
+            Zone::Stack,
+            Zone::Exile,
+            Zone::Command
+        ]
+    );
+    // not (in graveyard and in hand): no source is in both, so it always holds.
+    let contradiction = negated(StaticCondition::And {
+        conditions: vec![
+            in_zone(Zone::Graveyard),
+            in_zone(Zone::Hand),
+            non_zone_leaf(),
+        ],
+    });
+    assert_eq!(
+        zones_derived_from(contradiction),
+        vec![
+            Zone::Graveyard,
+            Zone::Hand,
+            Zone::Library,
+            Zone::Battlefield,
+            Zone::Stack,
+            Zone::Exile,
+            Zone::Command
+        ]
+    );
+    // A negation that tests no zone keeps the battlefield default.
+    assert_eq!(
+        zones_derived_from(negated(non_zone_leaf())),
+        Vec::<Zone>::new()
+    );
+    let zone_free_compound = negated(StaticCondition::And {
+        conditions: vec![non_zone_leaf(), StaticCondition::DuringYourTurn],
+    });
+    assert_eq!(zones_derived_from(zone_free_compound), Vec::<Zone>::new());
 
     // Paired positives: the unnegated Anger shape still derives [Graveyard], and a pure
     // Not inside a mixed And is still complemented.
@@ -40539,6 +40599,130 @@ fn non_pure_negation_declares_no_zone() {
     )
     .expect("mixed negation must parse");
     assert_eq!(from_text.active_zones, NON_BATTLEFIELD_ZONES.to_vec());
+}
+
+/// CR 113.6b + CR 113.6c: a source filter carrying a zone property is a test of
+/// the source's zone. Affirmed, it declares the zones it allows; negated, every
+/// zone it doesn't rule out. A source filter with no zone property tests no zone.
+#[test]
+fn zone_bearing_source_filter_is_a_zone_test() {
+    use crate::types::ability::{FilterProp, TypeFilter, TypedFilter};
+    let source_filter = |properties: Vec<FilterProp>| StaticCondition::SourceMatchesFilter {
+        filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature).properties(properties)),
+    };
+    let in_graveyard = source_filter(vec![FilterProp::InZone {
+        zone: Zone::Graveyard,
+    }]);
+    assert_eq!(
+        zones_derived_from(in_graveyard.clone()),
+        vec![Zone::Graveyard]
+    );
+    // Negated, it holds in every other zone, and in the graveyard whenever the
+    // source isn't a creature: it is zone-dependent, so it declares every zone
+    // (unlike a zone-free negation, below) and the runtime condition decides.
+    assert_eq!(
+        zones_derived_from(negated(in_graveyard)),
+        vec![
+            Zone::Graveyard,
+            Zone::Library,
+            Zone::Hand,
+            Zone::Battlefield,
+            Zone::Stack,
+            Zone::Exile,
+            Zone::Command
+        ]
+    );
+    let in_graveyard_or_exile = source_filter(vec![FilterProp::InAnyZone {
+        zones: vec![Zone::Graveyard, Zone::Exile],
+    }]);
+    assert_eq!(
+        zones_derived_from(in_graveyard_or_exile),
+        vec![Zone::Graveyard, Zone::Exile]
+    );
+    // A filter's own connectives compose: "a creature card in your graveyard or
+    // a spell" rules out every zone but those two.
+    let graveyard_or_spell = StaticCondition::SourceMatchesFilter {
+        filter: TargetFilter::Or {
+            filters: vec![
+                TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature).properties(vec![
+                    FilterProp::InZone {
+                        zone: Zone::Graveyard,
+                    },
+                ])),
+                TargetFilter::StackSpell,
+            ],
+        },
+    };
+    assert_eq!(
+        zones_derived_from(graveyard_or_spell),
+        vec![Zone::Graveyard, Zone::Stack]
+    );
+    // No zone property: no zone stated, affirmed or negated.
+    let zone_free = source_filter(vec![]);
+    assert_eq!(zones_derived_from(zone_free.clone()), Vec::<Zone>::new());
+    assert_eq!(zones_derived_from(negated(zone_free)), Vec::<Zone>::new());
+}
+
+/// CR 113.6b + CR 113.6c: a source filter's zone properties nested under
+/// `FilterProp::Not` / `FilterProp::AnyOf` are zone tests too.
+#[test]
+fn nested_zone_props_of_a_source_filter_are_zone_tests() {
+    use crate::types::ability::{FilterProp, TypeFilter, TypedFilter};
+    let source_filter = |properties: Vec<FilterProp>| StaticCondition::SourceMatchesFilter {
+        filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature).properties(properties)),
+    };
+    let not_on_battlefield = source_filter(vec![FilterProp::Not {
+        prop: Box::new(FilterProp::InZone {
+            zone: Zone::Battlefield,
+        }),
+    }]);
+    assert_eq!(
+        zones_derived_from(not_on_battlefield),
+        NON_BATTLEFIELD_ZONES.to_vec()
+    );
+    let graveyard_or_exile = source_filter(vec![FilterProp::AnyOf {
+        props: vec![
+            FilterProp::InZone {
+                zone: Zone::Graveyard,
+            },
+            FilterProp::InZone { zone: Zone::Exile },
+        ],
+    }]);
+    assert_eq!(
+        zones_derived_from(graveyard_or_exile),
+        vec![Zone::Graveyard, Zone::Exile]
+    );
+}
+
+/// CR 113.6c: a disjunction of a source-zone test and a non-zone leaf can hold
+/// in every zone (the non-zone leaf may be true anywhere), so it declares them
+/// all, the named zone first; a conjunction still declares only its zone.
+#[test]
+fn disjunction_with_a_non_zone_leaf_declares_every_zone() {
+    let in_hand_or_present = StaticCondition::Or {
+        conditions: vec![in_zone(Zone::Hand), non_zone_leaf()],
+    };
+    assert_eq!(
+        zones_derived_from(in_hand_or_present),
+        vec![
+            Zone::Hand,
+            Zone::Library,
+            Zone::Battlefield,
+            Zone::Graveyard,
+            Zone::Stack,
+            Zone::Exile,
+            Zone::Command
+        ]
+    );
+    let in_hand_and_present = StaticCondition::And {
+        conditions: vec![in_zone(Zone::Hand), non_zone_leaf()],
+    };
+    assert_eq!(zones_derived_from(in_hand_and_present), vec![Zone::Hand]);
+    // No node depends on the source's zone: the battlefield default.
+    let zone_free = StaticCondition::Or {
+        conditions: vec![non_zone_leaf(), StaticCondition::DuringYourTurn],
+    };
+    assert_eq!(zones_derived_from(zone_free), Vec::<Zone>::new());
 }
 
 #[test]

@@ -24,8 +24,8 @@ use engine::game::stickers::{
 };
 use engine::game::zones::{apply_resolved_zone_change, move_to_zone};
 use engine::types::ability::{
-    ChosenAttribute, Effect, ManaSpendRestriction, ResolvedAbility, StaticCondition,
-    StaticDefinition, TargetFilter, TargetRef,
+    ChosenAttribute, Effect, ManaSpendRestriction, QuantityExpr, ResolvedAbility, StaticCondition,
+    StaticDefinition, StickerTicketCostPayment, TargetFilter, TargetRef,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::{CoreType, Supertype};
@@ -37,6 +37,7 @@ use engine::types::game_state::{
     PersistedGameState, PersistedRestoreFinalization, StackEntryKind, WaitingFor,
 };
 use engine::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef};
+use engine::types::keywords::Keyword;
 use engine::types::layers::Layer;
 use engine::types::mana::{
     ManaColor, ManaCost, ManaCostShard, ManaRestriction, ManaSourceOutput, ManaSpellGrant,
@@ -790,6 +791,568 @@ fn cast_prohibition_restore_paused_prototype_cast_keeps_its_form() {
         cast_prohibition_assert_spell(restored.state(), proxy, spell);
         cast_prohibition_assert_proxy(restored.state(), proxy, true);
     }
+}
+
+/// Whether `branch` is, or chooses among, an `ApplySticker` whose sticker `pick` accepts.
+fn branch_applies_sticker(
+    branch: &engine::types::ability::AbilityDefinition,
+    pick: &dyn Fn(&AppliedSticker) -> bool,
+) -> bool {
+    match branch.effect.as_ref() {
+        Effect::ApplySticker { sticker, .. } => pick(sticker),
+        Effect::ChooseOneOf { branches, .. } => branches
+            .iter()
+            .any(|inner| branch_applies_sticker(inner, pick)),
+        _ => false,
+    }
+}
+
+/// Resolves a one-sticker `PutSticker` instruction on `recipient` through the
+/// sticker resolver and answers its public placement prompts with `pick`.
+fn put_sticker_through_resolver(
+    runner: &mut GameRunner,
+    source: ObjectId,
+    recipient: ObjectId,
+    kind: StickerKind,
+    pick: &dyn Fn(&AppliedSticker) -> bool,
+) {
+    let instruction = ResolvedAbility::new(
+        Effect::PutSticker {
+            target: TargetFilter::SpecificObject { id: recipient },
+            kind: Some(kind),
+            count: QuantityExpr::Fixed { value: 1 },
+            max_ticket_cost: None,
+            ticket_cost_payment: StickerTicketCostPayment::PayNormally,
+        },
+        vec![],
+        source,
+        P0,
+    );
+    let mut events = Vec::new();
+    engine::game::effects::resolve_ability_chain(runner.state_mut(), &instruction, &mut events, 0)
+        .expect("the sticker instruction resolves");
+    let mut placed = events
+        .iter()
+        .filter(
+            |e| matches!(e, GameEvent::StickerPlaced { object_id, .. } if *object_id == recipient),
+        )
+        .count();
+    for _ in 0..4 {
+        let WaitingFor::ChooseOneOfBranch {
+            player, branches, ..
+        } = runner.state().waiting_for.clone()
+        else {
+            break;
+        };
+        assert_eq!(player, P0);
+        let index = branches
+            .iter()
+            .position(|branch| branch_applies_sticker(branch, pick))
+            .expect("the wanted sticker is offered");
+        let outcome = runner
+            .act(GameAction::ChooseBranch { index })
+            .expect("placement answer is legal");
+        placed += outcome
+            .events
+            .iter()
+            .filter(|e| matches!(e, GameEvent::StickerPlaced { object_id, .. } if *object_id == recipient))
+            .count();
+    }
+    assert_eq!(placed, 1, "exactly one sticker reaches the spell");
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { player } if player == P0),
+        "{:?}",
+        runner.state().waiting_for
+    );
+}
+
+/// CR 702.33h + CR 123.6b + CR 123.7 + CR 718.3b: a sticker put on a spell
+/// (sticker kicker's "put a sticker on this spell") modifies the spell as it
+/// is. Arcane Proxy, cast prototyped with Cavern of Souls mana, keeps its
+/// prototype mana cost, colour and P/T and the cast-bound effect of Cavern's
+/// "that spell can't be countered"; it gains the name sticker's word and the ability sticker's keyword,
+/// both of which survive full layer passes, and Counterspell still can't
+/// counter it. Supplementary staging (labeled): the only printed Stack placer
+/// (sticker kicker, Wicker Picker) is Unimplemented, so the placement is a
+/// `PutSticker` instruction run through the sticker resolver.
+#[test]
+fn stickers_put_on_a_prototyped_uncounterable_spell_keep_its_cast_state() {
+    let (mut runner, cavern, proxy, counterspell) = cast_prohibition_paid_proxy(true);
+    let occurrence = ObjectIncarnationRef::from_object(&runner.state().objects[&proxy]);
+    set_player_sticker_sheets(
+        runner.state_mut(),
+        P0,
+        &["Ancestral Hot Dog Minotaur".to_string()],
+    );
+    runner.state_mut().players[0].add_player_counters(&PlayerCounterKind::Ticket, 10);
+    assert_eq!(runner.state().objects[&proxy].name, "Arcane Proxy");
+    assert!(!runner.state().objects[&proxy]
+        .keywords
+        .contains(&Keyword::Flying));
+
+    put_sticker_through_resolver(
+        &mut runner,
+        cavern,
+        proxy,
+        StickerKind::Name,
+        &|sticker| matches!(sticker, AppliedSticker::Name { text, position: 0, .. } if text == "Ancestral"),
+    );
+    put_sticker_through_resolver(
+        &mut runner,
+        cavern,
+        proxy,
+        StickerKind::Ability,
+        &|sticker| matches!(sticker, AppliedSticker::Ability { text, .. } if text == "Flying"),
+    );
+    assert_eq!(
+        tickets(runner.state()),
+        7,
+        "the Flying sticker's ticket cost was paid"
+    );
+
+    for pass in 0..3 {
+        flush_layers_full(&mut runner);
+        assert_same_stack_spell(runner.state(), proxy, occurrence);
+        cast_prohibition_assert_spell_form(runner.state(), proxy);
+        let object = &runner.state().objects[&proxy];
+        assert_eq!(object.stickers.len(), 2, "pass {pass}");
+        assert_eq!(object.name, "Ancestral Arcane Proxy", "pass {pass}");
+        assert!(
+            object.keywords.contains(&Keyword::Flying),
+            "pass {pass}: the ability sticker's keyword survives the stack reset"
+        );
+        assert_eq!(
+            cast_prohibition_count(runner.state(), proxy),
+            1,
+            "pass {pass}"
+        );
+    }
+
+    let events = cast_prohibition_counter(&mut runner, proxy, counterspell);
+    assert_same_stack_spell(runner.state(), proxy, occurrence);
+    assert!(!events.iter().any(
+        |event| matches!(event, GameEvent::SpellCountered { object_id, .. } if *object_id == proxy)
+    ));
+}
+
+/// CR 123.5 + CR 123.7: an ability sticker on a graveyard card is retained as the
+/// card is cast to the stack and keeps granting its keyword there, across full
+/// layer passes, and then on the battlefield. Marang River Prowler's own
+/// permission ("You may cast this card from your graveyard as long as you
+/// control a black or green permanent") moves it graveyard -> stack. The Flying
+/// sticker is placed on the graveyard card through the sticker resolver
+/// (supplementary staging: Scampire's printed ETB is exercised above).
+#[test]
+fn ability_sticker_retained_from_the_graveyard_keeps_its_keyword_on_the_stack() {
+    let (mut runner, prowler) = graveyard_prowler_with_stickers(&[StickerKind::Ability], &[]);
+    let card = &runner.state().objects[&prowler];
+    assert_eq!(card.zone, Zone::Graveyard);
+    assert!(card.keywords.contains(&Keyword::Flying));
+
+    runner.cast(prowler).commit();
+    let spell = &runner.state().objects[&prowler];
+    assert_eq!(spell.zone, Zone::Stack);
+    assert_eq!(spell.cast_from_zone, Some(Zone::Graveyard));
+    assert_eq!(spell.stickers.len(), 1, "CR 123.5: retained into the stack");
+    for pass in 0..2 {
+        flush_layers_full(&mut runner);
+        assert!(
+            runner.state().objects[&prowler]
+                .keywords
+                .contains(&Keyword::Flying),
+            "pass {pass}: the retained ability sticker's keyword survives the stack reset"
+        );
+    }
+
+    for _ in 0..4 {
+        if runner.state().stack.is_empty() {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("pass priority to resolve the spell");
+    }
+    assert_sticker_idle(runner.state());
+    let permanent = &runner.state().objects[&prowler];
+    assert_eq!(permanent.zone, Zone::Battlefield);
+    assert_eq!(permanent.stickers.len(), 1);
+    assert!(permanent.keywords.contains(&Keyword::Flying));
+}
+
+/// A real Marang River Prowler in P0's graveyard (Grizzly Bears on the
+/// battlefield satisfies its graveyard-cast permission; {U}{C}{C} pays for it),
+/// carrying one sticker of each `kinds` entry from the "Ancestral Hot Dog
+/// Minotaur" sheet placed through the sticker resolver: the "Ancestral" name
+/// sticker at the front, the Flying ability sticker, the 1/4 P/T sticker.
+/// `hand` cards are added to P0's hand.
+fn graveyard_prowler_with_stickers(kinds: &[StickerKind], hand: &[&str]) -> (GameRunner, ObjectId) {
+    let db = shared_card_db().expect("graveyard-cast sticker row requires the CardDB");
+    let mut scenario = main_phase();
+    let prowler = scenario.add_real_card(P0, "Marang River Prowler", Zone::Graveyard, db);
+    let bears = scenario.add_real_card(P0, "Grizzly Bears", Zone::Battlefield, db);
+    for name in hand {
+        scenario.add_real_card(P0, name, Zone::Hand, db);
+    }
+    scenario.with_mana_pool(
+        P0,
+        mana(&[ManaType::Blue, ManaType::Colorless, ManaType::Colorless]),
+    );
+    let mut runner = scenario.build();
+    set_player_sticker_sheets(
+        runner.state_mut(),
+        P0,
+        &["Ancestral Hot Dog Minotaur".to_string()],
+    );
+    runner.state_mut().players[0].add_player_counters(&PlayerCounterKind::Ticket, 10);
+    let card = &runner.state().objects[&prowler];
+    assert!(!card.base_keywords.contains(&Keyword::Flying));
+    assert_eq!(card.name, "Marang River Prowler");
+    assert_eq!((card.base_power, card.base_toughness), (Some(2), Some(1)));
+
+    for kind in kinds {
+        let pick: &dyn Fn(&AppliedSticker) -> bool = match kind {
+            StickerKind::Name => {
+                &|sticker| matches!(sticker, AppliedSticker::Name { text, position: 0, .. } if text == "Ancestral")
+            }
+            StickerKind::Ability => {
+                &|sticker| matches!(sticker, AppliedSticker::Ability { text, .. } if text == "Flying")
+            }
+            StickerKind::PowerToughness => &|sticker| {
+                matches!(
+                    sticker,
+                    AppliedSticker::PowerToughness {
+                        power: 1,
+                        toughness: 4,
+                        ..
+                    }
+                )
+            },
+            StickerKind::Art => panic!("no art sticker row"),
+        };
+        put_sticker_through_resolver(&mut runner, bears, prowler, *kind, pick);
+    }
+    flush_layers_full(&mut runner);
+    assert_eq!(runner.state().objects[&prowler].stickers.len(), kinds.len());
+    (runner, prowler)
+}
+
+/// CR 123.1 + CR 707.2 + CR 707.10: a copy of a stickered spell acquires only
+/// the spell's copiable values; stickers and their changes aren't copiable.
+/// A Marang River Prowler carrying name, Flying and 1/4 P/T stickers is cast
+/// from the graveyard and copied with Double Major: the spell keeps all three,
+/// while the copy has no stickers, its printed name, no Flying and its printed
+/// 2/1 — on the stack and as the token it becomes.
+#[test]
+fn copy_of_a_stickered_spell_has_none_of_its_stickers() {
+    let (mut runner, prowler) = graveyard_prowler_with_stickers(
+        &[
+            StickerKind::Name,
+            StickerKind::Ability,
+            StickerKind::PowerToughness,
+        ],
+        &["Double Major"],
+    );
+    let double_major = runner.state().players[0]
+        .hand
+        .iter()
+        .copied()
+        .find(|id| runner.state().objects[id].name == "Double Major")
+        .expect("Double Major in hand");
+    let assert_stickered = |state: &GameState, id: ObjectId| {
+        let object = &state.objects[&id];
+        assert_eq!(object.stickers.len(), 3);
+        assert_eq!(object.name, "Ancestral Marang River Prowler");
+        assert!(object.keywords.contains(&Keyword::Flying));
+        assert_eq!((object.power, object.toughness), (Some(1), Some(4)));
+    };
+    assert_stickered(runner.state(), prowler);
+
+    runner.cast(prowler).commit();
+    assert_eq!(runner.state().objects[&prowler].zone, Zone::Stack);
+    flush_layers_full(&mut runner);
+    assert_stickered(runner.state(), prowler);
+
+    add_mana(&mut runner, 0, &[ManaType::Green, ManaType::Blue]);
+    runner.cast(double_major).target_object(prowler).commit();
+    cast_prohibition_priority(&mut runner, P0);
+    let before: Vec<ObjectId> = runner.state().stack.iter().map(|e| e.id).collect();
+    for _ in 0..4 {
+        if runner.state().objects[&double_major].zone != Zone::Stack {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("pass priority to resolve Double Major");
+    }
+    assert_eq!(runner.state().objects[&double_major].zone, Zone::Graveyard);
+    let copy = runner
+        .state()
+        .stack
+        .iter()
+        .map(|entry| entry.id)
+        .find(|id| !before.contains(id))
+        .expect("Double Major put a copy of the spell on the stack");
+    let assert_unstickered = |state: &GameState, id: ObjectId, context: &str| {
+        let object = &state.objects[&id];
+        assert!(object.stickers.is_empty(), "{context}");
+        assert_eq!(object.name, "Marang River Prowler", "{context}");
+        assert!(!object.keywords.contains(&Keyword::Flying), "{context}");
+        assert_eq!(
+            (object.power, object.toughness),
+            (Some(2), Some(1)),
+            "{context}"
+        );
+    };
+    for pass in 0..2 {
+        assert_unstickered(
+            runner.state(),
+            copy,
+            &format!("copy on the stack, pass {pass}"),
+        );
+        assert_stickered(runner.state(), prowler);
+        flush_layers_full(&mut runner);
+    }
+
+    // The copy resolves first and becomes a token (CR 707.10f), still unstickered.
+    for _ in 0..4 {
+        if runner.state().objects[&copy].zone == Zone::Battlefield {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("pass priority to resolve the copy");
+    }
+    assert_eq!(runner.state().objects[&copy].zone, Zone::Battlefield);
+    assert_unstickered(runner.state(), copy, "token on the battlefield");
+    assert_eq!(runner.state().objects[&prowler].zone, Zone::Stack);
+    assert_stickered(runner.state(), prowler);
+}
+
+/// The sticker pickers the copy rows share: the "Ancestral" name sticker at the
+/// front, the Flying ability sticker, and the Hydra sheet's non-keyword
+/// activated-ability sticker "{T}: Draw a card, then discard a card."
+fn pick_ancestral_name(sticker: &AppliedSticker) -> bool {
+    matches!(sticker, AppliedSticker::Name { text, position: 0, .. } if text == "Ancestral")
+}
+fn pick_flying(sticker: &AppliedSticker) -> bool {
+    matches!(sticker, AppliedSticker::Ability { text, .. } if text == "Flying")
+}
+fn pick_looting(sticker: &AppliedSticker) -> bool {
+    matches!(sticker, AppliedSticker::Ability { text, .. } if text.starts_with("{T}: Draw a card"))
+}
+
+fn copy_sticker_sheets(runner: &mut GameRunner) {
+    set_player_sticker_sheets(
+        runner.state_mut(),
+        P0,
+        &[
+            "Ancestral Hot Dog Minotaur".to_string(),
+            "Playable Delusionary Hydra".to_string(),
+        ],
+    );
+    runner.state_mut().players[0].add_player_counters(&PlayerCounterKind::Ticket, 10);
+}
+
+fn flying_count(object: &engine::game::game_object::GameObject) -> usize {
+    object
+        .keywords
+        .iter()
+        .filter(|keyword| **keyword == Keyword::Flying)
+        .count()
+}
+
+/// CR 123.1 + CR 707.2 + CR 707.10: a copy of a spell with a non-keyword ability
+/// sticker and a sticker duplicating a printed keyword. Storm Crow (printed
+/// Flying) is cast, then gets the name, Flying and looting-ability stickers on
+/// the stack (supplementary staging: no printed card stickers a spell). Double
+/// Major's copy has the printed name, exactly the printed Flying, and none of
+/// the sticker's activated ability; the original keeps everything.
+#[test]
+fn copy_of_a_stickered_spell_keeps_printed_abilities_and_drops_granted_ones() {
+    let db = shared_card_db().expect("copy row requires the CardDB");
+    let mut scenario = main_phase();
+    let crow = scenario.add_real_card(P0, "Storm Crow", Zone::Hand, db);
+    let double_major = scenario.add_real_card(P0, "Double Major", Zone::Hand, db);
+    let bears = scenario.add_real_card(P0, "Grizzly Bears", Zone::Battlefield, db);
+    scenario.with_mana_pool(P0, mana(&[ManaType::Blue, ManaType::Colorless]));
+    let mut runner = scenario.build();
+    copy_sticker_sheets(&mut runner);
+    runner.cast(crow).commit();
+    assert_eq!(runner.state().objects[&crow].zone, Zone::Stack);
+    for (kind, pick) in [
+        (
+            StickerKind::Name,
+            pick_ancestral_name as fn(&AppliedSticker) -> bool,
+        ),
+        (StickerKind::Ability, pick_flying),
+        (StickerKind::Ability, pick_looting),
+    ] {
+        put_sticker_through_resolver(&mut runner, bears, crow, kind, &pick);
+    }
+    flush_layers_full(&mut runner);
+    let assert_original = |state: &GameState| {
+        let object = &state.objects[&crow];
+        assert_eq!(object.stickers.len(), 3);
+        assert_eq!(object.name, "Ancestral Storm Crow");
+        assert!(object.keywords.contains(&Keyword::Flying));
+        assert_eq!(
+            object.abilities.len(),
+            object.base_abilities.len() + 1,
+            "the original keeps the looting sticker's ability"
+        );
+    };
+    assert_original(runner.state());
+    assert_eq!(
+        flying_count(&runner.state().objects[&crow]),
+        2,
+        "reach guard: printed + sticker"
+    );
+
+    add_mana(&mut runner, 0, &[ManaType::Green, ManaType::Blue]);
+    runner.cast(double_major).target_object(crow).commit();
+    let before: Vec<ObjectId> = runner.state().stack.iter().map(|e| e.id).collect();
+    for _ in 0..4 {
+        if runner.state().objects[&double_major].zone != Zone::Stack {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("pass priority to resolve Double Major");
+    }
+    let copy = runner
+        .state()
+        .stack
+        .iter()
+        .map(|entry| entry.id)
+        .find(|id| !before.contains(id))
+        .expect("Double Major put a copy of the spell on the stack");
+    for pass in 0..2 {
+        let object = &runner.state().objects[&copy];
+        assert!(object.stickers.is_empty(), "pass {pass}");
+        assert_eq!(object.name, "Storm Crow", "pass {pass}");
+        assert_eq!(
+            flying_count(object),
+            1,
+            "pass {pass}: exactly the printed Flying"
+        );
+        assert_eq!(
+            object.abilities.len(),
+            object.base_abilities.len(),
+            "pass {pass}: no sticker-granted activated ability"
+        );
+        assert_original(runner.state());
+        flush_layers_full(&mut runner);
+    }
+}
+
+/// CR 123.1 + CR 707.2 + CR 707.12: a cast copy of a stickered card has none of
+/// its stickers. Divination in the graveyard carries the name, Flying and
+/// looting-ability stickers (supplementary staging through the sticker
+/// resolver); Mizzix's Mastery exiles it and casts a copy, which has no
+/// stickers, the printed name, no Flying and no sticker ability.
+#[test]
+fn cast_copy_of_a_stickered_card_has_none_of_its_stickers() {
+    let db = shared_card_db().expect("cast-copy row requires the CardDB");
+    let mut scenario = main_phase();
+    let divination = scenario.add_real_card(P0, "Divination", Zone::Graveyard, db);
+    let mastery = scenario.add_real_card(P0, "Mizzix's Mastery", Zone::Hand, db);
+    let bears = scenario.add_real_card(P0, "Grizzly Bears", Zone::Battlefield, db);
+    for _ in 0..4 {
+        scenario.add_real_card(P0, "Grizzly Bears", Zone::Library, db);
+    }
+    scenario.with_mana_pool(
+        P0,
+        mana(&[
+            ManaType::Red,
+            ManaType::Colorless,
+            ManaType::Colorless,
+            ManaType::Colorless,
+        ]),
+    );
+    let mut runner = scenario.build();
+    copy_sticker_sheets(&mut runner);
+    for (kind, pick) in [
+        (
+            StickerKind::Name,
+            pick_ancestral_name as fn(&AppliedSticker) -> bool,
+        ),
+        (StickerKind::Ability, pick_flying),
+        (StickerKind::Ability, pick_looting),
+    ] {
+        put_sticker_through_resolver(&mut runner, bears, divination, kind, &pick);
+    }
+    flush_layers_full(&mut runner);
+    let card = &runner.state().objects[&divination];
+    assert_eq!(card.stickers.len(), 3);
+    assert_eq!(card.name, "Ancestral Divination");
+    assert!(card.keywords.contains(&Keyword::Flying));
+
+    runner.cast(mastery).target_object(divination).commit();
+    let mut copy = None;
+    for _ in 0..12 {
+        copy = runner
+            .state()
+            .stack
+            .iter()
+            .map(|entry| entry.id)
+            .find(|id| *id != mastery && *id != divination);
+        if copy.is_some() {
+            break;
+        }
+        let action = match runner.state().waiting_for.clone() {
+            WaitingFor::Priority { .. } => GameAction::PassPriority,
+            WaitingFor::OptionalEffectChoice { player, .. } => {
+                assert_eq!(player, P0);
+                GameAction::DecideOptionalEffect { accept: true }
+            }
+            WaitingFor::ChooseFromZoneChoice { player, cards, .. } => {
+                assert_eq!(player, P0);
+                GameAction::SelectCards { cards }
+            }
+            other => panic!("unexpected Mizzix's Mastery prompt: {other:?}"),
+        };
+        runner
+            .act(action)
+            .expect("Mizzix's Mastery answer is legal");
+    }
+    let copy = copy.expect("Mizzix's Mastery cast a copy of the exiled card");
+    assert_eq!(runner.state().objects[&divination].zone, Zone::Exile);
+    for pass in 0..2 {
+        let object = &runner.state().objects[&copy];
+        assert_eq!(object.zone, Zone::Stack, "pass {pass}");
+        assert!(object.stickers.is_empty(), "pass {pass}");
+        assert_eq!(object.name, "Divination", "pass {pass}");
+        assert!(!object.keywords.contains(&Keyword::Flying), "pass {pass}");
+        // The cast-time keyword snapshot is taken at copy birth and never
+        // re-derived by a layer pass: the strip ran before it.
+        assert!(
+            !object.cast_spell_keywords.contains(&Keyword::Flying),
+            "pass {pass}"
+        );
+        assert_eq!(
+            object.abilities.len(),
+            object.base_abilities.len(),
+            "pass {pass}: no sticker-granted activated ability"
+        );
+        flush_layers_full(&mut runner);
+    }
+    // CR 123.5: the exiled card itself keeps its stickers.
+    assert_eq!(runner.state().objects[&divination].stickers.len(), 3);
+}
+
+/// CR 718.3b: the prototyped Arcane Proxy spell's alternative characteristics.
+fn cast_prohibition_assert_spell_form(state: &GameState, id: ObjectId) {
+    let object = &state.objects[&id];
+    assert!(object.prototype_form.is_some());
+    assert_eq!((object.power, object.toughness), (Some(2), Some(1)));
+    assert_eq!(
+        object.mana_cost,
+        ManaCost::Cost {
+            generic: 1,
+            shards: vec![ManaCostShard::Blue, ManaCostShard::Blue],
+        }
+    );
+    assert_eq!(object.color, vec![ManaColor::Blue]);
 }
 
 #[test]

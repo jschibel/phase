@@ -85164,17 +85164,26 @@ fn repeat_directive_wire_shapes_round_trip() {
         value.get("repeat_process_requested").is_none(),
         "a default state omits the slot"
     );
-    state.repeat_process_requested = true;
+    let request = crate::types::game_state::RepeatProcessRequest {
+        source_id: crate::types::identifiers::ObjectId(7),
+    };
+    state.repeat_process_requested = Some(request);
     let mut value = serde_json::to_value(&state).unwrap();
-    assert_eq!(value["repeat_process_requested"], serde_json::json!(true));
+    assert_eq!(
+        value["repeat_process_requested"],
+        serde_json::json!({ "source_id": 7 })
+    );
+    let round_tripped: crate::types::game_state::GameState =
+        serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(round_tripped.repeat_process_requested, Some(request));
     value
         .as_object_mut()
         .unwrap()
         .remove("repeat_process_requested");
     let restored: crate::types::game_state::GameState = serde_json::from_value(value).unwrap();
-    assert!(
-        !restored.repeat_process_requested,
-        "a payload without it reads false"
+    assert_eq!(
+        restored.repeat_process_requested, None,
+        "a payload without it reads as no request"
     );
 }
 

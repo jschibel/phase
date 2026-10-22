@@ -917,3 +917,98 @@ fn retained_sticker_timestamps_follow_each_real_public_move_and_skip_nontransiti
     assert_eq!(state.objects[&first].stickers[0].timestamp(), next + 1);
     assert_eq!(state.next_timestamp, next + 2);
 }
+
+/// CR 123.1 + CR 707.2: the copy-birth authority undoes exactly what each
+/// sticker added, observed on the clone before any layer pass can re-derive it.
+/// A graveyard creature card with printed Flying also gets a Flying sticker, a
+/// non-keyword activated-ability sticker, a name sticker and a P/T sticker; its
+/// copy keeps the printed Flying (only the sticker's instance is revoked) and
+/// none of the rest, while the original keeps all of it.
+#[test]
+fn remove_stickers_from_copy_undoes_only_what_the_stickers_added() {
+    let mut scenario = GameScenario::new();
+    let id = scenario.add_creature(P0, "Bear", 2, 2).id();
+    let mut game = scenario.build();
+    let state = game.state_mut();
+    {
+        let bear = state.objects.get_mut(&id).unwrap();
+        bear.base_keywords.push(Keyword::Flying);
+        bear.keywords.push(Keyword::Flying);
+    }
+    move_to_zone(state, id, Zone::Graveyard, &mut Vec::new());
+    set_player_sticker_sheets(
+        state,
+        P0,
+        &[
+            "Ancestral Hot Dog Minotaur".to_string(),
+            "Playable Delusionary Hydra".to_string(),
+        ],
+    );
+    state.players[0].add_player_counters(&PlayerCounterKind::Ticket, 20);
+    let candidates = available_sticker_candidates(state, P0, None, None, false);
+    let pick = |wanted: &dyn Fn(&AppliedSticker) -> bool| {
+        candidates
+            .iter()
+            .find(|candidate| wanted(&candidate.sticker))
+            .expect("the registry supplies the sticker")
+            .clone()
+    };
+    for candidate in [
+        pick(
+            &|s| matches!(s, AppliedSticker::Name { text, position: 0, .. } if text == "Ancestral"),
+        ),
+        pick(&|s| matches!(s, AppliedSticker::Ability { text, .. } if text == "Flying")),
+        pick(
+            &|s| matches!(s, AppliedSticker::Ability { text, .. } if text.starts_with("{T}: Draw a card")),
+        ),
+        pick(&|s| {
+            matches!(
+                s,
+                AppliedSticker::PowerToughness {
+                    power: 8,
+                    toughness: 6,
+                    ..
+                }
+            )
+        }),
+    ] {
+        apply_selected_sticker(
+            state,
+            P0,
+            id,
+            candidate.sticker,
+            candidate.pay_ticket,
+            &mut Vec::new(),
+        );
+    }
+    crate::game::layers::flush_layers(state);
+    let flying = |object: &crate::game::game_object::GameObject| {
+        object
+            .keywords
+            .iter()
+            .filter(|keyword| **keyword == Keyword::Flying)
+            .count()
+    };
+    let original = state.objects[&id].clone();
+    assert_eq!(original.stickers.len(), 4);
+    assert_eq!(original.name, "Ancestral Bear");
+    assert_eq!(
+        flying(&original),
+        2,
+        "reach guard: printed + sticker Flying"
+    );
+    assert_eq!(original.abilities.len(), original.base_abilities.len() + 1);
+    assert_eq!((original.power, original.toughness), (Some(8), Some(6)));
+
+    let mut copy = original.clone();
+    crate::game::stickers::remove_stickers_from_copy(&mut copy);
+    assert!(copy.stickers.is_empty());
+    assert_eq!(copy.name, "Bear");
+    assert_eq!(flying(&copy), 1, "the printed Flying survives the revoke");
+    assert_eq!(copy.abilities.len(), copy.base_abilities.len());
+    assert_eq!((copy.power, copy.toughness), (Some(2), Some(2)));
+    let untouched = &state.objects[&id];
+    assert_eq!(untouched.stickers.len(), 4, "the original is untouched");
+    assert_eq!(untouched.name, "Ancestral Bear");
+    assert_eq!(flying(untouched), 2);
+}

@@ -3575,16 +3575,7 @@ fn reset_remote_layer_recipients(state: &mut GameState, recipients: im::HashSet<
         let Some(object) = state.objects.get_mut(&id) else {
             continue;
         };
-        let (power, toughness) = object
-            .prototype_form
-            .as_ref()
-            .map_or((object.base_power, object.base_toughness), |form| {
-                (Some(form.power), Some(form.toughness))
-            });
-        object.power = power;
-        object.toughness = toughness;
-        object.layer_base_power = power;
-        object.layer_base_toughness = toughness;
+        crate::game::stickers::reset_pt_to_object_baseline(object);
     }
     let mut reset_ids = Vec::new();
     for id in recipients {
@@ -3775,20 +3766,28 @@ fn derive_layer_characteristics(state: &mut GameState) -> Vec<ObjectId> {
         if let Some(obj) = state.objects.get_mut(&id) {
             obj.sync_missing_base_characteristics();
             obj.keywords = obj.base_keywords.clone(); // pre-existing, unchanged
-                                                      // CR 109.4 (r5/§F-1): "Only objects on the stack or on the battlefield
-                                                      // have a controller." This loop enumerates STACK ENTRY ids
-                                                      // (`zone_object_ids(.., Zone::Stack)` is `state.stack.iter().map(|e| e.id)`,
-                                                      // unfiltered), and the CR 601.2a announcement puts the ENTRY on the stack
-                                                      // while the OBJECT is still in its origin zone until cast finalization —
-                                                      // MEASURED: a full pass forced at a real `TargetSelection` pause visits an
-                                                      // object living in `Zone::Exile`. Writing a controller there would stamp the
-                                                      // caster onto an opponent-owned card in Exile, which no rule gives a
-                                                      // controller and which `filter::is_owner_scoped_zone` (Hand | Library |
-                                                      // Graveyard) does NOT shield. Guard verbatim the way the `.chain()` above and
-                                                      // both stack-object enumerators guard — `targeting::targetable_stack_spell_
-                                                      // entries` and `filter::matches_stack_target_filter`'s `or_else` — so the seed
-                                                      // and its consumers agree by construction. Scoped to this write: the keyword
-                                                      // reset above keeps its pre-existing unguarded shape.
+
+            // CR 123.5 + CR 123.7: a spell's ability stickers (retained from a
+            // public zone, or put on the spell) keep granting their keywords
+            // across the reset.
+            if !obj.stickers.is_empty() {
+                let granted = crate::game::stickers::ability_sticker_keywords(obj);
+                obj.keywords.extend(granted);
+            }
+            // CR 109.4 (r5/§F-1): "Only objects on the stack or on the battlefield
+            // have a controller." This loop enumerates STACK ENTRY ids
+            // (`zone_object_ids(.., Zone::Stack)` is `state.stack.iter().map(|e| e.id)`,
+            // unfiltered), and the CR 601.2a announcement puts the ENTRY on the stack
+            // while the OBJECT is still in its origin zone until cast finalization —
+            // MEASURED: a full pass forced at a real `TargetSelection` pause visits an
+            // object living in `Zone::Exile`. Writing a controller there would stamp the
+            // caster onto an opponent-owned card in Exile, which no rule gives a
+            // controller and which `filter::is_owner_scoped_zone` (Hand | Library |
+            // Graveyard) does NOT shield. Guard verbatim the way the `.chain()` above and
+            // both stack-object enumerators guard — `targeting::targetable_stack_spell_
+            // entries` and `filter::matches_stack_target_filter`'s `or_else` — so the seed
+            // and its consumers agree by construction. Scoped to this write: the keyword
+            // reset above keeps its pre-existing unguarded shape.
             if obj.zone == Zone::Stack {
                 obj.controller = base; // NEW
             }
