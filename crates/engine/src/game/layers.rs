@@ -11799,13 +11799,7 @@ fn apply_continuous_effect_filtered(
             // `Effect::ChoosePermanent` answer (values fixed per CR 707.2c) —
             // so applying anything here would double-install. Explicit no-op.
             ContinuousModification::CopyChosen => {}
-            ContinuousModification::CopyValues {
-                values,
-                display_source,
-                printed_ref,
-                token_image_ref,
-                token_art,
-            } => {
+            ContinuousModification::CopyValues { values, display } => {
                 let copy_effect = crate::types::ability::CopyEffectInstanceRef {
                     continuous_effect_id: effect
                         .transient_id
@@ -11825,10 +11819,7 @@ fn apply_continuous_effect_filtered(
                 // copied name has no real-card printing); for a printed source,
                 // `display_source = Card` + `printed_ref`. None are copiable
                 // values — purely display routing.
-                obj.display_source = *display_source;
-                obj.printed_ref = printed_ref.clone();
-                obj.token_image_ref = token_image_ref.clone();
-                obj.token_art = token_art.clone();
+                obj.install_display_identity(display);
             }
             // CR 707.9b + CR 707.2: Name override is a copiable-value override
             // applied at Layer 1 after the base CopyValues (ordered by timestamp
@@ -13326,10 +13317,7 @@ mod tests {
                 TargetFilter::SpecificObject { id: copier },
                 vec![ContinuousModification::CopyValues {
                     values: Box::new(values),
-                    display_source: crate::game::game_object::DisplaySource::Card,
-                    printed_ref: None,
-                    token_image_ref: None,
-                    token_art: None,
+                    display: crate::game::game_object::DisplayIdentity::default(),
                 }],
                 None,
             )
@@ -14688,10 +14676,7 @@ mod tests {
             TargetFilter::SpecificObject { id: recipient },
             vec![ContinuousModification::CopyValues {
                 values: Box::new(donor_values),
-                display_source: crate::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             }],
             None,
         );
@@ -15159,10 +15144,7 @@ mod tests {
             host,
             ContinuousModification::CopyValues {
                 values: Box::new(donor_values),
-                display_source: crate::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             },
         );
         install_until_end_of_turn(
@@ -27380,10 +27362,7 @@ mod tests {
             values: Box::new(crate::game::printed_cards::intrinsic_copiable_values(
                 &state.objects[&donor],
             )),
-            display_source: crate::game::game_object::DisplaySource::Card,
-            printed_ref: None,
-            token_image_ref: None,
-            token_art: None,
+            display: Default::default(),
         }
     }
 
@@ -29357,10 +29336,7 @@ mod tests {
                 TargetFilter::SpecificObject { id: target },
                 vec![ContinuousModification::CopyValues {
                     values: Box::new(copy_values),
-                    display_source: crate::game::game_object::DisplaySource::Card,
-                    printed_ref: None,
-                    token_image_ref: None,
-                    token_art: None,
+                    display: Default::default(),
                 }],
                 None,
             )
@@ -30984,10 +30960,7 @@ mod tests {
             TargetFilter::SpecificObject { id: fd },
             vec![ContinuousModification::CopyValues {
                 values: Box::new(donor_values),
-                display_source: crate::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             }],
             None,
         );
@@ -31011,10 +30984,7 @@ mod tests {
             TargetFilter::SpecificObject { id: plain },
             vec![ContinuousModification::CopyValues {
                 values: Box::new(donor_values2),
-                display_source: crate::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             }],
             None,
         );
@@ -31909,10 +31879,7 @@ mod tests {
             TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
             vec![ContinuousModification::CopyValues {
                 values: Box::new(copied_values),
-                display_source: crate::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             }],
             None,
         );
@@ -31995,10 +31962,7 @@ mod tests {
             TargetFilter::SpecificObject { id: clone },
             vec![ContinuousModification::CopyValues {
                 values: Box::new(copied_values),
-                display_source: crate::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             }],
             None,
         );
@@ -32085,10 +32049,7 @@ mod tests {
         );
         let copy_of = |values: CopiableValues| ContinuousModification::CopyValues {
             values: Box::new(values),
-            display_source: crate::game::game_object::DisplaySource::Card,
-            printed_ref: None,
-            token_image_ref: None,
-            token_art: None,
+            display: Default::default(),
         };
 
         // The whole `Layer::Copy` set: (modification, adds ANY generator, adds a
@@ -32253,10 +32214,7 @@ mod tests {
                 TargetFilter::SpecificObject { id: target },
                 vec![ContinuousModification::CopyValues {
                     values: Box::new(values),
-                    display_source: crate::game::game_object::DisplaySource::Card,
-                    printed_ref: None,
-                    token_image_ref: None,
-                    token_art: None,
+                    display: Default::default(),
                 }],
                 None,
             );
@@ -32349,10 +32307,7 @@ mod tests {
                 TargetFilter::SpecificObject { id: recipient },
                 vec![ContinuousModification::CopyValues {
                     values: Box::new(values),
-                    display_source: crate::game::game_object::DisplaySource::Card,
-                    printed_ref: None,
-                    token_image_ref: None,
-                    token_art: None,
+                    display: Default::default(),
                 }],
                 None,
             );
@@ -32488,10 +32443,7 @@ mod tests {
                     prepare_face: None,
                     name_origin: Default::default(),
                 }),
-                display_source: Default::default(),
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             },
             ContinuousModification::CopyChosen,
             ContinuousModification::SetName {

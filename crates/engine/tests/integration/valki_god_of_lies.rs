@@ -2468,10 +2468,7 @@ fn tibalt_later_copy_effect_exile_does_not_feed_emblem() {
             TargetFilter::SpecificObject { id: tibalt },
             vec![ContinuousModification::CopyValues {
                 values: Box::new(values),
-                display_source: engine::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             }],
             None,
         )
