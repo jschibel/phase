@@ -1606,6 +1606,75 @@ fn interactive_excess_and_candidates_use_the_current_exact_recipient() {
     }
 }
 
+/// CR 510.1c + CR 702.19d + CR 702.19f + CR 506.4c: a blocked standard trampler whose only
+/// blocker died and whose attacked planeswalker left combat assigns no combat damage. Trample
+/// over an empty block assigns to the planeswalker it attacks, which is gone, and never to the
+/// defending player, so no assignment prompt opens and combat finishes with no damage from it.
+#[test]
+fn blocked_trampler_with_no_blocker_and_no_attacked_planeswalker_assigns_nothing() {
+    let mut b = damage_authority_board(false, false, 10);
+    let outcome = b.r.cast(b.rancor).target_object(b.attacker).resolve();
+    outcome.assert_zone(&[b.rancor], Zone::Battlefield);
+    assert_eq!(b.r.state().objects[&b.attacker].power, Some(6));
+    assert!(
+        b.r.state().objects[&b.attacker].has_keyword(&engine::types::keywords::Keyword::Trample)
+    );
+    attack(
+        &mut b.r,
+        &[(b.attacker, AttackTarget::Planeswalker(b.walker))],
+    );
+    let mut trigger_events = Vec::new();
+    settle(&mut b.r, &mut trigger_events, true, 0);
+    assert_eq!(
+        loyalty(&b.r, b.walker),
+        7,
+        "reach: the attack trigger hit Karn"
+    );
+    reach_blocked_priority(&mut b);
+    resolve_response(&mut b.r, b.murder, b.blocker);
+    assert_eq!(b.r.state().objects[&b.blocker].zone, Zone::Graveyard);
+    resolve_response(&mut b.r, b.word, b.walker);
+    {
+        let combat = b.r.state().combat.as_ref().unwrap();
+        assert!(!combat.attacked_permanents.contains_key(&b.attacker));
+        let info = combat
+            .attackers
+            .iter()
+            .find(|info| info.object_id == b.attacker)
+            .expect("the trampler is still attacking");
+        assert!(info.blocked, "CR 509.1h: it remains blocked");
+        assert!(combat
+            .blocker_assignments
+            .get(&b.attacker)
+            .is_none_or(Vec::is_empty));
+    }
+    let mut events = Vec::new();
+    let mut saw_damage_step = false;
+    for _ in 0..24 {
+        if matches!(b.r.state().phase, Phase::EndCombat | Phase::PostCombatMain) {
+            break;
+        }
+        saw_damage_step |= b.r.state().phase == Phase::CombatDamage;
+        match b.r.state().waiting_for.clone() {
+            WaitingFor::Priority { .. } => {
+                events.extend(b.r.act(GameAction::PassPriority).unwrap().events);
+            }
+            other => panic!("combat must finish without a damage prompt, got {other:?}"),
+        }
+    }
+    assert!(saw_damage_step, "reach: the combat damage step was entered");
+    assert!(
+        matches!(b.r.state().phase, Phase::EndCombat | Phase::PostCombatMain),
+        "combat finished"
+    );
+    assert_eq!(damage_from(&events, b.attacker), vec![]);
+    assert_eq!(loyalty(&b.r, b.walker), 7);
+    assert_eq!(
+        (life(&b.r, P0), life(&b.r, P1), life(&b.r, P2)),
+        (20, 20, 20)
+    );
+}
+
 /// Killed in response, still damages what it was attacking (ruling 2020-11-10).
 #[test]
 fn swordjack_killed_in_response_still_damages_the_planeswalker_it_was_attacking() {
@@ -1766,6 +1835,89 @@ fn mage_slayer_gone_in_response_still_damages_the_planeswalker() {
     let mut ev = Vec::new();
     settle(&mut r, &mut ev, true, 0);
     assert_eq!(loyalty(&r, karn), 2);
+}
+
+/// CR 603.3b + CR 506.4 + CR 704.5i: two Mage Slayers on two attackers of one 3-loyalty
+/// planeswalker fire on distinct attack events. The 3-power creature's damage removes the
+/// planeswalker, so whichever trigger resolves second may have no recipient: the controller must
+/// be offered the order, and each order produces its own damage.
+#[test]
+fn mage_slayer_fanout_prompts_when_the_first_trigger_can_remove_the_planeswalker() {
+    for small_first in [false, true] {
+        let mut sc = scenario();
+        let big = sc.add_creature(P0, "Three-Power", 3, 3).id();
+        let small = sc.add_creature(P0, "One-Power", 1, 1).id();
+        let slayers = [big, small].map(|_| {
+            sc.add_artifact_from_oracle(P0, "Mage Slayer", MAGE_SLAYER)
+                .with_subtypes(vec!["Equipment"])
+                .id()
+        });
+        let karn = add_karn(&mut sc, 3);
+        let mut r = sc.build();
+        control_by_p1(&mut r, karn);
+        for (slayer, host) in slayers.into_iter().zip([big, small]) {
+            r.state_mut().objects.get_mut(&slayer).unwrap().attached_to =
+                Some(AttachTarget::Object(host));
+            r.state_mut()
+                .objects
+                .get_mut(&host)
+                .unwrap()
+                .attachments
+                .push(slayer);
+        }
+        r.state_mut().layers_dirty.mark_full();
+        r.advance_to_combat();
+        r.declare_attackers(&[
+            (big, AttackTarget::Planeswalker(karn)),
+            (small, AttackTarget::Planeswalker(karn)),
+        ])
+        .unwrap();
+        let WaitingFor::OrderTriggers { player, triggers } = r.state().waiting_for.clone() else {
+            panic!(
+                "the first trigger can remove the planeswalker: an ordering choice is required, \
+                 got {:?}",
+                r.state().waiting_for
+            );
+        };
+        assert_eq!(player, P0);
+        assert_eq!(triggers.len(), 2);
+        let index_of = |source: ObjectId| triggers.iter().position(|t| t.source_id == source);
+        let (big_index, small_index) =
+            (index_of(slayers[0]).unwrap(), index_of(slayers[1]).unwrap());
+        // The last entry is put on the stack last, so it resolves first.
+        let order = if small_first {
+            vec![big_index, small_index]
+        } else {
+            vec![small_index, big_index]
+        };
+        r.act(GameAction::OrderTriggers { order }).unwrap();
+        for slayer in slayers {
+            assert_untargeted_triggers(&r, slayer, 1);
+        }
+        let mut ev = Vec::new();
+        settle(&mut r, &mut ev, true, 0);
+        assert_eq!(
+            deal_damage_resolutions(&ev, slayers[0]) + deal_damage_resolutions(&ev, slayers[1]),
+            2,
+            "both triggers resolved"
+        );
+        assert_eq!(
+            damage_from(&ev, big),
+            vec![(TargetRef::Object(karn), 3)],
+            "the 3-power creature always deals its damage (small first: {small_first})"
+        );
+        assert_eq!(
+            damage_from(&ev, small),
+            if small_first {
+                vec![(TargetRef::Object(karn), 1)]
+            } else {
+                vec![]
+            },
+            "the 1-power creature deals damage only if it resolves before Karn is gone"
+        );
+        assert_eq!(r.state().objects[&karn].zone, Zone::Graveyard);
+        assert_eq!((life(&r, P0), life(&r, P1), life(&r, P2)), (20, 20, 20));
+    }
 }
 
 fn cavalcade_board(text: &str, name: &str) -> (GameRunner, ObjectId, ObjectId, ObjectId, ObjectId) {

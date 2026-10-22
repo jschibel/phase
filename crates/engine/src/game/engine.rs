@@ -13441,12 +13441,15 @@ fn apply_non_priority_pass_action(
                     // resolves with X chosen by the player, so the count tapped defines X for the
                     // riders. The selection mode is the signal, as in casting_costs.rs and
                     // mana_abilities.rs; min_count == 0 is not (Aggregate also has floor 0).
+                    // Only the rider this payment parked receives it: a payment with no rider
+                    // leaves any enclosing continuation's X untouched.
                     if matches!(
                         *mode,
                         crate::types::ability::TapCreaturesSelectionMode::VariableX
                     ) {
-                        engine_resolution_choices::stamp_continuation_chosen_x(
+                        engine_resolution_choices::stamp_paused_payment_rider_x(
                             state,
+                            crate::types::game_state::ContinuationXAnnouncement::TappedCount,
                             u32::try_from(chosen.len()).unwrap_or(u32::MAX),
                         );
                     }

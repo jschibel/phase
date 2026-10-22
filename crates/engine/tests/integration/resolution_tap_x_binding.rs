@@ -6,15 +6,18 @@
 //! * (T) a real attack trigger parsed from a referent-free Battlesphere-grammar clause;
 //! * (C) a hand-built typed chain, resolved through `resolve_ability_chain`, so the Fixed and
 //!   Aggregate selection modes can be observed without a trigger event.
+//!
+//! (P) checks the sibling announcement, the amount paid for "pay any amount of {E}" (CR 107.14):
+//! both bind X only to the rider the payment parked, never to an enclosing chain.
 use engine::game::ability_utils::build_resolved_from_def;
 use engine::game::combat::AttackTarget;
 use engine::game::effects::resolve_ability_chain;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
-    AbilityDefinition, Effect, TapCreaturesRequirement, TapCreaturesSelectionMode,
+    AbilityDefinition, Effect, ResolvedAbility, TapCreaturesRequirement, TapCreaturesSelectionMode,
 };
 use engine::types::actions::GameAction;
-use engine::types::game_state::{CostResume, PayCostKind, WaitingFor};
+use engine::types::game_state::{CostResume, PayCostKind, PendingContinuation, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::phase::Phase;
 
@@ -234,6 +237,36 @@ fn run_chain(
     pick: usize,
     power: i32,
 ) -> ChainOutcome {
+    run_chain_inside(requirement, with_rider, pick, power, None)
+}
+
+/// An enclosing chain parked before the payment's chain resolves: another source's "deals X
+/// damage to you", whose own X was already announced as `x`.
+fn enclosing_chain(src: ObjectId, x: u32) -> ResolvedAbility {
+    let def: AbilityDefinition = serde_json::from_value(serde_json::json!({
+        "kind": "Spell",
+        "effect": {"type": "DealDamage",
+            "amount": {"type": "Ref", "qty": {"type": "Variable", "name": "X"}},
+            "target": {"type": "Controller"}},
+        "cost": null, "sub_ability": null, "duration": null, "description": null,
+        "target_prompt": null, "condition": null, "optional_targeting": false,
+        "optional": false, "forward_result": false
+    }))
+    .expect("enclosing definition");
+    let mut chain = build_resolved_from_def(&def, src, P0);
+    chain.set_chosen_x_recursive(x);
+    chain
+}
+
+/// [`run_chain`] with, when `enclosing` is `Some(x)`, [`enclosing_chain`] parked as the active
+/// continuation beneath the payment's chain.
+fn run_chain_inside(
+    requirement: &TapCreaturesRequirement,
+    with_rider: bool,
+    pick: usize,
+    power: i32,
+    enclosing: Option<u32>,
+) -> ChainOutcome {
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
     let src = sc.add_creature(P0, "Src", 1, 9).id();
@@ -248,7 +281,12 @@ fn run_chain(
         sc.add_card_to_library_top(P0, "Plains");
         sc.add_card_to_library_top(P1, "Plains");
     }
+    let other = sc.add_creature(P0, "Other", 1, 1).id();
     let mut r: GameRunner = sc.build();
+    if let Some(x) = enclosing {
+        let pending = PendingContinuation::new(Box::new(enclosing_chain(other, x)), r.state());
+        r.state_mut().park_ability_continuation(pending);
+    }
     let ability = build_resolved_from_def(&chain_def(requirement, with_rider), src, P0);
     let life0 = r.state().players[0].life;
     let mut events = Vec::new();
@@ -343,4 +381,137 @@ fn chain_without_rider_binds_nothing_and_does_not_panic() {
     assert_eq!(o.tapped, 2);
     assert!(o.drained);
     assert_eq!(o.life_delta, 0);
+}
+
+// Sibling of the no-rider row with another source's chain parked first: the payment parked no
+// rider, so the tapped count is X for no instruction, and the enclosing chain keeps the X its own
+// source announced (CR 107.3f + CR 107.3i: X is per object).
+#[test]
+fn chain_without_rider_leaves_enclosing_frame_x_alone() {
+    let o = run_chain_inside(
+        &TapCreaturesRequirement::Count { count: u32::MAX },
+        false,
+        2,
+        2,
+        Some(5),
+    );
+    assert_eq!(o.mode, TapCreaturesSelectionMode::VariableX);
+    assert_eq!(o.tapped, 2);
+    assert!(o.drained, "the enclosing chain resumed and finished");
+    assert_eq!(
+        o.life_delta, -5,
+        "the enclosing chain deals its own X (5), not the tapped count (2)"
+    );
+}
+
+// Sibling with a rider above the same enclosing chain: the rider gets the tapped count and the
+// enclosing chain keeps its own X.
+#[test]
+fn chain_with_rider_stamps_only_the_rider_above_an_enclosing_frame() {
+    let o = run_chain_inside(
+        &TapCreaturesRequirement::Count { count: u32::MAX },
+        true,
+        2,
+        2,
+        Some(5),
+    );
+    assert_eq!(o.mode, TapCreaturesSelectionMode::VariableX);
+    assert_eq!(o.tapped, 2);
+    assert!(o.drained, "rider and enclosing chain both resumed");
+    assert_eq!(
+        o.life_delta, -7,
+        "the rider deals the tapped count (2), the enclosing chain its own X (5)"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// (P) "pay any amount of energy": the amount paid defines X the same way (CR 107.14 + CR 107.3f)
+// ---------------------------------------------------------------------------------------------
+
+/// "Pay any amount of {E}", optionally followed by "deals X damage to you".
+fn pay_energy_def(with_rider: bool) -> AbilityDefinition {
+    let rider = if with_rider {
+        serde_json::json!({
+            "kind": "Spell",
+            "effect": {"type": "DealDamage",
+                "amount": {"type": "Ref", "qty": {"type": "Variable", "name": "X"}},
+                "target": {"type": "Controller"}},
+            "cost": null, "sub_ability": null, "duration": null, "description": null,
+            "target_prompt": null, "condition": null, "optional_targeting": false,
+            "optional": false, "forward_result": false
+        })
+    } else {
+        serde_json::Value::Null
+    };
+    serde_json::from_value(serde_json::json!({
+        "kind": "Spell",
+        "effect": {"type": "PayCost",
+            "cost": {"type": "PayEnergy",
+                "amount": {"type": "Ref", "qty": {"type": "Variable", "name": "X"}}},
+            "payer": {"type": "Controller"}},
+        "cost": null, "sub_ability": rider, "duration": null, "description": null,
+        "target_prompt": null, "condition": null, "optional_targeting": false,
+        "optional": false, "forward_result": false
+    }))
+    .expect("pay-energy definition")
+}
+
+/// Resolve the (P) chain above [`enclosing_chain`] (its own X = 5), pay `paid` of 4 energy.
+/// Returns (life delta, energy left, drained).
+fn run_pay_energy_inside(with_rider: bool, paid: u32) -> (i32, u32, bool) {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let src = sc.add_creature(P0, "Src", 1, 9).id();
+    let other = sc.add_creature(P0, "Other", 1, 1).id();
+    for _ in 0..20 {
+        sc.add_card_to_library_top(P0, "Plains");
+        sc.add_card_to_library_top(P1, "Plains");
+    }
+    let mut r: GameRunner = sc.build();
+    r.state_mut().players[0].energy = 4;
+    let pending = PendingContinuation::new(Box::new(enclosing_chain(other, 5)), r.state());
+    r.state_mut().park_ability_continuation(pending);
+    let ability = build_resolved_from_def(&pay_energy_def(with_rider), src, P0);
+    let life0 = r.state().players[0].life;
+    let mut events = Vec::new();
+    resolve_ability_chain(r.state_mut(), &ability, &mut events, 0).unwrap();
+    let WaitingFor::PayAmountChoice { player, max, .. } = r.state().waiting_for.clone() else {
+        panic!(
+            "pay-amount prompt expected, got {:?}",
+            r.state().waiting_for
+        );
+    };
+    assert_eq!((player, max), (P0, 4));
+    r.act(GameAction::SubmitPayAmount { amount: paid })
+        .expect("legal amount");
+    (
+        r.state().players[0].life - life0,
+        r.state().players[0].energy,
+        r.state().active_ability_continuation().is_none()
+            && matches!(r.state().waiting_for, WaitingFor::Priority { .. }),
+    )
+}
+
+// No rider: the amount paid is X for no instruction; the enclosing chain keeps its own X (5).
+#[test]
+fn pay_amount_without_rider_leaves_enclosing_frame_x_alone() {
+    let (life, energy, drained) = run_pay_energy_inside(false, 2);
+    assert_eq!(energy, 2, "reach: two energy were paid");
+    assert!(drained, "the enclosing chain resumed and finished");
+    assert_eq!(
+        life, -5,
+        "the enclosing chain deals its own X, not the amount paid (2)"
+    );
+}
+
+// With a rider: the rider gets the amount paid and the enclosing chain keeps its own X.
+#[test]
+fn pay_amount_with_rider_stamps_only_the_rider_above_an_enclosing_frame() {
+    let (life, energy, drained) = run_pay_energy_inside(true, 2);
+    assert_eq!(energy, 2);
+    assert!(drained);
+    assert_eq!(
+        life, -7,
+        "the rider deals the amount paid (2), the enclosing chain its own X (5)"
+    );
 }

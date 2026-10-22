@@ -3985,6 +3985,29 @@ fn board_membership_read(filter: &TargetFilter) -> RwProfile {
     p
 }
 
+/// CR 506.4 + CR 603.3b: the membership read behind "the player or planeswalker
+/// it's attacking". An attacked planeswalker or battle stays the answer only while
+/// it is that permanent on the battlefield; a sibling that removes it (damage to 0
+/// loyalty, CR 704.5i) writes that membership. Recorded with its census and zone
+/// through `board_membership_read` so the membership feed row can fire:
+/// `reads_board_of(SetMembership)` alone leaves the `Census::None` sentinel, which
+/// overlaps no write.
+fn attacked_permanent_membership_read() -> RwProfile {
+    let on_battlefield = |card_type: TypeFilter| {
+        TargetFilter::Typed(
+            TypedFilter::new(card_type).properties(vec![FilterProp::InZone {
+                zone: Zone::Battlefield,
+            }]),
+        )
+    };
+    board_membership_read(&TargetFilter::Or {
+        filters: vec![
+            on_battlefield(TypeFilter::Planeswalker),
+            on_battlefield(TypeFilter::Battle),
+        ],
+    })
+}
+
 /// CR 903.3d + CR 603.3b: the single read profile for a commander-control gate,
 /// shared by ALL THREE condition-vocabulary mirrors (`AbilityCondition`,
 /// `TriggerCondition`, `StaticCondition`).
@@ -7310,7 +7333,7 @@ fn rw_target_filter(x: &TargetFilter) -> RwProfile {
         // (`TurnStructure`).
         TargetFilter::AttackedPlayerOrPlaneswalker => {
             let mut p = reads_event_live();
-            p.merge(reads_board_of(StateKind::SetMembership));
+            p.merge(attacked_permanent_membership_read());
             p.merge(reads_board_of(StateKind::TurnStructure));
             p
         }
@@ -10082,5 +10105,40 @@ mod attacked_referent_classification_tests {
             "the referent reads combat.attackers, which RemoveFromCombat writes"
         );
         assert!(!read.legacy_batch_prompt);
+        // CR 506.4 + CR 704.5i: the membership read carries the attacked-permanent
+        // census, so this referent's own damage write (which can remove the
+        // planeswalker) feeds it across distinct attack events.
+        assert!(
+            matches!(&read.reads_membership_census, Census::Tags(tags)
+                if tags.contains("planeswalker") && tags.contains("battle")),
+            "census: {:?}",
+            read.reads_membership_census
+        );
+        let fanout = ability_rw_profile(&ResolvedAbility::new(
+            Effect::DealDamage {
+                amount: QuantityExpr::Fixed { value: 1 },
+                target: f.clone(),
+                damage_source: None,
+                excess: None,
+            },
+            vec![],
+            crate::types::identifiers::ObjectId(1),
+            crate::types::player::PlayerId(0),
+        ));
+        assert!(
+            profiles_conflict(
+                &fanout,
+                &GroupStructure {
+                    same_event: false,
+                    all_same_source: false,
+                    all_sources_self_departed: false,
+                    event_object_excludes_sources: true,
+                    event_object_present: true,
+                    source_census: SourceCensus::unknown(),
+                    controller_uniformity: ControllerUniformity::UniformAligned,
+                }
+            ),
+            "distinct-event siblings: one's damage can remove the other's recipient"
+        );
     }
 }

@@ -2981,6 +2981,39 @@ pub struct PendingContinuation {
     /// placeholder `chain` is never resolved when this is set.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) player_scope_queue_end: bool,
+    /// CR 107.3f + CR 107.3i + CR 608.2c: names the value a paused resolution-time
+    /// payment's answer announces as X for the instructions after it. Exactly two
+    /// park paths set it, both creating a NEW frame that holds only the rider and
+    /// becomes the active frame: the walker's separate park above an unchanged
+    /// enclosing owner, and `prepend_to_pending_continuation_with_producer`'s own
+    /// park (when no frame is active, or instead of merging into an active one). A
+    /// marked rider never merges into an existing frame. The other park paths
+    /// (outside the child stack boundary, outside a post-replacement draw pair,
+    /// beneath an active direct-choice child) leave it unset, and so does the
+    /// remaining-cost frame of a combined resolution cost
+    /// (`prepend_remaining_pay_cost_continuation`). The answer
+    /// (`stamp_paused_payment_rider_x`) stamps only a marked active frame, so the
+    /// value never reaches a continuation the payment did not park.
+    ///
+    /// Serde-defaulted: a save taken mid-prompt before this field existed
+    /// restores with its rider unmarked, so that one answer binds no X (X reads as
+    /// unannounced). The mark is not inferred on restore, because the frame that
+    /// owned the payment cannot be identified from the old payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) x_announcement: Option<ContinuationXAnnouncement>,
+}
+
+/// CR 107.3f: the resolution-time announcement that defines X for the rider a
+/// paused payment parked (see [`PendingContinuation::x_announcement`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContinuationXAnnouncement {
+    /// CR 107.3f + CR 118.12: the number of permanents tapped for a "tap X
+    /// untapped ..." payment (`TapCreaturesSelectionMode::VariableX`).
+    TappedCount,
+    /// CR 107.3f + CR 107.14 + CR 119.4: the amount chosen and paid for a
+    /// resolution-time "pay any amount of energy / life" or unannounced-X mana
+    /// payment (`WaitingFor::PayAmountChoice`).
+    PaidAmount,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3026,6 +3059,7 @@ impl PendingContinuation {
             attachment_remainder: None,
             player_scope_tail: state.resolving_player_scope_tail.clone(),
             player_scope_queue_end: false,
+            x_announcement: None,
         }
     }
 
@@ -3050,6 +3084,7 @@ impl PendingContinuation {
             attachment_remainder: None,
             player_scope_tail: state.resolving_player_scope_tail.clone(),
             player_scope_queue_end: false,
+            x_announcement: None,
         }
     }
 }
@@ -25003,6 +25038,263 @@ fn migrate_legacy_graveyard_paid_cast_cleanup(value: &mut serde_json::Value) -> 
     visit(value, &receipts)
 }
 
+/// The trigger-event context a suspended chain resumes with, for the restore
+/// validator's attacked-referent check.
+#[derive(Clone, Copy)]
+enum SuspendedChainEvent<'a> {
+    /// Resumes inside the current resolution, reading the ambient trigger event(s).
+    Ambient,
+    /// Carries its own captured trigger event (an unless-payment root).
+    Bound(Option<&'a GameEvent>),
+    /// CR 601.2 + CR 602.2: still being cast or activated; no trigger event.
+    Announcement,
+}
+
+type SuspendedChainVisitor<'v, 'a> =
+    dyn FnMut(&'a ResolvedAbility, SuspendedChainEvent<'a>) -> Result<(), String> + 'v;
+
+/// CR 605.3a + CR 118.12: every chain a paused mana-ability activation holds — its
+/// own resume root and the cost-move root it parked.
+fn visit_pending_mana_ability_chains<'a>(
+    pending: &'a PendingManaAbility,
+    f: &mut SuspendedChainVisitor<'_, 'a>,
+) -> Result<(), String> {
+    visit_mana_ability_resume_chains(&pending.resume, f)?;
+    if let Some(resume) = pending.cost_move_resume.as_ref() {
+        visit_mana_ability_resume_chains(resume, f)?;
+    }
+    Ok(())
+}
+
+fn visit_mana_ability_resume_chains<'a>(
+    resume: &'a ManaAbilityResume,
+    f: &mut SuspendedChainVisitor<'_, 'a>,
+) -> Result<(), String> {
+    match resume {
+        // CR 118.12: the unless-payment's effect resumes with its own trigger event.
+        ManaAbilityResume::UnlessPayment {
+            pending_effect,
+            trigger_event,
+            ..
+        } => f(
+            pending_effect,
+            SuspendedChainEvent::Bound(trigger_event.as_ref()),
+        ),
+        // CR 118.12 + CR 608.2c: a resolution-time `Effect::PayCost` whose mana
+        // payment paused keeps its rider here, and only here.
+        ManaAbilityResume::EffectPayCost { ability, .. } => {
+            f(ability, SuspendedChainEvent::Ambient)
+        }
+        // CR 605.3a: the outer mana ability parked behind this one.
+        ManaAbilityResume::ManaAbilityManaPayment {
+            pending_mana_ability,
+        } => visit_pending_mana_ability_chains(pending_mana_ability, f),
+        ManaAbilityResume::Priority
+        | ManaAbilityResume::CompanionToHand { .. }
+        | ManaAbilityResume::TurnFaceUp { .. }
+        | ManaAbilityResume::EndContinuousEffect { .. }
+        | ManaAbilityResume::ManaPayment { .. }
+        | ManaAbilityResume::ManaSourceSelection { .. }
+        | ManaAbilityResume::PhyrexianCastPayment { .. }
+        | ManaAbilityResume::FinalizePendingManaPayment { .. } => Ok(()),
+    }
+}
+
+fn visit_mana_cost_cursor_chains<'a>(
+    cursor: &'a ManaAbilityCostCursor,
+    f: &mut SuspendedChainVisitor<'_, 'a>,
+) -> Result<(), String> {
+    if let Some(parent) = cursor.parent.as_deref() {
+        visit_pending_mana_ability_chains(&parent.pending, f)?;
+        visit_mana_cost_cursor_chains(&parent.cursor, f)?;
+    }
+    Ok(())
+}
+
+fn visit_pending_cast_chain<'a>(
+    pending: &'a PendingCast,
+    f: &mut SuspendedChainVisitor<'_, 'a>,
+) -> Result<(), String> {
+    f(&pending.ability, SuspendedChainEvent::Announcement)
+}
+
+fn visit_collect_evidence_resume_chains<'a>(
+    resume: &'a CollectEvidenceResume,
+    f: &mut SuspendedChainVisitor<'_, 'a>,
+) -> Result<(), String> {
+    match resume {
+        CollectEvidenceResume::Casting { pending_cast, .. } => {
+            visit_pending_cast_chain(pending_cast, f)
+        }
+        // CR 701.59a + CR 608.2c: the effect chain that asked for the evidence.
+        CollectEvidenceResume::Effect { pending_ability } => {
+            f(pending_ability, SuspendedChainEvent::Ambient)
+        }
+        CollectEvidenceResume::ManaAbility {
+            pending_mana_ability,
+        } => visit_pending_mana_ability_chains(pending_mana_ability, f),
+    }
+}
+
+fn visit_cost_move_resume_chains<'a>(
+    resume: &'a PendingCostMoveResume,
+    f: &mut SuspendedChainVisitor<'_, 'a>,
+) -> Result<(), String> {
+    match resume {
+        PendingCostMoveResume::Cast { pending, .. }
+        | PendingCostMoveResume::SacrificeForCost { pending, .. }
+        | PendingCostMoveResume::CounterCostRemovalPayment { pending, .. } => pending
+            .as_deref()
+            .map_or(Ok(()), |pending| visit_pending_cast_chain(pending, f)),
+        PendingCostMoveResume::ActivationMillPayment { pending, .. } => {
+            visit_pending_cast_chain(pending, f)
+        }
+        // CR 606.4: a loyalty activation still paying its cost.
+        PendingCostMoveResume::LoyaltyActivation { resolved, .. } => {
+            f(resolved, SuspendedChainEvent::Announcement)
+        }
+        PendingCostMoveResume::WardSacrificePayment { pending_effect, .. }
+        | PendingCostMoveResume::UnlessBouncePayment { pending_effect, .. } => {
+            f(pending_effect, SuspendedChainEvent::Ambient)
+        }
+        PendingCostMoveResume::CounterAdditionUnlessPayment {
+            pending_effect,
+            trigger_event,
+            ..
+        } => f(
+            pending_effect,
+            SuspendedChainEvent::Bound(trigger_event.as_ref()),
+        ),
+        PendingCostMoveResume::RandomDiscardUnlessPayment(resume) => f(
+            &resume.pending_effect,
+            SuspendedChainEvent::Bound(resume.trigger_event.as_ref()),
+        ),
+        PendingCostMoveResume::CollectEvidencePayment { resume, .. } => {
+            visit_collect_evidence_resume_chains(resume, f)
+        }
+        PendingCostMoveResume::ManaAbilityPayment { pending, cursor } => {
+            visit_pending_mana_ability_chains(pending, f)?;
+            visit_mana_cost_cursor_chains(cursor, f)
+        }
+        PendingCostMoveResume::ReplacementMayCost { .. }
+        | PendingCostMoveResume::Foretell { .. } => Ok(()),
+    }
+}
+
+fn visit_deferred_life_cost_resume_chains<'a>(
+    resume: &'a DeferredLifeCostResume,
+    f: &mut SuspendedChainVisitor<'_, 'a>,
+) -> Result<(), String> {
+    match resume {
+        DeferredLifeCostResume::Cast { pending, .. } => pending
+            .as_deref()
+            .map_or(Ok(()), |pending| visit_pending_cast_chain(pending, f)),
+        DeferredLifeCostResume::ManaRoot { resume, .. } => {
+            visit_mana_ability_resume_chains(resume, f)
+        }
+        DeferredLifeCostResume::PayAmount { .. } => Ok(()),
+    }
+}
+
+fn visit_discard_for_cost_resume_chains<'a>(
+    resume: &'a PendingDiscardForCostResume,
+    f: &mut SuspendedChainVisitor<'_, 'a>,
+) -> Result<(), String> {
+    match resume {
+        PendingDiscardForCostResume::Chosen { pending, .. }
+        | PendingDiscardForCostResume::Random { pending, .. } => {
+            visit_pending_cast_chain(pending, f)
+        }
+    }
+}
+
+fn visit_cost_resume_chains<'a>(
+    resume: &'a CostResume,
+    f: &mut SuspendedChainVisitor<'_, 'a>,
+) -> Result<(), String> {
+    match resume {
+        CostResume::Spell { spell } | CostResume::SpellCost { spell, .. } => {
+            visit_pending_cast_chain(spell, f)
+        }
+        CostResume::ManaAbility { mana_ability } => {
+            visit_pending_mana_ability_chains(mana_ability, f)
+        }
+        // The resolving chain itself owns this payment's rider.
+        CostResume::Resolution => Ok(()),
+    }
+}
+
+/// CR 608.2c + CR 616.1: the batch-completion tails that resume a resolving ability.
+fn visit_batch_completion_chains<'a>(
+    completion: &'a BatchCompletion,
+    f: &mut SuspendedChainVisitor<'_, 'a>,
+) -> Result<(), String> {
+    match completion {
+        BatchCompletion::CastFromZoneExileDeliveryComplete { ability, .. }
+        | BatchCompletion::TopCardContestRoundComplete { ability, .. }
+        | BatchCompletion::ForEachCategoryExileComplete { ability, .. } => {
+            f(ability, SuspendedChainEvent::Ambient)
+        }
+        // CR 701.23a + CR 608.2c: a settled search delivery resumes its scoped
+        // "after the search" tail.
+        BatchCompletion::LibrarySearchDeliverySettled { resume }
+        | BatchCompletion::SearchPartitionPrimaryDelivered { resume, .. } => {
+            visit_library_search_delivery_resume_chains(resume, f)
+        }
+        BatchCompletion::RecordInstructionZoneResult { .. }
+        | BatchCompletion::ReturnAsAuraNoTargetComplete { .. }
+        | BatchCompletion::ExploreLandDeliveryComplete { .. }
+        | BatchCompletion::CloakExileDeliveryComplete { .. }
+        | BatchCompletion::ExileFaceDownPileDeliveryComplete { .. }
+        | BatchCompletion::ExileFaceDownPileReturnComplete { .. }
+        | BatchCompletion::CascadeExileLoopComplete { .. }
+        | BatchCompletion::CascadeBottomComplete { .. }
+        | BatchCompletion::RippleTerminalComplete { .. }
+        | BatchCompletion::DiscoverBottomComplete { .. }
+        | BatchCompletion::DiscoverPlacementComplete { .. }
+        | BatchCompletion::DiscoverDeclined { .. }
+        | BatchCompletion::ResolutionCastRejectedToHand { .. }
+        | BatchCompletion::DiscoverDeclinedComplete { .. }
+        | BatchCompletion::ResolutionCastRejectionComplete { .. }
+        | BatchCompletion::PutOnTopComplete { .. }
+        | BatchCompletion::TopOrBottomComplete { .. }
+        | BatchCompletion::EffectZonePutAtLibraryPositionComplete { .. }
+        | BatchCompletion::DrawnThisTurnTopdeckComplete { .. }
+        | BatchCompletion::SurveilKeepOnTop { .. }
+        | BatchCompletion::ManifestDreadCleanup { .. }
+        | BatchCompletion::RevealRestPile { .. }
+        | BatchCompletion::DigMassPutAllRestComplete { .. }
+        | BatchCompletion::DigMassPutAllComplete { .. }
+        | BatchCompletion::DigPriorLookRestComplete { .. }
+        | BatchCompletion::RemoveExileLinks { .. }
+        | BatchCompletion::NinjutsuPlacement { .. }
+        | BatchCompletion::AttractionOpenRemainder { .. }
+        | BatchCompletion::ContraptionAssembleRemainder { .. }
+        | BatchCompletion::SearchFoundZoneDelivery { .. }
+        | BatchCompletion::MeldExile { .. }
+        | BatchCompletion::MeldEntry { .. }
+        | BatchCompletion::MeldRedirect { .. }
+        | BatchCompletion::MilledDeliveryComplete { .. } => Ok(()),
+    }
+}
+
+/// CR 701.23a + CR 608.2c: a scoped search delivery's "after the search" tail.
+fn visit_library_search_delivery_resume_chains<'a>(
+    resume: &'a LibrarySearchDeliveryResume,
+    f: &mut SuspendedChainVisitor<'_, 'a>,
+) -> Result<(), String> {
+    match resume {
+        LibrarySearchDeliveryResume::Scoped {
+            after_scope: Some(after_scope),
+            ..
+        } => f(after_scope, SuspendedChainEvent::Ambient),
+        LibrarySearchDeliveryResume::Scoped {
+            after_scope: None, ..
+        }
+        | LibrarySearchDeliveryResume::Standard { .. } => Ok(()),
+    }
+}
+
 /// Checked persistence compatibility for unresolved attacked-recipient reads.
 /// Raw and Trusted enter here together; transport/display decoding stays separate.
 fn validate_restored_attack_authority(
@@ -25154,6 +25446,54 @@ fn validate_restored_attack_authority(
             Some(context) => check(node, context.event.as_ref(), &context.events),
             None => check(node, current_event, &[]),
         };
+    // Chains parked inside payment and batch roots, resumed with the event
+    // context their root names.
+    let mut suspended = |node: &ResolvedAbility, event: SuspendedChainEvent<'_>| match event {
+        SuspendedChainEvent::Ambient => check(node, current_event, current_events),
+        SuspendedChainEvent::Bound(event) => check(node, event, &[]),
+        SuspendedChainEvent::Announcement => check(node, None, &[]),
+    };
+    if let Some(resume) = state.pending_cost_move_resume.as_ref() {
+        visit_cost_move_resume_chains(resume, &mut suspended)?;
+    }
+    if let Some(resume) = state.pending_deferred_life_cost_resume.as_ref() {
+        visit_deferred_life_cost_resume_chains(resume, &mut suspended)?;
+    }
+    if let Some(resume) = state.pending_discard_for_cost.as_deref() {
+        visit_discard_for_cost_resume_chains(resume, &mut suspended)?;
+    }
+    if let Some(pending) = state.pending_cast.as_deref() {
+        visit_pending_cast_chain(pending, &mut suspended)?;
+    }
+    // CR 701.23a + CR 608.2c: a scoped library search resumes its ability and
+    // its "after the search" tail inside the current resolution.
+    if let Some(search) = state.pending_scoped_library_search.as_ref() {
+        suspended(&search.ability, SuspendedChainEvent::Ambient)?;
+        if let Some(after_scope) = search.after_scope.as_deref() {
+            suspended(after_scope, SuspendedChainEvent::Ambient)?;
+        }
+    }
+    if let Some(resume) = state.pending_library_search_delivery.as_ref() {
+        visit_library_search_delivery_resume_chains(resume, &mut suspended)?;
+    }
+    // CR 101.4 + CR 608.2c: a per-player sacrifice choice or unless payment
+    // resumes the effect it was collecting choices for.
+    if let Some(choice) = state.pending_player_scope_sacrifice_choice.as_ref() {
+        suspended(&choice.ability, SuspendedChainEvent::Ambient)?;
+    }
+    if let Some(payment) = state.pending_player_scope_unless_payment.as_deref() {
+        suspended(&payment.pending_effect, SuspendedChainEvent::Ambient)?;
+    }
+    // CR 608.2f + CR 701.9a: a discard paused mid fan-out resumes the clause for
+    // the remaining players and then its outer chain, in the current resolution.
+    if let Some(fan_out) = state
+        .pending_discard_batch
+        .as_deref()
+        .and_then(|batch| batch.fan_out.as_deref())
+    {
+        suspended(&fan_out.scoped_template, SuspendedChainEvent::Ambient)?;
+        suspended(&fan_out.outer, SuspendedChainEvent::Ambient)?;
+    }
     for frame in state.resolution_stack.iter() {
         match frame {
             ResolutionFrame::OptionalEffect(frame) => check(
@@ -25167,11 +25507,15 @@ fn validate_restored_attack_authority(
                     .trigger_context
                     .as_ref()
                     .or(frame.choose_zone_trigger_context.as_ref());
-                check(
-                    &frame.pending.chain,
-                    context.and_then(|context| context.event.as_ref()),
-                    context.map_or(&[], |context| context.events.as_slice()),
-                )?;
+                let event = context.and_then(|context| context.event.as_ref());
+                let events = context.map_or(&[][..], |context| context.events.as_slice());
+                check(&frame.pending.chain, event, events)?;
+                // CR 608.2f + CR 608.2c: the detached "after each player" tail
+                // runs while this frame's trigger context is pushed
+                // (`drain_pending_continuation`), so it reads the same event.
+                if let Some(tail) = frame.pending.player_scope_tail.as_ref() {
+                    check(&tail.after_scope, event, events)?;
+                }
             }
             ResolutionFrame::RepeatFor(frame) => {
                 check(&frame.ability, current_event, current_events)?
@@ -25196,8 +25540,12 @@ fn validate_restored_attack_authority(
                     check_choice_continuation(node, frame.trigger_context.as_ref())?;
                 }
             }
+            ResolutionFrame::BatchDelivery(batch) => {
+                if let Some(completion) = batch.completion.as_ref() {
+                    visit_batch_completion_chains(completion, &mut suspended)?;
+                }
+            }
             ResolutionFrame::ChangeZone(_)
-            | ResolutionFrame::BatchDelivery(_)
             | ResolutionFrame::CounterMoves(_)
             | ResolutionFrame::CounterRemovals(_)
             | ResolutionFrame::CounterAdditions(_)
@@ -25251,7 +25599,177 @@ fn validate_restored_attack_authority(
             trigger_context,
             ..
         } => check_choice_continuation(node, trigger_context.as_ref())?,
-        _ => {}
+        // CR 111.1 + CR 608.2c: the token-creation ability resumes once its
+        // host is chosen, so its unresolved chain reads the attacked referent.
+        WaitingFor::ChooseTokenHost {
+            pending_ability, ..
+        } => check(pending_ability, current_event, current_events)?,
+        // CR 701.59a + CR 608.2c: a collect-evidence choice resumes the effect,
+        // cast or mana ability that asked for it.
+        WaitingFor::CollectEvidenceChoice { resume, .. } => {
+            visit_collect_evidence_resume_chains(resume, &mut suspended)?
+        }
+        // CR 605.3a + CR 118.12: a paused mana-ability payment can hold a
+        // resolving rider (`EffectPayCost`) or unless-payment effect.
+        WaitingFor::PayManaAbilityMana {
+            pending_mana_ability,
+            ..
+        }
+        | WaitingFor::ManaAbilityManaPayment {
+            pending_mana_ability,
+            ..
+        } => visit_pending_mana_ability_chains(pending_mana_ability, &mut suspended)?,
+        WaitingFor::PayAmountChoice {
+            pending_mana_ability,
+            ..
+        } => {
+            if let Some(pending) = pending_mana_ability.as_deref() {
+                visit_pending_mana_ability_chains(pending, &mut suspended)?;
+            }
+        }
+        WaitingFor::PayCost { resume, .. } => visit_cost_resume_chains(resume, &mut suspended)?,
+        WaitingFor::DigRestSplitChoice { completion, .. } => {
+            if let Some(completion) = completion.as_deref() {
+                visit_batch_completion_chains(completion, &mut suspended)?;
+            }
+        }
+        // CR 601.2 + CR 602.2: a spell or ability still being cast or activated.
+        WaitingFor::ChooseXValue { pending_cast, .. }
+        | WaitingFor::TargetSelection { pending_cast, .. }
+        | WaitingFor::ModeChoice { pending_cast, .. }
+        | WaitingFor::OptionalCostChoice { pending_cast, .. }
+        | WaitingFor::ChooseGiftRecipient { pending_cast, .. }
+        | WaitingFor::SpliceOffer { pending_cast, .. }
+        | WaitingFor::DefilerPayment { pending_cast, .. }
+        | WaitingFor::OrderCostReductions { pending_cast, .. }
+        | WaitingFor::ActivationCostOneOfChoice { pending_cast, .. }
+        | WaitingFor::CostTypeChoice { pending_cast, .. }
+        | WaitingFor::BlightChoice { pending_cast, .. }
+        | WaitingFor::HarmonizeTapChoice { pending_cast, .. }
+        | WaitingFor::ChooseAnnouncingOpponent { pending_cast, .. } => {
+            visit_pending_cast_chain(pending_cast, &mut suspended)?
+        }
+        // Every other prompt carries no `ResolvedAbility` chain in its own fields.
+        // The chains walked above are: the stack and pending triggers; the
+        // resolution-stack frames (continuation chains with their player-scope
+        // tails, repeat / choice / payment frames, batch-delivery completions);
+        // and the state-level roots (cost-move, deferred-life, discard-for-cost,
+        // pending cast, scoped search and search delivery, player-scope sacrifice
+        // and unless payment, discard fan-out). Listed exhaustively so a new
+        // carrier on a prompt cannot skip this check silently.
+        WaitingFor::ChooseOneOfBranch {
+            continuation: None, ..
+        }
+        | WaitingFor::Priority { .. }
+        | WaitingFor::ResolveAllConsent { .. }
+        | WaitingFor::ResolveAllReady { .. }
+        | WaitingFor::MeldPairChoice { .. }
+        | WaitingFor::MeldAttackTargetChoice { .. }
+        | WaitingFor::EntryAttackTargetChoice { .. }
+        | WaitingFor::MulliganDecision { .. }
+        | WaitingFor::OpeningHandBottomCards { .. }
+        | WaitingFor::ManaPayment { .. }
+        | WaitingFor::ManaSourceSelection { .. }
+        | WaitingFor::AssistChoosePlayer { .. }
+        | WaitingFor::AssistPayment { .. }
+        | WaitingFor::DeclareAttackers { .. }
+        | WaitingFor::DeclareBlockers { .. }
+        | WaitingFor::UntapChoice { .. }
+        | WaitingFor::ChooseUntapSubset { .. }
+        | WaitingFor::ExertChoice { .. }
+        | WaitingFor::EnlistChoice { .. }
+        | WaitingFor::GameOver { .. }
+        | WaitingFor::ReplacementChoice { .. }
+        | WaitingFor::EntryControllerChoice { .. }
+        | WaitingFor::OrderTriggers { .. }
+        | WaitingFor::CopyTargetChoice { .. }
+        | WaitingFor::EquipTarget { .. }
+        | WaitingFor::CrewVehicle { .. }
+        | WaitingFor::StationTarget { .. }
+        | WaitingFor::SaddleMount { .. }
+        | WaitingFor::ScryChoice { .. }
+        | WaitingFor::RippleRevealChoice { .. }
+        | WaitingFor::RippleBottomOrder { .. }
+        | WaitingFor::RevealUntilBottomOrder { .. }
+        | WaitingFor::ArrangePlanarDeckTopChoice { .. }
+        | WaitingFor::RedistributeLifeTotals { .. }
+        | WaitingFor::CoinFlipKeepChoice { .. }
+        | WaitingFor::DieKeepChoice { .. }
+        | WaitingFor::DigChoice { .. }
+        | WaitingFor::SurveilChoice { .. }
+        | WaitingFor::RevealChoice { .. }
+        | WaitingFor::SearchChoice { .. }
+        | WaitingFor::SearchPartitionChoice { .. }
+        | WaitingFor::OutsideGameChoice { .. }
+        | WaitingFor::ChooseFromZoneChoice { .. }
+        | WaitingFor::BeholdChoice { .. }
+        | WaitingFor::EmpowerJaceChoice { .. }
+        | WaitingFor::SpellCopyOrderChoice { .. }
+        | WaitingFor::ConniveDiscard { .. }
+        | WaitingFor::DiscardChoice { .. }
+        | WaitingFor::EffectZoneChoice { .. }
+        | WaitingFor::DrawnThisTurnTopdeckChoice { .. }
+        | WaitingFor::LearnChoice { .. }
+        | WaitingFor::ManifestDreadChoice { .. }
+        | WaitingFor::TriggerTargetSelection { .. }
+        | WaitingFor::BetweenGamesSideboard { .. }
+        | WaitingFor::BetweenGamesChoosePlayDraw { .. }
+        | WaitingFor::NamedChoice { .. }
+        | WaitingFor::OpponentGuess { .. }
+        | WaitingFor::SpellbookDraft { .. }
+        | WaitingFor::DamageSourceChoice { .. }
+        | WaitingFor::DiscardToHandSize { .. }
+        | WaitingFor::CastOffer { .. }
+        | WaitingFor::ModalFaceChoice { .. }
+        | WaitingFor::AlternativeCastChoice { .. }
+        | WaitingFor::MutateMergeChoice { .. }
+        | WaitingFor::CipherEncodeChoice { .. }
+        | WaitingFor::CastingVariantChoice { .. }
+        | WaitingFor::ChoosePermanentTypeSlot { .. }
+        | WaitingFor::AbilityModeChoice { .. }
+        | WaitingFor::OptionalEffectChoice { .. }
+        | WaitingFor::ResolutionOptionalPaymentChoice { .. }
+        | WaitingFor::PairChoice { .. }
+        | WaitingFor::TributeChoice { .. }
+        | WaitingFor::MiracleReveal { .. }
+        | WaitingFor::OpponentMayChoice { .. }
+        | WaitingFor::LoopShortcut { .. }
+        | WaitingFor::RespondToShortcut { .. }
+        | WaitingFor::PrecastCopyShortcutOffer { .. }
+        | WaitingFor::RespondToPrecastCopyShortcut { .. }
+        | WaitingFor::ChooseRingBearer { .. }
+        | WaitingFor::ChooseRoomDoor { .. }
+        | WaitingFor::ChooseDungeon { .. }
+        | WaitingFor::ChooseDungeonRoom { .. }
+        | WaitingFor::SpecializeColor { .. }
+        | WaitingFor::ChooseManaColor { .. }
+        | WaitingFor::RevealUntilKeptChoice { .. }
+        | WaitingFor::TopOrBottomChoice { .. }
+        | WaitingFor::PopulateChoice { .. }
+        | WaitingFor::ClashCardPlacement { .. }
+        | WaitingFor::PhysicalContest { .. }
+        | WaitingFor::VoteChoice { .. }
+        | WaitingFor::SeparatePilesChooseOpponent { .. }
+        | WaitingFor::SeparatePilesPartition { .. }
+        | WaitingFor::SeparatePilesChoice { .. }
+        | WaitingFor::CompanionReveal { .. }
+        | WaitingFor::ChooseLegend { .. }
+        | WaitingFor::CommanderZoneChoice { .. }
+        | WaitingFor::BattleProtectorChoice { .. }
+        | WaitingFor::ProliferateChoice { .. }
+        | WaitingFor::TimeTravelChoice { .. }
+        | WaitingFor::ChooseObjectsSelection { .. }
+        | WaitingFor::CategoryChoice { .. }
+        | WaitingFor::EachPlayerCopyChosenSelection { .. }
+        | WaitingFor::KeepWithinTotalPowerChoice { .. }
+        | WaitingFor::KeepExactPermanentsChoice { .. }
+        | WaitingFor::CopyRetarget { .. }
+        | WaitingFor::AssignCombatDamage { .. }
+        | WaitingFor::AssignBlockerDamage { .. }
+        | WaitingFor::DistributeAmong { .. }
+        | WaitingFor::RetargetChoice { .. }
+        | WaitingFor::CombatTaxPayment { .. }
+        | WaitingFor::PhyrexianPayment { .. } => {}
     }
     Ok(())
 }
@@ -50801,6 +51319,292 @@ mod restored_exact_attack_authority_tests {
                         .to_string()
                         .contains("exact attack authority"),
                     "retained carrier {carrier} must validate both runtime child links"
+                );
+            }
+        }
+    }
+
+    /// The prompts that suspend a resolving chain in `WaitingFor` itself (a token
+    /// host choice, a resolution-time collect-evidence choice) are checked like
+    /// every other carrier, through both Raw and Trusted restore.
+    #[test]
+    fn suspended_prompt_chains_validate_their_attacked_referent() {
+        let (mut state, attacker, _) = queued();
+        let entry = state.stack.pop_back().unwrap();
+        state.stack_trigger_firings.clear();
+        state.stack_trigger_event_batches.clear();
+        let StackEntryKind::TriggeredAbility {
+            ability: leaf,
+            trigger_event,
+            ..
+        } = entry.kind
+        else {
+            unreachable!()
+        };
+        crate::game::zones::move_to_zone(&mut state, attacker, Zone::Graveyard, &mut Vec::new());
+        state.current_trigger_event = trigger_event;
+        let mut node = leaf.clone();
+        node.effect = Effect::NoOp;
+        node.sub_ability = Some(leaf);
+        for carrier in 0..2 {
+            let mut state = state.clone();
+            state.waiting_for = match carrier {
+                0 => WaitingFor::ChooseTokenHost {
+                    player: P0,
+                    source_id: attacker,
+                    legal_targets: vec![],
+                    pending_ability: node.clone(),
+                },
+                1 => WaitingFor::CollectEvidenceChoice {
+                    player: P0,
+                    minimum_mana_value: 1,
+                    cards: vec![],
+                    resume: Box::new(CollectEvidenceResume::Effect {
+                        pending_ability: node.clone(),
+                    }),
+                },
+                _ => unreachable!(),
+            };
+            for trusted in [false, true] {
+                let current = serialized(&state, trusted);
+                serde_json::from_value::<PersistedGameState>(current.clone())
+                    .expect("suspended prompt chain has exact authority");
+                let mut old = current;
+                let rows = payload(&mut old, trusted)["zone_changes_this_turn"]
+                    .as_array_mut()
+                    .unwrap();
+                let row = rows
+                    .iter_mut()
+                    .find(|row| {
+                        row["object_id"] == serde_json::json!(attacker.0)
+                            && row["from_zone"] == serde_json::json!("Battlefield")
+                    })
+                    .unwrap();
+                row["combat_status"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("attack_target_identity");
+                assert!(
+                    serde_json::from_value::<PersistedGameState>(old)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("exact attack authority"),
+                    "suspended prompt {carrier} (trusted: {trusted}) must validate its chain"
+                );
+            }
+        }
+    }
+
+    /// A paused mana-ability payment holds the resolving rider of an
+    /// `Effect::PayCost` (`ManaAbilityResume::EffectPayCost`, the rider's only home)
+    /// or an unless-payment's effect; a dig split or a batch-delivery frame holds a
+    /// batch-completion ability; state-level roots (`pending_cost_move_resume`,
+    /// `pending_player_scope_unless_payment`) hold the effect they resume, and a
+    /// continuation frame holds its player-scope tail. Each is checked through
+    /// both Raw and Trusted restore, wherever the root sits.
+    #[test]
+    fn payment_and_batch_roots_validate_their_attacked_referent() {
+        use crate::types::ability::{AbilityCost, DigRestSplitScope};
+        let (mut state, attacker, _) = queued();
+        let entry = state.stack.pop_back().unwrap();
+        state.stack_trigger_firings.clear();
+        state.stack_trigger_event_batches.clear();
+        let StackEntryKind::TriggeredAbility {
+            ability: leaf,
+            trigger_event,
+            ..
+        } = entry.kind
+        else {
+            unreachable!()
+        };
+        crate::game::zones::move_to_zone(&mut state, attacker, Zone::Graveyard, &mut Vec::new());
+        state.current_trigger_event = trigger_event.clone();
+        let mut node = leaf.clone();
+        node.effect = Effect::NoOp;
+        node.sub_ability = Some(leaf);
+        let mana_pending = |resume: ManaAbilityResume| PendingManaAbility {
+            player: P0,
+            source_id: attacker,
+            ability_index: None,
+            rules_execution_node: None,
+            ability_snapshot: None,
+            announced_source_incarnation: None,
+            color_override: None,
+            resume,
+            cost_move_resume: None,
+            chosen_tappers: None,
+            chosen_discards: Vec::new(),
+            chosen_mana_payment: None,
+            chosen_counter_counts: Vec::new(),
+            chosen_x: None,
+            collected_evidence: Vec::new(),
+            chosen_exiled: Vec::new(),
+            chosen_sacrificed_battlefield: Vec::new(),
+            cost_paid_object: None,
+            cost_removed_counters: None,
+            batch_siblings: Vec::new(),
+        };
+        let effect_pay_cost = ManaAbilityResume::EffectPayCost {
+            payer: P0,
+            return_to: P0,
+            ability: node.clone(),
+            cost: Box::new(AbilityCost::Tap),
+        };
+        for carrier in 0..8 {
+            let mut state = state.clone();
+            state.waiting_for = match carrier {
+                // The rider in the mana ability's own resume root.
+                0 => WaitingFor::ManaAbilityManaPayment {
+                    player: P0,
+                    pending_mana_ability: Box::new(mana_pending(effect_pay_cost.clone())),
+                },
+                // The rider in a parked cost-move root, reached through `PayCost`.
+                1 => WaitingFor::PayCost {
+                    player: P0,
+                    kind: PayCostKind::Sacrifice,
+                    choices: vec![],
+                    count: 1,
+                    min_count: 1,
+                    resume: CostResume::ManaAbility {
+                        mana_ability: Box::new(PendingManaAbility {
+                            cost_move_resume: Some(effect_pay_cost.clone()),
+                            ..mana_pending(ManaAbilityResume::Priority)
+                        }),
+                    },
+                },
+                // An unless-payment effect, with its own bound trigger event.
+                2 => WaitingFor::PayAmountChoice {
+                    player: P0,
+                    resource: PayableResource::Energy,
+                    min: 0,
+                    max: 0,
+                    accumulated: 0,
+                    source_id: attacker,
+                    pending_mana_ability: Some(Box::new(mana_pending(
+                        ManaAbilityResume::UnlessPayment {
+                            outer_player: None,
+                            cost: Box::new(AbilityCost::Tap),
+                            pending_effect: node.clone(),
+                            trigger_event: trigger_event.clone(),
+                            effect_description: None,
+                            remaining: vec![],
+                        },
+                    ))),
+                },
+                // A batch-completion tail that resumes the ability.
+                3 => WaitingFor::new_dig_rest_split(
+                    P0,
+                    P0,
+                    vec![],
+                    0,
+                    DigRestSplitScope::PartitionAndOrder,
+                    Some(attacker),
+                    Some(Box::new(
+                        BatchCompletion::CastFromZoneExileDeliveryComplete {
+                            ability: node.clone(),
+                            in_place_ids: vec![],
+                            exile_delivery_ids: vec![],
+                        },
+                    )),
+                ),
+                // A state-level cost-move root (an unless-bounce payment's effect).
+                4 => {
+                    state.pending_cost_move_resume =
+                        Some(PendingCostMoveResume::UnlessBouncePayment {
+                            player: P0,
+                            moved: attacker,
+                            permanents: vec![],
+                            pending_effect: node.clone(),
+                            remaining: 0,
+                        });
+                    state.waiting_for.clone()
+                }
+                // A batch-delivery frame whose completion resumes the ability.
+                5 => {
+                    let mut group = LogicalZoneChangeGroup::new(
+                        crate::types::identifiers::LogicalZoneChangeGroupId(1),
+                        Vec::new(),
+                    );
+                    group
+                        .latch_immediately_before(Vec::new(), Vec::new())
+                        .expect("test batch owner has explicit pre-delivery authority");
+                    state.push_batch_delivery(PendingBatchDeliveries {
+                        logical_zone_change_group: group,
+                        paused_current: None,
+                        remaining: Vec::new(),
+                        destination: Zone::Exile,
+                        source_id: None,
+                        enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                        exile_tracking: ZoneDeliveryExileTracking::None,
+                        library_placement: None,
+                        completion: Some(BatchCompletion::ForEachCategoryExileComplete {
+                            ability: node.clone(),
+                            pool: vec![],
+                            remaining_member_filters: vec![],
+                            chosen: vec![],
+                        }),
+                        replacement_applied: HashSet::new(),
+                        requests: Vec::new(),
+                        attempted: Vec::new(),
+                        zone_change_record_start: 0,
+                        deferred_events: Vec::new(),
+                    });
+                    state.waiting_for.clone()
+                }
+                // A state-level player-scope unless payment.
+                6 => {
+                    state.pending_player_scope_unless_payment =
+                        Some(Box::new(PendingPlayerScopeUnlessPayment {
+                            pending_effect: node.clone(),
+                            remaining_players: vec![],
+                            declining_players: vec![],
+                            current_player: P0,
+                            cost: AbilityCost::Tap,
+                        }));
+                    state.waiting_for.clone()
+                }
+                // A continuation frame whose chain is harmless but whose detached
+                // player-scope "after each player" tail reads the referent.
+                7 => {
+                    let mut harmless = node.clone();
+                    harmless.sub_ability = None;
+                    let mut pending = PendingContinuation::new(harmless, &state);
+                    pending.player_scope_tail = Some(PendingPlayerScopeTail {
+                        source_id: attacker,
+                        after_scope: node.clone(),
+                        linked_exile_batch: vec![],
+                        created_tokens: None,
+                    });
+                    state.park_ability_continuation(pending);
+                    state.waiting_for.clone()
+                }
+                _ => unreachable!(),
+            };
+            for trusted in [false, true] {
+                let current = serialized(&state, trusted);
+                serde_json::from_value::<PersistedGameState>(current.clone())
+                    .expect("payment root chain has exact authority");
+                let mut old = current;
+                let rows = payload(&mut old, trusted)["zone_changes_this_turn"]
+                    .as_array_mut()
+                    .unwrap();
+                let row = rows
+                    .iter_mut()
+                    .find(|row| {
+                        row["object_id"] == serde_json::json!(attacker.0)
+                            && row["from_zone"] == serde_json::json!("Battlefield")
+                    })
+                    .unwrap();
+                row["combat_status"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("attack_target_identity");
+                assert!(
+                    serde_json::from_value::<PersistedGameState>(old)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("exact attack authority"),
+                    "payment root {carrier} (trusted: {trusted}) must validate its chain"
                 );
             }
         }
