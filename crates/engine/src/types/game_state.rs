@@ -35067,7 +35067,6 @@ mod drain_stack_reentrancy_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::game_object::DisplaySource;
     use crate::game::printed_cards::intrinsic_copiable_values;
     use crate::game::triggers::{PendingTrigger, PendingTriggerContext};
     use crate::game::zones::create_object;
@@ -35200,10 +35199,7 @@ mod tests {
                     count: 1,
                     copy: Box::new(CopyTokenSpec {
                         values: Box::new(intrinsic_copiable_values(&source)),
-                        display_source: DisplaySource::Card,
-                        printed_ref: None,
-                        token_image_ref: None,
-                        token_art: None,
+                        display: Default::default(),
                         extra_keywords: vec![Keyword::Haste],
                         additional_modifications: vec![],
                         tapped: false,
