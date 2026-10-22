@@ -1640,6 +1640,7 @@ fn sticker_activations_keep_normal_costs_and_live_restrictions() {
                 .act(GameAction::ActivateAbility {
                     source_id: source,
                     ability_index: index,
+                    payment_mode: engine::types::game_state::CastPaymentMode::Auto,
                 })
                 .unwrap();
             assert!(runner.state().objects[&source].tapped);

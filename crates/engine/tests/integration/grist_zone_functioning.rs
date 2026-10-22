@@ -1757,7 +1757,7 @@ fn cast_prohibition_restore_plain_colorless_and_unspent_mana_are_counterable() {
         if selected_color == Some(ManaType::Blue) {
             let (_, _, grouped) = engine::ai_support::legal_actions_full(runner.state());
             let action = grouped[&second_source].iter().find(|action| match action {
-                GameAction::ActivateAbility { source_id, ability_index } if *source_id == second_source => {
+                GameAction::ActivateAbility { source_id, ability_index, .. } if *source_id == second_source => {
                     matches!(&*runner.state().objects[&second_source].abilities[*ability_index].effect,
                         Effect::Mana { grants, .. } if matches!(grants.as_slice(), [ManaSpellGrant::CantBeCountered { .. }]))
                 }

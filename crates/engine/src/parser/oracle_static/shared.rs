@@ -1228,6 +1228,7 @@ impl<'a> ZoneConditionNode<'a> {
             | StaticCondition::RingLevelAtLeast { .. }
             | StaticCondition::ControlsCommander { .. }
             | StaticCondition::SourceIsTapped
+            | StaticCondition::SourceExertedThisTurn
             | StaticCondition::IsTapped { .. }
             | StaticCondition::SourceIsFaceUp
             | StaticCondition::SourceIsSaddled
