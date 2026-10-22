@@ -5029,21 +5029,18 @@ fn create_entry_copy_spec_for_replacement(
     else {
         return None;
     };
-    let (values, display_source, printed_ref, token_image_ref, token_art) =
-        if let Some(source) = state.objects.get(copy_source) {
-            (
-                crate::game::layers::compute_current_copiable_values(state, *copy_source)?,
-                source.display_source,
-                source.printed_ref.clone(),
-                source.token_image_ref.clone(),
-                source.token_art.clone(),
-            )
-        } else {
-            let values = state.lki_copiable_values.get(copy_source)?.clone();
-            let lki = state.lki_cache.get(copy_source);
-            (
-                values,
-                if lki
+    let (values, display) = if let Some(source) = state.objects.get(copy_source) {
+        (
+            crate::game::layers::compute_current_copiable_values(state, *copy_source)?,
+            source.display_identity(),
+        )
+    } else {
+        let values = state.lki_copiable_values.get(copy_source)?.clone();
+        let lki = state.lki_cache.get(copy_source);
+        (
+            values,
+            crate::game::game_object::DisplayIdentity {
+                display_source: if lki
                     .and_then(|snapshot| snapshot.token_image_ref.as_ref())
                     .is_some()
                 {
@@ -5051,19 +5048,17 @@ fn create_entry_copy_spec_for_replacement(
                 } else {
                     crate::game::game_object::DisplaySource::Card
                 },
-                None,
-                lki.and_then(|snapshot| snapshot.token_image_ref.clone()),
+                printed_ref: None,
+                token_image_ref: lki.and_then(|snapshot| snapshot.token_image_ref.clone()),
                 // `LKISnapshot` is filter-shaped and carries no descriptor;
                 // the recipient falls back to its live (copied) fields.
-                None,
-            )
-        };
+                token_art: None,
+            },
+        )
+    };
     Some(CopyTokenSpec {
         values: Box::new(values),
-        display_source,
-        printed_ref,
-        token_image_ref,
-        token_art,
+        display,
         extra_keywords: Vec::new(),
         additional_modifications: additional_modifications.clone(),
         tapped: false,
@@ -9251,6 +9246,14 @@ enum ReplacementBranch {
 /// replacement source. CR 614.1c treats these as replacement effects; CR 601.2h
 /// guarantees `colors_spent_to_cast` is still populated at this point (the clear
 /// happens later in `process_triggers`).
+///
+/// `scoped_player` is the entrant's as-enters choice (e.g. "choose an opponent")
+/// carried on `event.enter_with_choices` as `ChosenAttribute::Player`. Binding it
+/// as `QuantityContext::scoped_player` lets `ObjectCount{..., controller: ScopedPlayer}`
+/// resolve against the chosen opponent rather than falling back to the controller
+/// (e.g. Canker Abomination: "-1/-1 counter for each creature that player controls").
+/// CR 614.12a: the choice is made before the permanent enters, so by the time the
+/// counter count resolves the choice already rides the entry event.
 fn extract_etb_counters(
     ability: Option<&AbilityDefinition>,
     state: &GameState,
@@ -9258,6 +9261,21 @@ fn extract_etb_counters(
     controller: PlayerId,
     event: &ProposedEvent,
 ) -> Vec<(CounterType, u32)> {
+    // CR 614.12a: read the as-enters choice off the entry event. `None` when the
+    // choice hasn't been made yet (e.g. this replacement is ordered before the
+    // `Effect::Choose { Opponent }` replacement) or when the entry carries no
+    // choice — `scoped_player` then stays `None` and `ScopedPlayer` falls back
+    // to `triggering_event_player` / `controller` as before.
+    let scoped_player = match event {
+        ProposedEvent::ZoneChange {
+            enter_with_choices: Some(choices),
+            ..
+        } => choices.0.iter().find_map(|attr| match attr {
+            crate::types::ability::ChosenAttribute::Player(pid) => Some(*pid),
+            _ => None,
+        }),
+        _ => None,
+    };
     let mut counters = Vec::new();
     let mut current = ability;
     // CR 614.1c: Only walk the event-modifier prefix of the ability chain.
@@ -9275,6 +9293,7 @@ fn extract_etb_counters(
             source_id,
             controller,
             event,
+            scoped_player,
         ));
         current = exec.sub_ability.as_deref();
     }
@@ -9287,6 +9306,7 @@ fn extract_etb_counters_from_effect(
     source_id: ObjectId,
     controller: PlayerId,
     event: &ProposedEvent,
+    scoped_player: Option<PlayerId>,
 ) -> Vec<(CounterType, u32)> {
     match effect {
         Effect::PutCounter {
@@ -9310,6 +9330,7 @@ fn extract_etb_counters_from_effect(
             };
             let ctx = crate::game::quantity::QuantityContext {
                 entering,
+                scoped_player,
                 ..crate::game::quantity::QuantityContext::new(source_id)
             };
             let n = match count {
@@ -9341,6 +9362,7 @@ fn extract_etb_counters_from_effect(
                 // `source_controller`).
                 let ctx = crate::game::quantity::QuantityContext {
                     entering: event.affected_object_id(),
+                    scoped_player,
                     ..crate::game::quantity::QuantityContext::new(source_id)
                 };
                 let n =

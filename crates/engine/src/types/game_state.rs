@@ -47570,10 +47570,10 @@ mod tests {
                 TargetFilter::SpecificObject { id: ObjectId(12) },
                 vec![ContinuousModification::CopyValues {
                     values: Box::new(copied_values.clone()),
-                    display_source: crate::game::game_object::DisplaySource::Card,
-                    printed_ref: Some(printed_ref.clone()),
-                    token_image_ref: None,
-                    token_art: None,
+                    display: crate::game::game_object::DisplayIdentity {
+                        printed_ref: Some(printed_ref.clone()),
+                        ..Default::default()
+                    },
                 }],
                 None,
                 TransientContinuousEffectBindings {
@@ -47667,10 +47667,10 @@ mod tests {
                 TargetFilter::SpecificObject { id: ObjectId(12) },
                 vec![ContinuousModification::CopyValues {
                     values: Box::new(copied_values),
-                    display_source: crate::game::game_object::DisplaySource::Card,
-                    printed_ref: Some(top_printed_ref),
-                    token_image_ref: None,
-                    token_art: None,
+                    display: crate::game::game_object::DisplayIdentity {
+                        printed_ref: Some(top_printed_ref),
+                        ..Default::default()
+                    },
                 }],
                 None,
                 TransientContinuousEffectBindings {

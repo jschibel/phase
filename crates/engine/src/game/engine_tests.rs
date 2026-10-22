@@ -2327,10 +2327,7 @@ fn an_ordinary_permanent_copying_a_room_gains_its_door_gated_form() {
             TargetFilter::SpecificObject { id: bear },
             vec![crate::types::ability::ContinuousModification::CopyValues {
                 values: Box::new(values),
-                display_source: crate::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             }],
             None,
         )
@@ -2439,10 +2436,7 @@ fn a_room_under_a_copy_effect_shows_the_copied_rooms_halves() {
             TargetFilter::SpecificObject { id: room },
             vec![crate::types::ability::ContinuousModification::CopyValues {
                 values: Box::new(values),
-                display_source: crate::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             }],
             None,
         )
@@ -2504,10 +2498,7 @@ fn a_copy_of_an_already_copied_room_snapshots_the_copied_halves() {
             TargetFilter::SpecificObject { id: bear },
             vec![crate::types::ability::ContinuousModification::CopyValues {
                 values: Box::new(values),
-                display_source: crate::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             }],
             None,
         )
@@ -2561,10 +2552,7 @@ fn a_set_name_exception_survives_the_room_name_derivation() {
         vec![
             crate::types::ability::ContinuousModification::CopyValues {
                 values: Box::new(values),
-                display_source: crate::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             },
             // CR 707.9b: the "except its name is X" rider follows CopyValues
             // within the same effect, exactly as production installs it.
@@ -2625,10 +2613,7 @@ fn a_set_name_exception_survives_the_room_name_derivation() {
             TargetFilter::SpecificObject { id: bear2 },
             vec![crate::types::ability::ContinuousModification::CopyValues {
                 values: Box::new(chained),
-                display_source: crate::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             }],
             None,
         )
@@ -2651,10 +2636,7 @@ fn a_set_name_exception_survives_the_room_name_derivation() {
             TargetFilter::SpecificObject { id: bear },
             vec![crate::types::ability::ContinuousModification::CopyValues {
                 values: Box::new(plain),
-                display_source: crate::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             }],
             None,
         )

@@ -520,10 +520,7 @@ fn install_unrelated_chooser(
                         .affected(TargetFilter::SpecificObject { id: baloth })
                         .modifications(vec![ContinuousModification::CopyValues {
                             values: Box::new(values),
-                            display_source: Default::default(),
-                            printed_ref: None,
-                            token_image_ref: None,
-                            token_art: None,
+                            display: Default::default(),
                         }])],
                     duration: Some(Duration::UntilEndOfTurn),
                     target: None,
