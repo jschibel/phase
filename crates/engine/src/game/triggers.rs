@@ -9634,7 +9634,10 @@ pub(crate) enum PendingTriggeredManaClass {
 }
 
 /// True iff any reachable `sub_ability` / `else_ability` link satisfies `pred`.
-fn any_reachable_link(ability: &ResolvedAbility, pred: &dyn Fn(&ResolvedAbility) -> bool) -> bool {
+pub(crate) fn any_reachable_link(
+    ability: &ResolvedAbility,
+    pred: &dyn Fn(&ResolvedAbility) -> bool,
+) -> bool {
     if pred(ability) {
         return true;
     }
