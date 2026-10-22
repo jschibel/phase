@@ -5584,6 +5584,7 @@ mod tests {
                 turn_zone_change_index: 0,
                 recorded_turn_number: 0,
                 is_suspected: false,
+                was_prepared: false,
             }),
         };
         let ability = ResolvedAbility::new(
