@@ -215,6 +215,7 @@ pub(crate) fn affected_filter_uses_object_population(filter: &TargetFilter) -> b
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::DefendingPlayer
+        | TargetFilter::AttackedPlayerOrPlaneswalker
         | TargetFilter::HasChosenName
         | TargetFilter::ChosenDamageSource { .. }
         | TargetFilter::Named { .. }
@@ -458,6 +459,7 @@ pub(crate) fn affected_filter_requires_attachment_relation(filter: &TargetFilter
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::DefendingPlayer
+        | TargetFilter::AttackedPlayerOrPlaneswalker
         | TargetFilter::HasChosenName
         | TargetFilter::ChosenDamageSource { .. }
         | TargetFilter::Named { .. }
@@ -613,6 +615,7 @@ pub(crate) fn target_filter_characteristic_reads_at(
         | TargetFilter::PostReplacementDamageTarget
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::DefendingPlayer
+        | TargetFilter::AttackedPlayerOrPlaneswalker
         | TargetFilter::Owner
         | TargetFilter::GrantingObject { .. }
         | TargetFilter::AllPlayers => CharacteristicKinds::EMPTY,
@@ -1004,6 +1007,7 @@ pub(crate) fn entered_object_perturbs_affected_filter(
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::DefendingPlayer
+        | TargetFilter::AttackedPlayerOrPlaneswalker
         | TargetFilter::HasChosenName
         | TargetFilter::ChosenDamageSource { .. }
         | TargetFilter::Named { .. }
@@ -2215,6 +2219,7 @@ pub(crate) fn filter_contains(filter: &TargetFilter, leaf: &dyn Fn(&TargetFilter
         | TargetFilter::PostReplacementDamageTarget
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::DefendingPlayer
+        | TargetFilter::AttackedPlayerOrPlaneswalker
         | TargetFilter::HasChosenName
         | TargetFilter::Named { .. }
         | TargetFilter::Owner
@@ -2591,6 +2596,7 @@ fn filter_grammar_any(
         | TargetFilter::PostReplacementDamageTarget
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::DefendingPlayer
+        | TargetFilter::AttackedPlayerOrPlaneswalker
         | TargetFilter::HasChosenName
         | TargetFilter::Named { .. }
         | TargetFilter::Owner
@@ -3128,6 +3134,7 @@ fn filter_contains_input(
         | TargetFilter::PostReplacementDamageTarget
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::DefendingPlayer
+        | TargetFilter::AttackedPlayerOrPlaneswalker
         | TargetFilter::HasChosenName
         | TargetFilter::Named { .. }
         | TargetFilter::Owner
@@ -4604,6 +4611,7 @@ fn absent_search_predicate_truth(filter: &TargetFilter) -> Option<bool> {
         | TargetFilter::PostReplacementDamageTarget
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::DefendingPlayer
+        | TargetFilter::AttackedPlayerOrPlaneswalker
         | TargetFilter::HasChosenName
         | TargetFilter::ChosenDamageSource { .. }
         | TargetFilter::Named { .. }
@@ -4835,6 +4843,7 @@ fn rewrite_filter_props(
         | TargetFilter::PostReplacementDamageTarget
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::DefendingPlayer
+        | TargetFilter::AttackedPlayerOrPlaneswalker
         | TargetFilter::HasChosenName
         | TargetFilter::Named { .. }
         | TargetFilter::Owner
@@ -8311,7 +8320,8 @@ fn filter_inner_for_object(
         | TargetFilter::TriggeringSourceController
         | TargetFilter::EventTargetController
         | TargetFilter::TriggeringPlayer
-        | TargetFilter::DefendingPlayer => false,
+        | TargetFilter::DefendingPlayer
+        | TargetFilter::AttackedPlayerOrPlaneswalker => false,
         // CR 608.2k: `TriggeringSource` IS object-valued (unlike its player-axis
         // siblings above — types/ability.rs documents it as "the source object
         // of the triggering event"), but it is still not a population predicate,
@@ -8791,6 +8801,7 @@ fn zone_change_filter_inner(
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::DefendingPlayer
+        | TargetFilter::AttackedPlayerOrPlaneswalker
         | TargetFilter::StackAbility { .. }
         | TargetFilter::StackSpell
         // CR 201.5a: record matching does not bind the granter, so it fails closed.
@@ -9129,6 +9140,7 @@ pub fn spell_record_matches_filter(
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::DefendingPlayer
+        | TargetFilter::AttackedPlayerOrPlaneswalker
         | TargetFilter::HasChosenName
         | TargetFilter::ChosenDamageSource { .. }
         // CR 201.5a: record matching does not bind the granter, so it fails closed.
@@ -9453,6 +9465,7 @@ fn spell_object_matches_filter_inner(
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::DefendingPlayer
+        | TargetFilter::AttackedPlayerOrPlaneswalker
         | TargetFilter::HasChosenName
         | TargetFilter::ChosenDamageSource { .. }
         | TargetFilter::Named { .. }
@@ -13049,6 +13062,7 @@ pub(crate) fn single_target_count(filter: &TargetFilter) -> Option<SingleTargetC
         | TargetFilter::PostReplacementDamageTarget
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::DefendingPlayer
+        | TargetFilter::AttackedPlayerOrPlaneswalker
         | TargetFilter::HasChosenName
         | TargetFilter::ChosenDamageSource { .. }
         | TargetFilter::Named { .. }
@@ -23377,6 +23391,8 @@ mod tests {
                 attacking_alone: true,
                 blocking_alone: false,
                 defending_player: Some(PlayerId(0)),
+                attack_target: None,
+                attack_target_identity: None,
             },
             ..ZoneChangeRecord::test_minimal(ObjectId(42), Some(Zone::Battlefield), Zone::Graveyard)
         };
@@ -23388,6 +23404,8 @@ mod tests {
                 attacking_alone: false,
                 blocking_alone: true,
                 defending_player: None,
+                attack_target: None,
+                attack_target_identity: None,
             },
             ..ZoneChangeRecord::test_minimal(ObjectId(43), Some(Zone::Battlefield), Zone::Graveyard)
         };
@@ -23459,6 +23477,8 @@ mod tests {
                 attacking_alone: false,
                 blocking_alone: false,
                 defending_player: Some(PlayerId(0)),
+                attack_target: None,
+                attack_target_identity: None,
             },
             ..ZoneChangeRecord::test_minimal(ObjectId(44), Some(Zone::Battlefield), Zone::Graveyard)
         };
@@ -26279,6 +26299,72 @@ mod dandan_axis_collapse_tests {
             assert!(observes(&own), "reach: P0's own pile creature matches");
             assert!(!observes(&theirs), "P1's pile creature is not P0's");
         }
+    }
+}
+
+#[cfg(test)]
+mod attacked_referent_filter_tests {
+    use super::*;
+    use crate::game::zones::create_object;
+    use crate::types::ability::{TargetFilter, TypeFilter, TypedFilter};
+    use crate::types::card_type::CoreType;
+    use crate::types::identifiers::CardId;
+    use crate::types::zones::Zone;
+
+    /// CR 506.3: a resolution-time reference is never a population member: it matches
+    /// no object and no player (a disjunction matches only through its other branch).
+    #[test]
+    fn attacked_referent_matches_nothing() {
+        let mut state = GameState::new_two_player(42);
+        let creature = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Bear".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&creature)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        let context = FilterContext::from_source(&state, creature);
+        let referent = TargetFilter::AttackedPlayerOrPlaneswalker;
+        assert!(!matches_target_filter(
+            &state, creature, &referent, &context
+        ));
+        let either = TargetFilter::Or {
+            filters: vec![
+                referent.clone(),
+                TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Creature],
+                    controller: None,
+                    properties: vec![],
+                }),
+            ],
+        };
+        assert!(
+            matches_target_filter(&state, creature, &either, &context),
+            "reach guard: the other branch still matches"
+        );
+        assert!(!player_matches_target_filter(
+            &referent,
+            PlayerId(0),
+            Some(PlayerId(0))
+        ));
+        assert!(!player_matches_target_filter(
+            &referent,
+            PlayerId(1),
+            Some(PlayerId(0))
+        ));
+        assert!(!affected_filter_uses_object_population(&referent));
+        assert!(!affected_filter_requires_attachment_relation(&referent));
+        assert!(filter_contains(&referent, &|f| matches!(
+            f,
+            TargetFilter::AttackedPlayerOrPlaneswalker
+        )));
     }
 }
 

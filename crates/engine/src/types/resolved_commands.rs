@@ -529,6 +529,8 @@ pub enum ResolvedCombatMembershipEdit {
     Attack {
         resulting_defending_player: PlayerId,
         resulting_attack_target: AttackTarget,
+        #[serde(default)]
+        resulting_attack_target_identity: Option<ObjectIncarnationRef>,
     },
     /// CR 509.1g + CR 506.3e: the object became a blocking creature for the
     /// recorded attacker, which becomes blocked per CR 509.1h.
@@ -551,6 +553,13 @@ pub enum ResolvedCombatMembershipEdit {
     Remove {
         expected_participation: CombatParticipation,
     },
+    /// CR 506.4 + CR 506.4c + CR 506.4d + CR 506.4e: the object, a planeswalker or
+    /// battle whose characteristics changed, stopped being attacked. Only its
+    /// incoming attacked relations end: the listed attackers (in declaration
+    /// order) stay attacking creatures, attacking nothing, and the object keeps
+    /// any role of its own. The applier requires the same attackers still attack
+    /// this exact object before retiring their edges.
+    RetireAttacked { expected_attacked_by: Vec<ObjectId> },
 }
 
 /// Typed failure while applying one already-resolved combat-membership edit.
@@ -589,6 +598,14 @@ pub enum ResolvedCombatMembershipReplayInvariantError {
         object: ObjectId,
         expected: Box<CombatParticipation>,
         found: Box<CombatParticipation>,
+    },
+    #[error(
+        "combat-membership attacked-relation retirement mismatch for {object:?}: expected attackers {expected:?}, found {found:?}"
+    )]
+    RetiredAttackMismatch {
+        object: ObjectId,
+        expected: Vec<ObjectId>,
+        found: Vec<ObjectId>,
     },
 }
 
@@ -3463,6 +3480,30 @@ impl ResolvedRulesJournal {
                     ));
                 }
                 match &command.edit {
+                    ResolvedCombatMembershipEdit::Attack {
+                        resulting_attack_target,
+                        resulting_attack_target_identity: Some(pin),
+                        ..
+                    } if pin.incarnation == LEGACY_INCARNATION
+                        || match resulting_attack_target {
+                            AttackTarget::Planeswalker(id) | AttackTarget::Battle(id) => {
+                                *id != pin.object_id
+                            }
+                            AttackTarget::Player(_) => true,
+                        } =>
+                    {
+                        return Err(ResolvedRulesJournalError::InvalidSerializedAuthority(
+                            "combat-membership attack has incoherent permanent identity"
+                                .to_string(),
+                        ));
+                    }
+                    ResolvedCombatMembershipEdit::Remove {
+                        expected_participation,
+                    } if !expected_participation.is_coherent(command.object.object_id) => {
+                        return Err(ResolvedRulesJournalError::InvalidSerializedAuthority(
+                            "combat-membership removal has incoherent attack authority".to_string(),
+                        ));
+                    }
                     // CR 509.1a: a creature is chosen to block an attacking
                     // creature, which is never itself.
                     ResolvedCombatMembershipEdit::Block {
@@ -3481,10 +3522,19 @@ impl ResolvedRulesJournal {
                             "combat-membership removal prunes no combat role".to_string(),
                         ));
                     }
+                    // CR 506.4: a retirement that ends no relation never happened.
+                    ResolvedCombatMembershipEdit::RetireAttacked {
+                        expected_attacked_by,
+                    } if expected_attacked_by.is_empty() => {
+                        return Err(ResolvedRulesJournalError::InvalidSerializedAuthority(
+                            "combat-membership retirement ends no attacked relation".to_string(),
+                        ));
+                    }
                     ResolvedCombatMembershipEdit::Attack { .. }
                     | ResolvedCombatMembershipEdit::Block { .. }
                     | ResolvedCombatMembershipEdit::MarkBlocked
-                    | ResolvedCombatMembershipEdit::Remove { .. } => {}
+                    | ResolvedCombatMembershipEdit::Remove { .. }
+                    | ResolvedCombatMembershipEdit::RetireAttacked { .. } => {}
                 }
             }
             ResolvedRulesCommand::ControllerOverride(command) => {

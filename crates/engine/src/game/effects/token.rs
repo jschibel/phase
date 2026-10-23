@@ -3632,6 +3632,7 @@ fn classify_attach_host_authority(filter: &TargetFilter) -> AttachHostAuthority 
         | TargetFilter::PostReplacementDamageTarget
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::DefendingPlayer
+        | TargetFilter::AttackedPlayerOrPlaneswalker
         | TargetFilter::Owner
         | TargetFilter::SpecificPlayer { .. }
         | TargetFilter::AllPlayers => AttachHostAuthority::NoHost,
