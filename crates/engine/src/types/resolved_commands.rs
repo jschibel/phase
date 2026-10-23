@@ -552,6 +552,13 @@ pub enum ResolvedCombatMembershipEdit {
     Remove {
         expected_participation: CombatParticipation,
     },
+    /// CR 506.4 + CR 506.4c + CR 506.4d + CR 506.4e: the object, a planeswalker or
+    /// battle whose characteristics changed, stopped being attacked. Only its
+    /// incoming attacked relations end: the listed attackers (in declaration
+    /// order) stay attacking creatures, attacking nothing, and the object keeps
+    /// any role of its own. The applier requires the same attackers still attack
+    /// this exact object before retiring their edges.
+    RetireAttacked { expected_attacked_by: Vec<ObjectId> },
 }
 
 /// Typed failure while applying one already-resolved combat-membership edit.
@@ -590,6 +597,14 @@ pub enum ResolvedCombatMembershipReplayInvariantError {
         object: ObjectId,
         expected: Box<CombatParticipation>,
         found: Box<CombatParticipation>,
+    },
+    #[error(
+        "combat-membership attacked-relation retirement mismatch for {object:?}: expected attackers {expected:?}, found {found:?}"
+    )]
+    RetiredAttackMismatch {
+        object: ObjectId,
+        expected: Vec<ObjectId>,
+        found: Vec<ObjectId>,
     },
 }
 
@@ -3424,10 +3439,19 @@ impl ResolvedRulesJournal {
                             "combat-membership removal prunes no combat role".to_string(),
                         ));
                     }
+                    // CR 506.4: a retirement that ends no relation never happened.
+                    ResolvedCombatMembershipEdit::RetireAttacked {
+                        expected_attacked_by,
+                    } if expected_attacked_by.is_empty() => {
+                        return Err(ResolvedRulesJournalError::InvalidSerializedAuthority(
+                            "combat-membership retirement ends no attacked relation".to_string(),
+                        ));
+                    }
                     ResolvedCombatMembershipEdit::Attack { .. }
                     | ResolvedCombatMembershipEdit::Block { .. }
                     | ResolvedCombatMembershipEdit::MarkBlocked
-                    | ResolvedCombatMembershipEdit::Remove { .. } => {}
+                    | ResolvedCombatMembershipEdit::Remove { .. }
+                    | ResolvedCombatMembershipEdit::RetireAttacked { .. } => {}
                 }
             }
             ResolvedRulesCommand::ControllerOverride(command) => {

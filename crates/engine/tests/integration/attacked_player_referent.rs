@@ -2169,3 +2169,130 @@ fn observer_player_scope_tail_resumed_after_a_pause_reads_the_trigger_event() {
     assert_eq!(loyalty(&r, karn), 4);
     assert_eq!((life(&r, P0), life(&r, P1), life(&r, P2)), (20, 20, 20));
 }
+
+// ---------------------------------------------------------------------------------------------
+// CR 506.4: a planeswalker that stops being one stops being attacked, for good
+// ---------------------------------------------------------------------------------------------
+
+const SONG_OF_THE_DRYADS: &str =
+    "Enchant permanent\nEnchanted permanent is a colorless Forest land.";
+const DISENCHANT: &str = "Destroy target artifact or enchantment.";
+
+/// Swordjack (3 artifacts) attacks Karn (loyalty 5, controlled by P1) and its trigger
+/// waits on the stack. With Leyline of Anticipation, P0 can answer with Song of the
+/// Dryads on `song_target` and then Disenchant on the Song.
+fn dryads_board() -> (GameRunner, ObjectId, ObjectId, ObjectId, ObjectId, ObjectId) {
+    let mut sc = scenario();
+    let jack = sc
+        .add_creature_from_oracle(P0, "Fathom Fleet Swordjack", 2, 2, SWORDJACK)
+        .id();
+    for i in 0..3 {
+        sc.add_artifact_from_oracle(P0, &format!("Trinket {i}"), "");
+    }
+    let karn = add_karn(&mut sc, 5);
+    let bystander = sc.add_creature(P2, "Bystander", 1, 1).id();
+    sc.add_enchantment_from_oracle(P0, "Leyline of Anticipation", LEYLINE);
+    let song = sc
+        .add_spell_to_hand(P0, "Song of the Dryads", false)
+        .as_enchantment()
+        .with_subtypes(vec!["Aura"])
+        .from_oracle_text_with_keywords(&["Enchant"], SONG_OF_THE_DRYADS)
+        .id();
+    let disenchant = sc
+        .add_spell_to_hand_from_oracle(P0, "Disenchant", true, DISENCHANT)
+        .id();
+    let mut r = sc.build();
+    control_by_p1(&mut r, karn);
+    (r, jack, karn, bystander, song, disenchant)
+}
+
+fn is_planeswalker(r: &GameRunner, id: ObjectId) -> bool {
+    r.state().objects[&id]
+        .card_types
+        .core_types
+        .contains(&CoreType::Planeswalker)
+}
+
+/// CR 506.4 + CR 506.4c: Song of the Dryads makes the attacked Karn a land, so Karn is
+/// removed from combat and stops being attacked; Swordjack stays an attacking creature,
+/// attacking nothing. Disenchant then destroys the Song and Karn is a planeswalker
+/// again, but restoring the type declares no new attack: the waiting trigger deals no
+/// damage to Karn or to anyone else.
+#[test]
+fn swordjack_trigger_deals_nothing_after_its_planeswalker_lost_and_regained_the_type() {
+    let (mut r, jack, karn, _, song, disenchant) = dryads_board();
+    attack(&mut r, &[(jack, AttackTarget::Planeswalker(karn))]);
+    assert_untargeted_triggers(&r, jack, 1);
+
+    resolve_response(&mut r, song, karn);
+    assert_eq!(
+        r.state().objects[&song].attached_to,
+        Some(AttachTarget::Object(karn)),
+        "reach: the Song enchants Karn"
+    );
+    assert!(
+        !is_planeswalker(&r, karn),
+        "Karn is a colorless Forest land"
+    );
+    {
+        let combat = r.state().combat.as_ref().unwrap();
+        assert!(
+            !combat.attacked_permanents.contains_key(&jack),
+            "Karn is no longer attacked"
+        );
+        assert!(
+            combat.attackers.iter().any(|info| info.object_id == jack),
+            "CR 506.4c: Swordjack is still attacking"
+        );
+    }
+
+    resolve_response(&mut r, disenchant, song);
+    assert_eq!(r.state().objects[&song].zone, Zone::Graveyard);
+    assert!(
+        is_planeswalker(&r, karn),
+        "reach: Karn is a planeswalker again"
+    );
+    assert!(!r
+        .state()
+        .combat
+        .as_ref()
+        .unwrap()
+        .attacked_permanents
+        .contains_key(&jack));
+    assert_untargeted_triggers(&r, jack, 1);
+
+    let mut ev = Vec::new();
+    settle(&mut r, &mut ev, true, 0);
+    assert_eq!(
+        deal_damage_resolutions(&ev, jack),
+        1,
+        "the trigger resolved"
+    );
+    assert_eq!(damage_from(&ev, jack), vec![]);
+    assert_eq!(loyalty(&r, karn), 5);
+    assert_eq!((life(&r, P0), life(&r, P1), life(&r, P2)), (20, 20, 20));
+}
+
+/// Positive control for the same response sequence: the Song and the Disenchant go to
+/// a bystander creature, Karn never stops being a planeswalker, and the trigger deals
+/// its 3 damage to Karn.
+#[test]
+fn swordjack_trigger_still_damages_a_planeswalker_that_kept_its_type() {
+    let (mut r, jack, karn, bystander, song, disenchant) = dryads_board();
+    attack(&mut r, &[(jack, AttackTarget::Planeswalker(karn))]);
+    assert_untargeted_triggers(&r, jack, 1);
+    resolve_response(&mut r, song, bystander);
+    assert_eq!(
+        r.state().objects[&song].attached_to,
+        Some(AttachTarget::Object(bystander))
+    );
+    resolve_response(&mut r, disenchant, song);
+    assert_eq!(r.state().objects[&song].zone, Zone::Graveyard);
+    assert!(is_planeswalker(&r, karn));
+
+    let mut ev = Vec::new();
+    settle(&mut r, &mut ev, true, 0);
+    assert_eq!(damage_from(&ev, jack), vec![(TargetRef::Object(karn), 3)]);
+    assert_eq!(loyalty(&r, karn), 2);
+    assert_eq!((life(&r, P0), life(&r, P1), life(&r, P2)), (20, 20, 20));
+}

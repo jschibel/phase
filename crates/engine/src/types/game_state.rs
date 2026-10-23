@@ -25381,9 +25381,10 @@ fn visit_pending_cast_chain<'a>(
     f: &mut SuspendedChainVisitor<'_, 'a>,
 ) -> Result<(), String> {
     f(&pending.ability, SuspendedChainEvent::Announcement)?;
-    // CR 602.2 + CR 603.3: triggers collected while an activation is announced
-    // are placed once it completes (`PendingActivationTriggerCollection::commit_into`),
-    // each with its own trigger event and batch.
+    // CR 601.2 / CR 602.2 + CR 603.3: triggers collected while a cast or activation
+    // is announced are placed once it completes
+    // (`PendingActivationTriggerCollection::commit_into`), each with its own
+    // trigger event and batch.
     if let Some(collection) = pending.activation_trigger_collection.as_deref() {
         for context in collection.pending_contexts() {
             f(
@@ -25918,14 +25919,26 @@ fn validate_restored_attack_authority(
                 node.trigger_source.as_ref(),
                 event,
             );
-            if !live {
-                let row = crate::game::combat::attacked_referent_departure_row(
-                    state,
-                    node.source_id,
-                    node.trigger_source.as_ref(),
-                    event,
-                )
-                .ok_or_else(|| ERROR.to_string())?;
+            // CR 608.2h: a reader with no trigger source (a spell or activated
+            // ability whose own source left) has no exact identity to name a
+            // departure row by, so the runtime reads nothing
+            // (`combat::attack_target_referent`): there is no attack authority to
+            // check, and the save must restore. A triggered reader always names
+            // its row, so a missing row there is missing authority.
+            let row = (!live)
+                .then(|| {
+                    crate::game::combat::attacked_referent_departure_row(
+                        state,
+                        node.source_id,
+                        node.trigger_source.as_ref(),
+                        event,
+                    )
+                })
+                .flatten();
+            if !live && row.is_none() && node.trigger_source.is_some() {
+                return Err(ERROR.to_string());
+            }
+            if let Some(row) = row {
                 let status = row.combat_status;
                 let index = state
                     .zone_changes_this_turn
@@ -52570,7 +52583,9 @@ mod restored_exact_attack_authority_tests {
     /// scoped search, search delivery, player-scope sacrifice, loyalty activation
     /// and bound-event unless roots; rows 20-23 the cost-move completions that hand
     /// back a prompt (`FinalizeCast`, `FinalizeDelvedCast`, `FinalizeSpell`, and a
-    /// counter-removal cost's `FinalizeCast`).
+    /// counter-removal cost's `FinalizeCast`); rows 24-25 the departed stack
+    /// records in the two shapes `record_departed_stack_entry` writes (a spell in
+    /// `departed_stack_spells`, an activation in `departed_activated_abilities`).
     /// Each is checked through both Raw and Trusted restore, wherever the root sits.
     #[test]
     fn payment_and_batch_roots_validate_their_attacked_referent() {
@@ -52640,7 +52655,7 @@ mod restored_exact_attack_authority_tests {
             cast_this_way_enters_mods: Default::default(),
         };
         let mut admitted = Vec::new();
-        for carrier in 0..24 {
+        for carrier in 0..26 {
             let mut state = state.clone();
             state.waiting_for = match carrier {
                 // The rider in the mana ability's own resume root.
@@ -53034,6 +53049,48 @@ mod restored_exact_attack_authority_tests {
                         });
                     state.waiting_for.clone()
                 }
+                // A countered spell, recorded in the shape production records: a
+                // `Spell` entry in `departed_stack_spells`, keyed by incarnation.
+                24 => {
+                    let id = ObjectId(9_001);
+                    let object = state.objects[&attacker].clone();
+                    let record = DepartedStackSpell {
+                        entry: StackEntry {
+                            id,
+                            source_id: id,
+                            controller: P0,
+                            kind: StackEntryKind::Spell {
+                                card_id: object.card_id,
+                                ability: Some(node.clone()),
+                                casting_variant: CastingVariant::Normal,
+                                actual_mana_spent: 0,
+                            },
+                        },
+                        object: Box::new(object),
+                    };
+                    state
+                        .departed_stack_spells
+                        .insert(id, std::iter::once((0, record)).collect());
+                    state.waiting_for.clone()
+                }
+                // A countered activation, recorded in the shape production records:
+                // an `ActivatedAbility` entry in `departed_activated_abilities`.
+                25 => {
+                    let id = ObjectId(9_002);
+                    state.departed_activated_abilities.insert(
+                        id,
+                        StackEntry {
+                            id,
+                            source_id: attacker,
+                            controller: P0,
+                            kind: StackEntryKind::ActivatedAbility {
+                                source_id: attacker,
+                                ability: node.clone(),
+                            },
+                        },
+                    );
+                    state.waiting_for.clone()
+                }
                 _ => unreachable!(),
             };
             for trusted in [false, true] {
@@ -53068,6 +53125,104 @@ mod restored_exact_attack_authority_tests {
         );
     }
 
+    /// CR 608.2h: the departed stack records in the exact shapes
+    /// `record_departed_stack_entry` writes (a `Spell` in `departed_stack_spells`, an
+    /// `ActivatedAbility` in `departed_activated_abilities`), read by a spell or
+    /// activation whose source is the departed attacker and which has no trigger
+    /// source. The runtime finds no departure row for such a reader and reads
+    /// nothing, so the validator has nothing to check: the save restores whether or
+    /// not the departure row carries its attack identity.
+    #[test]
+    fn departed_records_without_trigger_source_restore() {
+        let (mut state, attacker, _) = queued();
+        let entry = state.stack.pop_back().unwrap();
+        state.stack_trigger_firings.clear();
+        state.stack_trigger_event_batches.clear();
+        let StackEntryKind::TriggeredAbility { ability: leaf, .. } = entry.kind else {
+            unreachable!()
+        };
+        crate::game::zones::move_to_zone(&mut state, attacker, Zone::Graveyard, &mut Vec::new());
+        let mut reader = leaf;
+        reader.source_id = attacker;
+        reader.trigger_source = None;
+        assert!(reader.sub_ability.is_none() && reader.else_ability.is_none());
+        assert_eq!(
+            crate::game::combat::resolve_attacked_player_or_planeswalker(&state, attacker, None),
+            None,
+            "the runtime reads nothing for a source-less reader whose source left"
+        );
+        for carrier in 0..2 {
+            let mut state = state.clone();
+            match carrier {
+                0 => {
+                    let id = ObjectId(9_101);
+                    let object = state.objects[&attacker].clone();
+                    let record = DepartedStackSpell {
+                        entry: StackEntry {
+                            id,
+                            source_id: id,
+                            controller: P0,
+                            kind: StackEntryKind::Spell {
+                                card_id: object.card_id,
+                                ability: Some(reader.clone()),
+                                casting_variant: CastingVariant::Normal,
+                                actual_mana_spent: 0,
+                            },
+                        },
+                        object: Box::new(object),
+                    };
+                    state
+                        .departed_stack_spells
+                        .insert(id, std::iter::once((0, record)).collect());
+                }
+                1 => {
+                    let id = ObjectId(9_102);
+                    state.departed_activated_abilities.insert(
+                        id,
+                        StackEntry {
+                            id,
+                            source_id: attacker,
+                            controller: P0,
+                            kind: StackEntryKind::ActivatedAbility {
+                                source_id: attacker,
+                                ability: reader.clone(),
+                            },
+                        },
+                    );
+                }
+                _ => unreachable!(),
+            }
+            for trusted in [false, true] {
+                let current = serialized(&state, trusted);
+                serde_json::from_value::<PersistedGameState>(current.clone()).unwrap_or_else(
+                    |error| {
+                        panic!("departed record {carrier} (trusted: {trusted}) restores: {error}")
+                    },
+                );
+                let mut old = current;
+                let rows = payload(&mut old, trusted)["zone_changes_this_turn"]
+                    .as_array_mut()
+                    .unwrap();
+                let row = rows
+                    .iter_mut()
+                    .find(|row| {
+                        row["object_id"] == serde_json::json!(attacker.0)
+                            && row["from_zone"] == serde_json::json!("Battlefield")
+                    })
+                    .unwrap();
+                row["combat_status"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("attack_target_identity");
+                serde_json::from_value::<PersistedGameState>(old).unwrap_or_else(|error| {
+                    panic!(
+                        "departed record {carrier} (trusted: {trusted}) has no authority to check: {error}"
+                    )
+                });
+            }
+        }
+    }
+
     /// Roots that resume with an event of their own, built on an observer trigger
     /// whose referent is named only by its own attack event: with the ambient event
     /// (the observer's own attack) the referent is the live observer and nothing is
@@ -53075,7 +53230,9 @@ mod restored_exact_attack_authority_tests {
     /// Rows: a staged payment transaction's captured context; a triggered-mana
     /// fixed point's current, accepted-tail and collected-batch triggers; the
     /// prompt resumed after trigger ordering; a transaction's base prompt with no
-    /// context (5) and under its captured context (8); a departed stack record (6);
+    /// context (5) and under its captured context (8); a departed triggered entry, a
+    /// shape production never records (6, hostile payload; the recorded shapes are
+    /// rows 24-25 of `payment_and_batch_roots_validate_their_attacked_referent`);
     /// a trigger collected during an activation's announcement (7); and an optional
     /// sacrifice payment's optional-effect frame (9).
     #[test]
@@ -53193,8 +53350,9 @@ mod restored_exact_attack_authority_tests {
                     state.payment_transaction =
                         Some(Box::new(transaction(harmless.clone(), unless(), None)));
                 }
-                // A departed stack record that a copy can put back on the stack
-                // keeps its own trigger event.
+                // Hostile payload: `record_departed_stack_entry` never records a
+                // triggered ability, but a payload that carries one is still
+                // checked, with the entry's own trigger event.
                 6 => {
                     state
                         .departed_activated_abilities
