@@ -1779,7 +1779,7 @@ pub(crate) fn quantity_expr_recipient_read(expr: &QuantityExpr) -> RecipientRead
 }
 
 /// Classify every reference explicitly so a new variant requires a decision.
-fn quantity_ref_recipient_read(qty: &QuantityRef) -> RecipientRead {
+pub(crate) fn quantity_ref_recipient_read(qty: &QuantityRef) -> RecipientRead {
     match qty {
         QuantityRef::HandSize { player }
         | QuantityRef::LifeTotal { player }
@@ -2097,6 +2097,16 @@ fn quantity_ref_object_scope_read(qty: &QuantityRef) -> ObjectScopeRead {
         | QuantityRef::ConvokedCreatureCount | QuantityRef::TimesCostPaidThisResolution
         | QuantityRef::ColorsInCommandersColorIdentity | QuantityRef::CommanderCastFromCommandZoneCount
         | QuantityRef::VoteCount { .. } => ObjectScopeRead::Unscoped,
+    }
+}
+
+/// The explicit object scope, if any, from the exhaustive reference classifier.
+pub(crate) fn quantity_ref_object_scope(qty: &QuantityRef) -> Option<ObjectScope> {
+    match quantity_ref_object_scope_read(qty) {
+        ObjectScopeRead::ObjectInformation(scope) | ObjectScopeRead::CounterCount(scope) => {
+            Some(scope)
+        }
+        ObjectScopeRead::Unscoped => None,
     }
 }
 
