@@ -951,6 +951,20 @@ impl PendingActivationTriggerCollection {
         self.pending_contexts.extend(contexts);
     }
 
+    /// The triggers collected during the announcement, each with its own trigger
+    /// event, that `commit_into` hands to ordinary placement once the activation
+    /// completes. Read-only, for the restore validator.
+    pub(crate) fn pending_contexts(&self) -> &[PendingTriggerContext] {
+        &self.pending_contexts
+    }
+
+    /// Test fixture: a collection already holding `context`.
+    #[cfg(test)]
+    pub(crate) fn with_pending_context_for_test(mut self, context: PendingTriggerContext) -> Self {
+        self.pending_contexts.push(context);
+        self
+    }
+
     /// Commit collector consequences exactly once and append the retained
     /// contexts to the caller's deferred delivery list.
     ///

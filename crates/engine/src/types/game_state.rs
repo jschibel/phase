@@ -25277,6 +25277,17 @@ enum SuspendedChainEvent<'a> {
 type SuspendedChainVisitor<'v, 'a> =
     dyn FnMut(&'a ResolvedAbility, SuspendedChainEvent<'a>) -> Result<(), String> + 'v;
 
+/// The event context a choose-one-of continuation resumes with, shared by the
+/// `ChooseOneOfBranch` prompt and the `ChooseOneOf` frame. It matches the branch
+/// resolver's context push: even `Some(empty)` replaces the ambient events, and
+/// `None` reads the ambient singular without promoting its plural batch.
+fn choice_continuation_event(context: Option<&ResolvingTriggerContext>) -> SuspendedChainEvent<'_> {
+    context.map_or(
+        SuspendedChainEvent::AmbientEventOnly,
+        SuspendedChainEvent::Context,
+    )
+}
+
 /// CR 605.3a + CR 118.12: every chain a paused mana-ability activation holds — its
 /// own resume root and the cost-move root it parked.
 fn visit_pending_mana_ability_chains<'a>(
@@ -25369,7 +25380,22 @@ fn visit_pending_cast_chain<'a>(
     pending: &'a PendingCast,
     f: &mut SuspendedChainVisitor<'_, 'a>,
 ) -> Result<(), String> {
-    f(&pending.ability, SuspendedChainEvent::Announcement)
+    f(&pending.ability, SuspendedChainEvent::Announcement)?;
+    // CR 602.2 + CR 603.3: triggers collected while an activation is announced
+    // are placed once it completes (`PendingActivationTriggerCollection::commit_into`),
+    // each with its own trigger event and batch.
+    if let Some(collection) = pending.activation_trigger_collection.as_deref() {
+        for context in collection.pending_contexts() {
+            f(
+                &context.pending.ability,
+                SuspendedChainEvent::Captured(
+                    context.pending.trigger_event.as_ref(),
+                    &context.trigger_events,
+                ),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn visit_collect_evidence_resume_chains<'a>(
@@ -25661,13 +25687,7 @@ fn visit_waiting_for_chains<'a>(
             continuation: Some(node),
             trigger_context,
             ..
-        } => f(
-            node,
-            trigger_context.as_ref().map_or(
-                SuspendedChainEvent::AmbientEventOnly,
-                SuspendedChainEvent::Context,
-            ),
-        )?,
+        } => f(node, choice_continuation_event(trigger_context.as_ref()))?,
         // CR 111.1 + CR 608.2c: the token-creation ability resumes once its
         // host is chosen, so its unresolved chain reads the attacked referent.
         WaitingFor::ChooseTokenHost {
@@ -25985,16 +26005,26 @@ fn validate_restored_attack_authority(
             )?;
         }
     }
+    // CR 707.10 + CR 608.2h: a departed stack record can be copied back onto the
+    // stack (`copy_spell`), and the copy keeps the entry's kind: a triggered
+    // ability keeps its own trigger event, a spell or activated ability has none.
+    // The copy takes a fresh stack id, so no event batch follows it.
+    for entry in state
+        .departed_stack_spells
+        .values()
+        .flat_map(|records| records.values().map(|record| &record.entry))
+        .chain(state.departed_activated_abilities.values())
+    {
+        if let Some(node) = entry.ability() {
+            let event = match &entry.kind {
+                StackEntryKind::TriggeredAbility { trigger_event, .. } => trigger_event.as_ref(),
+                _ => None,
+            };
+            check(node, event, &[])?;
+        }
+    }
     let current_event = state.current_trigger_event.as_ref();
     let current_events = state.current_trigger_events.as_slice();
-    let check_choice_continuation =
-        |node: &ResolvedAbility, context: Option<&ResolvingTriggerContext>| match context {
-            // Match the branch resolver's context push: even Some(empty)
-            // replaces ambient events; None reads the ambient singular without
-            // promoting its plural batch.
-            Some(context) => check(node, context.event.as_ref(), &context.events),
-            None => check(node, current_event, &[]),
-        };
     // Chains parked inside payment and batch roots, resumed with the event
     // context their root names.
     let mut suspended = |node: &ResolvedAbility, event: SuspendedChainEvent<'_>| match event {
@@ -26088,8 +26118,23 @@ fn validate_restored_attack_authority(
                 .as_ref()
                 .map_or(SuspendedChainEvent::Ambient, SuspendedChainEvent::Context),
         )?;
-        // The prompt the transaction returns to once it settles.
-        visit_waiting_for_chains(&transaction.base_waiting_for, &mut suspended)?;
+        // The prompt the transaction returns to once it settles. The runtime
+        // reinstalls it and then restores the captured trigger context
+        // (`payment_transaction` -> `restore_trigger_context`), so with a context
+        // its ambient reads become reads of that context.
+        let context = transaction.resolving_trigger_context.as_ref();
+        visit_waiting_for_chains(&transaction.base_waiting_for, &mut |node, event| {
+            let event = match (event, context) {
+                (SuspendedChainEvent::Ambient, Some(context)) => {
+                    SuspendedChainEvent::Context(context)
+                }
+                (SuspendedChainEvent::AmbientEventOnly, Some(context)) => {
+                    SuspendedChainEvent::Captured(context.event.as_ref(), &[])
+                }
+                (event, _) => event,
+            };
+            suspended(node, event)
+        })?;
     }
     for frame in state.resolution_stack.iter() {
         match frame {
@@ -26135,7 +26180,10 @@ fn validate_restored_attack_authority(
             }
             ResolutionFrame::ChooseOneOf(frame) => {
                 if let Some(node) = &frame.continuation {
-                    check_choice_continuation(node, frame.trigger_context.as_ref())?;
+                    suspended(
+                        node,
+                        choice_continuation_event(frame.trigger_context.as_ref()),
+                    )?;
                 }
             }
             ResolutionFrame::BatchDelivery(batch) => {
@@ -52520,8 +52568,9 @@ mod restored_exact_attack_authority_tests {
     /// color choice (both contexts), triggered-mana fixed point (root and color
     /// choice), staged payment transaction, pending cast, deferred life cost,
     /// scoped search, search delivery, player-scope sacrifice, loyalty activation
-    /// and bound-event unless roots; rows 20-21 the cost-move completions (a cast's
-    /// post-payment prompt, an optional sacrifice payment's optional-effect frame).
+    /// and bound-event unless roots; rows 20-23 the cost-move completions that hand
+    /// back a prompt (`FinalizeCast`, `FinalizeDelvedCast`, `FinalizeSpell`, and a
+    /// counter-removal cost's `FinalizeCast`).
     /// Each is checked through both Raw and Trusted restore, wherever the root sits.
     #[test]
     fn payment_and_batch_roots_validate_their_attacked_referent() {
@@ -52577,8 +52626,21 @@ mod restored_exact_attack_authority_tests {
             node.as_ref().clone(),
             ManaCost::default(),
         );
+        let token_host = || WaitingFor::ChooseTokenHost {
+            player: P0,
+            source_id: attacker,
+            legal_targets: vec![],
+            pending_ability: node.clone(),
+        };
+        let pre_payment_checks = || FinalizePrePaymentChecks {
+            early_waiting_for: Some(token_host()),
+            cascade_cast_transformed: false,
+            resolution_success_waiting_for: None,
+            cast_this_way_etb_counter: None,
+            cast_this_way_enters_mods: Default::default(),
+        };
         let mut admitted = Vec::new();
-        for carrier in 0..22 {
+        for carrier in 0..24 {
             let mut state = state.clone();
             state.waiting_for = match carrier {
                 // The rider in the mana ability's own resume root.
@@ -52904,27 +52966,71 @@ mod restored_exact_attack_authority_tests {
                     });
                     state.waiting_for.clone()
                 }
-                // A resolution-time optional sacrifice payment resuming its
-                // optional-effect frame.
+                // A delved cast's cost-move root whose pre-payment checks hand back
+                // a prompt holding the chain.
                 21 => {
+                    state.pending_cost_move_resume = Some(PendingCostMoveResume::Cast {
+                        player: P0,
+                        pending: None,
+                        chosen: vec![],
+                        paused_at_index: 0,
+                        destination: Zone::Graveyard,
+                        completion: PendingCostMoveCompletion::FinalizeDelvedCast {
+                            phyrexian_choices: None,
+                            pre_payment_checks: Some(Box::new(pre_payment_checks())),
+                        },
+                        deferred_cost_events: vec![],
+                        departure_record_indices: vec![],
+                    });
+                    state.waiting_for.clone()
+                }
+                // A sacrifice cost of a spell whose finalization hands back the prompt.
+                22 => {
                     state.pending_cost_move_resume =
                         Some(PendingCostMoveResume::SacrificeForCost {
                             player: P0,
                             pending: None,
                             chosen: vec![],
                             paused_at_index: 0,
-                            completion: PendingSacrificeCostCompletion::ResolutionOptionalPayment {
-                                frame: Box::new(OptionalEffectFrame {
-                                    ability: node.clone(),
-                                    trigger_event: trigger_event.clone(),
-                                    trigger_events: trigger_event.clone().into_iter().collect(),
-                                    trigger_match_count: None,
-                                    return_result_occurrence: None,
-                                }),
-                                selected: vec![],
+                            completion: PendingSacrificeCostCompletion::FinalizeSpell {
+                                phyrexian_choices: None,
+                                pre_payment_checks: Box::new(pre_payment_checks()),
                             },
                             deferred_cost_events: vec![],
                             departure_record_indices: vec![],
+                        });
+                    state.waiting_for.clone()
+                }
+                // A counter-removal cost whose completion hands back the prompt.
+                23 => {
+                    let removal = PendingCounterRemoval {
+                        object_id: attacker,
+                        counter_type: crate::types::counter::CounterType::Generic(
+                            "charge".to_string(),
+                        ),
+                        count: 1,
+                    };
+                    state.pending_cost_move_resume =
+                        Some(PendingCostMoveResume::CounterCostRemovalPayment {
+                            player: P0,
+                            pending: None,
+                            removal: Box::new(PausedCounterCostRemoval {
+                                in_flight: PendingCounterRemovalInFlight {
+                                    removal,
+                                    counter_count_before: 1,
+                                },
+                                remaining: Vec::new(),
+                                replacement_subtree: ReplacementSubtreeBoundary::at(
+                                    &state.resolution_stack,
+                                ),
+                            }),
+                            cost_paid_object: None,
+                            completion: PendingCostMoveCompletion::FinalizeCast {
+                                phyrexian_choices: None,
+                                cascade_cast_transformed: false,
+                                resolution_success_waiting_for: Some(Box::new(token_host())),
+                                prepaid_actual_mana_spent: None,
+                            },
                         });
                     state.waiting_for.clone()
                 }
@@ -52968,11 +53074,15 @@ mod restored_exact_attack_authority_tests {
     /// checked, so a root walked with the wrong context, or not walked, is admitted.
     /// Rows: a staged payment transaction's captured context; a triggered-mana
     /// fixed point's current, accepted-tail and collected-batch triggers; the
-    /// prompt resumed after trigger ordering; a transaction's base prompt.
+    /// prompt resumed after trigger ordering; a transaction's base prompt with no
+    /// context (5) and under its captured context (8); a departed stack record (6);
+    /// a trigger collected during an activation's announcement (7); and an optional
+    /// sacrifice payment's optional-effect frame (9).
     #[test]
     fn observer_roots_validate_with_their_own_event() {
         use crate::types::ability::AbilityCost;
         let (state, attacker, entry) = observer_with_two_bound_events();
+        let departed = entry.clone();
         let StackEntryKind::TriggeredAbility {
             ability: node,
             trigger_event,
@@ -53035,7 +53145,7 @@ mod restored_exact_attack_authority_tests {
             };
         let harmless = Box::new(ResolvedAbility::new(Effect::NoOp, vec![], source_id, P0));
         let mut admitted = Vec::new();
-        for carrier in 0..6 {
+        for carrier in 0..10 {
             let mut state = state.clone();
             match carrier {
                 0 => {
@@ -53082,6 +53192,70 @@ mod restored_exact_attack_authority_tests {
                 5 => {
                     state.payment_transaction =
                         Some(Box::new(transaction(harmless.clone(), unless(), None)));
+                }
+                // A departed stack record that a copy can put back on the stack
+                // keeps its own trigger event.
+                6 => {
+                    state
+                        .departed_activated_abilities
+                        .insert(departed.id, departed.clone());
+                }
+                // A trigger collected while an activation is still announced.
+                7 => {
+                    let mut announced = PendingCast::new(
+                        source_id,
+                        state.objects[&source_id].card_id,
+                        ResolvedAbility::new(Effect::NoOp, vec![], source_id, P0),
+                        ManaCost::default(),
+                    );
+                    announced.activation_trigger_collection = Some(Box::new(
+                        crate::game::triggers::PendingActivationTriggerCollection::for_activated_ability(
+                            source_id, P0,
+                        )
+                        .with_pending_context_for_test(own_trigger()),
+                    ));
+                    state.pending_cast = Some(Box::new(announced));
+                }
+                // A transaction's base prompt read under the captured context.
+                8 => {
+                    state.payment_transaction = Some(Box::new(transaction(
+                        harmless.clone(),
+                        WaitingFor::ChooseTokenHost {
+                            player: P0,
+                            source_id,
+                            legal_targets: vec![],
+                            pending_ability: node.clone(),
+                        },
+                        Some(ResolvingTriggerContext {
+                            event: trigger_event.clone(),
+                            events: trigger_event.clone().into_iter().collect(),
+                            match_count: None,
+                            die_result: None,
+                        }),
+                    )));
+                }
+                // An optional sacrifice payment resuming its optional-effect frame
+                // with that frame's own events.
+                9 => {
+                    state.pending_cost_move_resume =
+                        Some(PendingCostMoveResume::SacrificeForCost {
+                            player: P0,
+                            pending: None,
+                            chosen: vec![],
+                            paused_at_index: 0,
+                            completion: PendingSacrificeCostCompletion::ResolutionOptionalPayment {
+                                frame: Box::new(OptionalEffectFrame {
+                                    ability: node.clone(),
+                                    trigger_event: trigger_event.clone(),
+                                    trigger_events: trigger_event.clone().into_iter().collect(),
+                                    trigger_match_count: None,
+                                    return_result_occurrence: None,
+                                }),
+                                selected: vec![],
+                            },
+                            deferred_cost_events: vec![],
+                            departure_record_indices: vec![],
+                        });
                 }
                 _ => unreachable!(),
             }
