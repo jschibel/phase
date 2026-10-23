@@ -7567,6 +7567,10 @@ pub enum PendingCounterPostAction {
         source_id: ObjectId,
         controller: PlayerId,
         remaining_modifications: Vec<ContinuousModification>,
+        /// CR 608.2h + CR 707.9b: donor incarnation carried across the
+        /// counter pause so resumed dynamic-P/T stamps halve donor values.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        donor: Option<ObjectIncarnationRef>,
     },
     /// CR 303.4f: finish a NON-liminal copy-token entry whose CR 303.4f Aura-host
     /// choice paused it between the body's materialization and the rest of its
@@ -7578,6 +7582,21 @@ pub enum PendingCounterPostAction {
     /// them — reusing it would silently drop a copied planeswalker's CR 306.5b
     /// loyalty and every CR 614.1c "enters with counters" self-replacement.
     ContinueCopyTokenEntryAfterAuraHost {
+        object_id: ObjectId,
+        tail: Box<CopyTokenEntryTail>,
+    },
+    /// CR 614.12a + CR 707.2: finish a NON-liminal copy-token entry whose
+    /// copied as-enters life payment (Minion of the Wastes / Nameless Race
+    /// via Saw in Half) paused it between the body's materialization and its
+    /// CR 733 birth record.
+    ///
+    /// Deliberately NOT `ContinueCopyTokenEntryAfterAuraHost`: that pause
+    /// happens AFTER the birth is journaled and resumes straight at the aura
+    /// attach, while this pause happens BEFORE it — the resume must journal
+    /// the birth with the answered amount (`entry_choices`) first, or the
+    /// record would permanently miss the payment. Reusing the aura variant
+    /// would either double-record or record without the answer.
+    ContinueNonLiminalCopyTokenAfterEntryPayment {
         object_id: ObjectId,
         tail: Box<CopyTokenEntryTail>,
     },
@@ -8368,6 +8387,13 @@ pub enum DeferredLifeCostResume {
         /// Resolution-stack depth containing the outer pay-amount chain.
         /// The replacement's child work drains above it first.
         resume_at_resolution_depth: usize,
+        /// CR 614.12a: the parked battlefield entry this payment answers, when
+        /// the prompt is a pre-entry as-enters life payment (Phyrexian
+        /// Processor class). `Some` routes the drain to `complete_entry_payment`
+        /// (entry resume, no `last_effect_count` stamp); `None` keeps the
+        /// ordinary resolution path through `finish_pay_amount_choice`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending_entry: Option<Box<PendingReplacement>>,
     },
     /// Resume a resolution/special-action mana-payment root after all selected
     /// Phyrexian life components and their replacement children settle.
@@ -24786,17 +24812,28 @@ declare_game_state! {
     /// CR 725: The initiative designation (like monarch — one player at a time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiative: Option<PlayerId>,
-    /// CR 510.2 + CR 615.7: Transient per-shield combat-damage prevention tally.
-    /// Set to `Some(empty)` by `apply_combat_damage` for the duration of one
-    /// simultaneous combat-damage batch. While `Some`, the `Prevention::All`
-    /// branch of the damage-replacement applier accumulates each prevented
-    /// amount into this map (keyed by the shield's `ReplacementId`) instead of
-    /// stamping `last_effect_count` per source. After the batch, the combat
-    /// resolver reads the aggregate to fire each shield's `runtime_execute`
-    /// rider exactly once (CR 615.13). Always `None` at every `apply()`
-    /// boundary, so it is excluded from serialization and structural equality.
+    /// CR 510.2 + CR 615.5: Transient per-shield combat-damage prevention tally.
+    /// Set to `Some(empty)` by `replace_combat_damage_batch` for one simultaneous
+    /// combat-damage batch. Continuous all-damage and one-shot prevention shields
+    /// accumulate amounts under their `AppliedReplacementKey`; the combat resolver
+    /// fires each aggregate runtime rider once with the total.
+    /// `ShieldKind::PreventionOneShot` (Awe Strike) emits real per-recipient
+    /// source/recipient `DamagePrevented` events separately. `Prevention { All }`
+    /// with `consume_on_apply` (Impulsive Maneuvers' lose branch) uses the
+    /// continuous-All path and emits its aggregate event at the rider boundary.
+    /// Always `None` at every `apply()` boundary, so this execution-local field
+    /// is excluded from serialization and structural equality.
     #[serde(skip)]
     pub combat_prevention_tally: Option<HashMap<AppliedReplacementKey, i32>>,
+    /// CR 510.2 + CR 700.1 + CR 615.8: Successful one-shot applications to a
+    /// damage source's current simultaneous combat-damage instance. A consumed
+    /// replacement stays eligible only for that same source inside this batch.
+    /// Only this ledger is suspended during independent follow-ups, then restored
+    /// before the next portion; the prevention tally remains active.
+    /// Restored to its prior value before returning; excluded from serialization
+    /// and equality like the prevention tally.
+    #[serde(skip)]
+    pub(crate) combat_one_shot_applications: Option<Vec<(AppliedReplacementKey, ObjectId)>>,
 }
 
 /// The map-backed history entries `copy` does not share with `original`, a nested causes map
@@ -31723,6 +31760,7 @@ impl GameState {
             archenemy,
             initiative: None,
             combat_prevention_tally: None,
+            combat_one_shot_applications: None,
             cancelled_casts: Vec::new(),
             pending_activations: Vec::new(),
             commander_declined_zone_return: HashSet::new(),
@@ -34778,6 +34816,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         archenemy: _,
         initiative: _,
         combat_prevention_tally: _,
+        combat_one_shot_applications: _,
         // Post-rebase upstream additions (v0.21.x: #5515 discover + liminal mechanic).
         // Strict-compared by eq_except_growable's GameState PartialEq reuse (fail-safe:
         // a differing value is correctly not a fixed-point repeat); object-growth loops
@@ -36467,6 +36506,8 @@ mod tests {
                         sacrifice_at: None,
                         source_id: ObjectId(42),
                         controller: PlayerId(0),
+                        // Test batch: no donor in scope (no dynamic P/T mods).
+                        donor: None,
                     }),
                 }]),
                 effect_kind: EffectKind::CopyTokenOf,
@@ -48305,6 +48346,7 @@ mod tests {
         };
         state.pending_deferred_life_cost_resume = Some(DeferredLifeCostResume::PayAmount {
             player: PlayerId(0),
+            pending_entry: None,
             total: 3,
             resume_at_resolution_depth: 0,
         });

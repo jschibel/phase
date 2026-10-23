@@ -1485,6 +1485,7 @@ mod tests {
                 entry_ref: victim,
                 enter_tapped: Default::default(),
                 enter_with_counters: Vec::new(),
+                enter_with_choices: None,
                 applied: Default::default(),
             }
         ));
