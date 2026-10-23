@@ -1085,6 +1085,7 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             acc
         }
         Effect::CopySpell { .. } => Axes::CONSERVATIVE,
+        Effect::ModifyAnnouncedX { .. } => Axes::CONSERVATIVE,
         Effect::EpicCopy { .. } => Axes::CONSERVATIVE,
         Effect::CastCopyOfCard {
             target,
@@ -2675,7 +2676,16 @@ fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
         // not decomposed here because no caller needs a narrower answer.
         QuantityRef::DistinctCardTypes { .. } => Axes::CONSERVATIVE,
         QuantityRef::SharedCardTypes { .. } => Axes::CONSERVATIVE,
-        QuantityRef::DistinctSubtypes { .. } => Axes::CONSERVATIVE,
+        // `restrict` narrows which subtype VALUES tally within the same
+        // population scan (a value filter, not a new state axis — the
+        // population read is unchanged), so the verdict stays `CONSERVATIVE`.
+        // Explicit destructure (not `{ .. }`) so the next field addition is
+        // compiler-visible.
+        QuantityRef::DistinctSubtypes {
+            source: _,
+            exclude: _,
+            restrict: _,
+        } => Axes::CONSERVATIVE,
         QuantityRef::CardsExiledBySource => Axes::NONE,
         QuantityRef::ExiledCardPower { index: _ } => Axes::NONE,
         QuantityRef::ZoneCardCount {
@@ -6718,6 +6728,7 @@ fn replacement_definition_axes(
         origin: _,
         counter_replacement_subject: _,
         granting_object: _,
+        entry_payment_max,
         // The objects these create are scanned once they are live.
         additional_token_spec: _,
         ensure_token_specs: _,
@@ -6758,6 +6769,10 @@ fn replacement_definition_axes(
     }
     if let Some(controller) = enters_under {
         acc = acc.or(scan_controller_ref(controller));
+    }
+    // CR 614.12a: the entry-payment cap reads live game state (Nameless Race).
+    if let Some(max) = entry_payment_max {
+        acc = acc.or(scan_quantity_expr(max, mode));
     }
     match damage_modification {
         Some(DamageModification::Plus { value })
@@ -7075,6 +7090,7 @@ fn effect_target_ctx(e: &Effect, mode: ScanMode) -> FilterReadContext {
         | Effect::ExileTopCardContest { .. }
         | Effect::SwitchPT { .. }
         | Effect::CopySpell { .. }
+        | Effect::ModifyAnnouncedX { .. }
         | Effect::EpicCopy { .. }
         | Effect::CastCopyOfCard { .. }
         | Effect::CopyTokenOf { .. }
@@ -7497,6 +7513,7 @@ fn effect_census_role(e: &Effect) -> CensusRole {
         | Effect::ExileTopCardContest { .. }
         | Effect::SwitchPT { .. }
         | Effect::CopySpell { .. }
+        | Effect::ModifyAnnouncedX { .. }
         | Effect::EpicCopy { .. }
         | Effect::CopyTokenOf { .. }
         | Effect::Myriad

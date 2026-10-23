@@ -1296,6 +1296,15 @@ pub struct AbilityActivationRecord {
     pub ability_tag: Option<crate::types::ability::AbilityTag>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_loyalty_ability: bool,
+    /// CR 602.1a + CR 602.2b: the activation cost of the announcement-bound
+    /// definition, captured with the record's other facts before payment. The
+    /// placement publishes it on the activation's event; the record is its
+    /// transport, never a read site. `Unknown` for a record predating the field.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::types::events::BoundActivationCost::is_unknown"
+    )]
+    pub activation_cost: crate::types::events::BoundActivationCost,
     /// CR 115.1: the committed targets of the whole chain, empty for an
     /// untargeted ability.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -7519,6 +7528,10 @@ pub enum PendingCounterPostAction {
         source_id: ObjectId,
         controller: PlayerId,
         remaining_modifications: Vec<ContinuousModification>,
+        /// CR 608.2h + CR 707.9b: donor incarnation carried across the
+        /// counter pause so resumed dynamic-P/T stamps halve donor values.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        donor: Option<ObjectIncarnationRef>,
     },
     /// CR 303.4f: finish a NON-liminal copy-token entry whose CR 303.4f Aura-host
     /// choice paused it between the body's materialization and the rest of its
@@ -7530,6 +7543,21 @@ pub enum PendingCounterPostAction {
     /// them — reusing it would silently drop a copied planeswalker's CR 306.5b
     /// loyalty and every CR 614.1c "enters with counters" self-replacement.
     ContinueCopyTokenEntryAfterAuraHost {
+        object_id: ObjectId,
+        tail: Box<CopyTokenEntryTail>,
+    },
+    /// CR 614.12a + CR 707.2: finish a NON-liminal copy-token entry whose
+    /// copied as-enters life payment (Minion of the Wastes / Nameless Race
+    /// via Saw in Half) paused it between the body's materialization and its
+    /// CR 733 birth record.
+    ///
+    /// Deliberately NOT `ContinueCopyTokenEntryAfterAuraHost`: that pause
+    /// happens AFTER the birth is journaled and resumes straight at the aura
+    /// attach, while this pause happens BEFORE it — the resume must journal
+    /// the birth with the answered amount (`entry_choices`) first, or the
+    /// record would permanently miss the payment. Reusing the aura variant
+    /// would either double-record or record without the answer.
+    ContinueNonLiminalCopyTokenAfterEntryPayment {
         object_id: ObjectId,
         tail: Box<CopyTokenEntryTail>,
     },
@@ -8320,6 +8348,13 @@ pub enum DeferredLifeCostResume {
         /// Resolution-stack depth containing the outer pay-amount chain.
         /// The replacement's child work drains above it first.
         resume_at_resolution_depth: usize,
+        /// CR 614.12a: the parked battlefield entry this payment answers, when
+        /// the prompt is a pre-entry as-enters life payment (Phyrexian
+        /// Processor class). `Some` routes the drain to `complete_entry_payment`
+        /// (entry resume, no `last_effect_count` stamp); `None` keeps the
+        /// ordinary resolution path through `finish_pay_amount_choice`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending_entry: Option<Box<PendingReplacement>>,
     },
     /// Resume a resolution/special-action mana-payment root after all selected
     /// Phyrexian life components and their replacement children settle.
@@ -24119,8 +24154,10 @@ declare_game_state! {
     /// are surfaced by `filter_state_for_viewer` ONLY to `private_look_player`,
     /// so the looking player can see the card while deciding a subsequent
     /// "you may reveal that card" optional, without leaking it to opponents.
-    /// Cleared at depth 0 of `resolve_ability_chain` and at action boundaries
-    /// once no optional-effect decision that depends on the peek is pending.
+    /// Cleared at depth 0 of `resolve_ability_chain` and at every action
+    /// boundary except while the pending prompt is an `OptionalEffectChoice` or
+    /// `RevealChoice`, or a parked ability continuation still holds a
+    /// `DigSource::PriorLook` reader (`engine::private_look_outlives_action_boundary`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub private_look_ids: Vec<ObjectId>,
     /// CR 701.20e: The player to whom `private_look_ids` is visible (the looker).
@@ -24528,11 +24565,28 @@ declare_game_state! {
     /// existed on the stack (`stack::record_departed_stack_spell`) — keyed by storage id,
     /// then the incarnation the spell had on the stack. Consulted by
     /// `targeting::triggering_spell` / `copy_spell::copy_source_entry` once a
-    /// spell-cast trigger's spell has left the stack. Cleared with
-    /// `lki_by_incarnation` at step transitions.
+    /// spell-cast trigger's spell has left the stack. Cleared at step transitions by
+    /// `clear_departed_stack_records`, with its activated-ability sibling
+    /// `departed_activated_abilities`.
     #[serde(default, skip_serializing_if = "im::HashMap::is_empty")]
     #[serde(serialize_with = "crate::types::deterministic_serde::im_hash_map_of_im_hash_map")]
     pub departed_stack_spells: im::HashMap<ObjectId, im::HashMap<u64, DepartedStackSpell>>,
+
+    /// CR 113.1c + CR 113.7a + CR 608.2h: an activated ability's stack entry as it last
+    /// existed on the stack (`stack::record_departed_stack_entry`), keyed by the entry's
+    /// own id. An ability on the stack is an object this engine keeps only as its
+    /// `StackEntry` (no `GameObject`), and its id is minted for it alone and never reused,
+    /// so there is no incarnation layer. Consulted by `targeting::triggering_activation`
+    /// once an activation trigger's "that ability" has left the stack without resolving
+    /// (countered, CR 701.6a). Shares every lifecycle site of `departed_stack_spells`:
+    /// `clear_departed_stack_records` (step clear),
+    /// `retain_trigger_referenced_departed_stack_records` (loop prune), and the viewer
+    /// projection (`visibility::redact_hidden_identity_side_tables` drops a record whose
+    /// source is hidden from the viewer; the live-stack redaction loops redact every
+    /// record it keeps).
+    #[serde(default, skip_serializing_if = "im::HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::im_hash_map")]
+    pub departed_activated_abilities: im::HashMap<ObjectId, StackEntry>,
 
     /// CR 607.2a + CR 607.2b + CR 113.7a: Last-known "cards exiled with [source]" linkage,
     /// captured when a source with `TrackedBySource` exile links leaves the
@@ -24713,17 +24767,28 @@ declare_game_state! {
     /// CR 725: The initiative designation (like monarch — one player at a time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiative: Option<PlayerId>,
-    /// CR 510.2 + CR 615.7: Transient per-shield combat-damage prevention tally.
-    /// Set to `Some(empty)` by `apply_combat_damage` for the duration of one
-    /// simultaneous combat-damage batch. While `Some`, the `Prevention::All`
-    /// branch of the damage-replacement applier accumulates each prevented
-    /// amount into this map (keyed by the shield's `ReplacementId`) instead of
-    /// stamping `last_effect_count` per source. After the batch, the combat
-    /// resolver reads the aggregate to fire each shield's `runtime_execute`
-    /// rider exactly once (CR 615.13). Always `None` at every `apply()`
-    /// boundary, so it is excluded from serialization and structural equality.
+    /// CR 510.2 + CR 615.5: Transient per-shield combat-damage prevention tally.
+    /// Set to `Some(empty)` by `replace_combat_damage_batch` for one simultaneous
+    /// combat-damage batch. Continuous all-damage and one-shot prevention shields
+    /// accumulate amounts under their `AppliedReplacementKey`; the combat resolver
+    /// fires each aggregate runtime rider once with the total.
+    /// `ShieldKind::PreventionOneShot` (Awe Strike) emits real per-recipient
+    /// source/recipient `DamagePrevented` events separately. `Prevention { All }`
+    /// with `consume_on_apply` (Impulsive Maneuvers' lose branch) uses the
+    /// continuous-All path and emits its aggregate event at the rider boundary.
+    /// Always `None` at every `apply()` boundary, so this execution-local field
+    /// is excluded from serialization and structural equality.
     #[serde(skip)]
     pub combat_prevention_tally: Option<HashMap<AppliedReplacementKey, i32>>,
+    /// CR 510.2 + CR 700.1 + CR 615.8: Successful one-shot applications to a
+    /// damage source's current simultaneous combat-damage instance. A consumed
+    /// replacement stays eligible only for that same source inside this batch.
+    /// Only this ledger is suspended during independent follow-ups, then restored
+    /// before the next portion; the prevention tally remains active.
+    /// Restored to its prior value before returning; excluded from serialization
+    /// and equality like the prevention tally.
+    #[serde(skip)]
+    pub(crate) combat_one_shot_applications: Option<Vec<(AppliedReplacementKey, ObjectId)>>,
 }
 
 /// The map-backed history entries `copy` does not share with `original`, a nested causes map
@@ -30632,6 +30697,7 @@ impl GameState {
             lki_by_incarnation: im::HashMap::new(),
             lki_copiable_values_by_incarnation: im::HashMap::new(),
             departed_stack_spells: im::HashMap::new(),
+            departed_activated_abilities: im::HashMap::new(),
             linked_exile_lki: HashMap::new(),
             cost_payment_failed_flag: false,
             pending_taps_for_mana_overrides: std::collections::HashMap::new(),
@@ -30657,6 +30723,7 @@ impl GameState {
             archenemy,
             initiative: None,
             combat_prevention_tally: None,
+            combat_one_shot_applications: None,
             cancelled_casts: Vec::new(),
             pending_activations: Vec::new(),
             commander_declined_zone_return: HashSet::new(),
@@ -31867,9 +31934,10 @@ impl GameState {
                 occurrence.turn_journal_index = 0;
             }
         }
-        // CR 104.4b + CR 608.2h: BEFORE the stack-carrier loop below clears each
+        // CR 104.4b + CR 608.2h: prune both departed stack tables (spells and
+        // activated abilities) BEFORE the stack-carrier loop below clears each
         // trigger's pin (`clear_trigger_identity_recursive`), which the prune reads.
-        clone.retain_trigger_referenced_departed_spells();
+        clone.retain_trigger_referenced_departed_stack_records();
 
         // CR 104.4b + CR 608.2h: which `lki_copiable_values_by_incarnation`
         // entries an ability can still read as its own copy source. Read BEFORE
@@ -32074,12 +32142,27 @@ impl GameState {
     /// CR 104.4b + CR 608.2h: keeps only the `departed_stack_spells` records a spell-cast
     /// trigger on the stack or resolving can still name, plus every departure whose spell a
     /// `BecomesTarget` targeter still names (`targeting::event_referent_controller` reads
-    /// that record); the rest are history, not position.
+    /// that record), and the `departed_activated_abilities` records an activation trigger on
+    /// the stack or resolving still names (CR 602.2a: the event names the activation's own
+    /// stack object; `targeting::triggering_activation` reads it); the rest are history, not
+    /// position.
     /// Mirrors `targeting::triggering_spell`: a pinned trigger keeps its pinned record, an
     /// unpinned one the highest key.
-    pub(crate) fn retain_trigger_referenced_departed_spells(&mut self) {
+    pub(crate) fn retain_trigger_referenced_departed_stack_records(&mut self) {
         let mut retained: HashSet<ObjectIncarnationRef> = HashSet::new();
+        let mut retained_activations: HashSet<ObjectId> = HashSet::new();
         for entry in self.stack.iter().chain(self.resolving_stack_entry.iter()) {
+            if let StackEntryKind::TriggeredAbility {
+                trigger_event:
+                    Some(GameEvent::AbilityActivated {
+                        stack_entry: Some(activation),
+                        ..
+                    }),
+                ..
+            } = &entry.kind
+            {
+                retained_activations.insert(*activation);
+            }
             if let StackEntryKind::TriggeredAbility {
                 ability,
                 trigger_event: Some(GameEvent::SpellCast { object_id, .. }),
@@ -32102,6 +32185,8 @@ impl GameState {
                 }
             }
         }
+        self.departed_activated_abilities
+            .retain(|activation, _| retained_activations.contains(activation));
         let targeted_announcements = self.targeter_spell_announcements();
         self.departed_stack_spells = std::mem::take(&mut self.departed_stack_spells)
             .into_iter()
@@ -32118,6 +32203,15 @@ impl GameState {
                 (!history.is_empty()).then_some((object_id, history))
             })
             .collect();
+    }
+
+    /// CR 400.7 + CR 500.2: departed stack records are step-scoped last-known
+    /// information. A step ends only when the stack is empty and all players pass, so
+    /// every trigger that can name a departed spell or activated ability has resolved
+    /// by then. The single clear of both tables.
+    pub(crate) fn clear_departed_stack_records(&mut self) {
+        self.departed_stack_spells.clear();
+        self.departed_activated_abilities.clear();
     }
 
     /// CR 104.4b: renumbers spell announcements (CR 601.2a) and incarnations (CR 400.7) by
@@ -33660,6 +33754,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         lki_by_incarnation: _,
         lki_copiable_values_by_incarnation: _,
         departed_stack_spells: _,
+        departed_activated_abilities: _,
         linked_exile_lki: _,
         cost_payment_failed_flag: _,
         pending_taps_for_mana_overrides: _,
@@ -33685,6 +33780,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         archenemy: _,
         initiative: _,
         combat_prevention_tally: _,
+        combat_one_shot_applications: _,
         // Post-rebase upstream additions (v0.21.x: #5515 discover + liminal mechanic).
         // Strict-compared by eq_except_growable's GameState PartialEq reuse (fail-safe:
         // a differing value is correctly not a fixed-point repeat); object-growth loops
@@ -34007,6 +34103,7 @@ impl PartialEq for GameState {
             && self.lki_copiable_values_by_incarnation
                 == other.lki_copiable_values_by_incarnation
             && self.departed_stack_spells == other.departed_stack_spells
+            && self.departed_activated_abilities == other.departed_activated_abilities
             && self.city_blessing == other.city_blessing
             && self.enduring_story == other.enduring_story
             && self.planar_deck == other.planar_deck
@@ -35204,6 +35301,54 @@ mod tests {
     use crate::types::resolved_commands::ResolvedDelayedTriggerCommand;
     use crate::types::triggers::TriggerMode;
 
+    /// CR 602.1a + CR 602.2b: the record's bound activation cost survives
+    /// serialization, and a record predating the field decodes as `Unknown`
+    /// (no binding), never as a cost-less activation.
+    #[test]
+    fn ability_activation_record_activation_cost_round_trips_and_defaults_to_unknown() {
+        use crate::types::events::BoundActivationCost;
+        use crate::types::mana::{ManaCost, ManaCostShard};
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Record Source".to_string(),
+            Zone::Battlefield,
+        );
+        let mut record = AbilityActivationRecord {
+            activator: PlayerId(0),
+            source,
+            source_lki: state.objects[&source].snapshot_public_characteristics(),
+            source_zone: Zone::Battlefield,
+            ability_tag: None,
+            is_loyalty_ability: false,
+            activation_cost: BoundActivationCost::Cost(Box::new(
+                crate::types::ability::AbilityCost::Mana {
+                    cost: ManaCost::Cost {
+                        shards: vec![ManaCostShard::X],
+                        generic: 0,
+                    },
+                },
+            )),
+            targets: Vec::new(),
+        };
+        let json = serde_json::to_value(&record).unwrap();
+        assert!(json.get("activation_cost").is_some(), "{json}");
+        let back: AbilityActivationRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back, record);
+
+        record.activation_cost = BoundActivationCost::Unknown;
+        // The record without the key is exactly a record predating the field.
+        let legacy = serde_json::to_value(&record).unwrap();
+        assert!(
+            legacy.get("activation_cost").is_none(),
+            "an unknown cost is omitted: {legacy}"
+        );
+        let decoded: AbilityActivationRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.activation_cost, BoundActivationCost::Unknown);
+    }
+
     fn historical_exert_schema_leaf() -> serde_json::Value {
         serde_json::from_str(include_str!(
             "../../tests/fixtures/legacy_attack_exert_permission.json"
@@ -35325,6 +35470,8 @@ mod tests {
                         sacrifice_at: None,
                         source_id: ObjectId(42),
                         controller: PlayerId(0),
+                        // Test batch: no donor in scope (no dynamic P/T mods).
+                        donor: None,
                     }),
                 }]),
                 effect_kind: EffectKind::CopyTokenOf,
@@ -43921,6 +44068,139 @@ mod tests {
         );
     }
 
+    /// A `departed_activated_abilities` record: an `{X}` activation of source 30
+    /// with the given entry id and announced X.
+    fn departed_activation(id: u64, x: u32) -> StackEntry {
+        use crate::types::ability::Effect;
+
+        let mut ability = ResolvedAbility::new(Effect::NoOp, vec![], ObjectId(30), PlayerId(0));
+        ability.chosen_x = Some(x);
+        StackEntry {
+            id: ObjectId(id),
+            source_id: ObjectId(30),
+            controller: PlayerId(0),
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: ObjectId(30),
+                ability: Box::new(ability),
+            },
+        }
+    }
+
+    /// CR 104.4b + CR 602.2a + CR 608.2h: a `departed_activated_abilities`
+    /// record no activation trigger on the stack names is history, not position —
+    /// pruned like a departed spell. The record the waiting trigger's event names
+    /// remains, and a change to it remains loop-meaningful.
+    #[test]
+    fn normalize_for_loop_keeps_only_the_departed_activation_a_trigger_names() {
+        use crate::types::ability::Effect;
+        use crate::types::events::{
+            ActivatedAbilityKind, ActivationTriggerState, BoundActivationCost,
+        };
+
+        let mut state = GameState::new_two_player(7);
+        state.stack.push_back(StackEntry {
+            id: ObjectId(40),
+            source_id: ObjectId(31),
+            controller: PlayerId(0),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id: ObjectId(31),
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::NoOp,
+                    vec![],
+                    ObjectId(31),
+                    PlayerId(0),
+                )),
+                condition: None,
+                trigger_event: Some(GameEvent::AbilityActivated {
+                    player_id: PlayerId(0),
+                    source_id: ObjectId(30),
+                    kind: ActivatedAbilityKind::Normal,
+                    departed_source_lki: None,
+                    trigger_state: ActivationTriggerState::Pending,
+                    stack_entry: Some(ObjectId(41)),
+                    activation_cost: BoundActivationCost::Unknown,
+                }),
+                description: None,
+                source_name: String::new(),
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            },
+        });
+        state
+            .departed_activated_abilities
+            .insert(ObjectId(41), departed_activation(41, 2));
+
+        // An unreachable record 42 must not block loop confirmation, and only
+        // the named record 41 survives normalization.
+        let mut b = state.clone();
+        b.departed_activated_abilities
+            .insert(ObjectId(42), departed_activation(42, 1));
+        assert_ne!(
+            state, b,
+            "fixture differs by an unreachable departed activation"
+        );
+        let normalized = state.normalize_for_loop();
+        assert!(
+            loop_states_equal(&normalized, &b.normalize_for_loop()),
+            "an unreachable departed activation must not block loop recurrence"
+        );
+        assert_eq!(
+            normalized
+                .departed_activated_abilities
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![ObjectId(41)],
+            "only the departed activation the trigger names remains"
+        );
+
+        // A change to the named record remains meaningful.
+        let mut changed = state.clone();
+        changed
+            .departed_activated_abilities
+            .insert(ObjectId(41), departed_activation(41, 3));
+        assert!(
+            !loop_states_equal(&normalized, &changed.normalize_for_loop()),
+            "a change to the named departed activation remains loop-meaningful"
+        );
+    }
+
+    /// CR 608.2h: a `GameState` holding a `departed_activated_abilities`
+    /// record round-trips through serde, and a payload without the key
+    /// deserializes to an empty map.
+    #[test]
+    fn departed_activated_abilities_round_trip_and_absent_key_is_empty() {
+        let mut state = GameState::new_two_player(7);
+        state
+            .departed_activated_abilities
+            .insert(ObjectId(41), departed_activation(41, 2));
+
+        let json = serde_json::to_value(&state).expect("state must serialize");
+        assert!(
+            json.get("departed_activated_abilities").is_some(),
+            "a populated map must serialize its key"
+        );
+        let restored: GameState = serde_json::from_value(json).expect("state must round-trip");
+        assert_eq!(
+            restored.departed_activated_abilities, state.departed_activated_abilities,
+            "the record must survive the round trip"
+        );
+
+        let empty_json =
+            serde_json::to_value(GameState::new_two_player(7)).expect("state must serialize");
+        assert!(
+            empty_json.get("departed_activated_abilities").is_none(),
+            "an empty map must be omitted (skip_serializing_if)"
+        );
+        let restored_empty: GameState =
+            serde_json::from_value(empty_json).expect("payload without the key must deserialize");
+        assert!(
+            restored_empty.departed_activated_abilities.is_empty(),
+            "a payload without the key must yield an empty map"
+        );
+    }
+
     /// The Devour snapshot is rules-bearing while a prompt is live, but remains
     /// intentionally outside the state-equality key just as it was before the
     /// ChangeZone frame migration. Replacing `game_state_eq` with derived stack
@@ -47030,6 +47310,7 @@ mod tests {
         };
         state.pending_deferred_life_cost_resume = Some(DeferredLifeCostResume::PayAmount {
             player: PlayerId(0),
+            pending_entry: None,
             total: 3,
             resume_at_resolution_depth: 0,
         });
