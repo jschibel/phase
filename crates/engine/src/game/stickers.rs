@@ -218,6 +218,7 @@ fn remove_name_sticker_words(words: &mut Vec<String>, text: &str, position: u8) 
 fn revoke_ability_sticker(obj: &mut GameObject, text: &str) {
     let parsed = parse_sticker_ability_face(text);
     for keyword in &parsed.keywords {
+        // allow-raw-authority: structural edit of this object's own keyword list (removing the instance the sticker added); the helpers only answer has/has-not.
         if let Some(index) = obj.keywords.iter().rposition(|k| k == keyword) {
             obj.keywords.remove(index);
         }
