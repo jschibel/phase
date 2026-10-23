@@ -8,14 +8,14 @@ use engine::game::dungeon::DungeonProgress;
 use engine::game::game_object::{BackFaceData, GameObject, ProtectionStartSnapshot};
 use engine::game::printed_cards::intrinsic_copiable_values;
 use engine::types::ability::{
-    ControllerRef, CopyTargetPurpose, Effect, KeywordAction, ReplacementCondition, ResolvedAbility,
-    ThisWayCause,
+    AbilityCost, ControllerRef, CopyTargetPurpose, Effect, KeywordAction, ReplacementCondition,
+    ResolvedAbility, ThisWayCause,
 };
 use engine::types::attribution::ObjectAttribution;
 use engine::types::card_type::{CardType, CoreType};
 use engine::types::counter::CounterType;
 use engine::types::definitions::Definitions;
-use engine::types::events::{GameEvent, PlayerActionKind};
+use engine::types::events::{BoundActivationCost, GameEvent, PlayerActionKind};
 use engine::types::game_state::{
     AbilityActivationRecord, ActivationTargetFact, AutoPassMode, DepartedStackSpell,
     LandPlayRecord, LiminalEntrant, LiminalEntry, LinkedExileLki, LinkedExileSnapshot,
@@ -132,6 +132,7 @@ const NUMERIC_MAP_ROUND_TRIP_OWNERS: &[NumericRoundTripOwner] = &[
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::lki_by_incarnation", map_key_types: &["ObjectId", "u64"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::lki_copiable_values_by_incarnation", map_key_types: &["ObjectId", "u64"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::departed_stack_spells", map_key_types: &["ObjectId", "u64"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
+    NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::departed_activated_abilities", map_key_types: &["ObjectId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::linked_exile_lki", map_key_types: &["ObjectId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::ring_level", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::ring_bearer", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
@@ -387,7 +388,12 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         "ObjectMap",
         Classification::Canonical(OBJECT_MAP),
     );
-    for field in ["attribution", "lki_cache", "tracked_object_sets"] {
+    for field in [
+        "attribution",
+        "lki_cache",
+        "tracked_object_sets",
+        "departed_activated_abilities",
+    ] {
         add_spec(
             &mut specs,
             game_state,
@@ -1924,6 +1930,7 @@ fn build_all_direct_numeric_maps_state() -> GameState {
                 source_zone: engine::types::zones::Zone::Battlefield,
                 ability_tag: None,
                 is_loyalty_ability: false,
+                activation_cost: BoundActivationCost::Cost(Box::new(AbilityCost::Tap)),
                 targets: vec![ActivationTargetFact::Object {
                     id: ObjectId(2),
                     lki: Box::new(second_lki.clone()),
@@ -1939,6 +1946,9 @@ fn build_all_direct_numeric_maps_state() -> GameState {
                 source_zone: engine::types::zones::Zone::Battlefield,
                 ability_tag: None,
                 is_loyalty_ability: true,
+                activation_cost: BoundActivationCost::Cost(Box::new(AbilityCost::Loyalty {
+                    amount: 1,
+                })),
                 targets: vec![ActivationTargetFact::Player(PlayerId(0))],
             }]),
         ),
@@ -2006,6 +2016,24 @@ fn build_all_direct_numeric_maps_state() -> GameState {
                 (2, departed_spell(ObjectId(2), PlayerId(1), &first)),
             ]),
         ),
+    ]);
+    let departed_activation = |entry_id: ObjectId, controller: PlayerId| StackEntry {
+        id: entry_id,
+        source_id: entry_id,
+        controller,
+        kind: StackEntryKind::ActivatedAbility {
+            source_id: entry_id,
+            ability: Box::new(ResolvedAbility::new(
+                Effect::NoOp,
+                Vec::new(),
+                entry_id,
+                controller,
+            )),
+        },
+    };
+    state.departed_activated_abilities = im::HashMap::from_iter([
+        (ObjectId(1), departed_activation(ObjectId(1), PlayerId(0))),
+        (ObjectId(2), departed_activation(ObjectId(2), PlayerId(1))),
     ]);
     state.linked_exile_lki = HashMap::from([
         (
@@ -2125,6 +2153,7 @@ fn every_direct_numeric_key_game_state_map_round_trips_populated() {
         "lki_by_incarnation",
         "lki_copiable_values_by_incarnation",
         "departed_stack_spells",
+        "departed_activated_abilities",
         "linked_exile_lki",
         "ring_level",
         "ring_bearer",
@@ -2133,7 +2162,7 @@ fn every_direct_numeric_key_game_state_map_round_trips_populated() {
     ];
     assert_eq!(
         direct_fields.len(),
-        44,
+        45,
         "private stack_trigger_firings is covered by its unit test"
     );
     for field in direct_fields {

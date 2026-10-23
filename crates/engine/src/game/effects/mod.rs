@@ -175,6 +175,7 @@ pub mod mana;
 pub mod manifest;
 pub mod manifest_dread;
 pub mod mill;
+pub mod modify_announced_x;
 pub mod monstrosity;
 pub mod myriad;
 pub mod note_mana_spent;
@@ -7552,6 +7553,7 @@ fn audit_later_instruction(effect: &Effect) -> LaterInstructionAudit<'_> {
         | Effect::SkipNextTurn { .. }
         | Effect::SkipNextStep { .. }
         | Effect::Double { .. }
+        | Effect::ModifyAnnouncedX { .. }
         | Effect::RuntimeHandled { .. }
         | Effect::Incubate { .. }
         | Effect::Amass { .. }
@@ -8824,6 +8826,7 @@ fn effect_fields_read_filter_population(
         | Effect::Bolster { .. }
         | Effect::Adapt { .. }
         | Effect::Learn
+        | Effect::ModifyAnnouncedX { .. }
         | Effect::Forage
         | Effect::CompletePlayerAction { .. }
         | Effect::Harness
@@ -12381,6 +12384,7 @@ fn resolve_legacy_effect(
         Effect::SkipNextStep { .. } => skip_next_step::resolve(state, ability, events),
         Effect::SkipNextTurn { .. } => skip_next_turn::resolve(state, ability, events),
         Effect::Double { .. } => double::resolve(state, ability, events),
+        Effect::ModifyAnnouncedX { .. } => modify_announced_x::resolve(state, ability, events),
         Effect::RuntimeHandled { .. } => Ok(()), // Handled by dedicated engine path
         Effect::Learn => learn::resolve(state, ability, events),
         Effect::BlightEffect { .. } => blight::resolve(state, ability, events),
@@ -28066,6 +28070,7 @@ mod tests {
                     QuantityRef::DistinctSubtypes {
                         source: objects.clone(),
                         exclude: crate::types::ability::SubtypeExclusion::None,
+                        restrict: None,
                     },
                     QuantityRef::DistinctColorsAmong { source: journal },
                     QuantityRef::ZoneCardCount {
@@ -30156,6 +30161,7 @@ mod tests {
             QuantityRef::DistinctSubtypes {
                 source: source.clone(),
                 exclude: Default::default(),
+                restrict: None,
             },
             QuantityRef::DistinctColorsAmong {
                 source: source.clone(),
@@ -30510,6 +30516,7 @@ mod tests {
                     QuantityRef::DistinctSubtypes {
                         source: population.clone(),
                         exclude: Default::default(),
+                        restrict: None,
                     },
                     QuantityRef::DistinctColorsAmong {
                         source: population.clone(),
