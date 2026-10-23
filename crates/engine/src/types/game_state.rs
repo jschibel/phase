@@ -25233,6 +25233,9 @@ fn migrate_legacy_graveyard_paid_cast_cleanup(value: &mut serde_json::Value) -> 
 enum SuspendedChainEvent<'a> {
     /// Resumes inside the current resolution, reading the ambient trigger event(s).
     Ambient,
+    /// Reads the ambient singular trigger event without promoting its plural batch
+    /// (a choose-one-of continuation that captured no context of its own).
+    AmbientEventOnly,
     /// Carries its own captured trigger event (an unless-payment root).
     Bound(Option<&'a GameEvent>),
     /// CR 601.2 + CR 602.2: still being cast or activated; no trigger event.
@@ -25240,6 +25243,9 @@ enum SuspendedChainEvent<'a> {
     /// Resumes under a captured trigger context it carries (a staged payment
     /// transaction's `resolving_trigger_context`).
     Context(&'a ResolvingTriggerContext),
+    /// Resumes with the trigger event and batch its own frame captured (an
+    /// optional-effect frame parked inside a cost payment).
+    Captured(Option<&'a GameEvent>, &'a [GameEvent]),
 }
 
 type SuspendedChainVisitor<'v, 'a> =
@@ -25303,7 +25309,7 @@ fn visit_mana_cost_cursor_chains<'a>(
     Ok(())
 }
 
-/// CR 106.1a + CR 605.3a: a mana color choice resumes either the mana ability
+/// CR 106.3 + CR 605.3b: a mana color choice resumes either the mana ability
 /// that is producing (whose resume root can hold a rider) or the resolving effect
 /// that adds the mana.
 fn visit_mana_choice_context_chains<'a>(
@@ -25358,16 +25364,97 @@ fn visit_collect_evidence_resume_chains<'a>(
     }
 }
 
+/// CR 601.2h + CR 608.2c: the prompts a cast or activation hands back once its
+/// paused cost payment finishes (`early_waiting_for` / `resolution_success_waiting_for`).
+fn visit_pre_payment_checks_chains<'a>(
+    checks: &'a FinalizePrePaymentChecks,
+    f: &mut SuspendedChainVisitor<'_, 'a>,
+) -> Result<(), String> {
+    for waiting_for in [
+        &checks.early_waiting_for,
+        &checks.resolution_success_waiting_for,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        visit_waiting_for_chains(waiting_for, f)?;
+    }
+    Ok(())
+}
+
+fn visit_cost_move_completion_chains<'a>(
+    completion: &'a PendingCostMoveCompletion,
+    f: &mut SuspendedChainVisitor<'_, 'a>,
+) -> Result<(), String> {
+    match completion {
+        PendingCostMoveCompletion::FinalizeCast {
+            resolution_success_waiting_for,
+            ..
+        } => resolution_success_waiting_for
+            .as_deref()
+            .map_or(Ok(()), |waiting_for| {
+                visit_waiting_for_chains(waiting_for, f)
+            }),
+        PendingCostMoveCompletion::FinalizeDelvedCast {
+            pre_payment_checks, ..
+        } => pre_payment_checks
+            .as_deref()
+            .map_or(Ok(()), |checks| visit_pre_payment_checks_chains(checks, f)),
+        PendingCostMoveCompletion::FinishPending
+        | PendingCostMoveCompletion::CompleteSelectedReturnToHand { .. }
+        | PendingCostMoveCompletion::PublishExileTrackedSet => Ok(()),
+    }
+}
+
+fn visit_sacrifice_cost_completion_chains<'a>(
+    completion: &'a PendingSacrificeCostCompletion,
+    f: &mut SuspendedChainVisitor<'_, 'a>,
+) -> Result<(), String> {
+    match completion {
+        PendingSacrificeCostCompletion::FinalizeSpell {
+            pre_payment_checks, ..
+        } => visit_pre_payment_checks_chains(pre_payment_checks, f),
+        // CR 118.12 + CR 608.2c: a resolution-time optional sacrifice payment
+        // resumes the optional effect it pays for, with that frame's own events.
+        PendingSacrificeCostCompletion::ResolutionOptionalPayment { frame, .. } => f(
+            &frame.ability,
+            SuspendedChainEvent::Captured(frame.trigger_event.as_ref(), &frame.trigger_events),
+        ),
+        PendingSacrificeCostCompletion::SelectedNonSelf
+        | PendingSacrificeCostCompletion::SelfRef => Ok(()),
+    }
+}
+
 fn visit_cost_move_resume_chains<'a>(
     resume: &'a PendingCostMoveResume,
     f: &mut SuspendedChainVisitor<'_, 'a>,
 ) -> Result<(), String> {
     match resume {
-        PendingCostMoveResume::Cast { pending, .. }
-        | PendingCostMoveResume::SacrificeForCost { pending, .. }
-        | PendingCostMoveResume::CounterCostRemovalPayment { pending, .. } => pending
-            .as_deref()
-            .map_or(Ok(()), |pending| visit_pending_cast_chain(pending, f)),
+        PendingCostMoveResume::Cast {
+            pending,
+            completion,
+            ..
+        }
+        | PendingCostMoveResume::CounterCostRemovalPayment {
+            pending,
+            completion,
+            ..
+        } => {
+            if let Some(pending) = pending.as_deref() {
+                visit_pending_cast_chain(pending, f)?;
+            }
+            visit_cost_move_completion_chains(completion, f)
+        }
+        PendingCostMoveResume::SacrificeForCost {
+            pending,
+            completion,
+            ..
+        } => {
+            if let Some(pending) = pending.as_deref() {
+                visit_pending_cast_chain(pending, f)?;
+            }
+            visit_sacrifice_cost_completion_chains(completion, f)
+        }
         PendingCostMoveResume::ActivationMillPayment { pending, .. } => {
             visit_pending_cast_chain(pending, f)
         }
@@ -25503,6 +25590,232 @@ fn visit_library_search_delivery_resume_chains<'a>(
         }
         | LibrarySearchDeliveryResume::Standard { .. } => Ok(()),
     }
+}
+
+/// Every chain a prompt holds in its own fields, reported to `f` with the event context
+/// that prompt resumes with. Shared by the live `state.waiting_for` and every stored prompt
+/// that becomes live again later (a prompt resumed after trigger ordering, a staged payment
+/// transaction's base prompt, a cast's post-payment prompt).
+fn visit_waiting_for_chains<'a>(
+    waiting_for: &'a WaitingFor,
+    f: &mut SuspendedChainVisitor<'_, 'a>,
+) -> Result<(), String> {
+    match waiting_for {
+        WaitingFor::UnlessPayment {
+            pending_effect,
+            trigger_event,
+            ..
+        }
+        | WaitingFor::UnlessPaymentChooseCost {
+            pending_effect,
+            trigger_event,
+            ..
+        } => f(
+            pending_effect,
+            SuspendedChainEvent::Bound(trigger_event.as_ref()),
+        )?,
+        WaitingFor::ExploreChoice { pending_effect, .. }
+        | WaitingFor::ReturnAsAuraTarget { pending_effect, .. }
+        | WaitingFor::WardDiscardChoice { pending_effect, .. }
+        | WaitingFor::WardSacrificeChoice { pending_effect, .. }
+        | WaitingFor::UnlessBounceChoice { pending_effect, .. }
+        | WaitingFor::MoveCountersDistribution { pending_effect, .. }
+        | WaitingFor::RemoveCountersChoice { pending_effect, .. } => {
+            f(pending_effect, SuspendedChainEvent::Ambient)?
+        }
+        WaitingFor::MultiTargetSelection {
+            pending_ability, ..
+        } => f(pending_ability, SuspendedChainEvent::Ambient)?,
+        WaitingFor::RepeatDecision { ability, .. }
+        | WaitingFor::ClashChooseOpponent { ability, .. }
+        | WaitingFor::ChooseFromZoneOpponentChooser { ability, .. } => {
+            f(ability, SuspendedChainEvent::Ambient)?
+        }
+        WaitingFor::ChooseOneOfBranch {
+            continuation: Some(node),
+            trigger_context,
+            ..
+        } => f(
+            node,
+            trigger_context.as_ref().map_or(
+                SuspendedChainEvent::AmbientEventOnly,
+                SuspendedChainEvent::Context,
+            ),
+        )?,
+        // CR 111.1 + CR 608.2c: the token-creation ability resumes once its
+        // host is chosen, so its unresolved chain reads the attacked referent.
+        WaitingFor::ChooseTokenHost {
+            pending_ability, ..
+        } => f(pending_ability, SuspendedChainEvent::Ambient)?,
+        // CR 701.59a + CR 608.2c: a collect-evidence choice resumes the effect,
+        // cast or mana ability that asked for it.
+        WaitingFor::CollectEvidenceChoice { resume, .. } => {
+            visit_collect_evidence_resume_chains(resume, f)?
+        }
+        // CR 605.3a + CR 118.12: a paused mana-ability payment can hold a
+        // resolving rider (`EffectPayCost`) or unless-payment effect.
+        WaitingFor::PayManaAbilityMana {
+            pending_mana_ability,
+            ..
+        }
+        | WaitingFor::ManaAbilityManaPayment {
+            pending_mana_ability,
+            ..
+        } => visit_pending_mana_ability_chains(pending_mana_ability, f)?,
+        WaitingFor::PayAmountChoice {
+            pending_mana_ability,
+            ..
+        } => {
+            if let Some(pending) = pending_mana_ability.as_deref() {
+                visit_pending_mana_ability_chains(pending, f)?;
+            }
+        }
+        WaitingFor::PayCost { resume, .. } => visit_cost_resume_chains(resume, f)?,
+        WaitingFor::ChooseManaColor { context, .. } => {
+            visit_mana_choice_context_chains(context, f)?
+        }
+        WaitingFor::DigRestSplitChoice { completion, .. } => {
+            if let Some(completion) = completion.as_deref() {
+                visit_batch_completion_chains(completion, f)?;
+            }
+        }
+        // CR 601.2 + CR 602.2: a spell or ability still being cast or activated.
+        WaitingFor::ChooseXValue { pending_cast, .. }
+        | WaitingFor::TargetSelection { pending_cast, .. }
+        | WaitingFor::ModeChoice { pending_cast, .. }
+        | WaitingFor::OptionalCostChoice { pending_cast, .. }
+        | WaitingFor::ChooseGiftRecipient { pending_cast, .. }
+        | WaitingFor::SpliceOffer { pending_cast, .. }
+        | WaitingFor::DefilerPayment { pending_cast, .. }
+        | WaitingFor::OrderCostReductions { pending_cast, .. }
+        | WaitingFor::ActivationCostOneOfChoice { pending_cast, .. }
+        | WaitingFor::CostTypeChoice { pending_cast, .. }
+        | WaitingFor::BlightChoice { pending_cast, .. }
+        | WaitingFor::HarmonizeTapChoice { pending_cast, .. }
+        | WaitingFor::ChooseAnnouncingOpponent { pending_cast, .. } => {
+            visit_pending_cast_chain(pending_cast, f)?
+        }
+        // Every other prompt carries no `ResolvedAbility` chain in its own fields.
+        // Chains outside a prompt's own fields (the stack and pending triggers,
+        // resolution-stack frames, state-level payment / search / player-scope /
+        // triggered-mana / transaction roots, and every stored prompt routed back
+        // through this function) are walked by `validate_restored_attack_authority`.
+        // Listed exhaustively so a new carrier on a prompt cannot skip this check
+        // silently.
+        WaitingFor::ChooseOneOfBranch {
+            continuation: None, ..
+        }
+        | WaitingFor::Priority { .. }
+        | WaitingFor::ResolveAllConsent { .. }
+        | WaitingFor::ResolveAllReady { .. }
+        | WaitingFor::MeldPairChoice { .. }
+        | WaitingFor::MeldAttackTargetChoice { .. }
+        | WaitingFor::EntryAttackTargetChoice { .. }
+        | WaitingFor::MulliganDecision { .. }
+        | WaitingFor::OpeningHandBottomCards { .. }
+        | WaitingFor::ManaPayment { .. }
+        | WaitingFor::ManaSourceSelection { .. }
+        | WaitingFor::AssistChoosePlayer { .. }
+        | WaitingFor::AssistPayment { .. }
+        | WaitingFor::DeclareAttackers { .. }
+        | WaitingFor::DeclareBlockers { .. }
+        | WaitingFor::UntapChoice { .. }
+        | WaitingFor::ChooseUntapSubset { .. }
+        | WaitingFor::ExertChoice { .. }
+        | WaitingFor::EnlistChoice { .. }
+        | WaitingFor::GameOver { .. }
+        | WaitingFor::ReplacementChoice { .. }
+        | WaitingFor::EntryControllerChoice { .. }
+        | WaitingFor::OrderTriggers { .. }
+        | WaitingFor::CopyTargetChoice { .. }
+        | WaitingFor::EquipTarget { .. }
+        | WaitingFor::CrewVehicle { .. }
+        | WaitingFor::StationTarget { .. }
+        | WaitingFor::SaddleMount { .. }
+        | WaitingFor::ScryChoice { .. }
+        | WaitingFor::RippleRevealChoice { .. }
+        | WaitingFor::RippleBottomOrder { .. }
+        | WaitingFor::RevealUntilBottomOrder { .. }
+        | WaitingFor::ArrangePlanarDeckTopChoice { .. }
+        | WaitingFor::RedistributeLifeTotals { .. }
+        | WaitingFor::CoinFlipKeepChoice { .. }
+        | WaitingFor::DieKeepChoice { .. }
+        | WaitingFor::DigChoice { .. }
+        | WaitingFor::SurveilChoice { .. }
+        | WaitingFor::RevealChoice { .. }
+        | WaitingFor::SearchChoice { .. }
+        | WaitingFor::SearchPartitionChoice { .. }
+        | WaitingFor::OutsideGameChoice { .. }
+        | WaitingFor::ChooseFromZoneChoice { .. }
+        | WaitingFor::BeholdChoice { .. }
+        | WaitingFor::EmpowerJaceChoice { .. }
+        | WaitingFor::SpellCopyOrderChoice { .. }
+        | WaitingFor::ConniveDiscard { .. }
+        | WaitingFor::DiscardChoice { .. }
+        | WaitingFor::EffectZoneChoice { .. }
+        | WaitingFor::DrawnThisTurnTopdeckChoice { .. }
+        | WaitingFor::LearnChoice { .. }
+        | WaitingFor::ManifestDreadChoice { .. }
+        | WaitingFor::TriggerTargetSelection { .. }
+        | WaitingFor::BetweenGamesSideboard { .. }
+        | WaitingFor::BetweenGamesChoosePlayDraw { .. }
+        | WaitingFor::NamedChoice { .. }
+        | WaitingFor::OpponentGuess { .. }
+        | WaitingFor::SpellbookDraft { .. }
+        | WaitingFor::DamageSourceChoice { .. }
+        | WaitingFor::DiscardToHandSize { .. }
+        | WaitingFor::CastOffer { .. }
+        | WaitingFor::ModalFaceChoice { .. }
+        | WaitingFor::AlternativeCastChoice { .. }
+        | WaitingFor::MutateMergeChoice { .. }
+        | WaitingFor::CipherEncodeChoice { .. }
+        | WaitingFor::CastingVariantChoice { .. }
+        | WaitingFor::ChoosePermanentTypeSlot { .. }
+        | WaitingFor::AbilityModeChoice { .. }
+        | WaitingFor::OptionalEffectChoice { .. }
+        | WaitingFor::ResolutionOptionalPaymentChoice { .. }
+        | WaitingFor::PairChoice { .. }
+        | WaitingFor::TributeChoice { .. }
+        | WaitingFor::MiracleReveal { .. }
+        | WaitingFor::OpponentMayChoice { .. }
+        | WaitingFor::LoopShortcut { .. }
+        | WaitingFor::RespondToShortcut { .. }
+        | WaitingFor::PrecastCopyShortcutOffer { .. }
+        | WaitingFor::RespondToPrecastCopyShortcut { .. }
+        | WaitingFor::ChooseRingBearer { .. }
+        | WaitingFor::ChooseRoomDoor { .. }
+        | WaitingFor::ChooseDungeon { .. }
+        | WaitingFor::ChooseDungeonRoom { .. }
+        | WaitingFor::SpecializeColor { .. }
+        | WaitingFor::RevealUntilKeptChoice { .. }
+        | WaitingFor::TopOrBottomChoice { .. }
+        | WaitingFor::PopulateChoice { .. }
+        | WaitingFor::ClashCardPlacement { .. }
+        | WaitingFor::PhysicalContest { .. }
+        | WaitingFor::VoteChoice { .. }
+        | WaitingFor::SeparatePilesChooseOpponent { .. }
+        | WaitingFor::SeparatePilesPartition { .. }
+        | WaitingFor::SeparatePilesChoice { .. }
+        | WaitingFor::CompanionReveal { .. }
+        | WaitingFor::ChooseLegend { .. }
+        | WaitingFor::CommanderZoneChoice { .. }
+        | WaitingFor::BattleProtectorChoice { .. }
+        | WaitingFor::ProliferateChoice { .. }
+        | WaitingFor::TimeTravelChoice { .. }
+        | WaitingFor::ChooseObjectsSelection { .. }
+        | WaitingFor::CategoryChoice { .. }
+        | WaitingFor::EachPlayerCopyChosenSelection { .. }
+        | WaitingFor::KeepWithinTotalPowerChoice { .. }
+        | WaitingFor::KeepExactPermanentsChoice { .. }
+        | WaitingFor::CopyRetarget { .. }
+        | WaitingFor::AssignCombatDamage { .. }
+        | WaitingFor::AssignBlockerDamage { .. }
+        | WaitingFor::DistributeAmong { .. }
+        | WaitingFor::RetargetChoice { .. }
+        | WaitingFor::CombatTaxPayment { .. }
+        | WaitingFor::PhyrexianPayment { .. } => {}
+    }
+    Ok(())
 }
 
 /// Checked persistence compatibility for unresolved attacked-recipient reads.
@@ -25660,12 +25973,22 @@ fn validate_restored_attack_authority(
     // context their root names.
     let mut suspended = |node: &ResolvedAbility, event: SuspendedChainEvent<'_>| match event {
         SuspendedChainEvent::Ambient => check(node, current_event, current_events),
+        SuspendedChainEvent::AmbientEventOnly => check(node, current_event, &[]),
         SuspendedChainEvent::Bound(event) => check(node, event, &[]),
         SuspendedChainEvent::Announcement => check(node, None, &[]),
+        SuspendedChainEvent::Captured(event, events) => check(node, event, events),
         SuspendedChainEvent::Context(context) => {
             check(node, context.event.as_ref(), &context.events)
         }
     };
+    // CR 603.3b: the prompt that becomes live again once trigger ordering is done.
+    if let Some(resume) = state
+        .pending_trigger_order
+        .as_ref()
+        .and_then(|order| order.resume_after_ordering.as_deref())
+    {
+        visit_waiting_for_chains(resume, &mut suspended)?;
+    }
     if let Some(resume) = state.pending_cost_move_resume.as_ref() {
         visit_cost_move_resume_chains(resume, &mut suspended)?;
     }
@@ -25706,10 +26029,20 @@ fn validate_restored_attack_authority(
         suspended(&fan_out.scoped_template, SuspendedChainEvent::Ambient)?;
         suspended(&fan_out.outer, SuspendedChainEvent::Ambient)?;
     }
-    // CR 605.4a: a triggered-mana fixed point holds the triggered mana abilities
-    // it is settling and the outer root it resumes once they are done.
+    // CR 605.4a + CR 603.3b: a triggered-mana fixed point holds the triggered mana
+    // abilities it is settling (the current one, the accepted tail it runs inline,
+    // and every collected batch it hands to ordinary placement), each with its own
+    // trigger event, and the outer root it resumes once they are done.
     if let Some(resume) = state.pending_triggered_mana_resume.as_deref() {
-        for pending in std::iter::once(resume.current.as_ref()).chain(&resume.accepted_tail) {
+        for pending in std::iter::once(resume.current.as_ref())
+            .chain(&resume.accepted_tail)
+            .chain(
+                resume
+                    .collected_batches
+                    .iter()
+                    .flat_map(|batch| &batch.contexts),
+            )
+        {
             check(
                 &pending.pending.ability,
                 pending.pending.trigger_event.as_ref(),
@@ -25729,6 +26062,8 @@ fn validate_restored_attack_authority(
                 .as_ref()
                 .map_or(SuspendedChainEvent::Ambient, SuspendedChainEvent::Context),
         )?;
+        // The prompt the transaction returns to once it settles.
+        visit_waiting_for_chains(&transaction.base_waiting_for, &mut suspended)?;
     }
     for frame in state.resolution_stack.iter() {
         match frame {
@@ -25803,214 +26138,7 @@ fn validate_restored_attack_authority(
             | ResolutionFrame::PostReplacement(_) => {}
         }
     }
-    match &state.waiting_for {
-        WaitingFor::UnlessPayment {
-            pending_effect,
-            trigger_event,
-            ..
-        }
-        | WaitingFor::UnlessPaymentChooseCost {
-            pending_effect,
-            trigger_event,
-            ..
-        } => check(pending_effect, trigger_event.as_ref(), &[])?,
-        WaitingFor::ExploreChoice { pending_effect, .. }
-        | WaitingFor::ReturnAsAuraTarget { pending_effect, .. }
-        | WaitingFor::WardDiscardChoice { pending_effect, .. }
-        | WaitingFor::WardSacrificeChoice { pending_effect, .. }
-        | WaitingFor::UnlessBounceChoice { pending_effect, .. }
-        | WaitingFor::MoveCountersDistribution { pending_effect, .. }
-        | WaitingFor::RemoveCountersChoice { pending_effect, .. } => {
-            check(pending_effect, current_event, current_events)?
-        }
-        WaitingFor::MultiTargetSelection {
-            pending_ability, ..
-        } => check(pending_ability, current_event, current_events)?,
-        WaitingFor::RepeatDecision { ability, .. }
-        | WaitingFor::ClashChooseOpponent { ability, .. }
-        | WaitingFor::ChooseFromZoneOpponentChooser { ability, .. } => {
-            check(ability, current_event, current_events)?
-        }
-        WaitingFor::ChooseOneOfBranch {
-            continuation: Some(node),
-            trigger_context,
-            ..
-        } => check_choice_continuation(node, trigger_context.as_ref())?,
-        // CR 111.1 + CR 608.2c: the token-creation ability resumes once its
-        // host is chosen, so its unresolved chain reads the attacked referent.
-        WaitingFor::ChooseTokenHost {
-            pending_ability, ..
-        } => check(pending_ability, current_event, current_events)?,
-        // CR 701.59a + CR 608.2c: a collect-evidence choice resumes the effect,
-        // cast or mana ability that asked for it.
-        WaitingFor::CollectEvidenceChoice { resume, .. } => {
-            visit_collect_evidence_resume_chains(resume, &mut suspended)?
-        }
-        // CR 605.3a + CR 118.12: a paused mana-ability payment can hold a
-        // resolving rider (`EffectPayCost`) or unless-payment effect.
-        WaitingFor::PayManaAbilityMana {
-            pending_mana_ability,
-            ..
-        }
-        | WaitingFor::ManaAbilityManaPayment {
-            pending_mana_ability,
-            ..
-        } => visit_pending_mana_ability_chains(pending_mana_ability, &mut suspended)?,
-        WaitingFor::PayAmountChoice {
-            pending_mana_ability,
-            ..
-        } => {
-            if let Some(pending) = pending_mana_ability.as_deref() {
-                visit_pending_mana_ability_chains(pending, &mut suspended)?;
-            }
-        }
-        WaitingFor::PayCost { resume, .. } => visit_cost_resume_chains(resume, &mut suspended)?,
-        WaitingFor::ChooseManaColor { context, .. } => {
-            visit_mana_choice_context_chains(context, &mut suspended)?
-        }
-        WaitingFor::DigRestSplitChoice { completion, .. } => {
-            if let Some(completion) = completion.as_deref() {
-                visit_batch_completion_chains(completion, &mut suspended)?;
-            }
-        }
-        // CR 601.2 + CR 602.2: a spell or ability still being cast or activated.
-        WaitingFor::ChooseXValue { pending_cast, .. }
-        | WaitingFor::TargetSelection { pending_cast, .. }
-        | WaitingFor::ModeChoice { pending_cast, .. }
-        | WaitingFor::OptionalCostChoice { pending_cast, .. }
-        | WaitingFor::ChooseGiftRecipient { pending_cast, .. }
-        | WaitingFor::SpliceOffer { pending_cast, .. }
-        | WaitingFor::DefilerPayment { pending_cast, .. }
-        | WaitingFor::OrderCostReductions { pending_cast, .. }
-        | WaitingFor::ActivationCostOneOfChoice { pending_cast, .. }
-        | WaitingFor::CostTypeChoice { pending_cast, .. }
-        | WaitingFor::BlightChoice { pending_cast, .. }
-        | WaitingFor::HarmonizeTapChoice { pending_cast, .. }
-        | WaitingFor::ChooseAnnouncingOpponent { pending_cast, .. } => {
-            visit_pending_cast_chain(pending_cast, &mut suspended)?
-        }
-        // Every other prompt carries no `ResolvedAbility` chain in its own fields.
-        // The chains walked above are: the stack and pending triggers; the
-        // resolution-stack frames (continuation chains with their player-scope
-        // tails, repeat / choice / payment frames, batch-delivery completions);
-        // and the state-level roots (cost-move, deferred-life, pending cast,
-        // scoped search and search delivery, player-scope sacrifice and unless
-        // payment, discard fan-out, triggered-mana fixed point, staged payment
-        // transaction). Listed exhaustively so a new carrier on a prompt cannot
-        // skip this check silently.
-        WaitingFor::ChooseOneOfBranch {
-            continuation: None, ..
-        }
-        | WaitingFor::Priority { .. }
-        | WaitingFor::ResolveAllConsent { .. }
-        | WaitingFor::ResolveAllReady { .. }
-        | WaitingFor::MeldPairChoice { .. }
-        | WaitingFor::MeldAttackTargetChoice { .. }
-        | WaitingFor::EntryAttackTargetChoice { .. }
-        | WaitingFor::MulliganDecision { .. }
-        | WaitingFor::OpeningHandBottomCards { .. }
-        | WaitingFor::ManaPayment { .. }
-        | WaitingFor::ManaSourceSelection { .. }
-        | WaitingFor::AssistChoosePlayer { .. }
-        | WaitingFor::AssistPayment { .. }
-        | WaitingFor::DeclareAttackers { .. }
-        | WaitingFor::DeclareBlockers { .. }
-        | WaitingFor::UntapChoice { .. }
-        | WaitingFor::ChooseUntapSubset { .. }
-        | WaitingFor::ExertChoice { .. }
-        | WaitingFor::EnlistChoice { .. }
-        | WaitingFor::GameOver { .. }
-        | WaitingFor::ReplacementChoice { .. }
-        | WaitingFor::EntryControllerChoice { .. }
-        | WaitingFor::OrderTriggers { .. }
-        | WaitingFor::CopyTargetChoice { .. }
-        | WaitingFor::EquipTarget { .. }
-        | WaitingFor::CrewVehicle { .. }
-        | WaitingFor::StationTarget { .. }
-        | WaitingFor::SaddleMount { .. }
-        | WaitingFor::ScryChoice { .. }
-        | WaitingFor::RippleRevealChoice { .. }
-        | WaitingFor::RippleBottomOrder { .. }
-        | WaitingFor::RevealUntilBottomOrder { .. }
-        | WaitingFor::ArrangePlanarDeckTopChoice { .. }
-        | WaitingFor::RedistributeLifeTotals { .. }
-        | WaitingFor::CoinFlipKeepChoice { .. }
-        | WaitingFor::DieKeepChoice { .. }
-        | WaitingFor::DigChoice { .. }
-        | WaitingFor::SurveilChoice { .. }
-        | WaitingFor::RevealChoice { .. }
-        | WaitingFor::SearchChoice { .. }
-        | WaitingFor::SearchPartitionChoice { .. }
-        | WaitingFor::OutsideGameChoice { .. }
-        | WaitingFor::ChooseFromZoneChoice { .. }
-        | WaitingFor::BeholdChoice { .. }
-        | WaitingFor::EmpowerJaceChoice { .. }
-        | WaitingFor::SpellCopyOrderChoice { .. }
-        | WaitingFor::ConniveDiscard { .. }
-        | WaitingFor::DiscardChoice { .. }
-        | WaitingFor::EffectZoneChoice { .. }
-        | WaitingFor::DrawnThisTurnTopdeckChoice { .. }
-        | WaitingFor::LearnChoice { .. }
-        | WaitingFor::ManifestDreadChoice { .. }
-        | WaitingFor::TriggerTargetSelection { .. }
-        | WaitingFor::BetweenGamesSideboard { .. }
-        | WaitingFor::BetweenGamesChoosePlayDraw { .. }
-        | WaitingFor::NamedChoice { .. }
-        | WaitingFor::OpponentGuess { .. }
-        | WaitingFor::SpellbookDraft { .. }
-        | WaitingFor::DamageSourceChoice { .. }
-        | WaitingFor::DiscardToHandSize { .. }
-        | WaitingFor::CastOffer { .. }
-        | WaitingFor::ModalFaceChoice { .. }
-        | WaitingFor::AlternativeCastChoice { .. }
-        | WaitingFor::MutateMergeChoice { .. }
-        | WaitingFor::CipherEncodeChoice { .. }
-        | WaitingFor::CastingVariantChoice { .. }
-        | WaitingFor::ChoosePermanentTypeSlot { .. }
-        | WaitingFor::AbilityModeChoice { .. }
-        | WaitingFor::OptionalEffectChoice { .. }
-        | WaitingFor::ResolutionOptionalPaymentChoice { .. }
-        | WaitingFor::PairChoice { .. }
-        | WaitingFor::TributeChoice { .. }
-        | WaitingFor::MiracleReveal { .. }
-        | WaitingFor::OpponentMayChoice { .. }
-        | WaitingFor::LoopShortcut { .. }
-        | WaitingFor::RespondToShortcut { .. }
-        | WaitingFor::PrecastCopyShortcutOffer { .. }
-        | WaitingFor::RespondToPrecastCopyShortcut { .. }
-        | WaitingFor::ChooseRingBearer { .. }
-        | WaitingFor::ChooseRoomDoor { .. }
-        | WaitingFor::ChooseDungeon { .. }
-        | WaitingFor::ChooseDungeonRoom { .. }
-        | WaitingFor::SpecializeColor { .. }
-        | WaitingFor::RevealUntilKeptChoice { .. }
-        | WaitingFor::TopOrBottomChoice { .. }
-        | WaitingFor::PopulateChoice { .. }
-        | WaitingFor::ClashCardPlacement { .. }
-        | WaitingFor::PhysicalContest { .. }
-        | WaitingFor::VoteChoice { .. }
-        | WaitingFor::SeparatePilesChooseOpponent { .. }
-        | WaitingFor::SeparatePilesPartition { .. }
-        | WaitingFor::SeparatePilesChoice { .. }
-        | WaitingFor::CompanionReveal { .. }
-        | WaitingFor::ChooseLegend { .. }
-        | WaitingFor::CommanderZoneChoice { .. }
-        | WaitingFor::BattleProtectorChoice { .. }
-        | WaitingFor::ProliferateChoice { .. }
-        | WaitingFor::TimeTravelChoice { .. }
-        | WaitingFor::ChooseObjectsSelection { .. }
-        | WaitingFor::CategoryChoice { .. }
-        | WaitingFor::EachPlayerCopyChosenSelection { .. }
-        | WaitingFor::KeepWithinTotalPowerChoice { .. }
-        | WaitingFor::KeepExactPermanentsChoice { .. }
-        | WaitingFor::CopyRetarget { .. }
-        | WaitingFor::AssignCombatDamage { .. }
-        | WaitingFor::AssignBlockerDamage { .. }
-        | WaitingFor::DistributeAmong { .. }
-        | WaitingFor::RetargetChoice { .. }
-        | WaitingFor::CombatTaxPayment { .. }
-        | WaitingFor::PhyrexianPayment { .. } => {}
-    }
+    visit_waiting_for_chains(&state.waiting_for, &mut suspended)?;
     Ok(())
 }
 
@@ -52155,8 +52283,9 @@ mod restored_exact_attack_authority_tests {
     /// color choice (both contexts), triggered-mana fixed point (root and color
     /// choice), staged payment transaction, pending cast, deferred life cost,
     /// scoped search, search delivery, player-scope sacrifice, loyalty activation
-    /// and bound-event unless roots. Each is checked through both Raw and Trusted
-    /// restore, wherever the root sits.
+    /// and bound-event unless roots; rows 20-21 the cost-move completions (a cast's
+    /// post-payment prompt, an optional sacrifice payment's optional-effect frame).
+    /// Each is checked through both Raw and Trusted restore, wherever the root sits.
     #[test]
     fn payment_and_batch_roots_validate_their_attacked_referent() {
         use crate::types::ability::{AbilityCost, DigRestSplitScope};
@@ -52212,7 +52341,7 @@ mod restored_exact_attack_authority_tests {
             ManaCost::default(),
         );
         let mut admitted = Vec::new();
-        for carrier in 0..20 {
+        for carrier in 0..22 {
             let mut state = state.clone();
             state.waiting_for = match carrier {
                 // The rider in the mana ability's own resume root.
@@ -52511,6 +52640,57 @@ mod restored_exact_attack_authority_tests {
                         });
                     state.waiting_for.clone()
                 }
+                // A paused cast's cost-move root whose completion hands back a
+                // prompt holding the chain (`resolution_success_waiting_for`).
+                20 => {
+                    state.pending_cost_move_resume = Some(PendingCostMoveResume::Cast {
+                        player: P0,
+                        pending: None,
+                        chosen: vec![],
+                        paused_at_index: 0,
+                        destination: Zone::Graveyard,
+                        completion: PendingCostMoveCompletion::FinalizeCast {
+                            phyrexian_choices: None,
+                            cascade_cast_transformed: false,
+                            resolution_success_waiting_for: Some(Box::new(
+                                WaitingFor::ChooseTokenHost {
+                                    player: P0,
+                                    source_id: attacker,
+                                    legal_targets: vec![],
+                                    pending_ability: node.clone(),
+                                },
+                            )),
+                            prepaid_actual_mana_spent: None,
+                        },
+                        deferred_cost_events: vec![],
+                        departure_record_indices: vec![],
+                    });
+                    state.waiting_for.clone()
+                }
+                // A resolution-time optional sacrifice payment resuming its
+                // optional-effect frame.
+                21 => {
+                    state.pending_cost_move_resume =
+                        Some(PendingCostMoveResume::SacrificeForCost {
+                            player: P0,
+                            pending: None,
+                            chosen: vec![],
+                            paused_at_index: 0,
+                            completion: PendingSacrificeCostCompletion::ResolutionOptionalPayment {
+                                frame: Box::new(OptionalEffectFrame {
+                                    ability: node.clone(),
+                                    trigger_event: trigger_event.clone(),
+                                    trigger_events: trigger_event.clone().into_iter().collect(),
+                                    trigger_match_count: None,
+                                    return_result_occurrence: None,
+                                }),
+                                selected: vec![],
+                            },
+                            deferred_cost_events: vec![],
+                            departure_record_indices: vec![],
+                        });
+                    state.waiting_for.clone()
+                }
                 _ => unreachable!(),
             };
             for trusted in [false, true] {
@@ -52542,6 +52722,161 @@ mod restored_exact_attack_authority_tests {
         assert!(
             admitted.is_empty(),
             "every payment root must validate its chain; admitted (carrier, trusted): {admitted:?}"
+        );
+    }
+
+    /// Roots that resume with an event of their own, built on an observer trigger
+    /// whose referent is named only by its own attack event: with the ambient event
+    /// (the observer's own attack) the referent is the live observer and nothing is
+    /// checked, so a root walked with the wrong context, or not walked, is admitted.
+    /// Rows: a staged payment transaction's captured context; a triggered-mana
+    /// fixed point's current, accepted-tail and collected-batch triggers; the
+    /// prompt resumed after trigger ordering; a transaction's base prompt.
+    #[test]
+    fn observer_roots_validate_with_their_own_event() {
+        use crate::types::ability::AbilityCost;
+        let (state, attacker, entry) = observer_with_two_bound_events();
+        let StackEntryKind::TriggeredAbility {
+            ability: node,
+            trigger_event,
+            ..
+        } = entry.kind
+        else {
+            unreachable!()
+        };
+        let source_id = node.source_id;
+        let own_trigger = || {
+            let mut pending = crate::game::triggers::PendingTrigger::ordinary(
+                source_id,
+                P0,
+                None,
+                node.clone(),
+                1,
+            );
+            pending.trigger_event = trigger_event.clone();
+            crate::game::triggers::PendingTriggerContext::single(pending)
+        };
+        let harmless_trigger = || {
+            crate::game::triggers::PendingTriggerContext::single(
+                crate::game::triggers::PendingTrigger::ordinary(
+                    source_id,
+                    P0,
+                    None,
+                    Box::new(ResolvedAbility::new(Effect::NoOp, vec![], source_id, P0)),
+                    1,
+                ),
+            )
+        };
+        let mana_resume = |current, accepted_tail, collected_batches| TriggeredManaResume {
+            current: Box::new(current),
+            current_override: None,
+            rules_execution_node:
+                crate::types::resolved_commands::RulesExecutionNodeRef::TriggeredMana(
+                    crate::types::resolved_commands::SettlementNodeOrdinal(5),
+                ),
+            accepted_tail,
+            collected_batches,
+            outer_resume: ManaTriggerFixedPointResume::Parent,
+            stage: TriggeredManaStage::ChoosingModes,
+        };
+        let unless = || WaitingFor::UnlessPayment {
+            player: P0,
+            cost: AbilityCost::Tap,
+            pending_effect: node.clone(),
+            trigger_event: trigger_event.clone(),
+            effect_description: None,
+            remaining: vec![],
+        };
+        let transaction =
+            |root: Box<ResolvedAbility>, base, context| ResolutionPaymentTransaction {
+                wire_version: resolution_payment_transaction_wire_version(),
+                owner: P0,
+                root,
+                transcript: vec![],
+                base_waiting_for: base,
+                resolving_trigger_context: context,
+            };
+        let harmless = Box::new(ResolvedAbility::new(Effect::NoOp, vec![], source_id, P0));
+        let mut admitted = Vec::new();
+        for carrier in 0..6 {
+            let mut state = state.clone();
+            match carrier {
+                0 => {
+                    state.payment_transaction = Some(Box::new(transaction(
+                        node.clone(),
+                        state.waiting_for.clone(),
+                        Some(ResolvingTriggerContext {
+                            event: trigger_event.clone(),
+                            events: trigger_event.clone().into_iter().collect(),
+                            match_count: None,
+                            die_result: None,
+                        }),
+                    )));
+                }
+                1 => {
+                    state.pending_triggered_mana_resume =
+                        Some(Box::new(mana_resume(own_trigger(), vec![], vec![])));
+                }
+                2 => {
+                    state.pending_triggered_mana_resume = Some(Box::new(mana_resume(
+                        harmless_trigger(),
+                        vec![own_trigger()],
+                        vec![],
+                    )));
+                }
+                3 => {
+                    state.pending_triggered_mana_resume = Some(Box::new(mana_resume(
+                        harmless_trigger(),
+                        vec![],
+                        vec![CollectedTriggerContextBatch {
+                            contexts: vec![own_trigger()],
+                            delayed_events: vec![],
+                            delayed_consumed: vec![],
+                            normal_was_non_empty: true,
+                        }],
+                    )));
+                }
+                4 => {
+                    state.pending_trigger_order = Some(PendingTriggerOrder {
+                        groups: vec![],
+                        resume_after_ordering: Some(Box::new(unless())),
+                    });
+                }
+                5 => {
+                    state.payment_transaction =
+                        Some(Box::new(transaction(harmless.clone(), unless(), None)));
+                }
+                _ => unreachable!(),
+            }
+            for trusted in [false, true] {
+                let current = serialized(&state, trusted);
+                serde_json::from_value::<PersistedGameState>(current.clone())
+                    .expect("observer root has exact authority");
+                let mut old = current;
+                let rows = payload(&mut old, trusted)["zone_changes_this_turn"]
+                    .as_array_mut()
+                    .unwrap();
+                let row = rows
+                    .iter_mut()
+                    .find(|row| {
+                        row["object_id"] == serde_json::json!(attacker.0)
+                            && row["from_zone"] == serde_json::json!("Battlefield")
+                    })
+                    .unwrap();
+                row["combat_status"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("attack_target_identity");
+                let rejected = serde_json::from_value::<PersistedGameState>(old)
+                    .is_err_and(|error| error.to_string().contains("exact attack authority"));
+                if !rejected {
+                    admitted.push((carrier, trusted));
+                }
+            }
+        }
+        assert!(
+            admitted.is_empty(),
+            "every observer root must be checked with its own event; admitted (carrier, trusted): {admitted:?}"
         );
     }
 }
