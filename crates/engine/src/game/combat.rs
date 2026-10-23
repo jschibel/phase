@@ -325,6 +325,16 @@ pub struct CombatState {
         serialize_with = "crate::types::deterministic_serde::hash_map"
     )]
     pub attacked_permanents: HashMap<ObjectId, ObjectIncarnationRef>,
+    /// CR 506.4 + CR 506.4e: each pinned attacked permanent's kinds as of its
+    /// declaration or the last settled layer pass, keyed like `attacked_permanents`
+    /// (and maintained with it). A type change written outside a pass (a transform,
+    /// turning face down or face up) is compared against these at the next settled
+    /// pass, so it retires the relation exactly once.
+    #[serde(
+        default,
+        serialize_with = "crate::types::deterministic_serde::hash_map"
+    )]
+    pub attacked_permanent_kinds: HashMap<ObjectId, AttackedPermanentKinds>,
     /// attacker_id -> list of blocker ids
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub blocker_assignments: HashMap<ObjectId, Vec<ObjectId>>,
@@ -408,6 +418,7 @@ impl PartialEq for CombatState {
     fn eq(&self, other: &Self) -> bool {
         self.attackers == other.attackers
             && self.attacked_permanents == other.attacked_permanents
+            && self.attacked_permanent_kinds == other.attacked_permanent_kinds
             && self.blocker_assignments == other.blocker_assignments
             && self.blocker_to_attacker == other.blocker_to_attacker
             && self.blockers_declared_by == other.blockers_declared_by
@@ -561,6 +572,9 @@ pub(crate) fn active_attack_target(
 }
 
 /// Current relation maps must name current members and exact current permanents.
+/// Stored attacked kinds (CR 506.4) belong only to a current pin, and never record
+/// a permanent that is neither a planeswalker nor a battle: such a pin is retired by
+/// the settled pass that would have stored it.
 pub(crate) fn combat_attack_authority_is_coherent(state: &GameState) -> bool {
     state.combat.as_ref().is_none_or(|combat| {
         combat.attacked_permanents.iter().all(|(id, pin)| {
@@ -570,6 +584,8 @@ pub(crate) fn combat_attack_authority_is_coherent(state: &GameState) -> bool {
                 .find(|info| info.object_id == *id)
                 .and_then(|info| related_attack_permanent(state, info.attack_target))
                 .is_some_and(|object| ObjectIncarnationRef::from_object(object) == *pin)
+        }) && combat.attacked_permanent_kinds.iter().all(|(id, kinds)| {
+            *kinds != AttackedPermanentKinds::Neither && combat.attacked_permanents.contains_key(id)
         })
     })
 }
@@ -792,6 +808,7 @@ pub(crate) fn prune_object_from_combat(state: &mut GameState, oid: ObjectId) -> 
         .attacked_permanents
         .retain(|_, pin| pin.object_id != oid);
     changed |= combat.attacked_permanents.len() != edges_before;
+    drop_unpinned_attacked_kinds(combat);
     // Drop attacker-keyed forward assignments (oid was an attacker with blockers
     // assigned to it).
     changed |= combat.blocker_assignments.remove(&oid).is_some();
@@ -816,22 +833,28 @@ pub(crate) fn prune_object_from_combat(state: &mut GameState, oid: ObjectId) -> 
     changed
 }
 
-/// CR 506.4 + CR 506.4e: which of the two attackable permanent kinds an attacked
-/// permanent has, read before and after a layer pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AttackedPermanentKinds {
-    planeswalker: bool,
-    battle: bool,
+/// CR 506.4 + CR 506.4e: which attackable permanent kinds an attacked permanent has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttackedPermanentKinds {
+    Planeswalker,
+    Battle,
+    /// CR 506.4e: both a planeswalker and a battle.
+    PlaneswalkerBattle,
+    /// Neither: no longer something that can be attacked.
+    Neither,
 }
 
 impl AttackedPermanentKinds {
     fn of(object: &GameObject) -> Self {
-        Self {
-            planeswalker: object
-                .card_types
-                .core_types
-                .contains(&CoreType::Planeswalker),
-            battle: object.card_types.core_types.contains(&CoreType::Battle),
+        let types = &object.card_types.core_types;
+        match (
+            types.contains(&CoreType::Planeswalker),
+            types.contains(&CoreType::Battle),
+        ) {
+            (true, false) => Self::Planeswalker,
+            (false, true) => Self::Battle,
+            (true, true) => Self::PlaneswalkerBattle,
+            (false, false) => Self::Neither,
         }
     }
 
@@ -843,77 +866,125 @@ impl AttackedPermanentKinds {
     /// * A permanent that was both is removed only when it stops being both. If it
     ///   stops being a battle but is still a planeswalker, it is removed only if it
     ///   is not controlled by its protector; if it stops being a planeswalker but is
-    ///   still a battle, it is not removed (CR 506.4e). The protector survives the
-    ///   type loss (CR 310.9g).
+    ///   still a battle, it is not removed (CR 506.4e).
     fn change_ends_attack(self, after: Self, controlled_by_protector: bool) -> bool {
-        match (self.planeswalker, self.battle) {
-            (true, true) => match (after.planeswalker, after.battle) {
-                (false, false) => true,
-                (true, false) => !controlled_by_protector,
-                (false, true) | (true, true) => false,
+        match self {
+            Self::PlaneswalkerBattle => match after {
+                Self::Neither => true,
+                Self::Planeswalker => !controlled_by_protector,
+                Self::Battle | Self::PlaneswalkerBattle => false,
             },
-            (true, false) => !after.planeswalker,
-            (false, true) => !after.battle,
+            Self::Planeswalker => !matches!(after, Self::Planeswalker | Self::PlaneswalkerBattle),
+            Self::Battle => !matches!(after, Self::Battle | Self::PlaneswalkerBattle),
             // Never attackable, so never attacked; nothing to end.
-            (false, false) => false,
+            Self::Neither => false,
         }
     }
 }
 
-/// CR 506.4: the kinds of every exact permanent currently being attacked, read
-/// before a layer pass so the settled pass can tell which ones changed.
-pub(crate) fn attacked_permanent_kinds(
-    state: &GameState,
-) -> Vec<(ObjectIncarnationRef, AttackedPermanentKinds)> {
+/// CR 506.4e + CR 310.9g: whether `object` is controlled by its protector. Reads the
+/// persisted chosen protector, which survives the permanent no longer being a battle
+/// (`GameObject::protector` answers only for a current battle).
+fn controlled_by_protector(object: &GameObject) -> bool {
+    object.chosen_player() == Some(object.controller)
+}
+
+/// The exact live permanent `pin` names, if it is still that incarnation.
+fn pinned_object(state: &GameState, pin: ObjectIncarnationRef) -> Option<&GameObject> {
+    state
+        .objects
+        .get(&pin.object_id)
+        .filter(|object| ObjectIncarnationRef::from_object(object) == pin)
+}
+
+/// CR 506.4: record `attacker`'s attacked permanent's current kinds next to its pin,
+/// as the baseline a later settled type change is compared against. Called where a
+/// pin is written (declaration, entering attacking, a replayed attack, meld).
+pub(crate) fn record_attacked_kinds(state: &mut GameState, attacker: ObjectId) {
+    let kinds = state
+        .combat
+        .as_ref()
+        .and_then(|combat| combat.attacked_permanents.get(&attacker))
+        .and_then(|pin| pinned_object(state, *pin))
+        .map(AttackedPermanentKinds::of);
+    if let Some(combat) = state.combat.as_mut() {
+        match kinds {
+            Some(kinds) => {
+                combat.attacked_permanent_kinds.insert(attacker, kinds);
+            }
+            None => {
+                combat.attacked_permanent_kinds.remove(&attacker);
+            }
+        }
+    }
+}
+
+/// Keep `attacked_permanent_kinds` keyed exactly like `attacked_permanents`.
+fn drop_unpinned_attacked_kinds(combat: &mut CombatState) {
+    let pinned = &combat.attacked_permanents;
+    combat
+        .attacked_permanent_kinds
+        .retain(|attacker, _| pinned.contains_key(attacker));
+}
+
+/// CR 506.4: after a settled pass (and its retirements), every remaining pin's
+/// stored kinds become the settled kinds of this pass.
+pub(crate) fn refresh_attacked_kinds(state: &mut GameState) {
+    let Some(combat) = state.combat.as_ref() else {
+        return;
+    };
+    let refreshed: HashMap<ObjectId, AttackedPermanentKinds> = combat
+        .attacked_permanents
+        .iter()
+        .filter_map(|(attacker, pin)| {
+            pinned_object(state, *pin).map(|object| (*attacker, AttackedPermanentKinds::of(object)))
+        })
+        .collect();
+    if let Some(combat) = state.combat.as_mut() {
+        combat.attacked_permanent_kinds = refreshed;
+    }
+}
+
+/// CR 506.4 + CR 506.4e: the exact attacked permanents whose settled kinds differ
+/// from the kinds stored at their declaration or the last settled pass in a way that
+/// ends their being attacked. Comparing against the stored kinds, not a snapshot at
+/// the start of this pass, catches a type change written outside a pass (a transform,
+/// turning face down or face up). A pin with no stored kinds (a state saved before
+/// they were recorded) ends only once its permanent is neither a planeswalker nor a
+/// battle, which ends it whatever its declared kinds were. A pin whose permanent left
+/// or changed incarnation is not decided here (its departure owns it).
+pub(crate) fn type_changed_attacked_permanents(state: &GameState) -> Vec<ObjectIncarnationRef> {
     let Some(combat) = state.combat.as_ref() else {
         return Vec::new();
     };
-    let mut kinds: Vec<(ObjectIncarnationRef, AttackedPermanentKinds)> = Vec::new();
-    for pin in combat.attacked_permanents.values() {
-        if kinds.iter().any(|(seen, _)| seen == pin) {
+    let mut ended: Vec<ObjectIncarnationRef> = Vec::new();
+    for (attacker, pin) in &combat.attacked_permanents {
+        let Some(object) = pinned_object(state, *pin) else {
             continue;
-        }
-        if let Some(object) = state
-            .objects
-            .get(&pin.object_id)
-            .filter(|object| ObjectIncarnationRef::from_object(object) == *pin)
-        {
-            kinds.push((*pin, AttackedPermanentKinds::of(object)));
+        };
+        let current = AttackedPermanentKinds::of(object);
+        let ends = match combat.attacked_permanent_kinds.get(attacker) {
+            Some(stored) => stored.change_ends_attack(current, controlled_by_protector(object)),
+            None => current == AttackedPermanentKinds::Neither,
+        };
+        if ends && !ended.contains(pin) {
+            ended.push(*pin);
         }
     }
-    kinds
+    // Deterministic order for the journal.
+    ended.sort_by_key(|pin| (pin.object_id, pin.incarnation));
+    ended
 }
 
-/// CR 506.4 + CR 506.4e: the attacked permanents whose settled type change, from
-/// the kinds recorded in `before`, ends their being attacked. A permanent that
-/// left or changed incarnation is not decided here (its departure owns it).
-pub(crate) fn type_changed_attacked_permanents(
-    state: &GameState,
-    before: &[(ObjectIncarnationRef, AttackedPermanentKinds)],
-) -> Vec<ObjectId> {
-    before
-        .iter()
-        .filter_map(|(pin, prior)| {
-            let object = state
-                .objects
-                .get(&pin.object_id)
-                .filter(|object| ObjectIncarnationRef::from_object(object) == *pin)?;
-            let controlled_by_protector = object.protector() == Some(object.controller);
-            prior
-                .change_ends_attack(AttackedPermanentKinds::of(object), controlled_by_protector)
-                .then_some(pin.object_id)
-        })
-        .collect()
-}
-
-/// CR 506.4 + CR 506.4c + CR 506.4d: `attacked` stops being attacked. Only the
-/// incoming attacked relations are retired: each attacker stays an attacking
-/// creature, attacking nothing (CR 506.4c), and `attacked`'s own roles (a blocking
-/// creature that is also a planeswalker, CR 506.4d) are untouched. Returns the
-/// attackers whose relation ended, in declaration order.
+/// CR 506.4 + CR 506.4c + CR 506.4d: the exact permanent `attacked` stops being
+/// attacked. Only the incoming attacked relations naming that exact incarnation are
+/// retired: each attacker stays an attacking creature, attacking nothing
+/// (CR 506.4c), and the permanent's own roles (a blocking creature that is also a
+/// planeswalker, CR 506.4d) are untouched. Returns the attackers whose relation
+/// ended, in declaration order.
 pub(crate) fn retire_incoming_attack_relations(
     state: &mut GameState,
-    attacked: ObjectId,
+    attacked: ObjectIncarnationRef,
 ) -> Vec<ObjectId> {
     let Some(combat) = state.combat.as_mut() else {
         return Vec::new();
@@ -922,16 +993,10 @@ pub(crate) fn retire_incoming_attack_relations(
         .attackers
         .iter()
         .map(|info| info.object_id)
-        .filter(|attacker| {
-            combat
-                .attacked_permanents
-                .get(attacker)
-                .is_some_and(|pin| pin.object_id == attacked)
-        })
+        .filter(|attacker| combat.attacked_permanents.get(attacker) == Some(&attacked))
         .collect();
-    combat
-        .attacked_permanents
-        .retain(|_, pin| pin.object_id != attacked);
+    combat.attacked_permanents.retain(|_, pin| *pin != attacked);
+    drop_unpinned_attacked_kinds(combat);
     retired
 }
 
@@ -939,22 +1004,15 @@ pub(crate) fn retire_incoming_attack_relations(
 /// settlement, so a replay retires the same edges. Returns whether any edge ended.
 pub(crate) fn retire_incoming_attack_relations_journaled(
     state: &mut GameState,
-    attacked: ObjectId,
+    attacked: ObjectIncarnationRef,
 ) -> bool {
-    let Some(reference) = state
-        .objects
-        .get(&attacked)
-        .map(ObjectIncarnationRef::from_object)
-    else {
-        return false;
-    };
     let retired = retire_incoming_attack_relations(state, attacked);
     if retired.is_empty() {
         return false;
     }
     record_combat_membership_edit(
         state,
-        reference,
+        attacked,
         ResolvedCombatMembershipEdit::RetireAttacked {
             expected_attacked_by: retired,
         },
@@ -1071,6 +1129,8 @@ fn push_attacker_and_journal(
         // attacking is an attacking creature; re-evaluate Layer 6
         // FilterProp::Attacking { defender: None } grants immediately.
         state.layers_dirty.mark_full();
+        // CR 506.4: the new pin's kinds are the baseline for later type changes.
+        record_attacked_kinds(state, object_id);
 
         // CR 733 + CR 508.4: the defending player and attack target are a CHOICE
         // the rules assign to the controller; record the settled pair so replay
@@ -1431,6 +1491,7 @@ pub fn apply_resolved_combat_membership(
             if let Some(pin) = resulting_attack_target_identity {
                 combat.attacked_permanents.insert(object_id, *pin);
             }
+            record_attacked_kinds(state, object_id);
         }
         ResolvedCombatMembershipEdit::Block {
             resulting_attacker,
@@ -1582,7 +1643,7 @@ pub fn apply_resolved_combat_membership(
                     },
                 );
             }
-            retire_incoming_attack_relations(state, object_id);
+            retire_incoming_attack_relations(state, command.object);
         }
     }
 
@@ -6958,6 +7019,8 @@ pub(super) fn commit_attack_declaration(
     // declaration-time characteristics are fixed. Flush attack-dependent
     // continuous effects first, then retain the exact values through later
     // movement and state-based actions.
+    // CR 506.4: each declared pin's kinds are the baseline for later type changes.
+    refresh_attacked_kinds(state);
     crate::game::layers::flush_layers(state);
     let attacker_declarations: Vec<_> = attacker_ids
         .iter()
@@ -9515,6 +9578,8 @@ mod tests {
                 .collect(),
             ..CombatState::default()
         });
+        // CR 506.4: the declaration's kinds are the baseline, as at a real declaration.
+        refresh_attacked_kinds(state);
     }
 
     /// An attack event naming exactly `attacker`, stamped with its incarnation.
@@ -9793,14 +9858,10 @@ mod tests {
     /// the protector. Only CR 506.4e's two exceptions keep a changed permanent attacked.
     #[test]
     fn attacked_kind_change_follows_cr_506_4_and_506_4e() {
-        let kinds = |planeswalker, battle| AttackedPermanentKinds {
-            planeswalker,
-            battle,
-        };
-        let walker = kinds(true, false);
-        let battle = kinds(false, true);
-        let both = kinds(true, true);
-        let neither = kinds(false, false);
+        let walker = AttackedPermanentKinds::Planeswalker;
+        let battle = AttackedPermanentKinds::Battle;
+        let both = AttackedPermanentKinds::PlaneswalkerBattle;
+        let neither = AttackedPermanentKinds::Neither;
         for protector_controls in [false, true] {
             // CR 506.4: losing the attacked type ends the attack, whatever it gained.
             assert!(walker.change_ends_attack(neither, protector_controls));
@@ -9819,6 +9880,180 @@ mod tests {
         // does not control it.
         assert!(both.change_ends_attack(walker, false));
         assert!(!both.change_ends_attack(walker, true));
+    }
+
+    /// CR 506.4e + CR 310.9g: a planeswalker-battle that stops being a battle stays
+    /// attacked only while its protector controls it. The protector is the persisted
+    /// chosen player, which survives the permanent no longer being a battle.
+    #[test]
+    fn planeswalker_battle_losing_battle_stays_attacked_only_under_its_protector() {
+        let (mut state, source) = anchor_state();
+        make_creature(&mut state, source);
+        let other = spawn_creature(&mut state, 2, "Other");
+        let planeswalker_battle = |state: &mut GameState, card: u64, protector: PlayerId| {
+            let id = spawn_planeswalker(state, card, PlayerId(1));
+            let object = state.objects.get_mut(&id).unwrap();
+            object.card_types.core_types = vec![CoreType::Planeswalker, CoreType::Battle];
+            object.base_card_types = object.card_types.clone();
+            object
+                .chosen_attributes
+                .push(ChosenAttribute::Player(protector));
+            id
+        };
+        let guarded = planeswalker_battle(&mut state, 9, PlayerId(1));
+        let unguarded = planeswalker_battle(&mut state, 10, PlayerId(2));
+        declare_targets(
+            &mut state,
+            &[
+                (source, AttackTarget::Planeswalker(guarded)),
+                (other, AttackTarget::Planeswalker(unguarded)),
+            ],
+        );
+        assert_eq!(
+            state
+                .combat
+                .as_ref()
+                .unwrap()
+                .attacked_permanent_kinds
+                .get(&source),
+            Some(&AttackedPermanentKinds::PlaneswalkerBattle)
+        );
+        assert!(type_changed_attacked_permanents(&state).is_empty());
+
+        for id in [guarded, unguarded] {
+            let object = state.objects.get_mut(&id).unwrap();
+            object.card_types.core_types = vec![CoreType::Planeswalker];
+            object.base_card_types = object.card_types.clone();
+        }
+        assert_eq!(
+            type_changed_attacked_permanents(&state),
+            vec![ObjectIncarnationRef::from_object(
+                &state.objects[&unguarded]
+            )],
+            "only the planeswalker its protector does not control is removed"
+        );
+        state.layers_dirty.mark_full();
+        crate::game::layers::flush_layers(&mut state);
+        let combat = state.combat.as_ref().unwrap();
+        assert!(combat.attacked_permanents.contains_key(&source));
+        assert!(!combat.attacked_permanents.contains_key(&other));
+        assert_eq!(
+            combat.attacked_permanent_kinds.get(&source),
+            Some(&AttackedPermanentKinds::Planeswalker),
+            "the settled pass refreshes the stored kinds"
+        );
+        assert!(!combat.attacked_permanent_kinds.contains_key(&other));
+        assert!(combat_attack_authority_is_coherent(&state));
+    }
+
+    /// CR 506.4: a type change written straight onto the permanent outside a layer
+    /// pass (turning face down rewrites the characteristics, CR 708.2a) still ends
+    /// the attack at the next settled pass, because the pass compares against the
+    /// kinds stored with the pin, not the kinds it finds at its own start. Writing the
+    /// planeswalker type back afterwards declares no new attack.
+    #[test]
+    fn type_change_written_outside_a_pass_retires_at_the_next_pass() {
+        let (mut state, source) = anchor_state();
+        make_creature(&mut state, source);
+        let karn = spawn_planeswalker(&mut state, 9, PlayerId(1));
+        {
+            let object = state.objects.get_mut(&karn).unwrap();
+            object.base_card_types = object.card_types.clone();
+        }
+        declare_targets(&mut state, &[(source, AttackTarget::Planeswalker(karn))]);
+        state.layers_dirty.mark_full();
+        crate::game::layers::flush_layers(&mut state);
+        assert!(state
+            .combat
+            .as_ref()
+            .unwrap()
+            .attacked_permanents
+            .contains_key(&source));
+
+        {
+            let object = state.objects.get_mut(&karn).unwrap();
+            object.card_types.core_types = vec![CoreType::Artifact, CoreType::Creature];
+            object.base_card_types = object.card_types.clone();
+        }
+        state.layers_dirty.mark_full();
+        crate::game::layers::flush_layers(&mut state);
+        assert!(!state
+            .combat
+            .as_ref()
+            .unwrap()
+            .attacked_permanents
+            .contains_key(&source));
+
+        {
+            let object = state.objects.get_mut(&karn).unwrap();
+            object.card_types.core_types = vec![CoreType::Planeswalker];
+            object.base_card_types = object.card_types.clone();
+        }
+        state.layers_dirty.mark_full();
+        crate::game::layers::flush_layers(&mut state);
+        let combat = state.combat.as_ref().unwrap();
+        assert!(!combat.attacked_permanents.contains_key(&source));
+        assert!(combat.attacked_permanent_kinds.is_empty());
+        assert!(combat.attackers.iter().any(|info| info.object_id == source));
+    }
+
+    /// CR 506.4 + CR 733: live retirement ends only the relations naming the exact
+    /// incarnation, as its replay requires, so a stale pin to another incarnation
+    /// of the same object id is left for its own authority and the journaled
+    /// retirement replays to the same relations.
+    #[test]
+    fn type_loss_retirement_matches_the_exact_pin() {
+        use crate::types::resolved_commands::ResolvedRulesCommand;
+        let (mut state, source) = anchor_state();
+        make_creature(&mut state, source);
+        let other = spawn_creature(&mut state, 2, "Other");
+        let karn = spawn_planeswalker(&mut state, 9, PlayerId(1));
+        declare_targets(
+            &mut state,
+            &[
+                (source, AttackTarget::Planeswalker(karn)),
+                (other, AttackTarget::Planeswalker(karn)),
+            ],
+        );
+        let live = ObjectIncarnationRef::from_object(&state.objects[&karn]);
+        let stale = ObjectIncarnationRef {
+            incarnation: live.incarnation.wrapping_add(1),
+            ..live
+        };
+        state
+            .combat
+            .as_mut()
+            .unwrap()
+            .attacked_permanents
+            .insert(other, stale);
+        let before = state.clone();
+
+        assert!(retire_incoming_attack_relations_journaled(&mut state, live));
+        let combat = state.combat.as_ref().unwrap();
+        assert!(!combat.attacked_permanents.contains_key(&source));
+        assert_eq!(combat.attacked_permanents.get(&other), Some(&stale));
+        let command = state
+            .resolved_rules_journal
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|entry| match entry.command.as_ref() {
+                Some(ResolvedRulesCommand::CombatMembership(command)) => Some(command.clone()),
+                _ => None,
+            })
+            .expect("the retirement is journaled");
+        assert_eq!(
+            command.edit,
+            ResolvedCombatMembershipEdit::RetireAttacked {
+                expected_attacked_by: vec![source],
+            }
+        );
+        let mut replay = before;
+        apply_resolved_combat_membership(&mut replay, &command).expect("replays");
+        assert_eq!(
+            replay.combat.as_ref().unwrap().attacked_permanents,
+            state.combat.as_ref().unwrap().attacked_permanents
+        );
     }
 
     /// CR 506.4d: a planeswalker creature that is blocking and being attacked keeps

@@ -24,6 +24,7 @@ use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
 use engine::types::game_state::{StackEntryKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
+use engine::types::mana::{ManaCost, ManaCostShard};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
@@ -2289,6 +2290,204 @@ fn swordjack_trigger_still_damages_a_planeswalker_that_kept_its_type() {
     resolve_response(&mut r, disenchant, song);
     assert_eq!(r.state().objects[&song].zone, Zone::Graveyard);
     assert!(is_planeswalker(&r, karn));
+
+    let mut ev = Vec::new();
+    settle(&mut r, &mut ev, true, 0);
+    assert_eq!(damage_from(&ev, jack), vec![(TargetRef::Object(karn), 3)]);
+    assert_eq!(loyalty(&r, karn), 2);
+    assert_eq!((life(&r, P0), life(&r, P1), life(&r, P2)), (20, 20, 20));
+}
+
+const MYCOSYNTH_LATTICE: &str = "All permanents are artifacts in addition to their other types.\nAll cards that aren't on the battlefield, spells, and permanents are colorless.\nPlayers may spend mana as though it were mana of any color.";
+const MARCH_OF_THE_MACHINES: &str = "Each noncreature artifact is an artifact creature with power and toughness each equal to its mana value. (Equipment that's a creature can't equip a creature.)";
+const CYBER_CONVERSION: &str =
+    "Turn target creature face down. It's a 2/2 Cyberman artifact creature.";
+const BREAK_OPEN: &str = "Turn target face-down creature an opponent controls face up.";
+const LIQUIMETAL_COATING: &str =
+    "{T}: Target permanent becomes an artifact in addition to its other types until end of turn.";
+
+/// Swordjack attacks a mana value 4 Karn (loyalty 5, controlled by P1) under Mycosynth
+/// Lattice and March of the Machines, so Karn is a 4/4 artifact creature planeswalker that
+/// Cyber Conversion can target. P2's bystander is a creature too. Swordjack counts three
+/// artifacts: itself, the Lattice and the March. P0 holds Cyber Conversion and Break Open.
+fn face_down_board() -> (GameRunner, ObjectId, ObjectId, ObjectId, ObjectId, ObjectId) {
+    let mut sc = scenario();
+    let jack = sc
+        .add_creature_from_oracle(P0, "Fathom Fleet Swordjack", 2, 2, SWORDJACK)
+        .id();
+    sc.add_artifact_from_oracle(P0, "Mycosynth Lattice", MYCOSYNTH_LATTICE)
+        .with_mana_cost(ManaCost::generic(6));
+    sc.add_enchantment_from_oracle(P0, "March of the Machines", MARCH_OF_THE_MACHINES)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Blue],
+            generic: 3,
+        });
+    let karn = sc
+        .add_planeswalker_from_oracle(P2, "Karn Stand-in", "Karn", 5, "+1: You gain 1 life.")
+        .as_planeswalker_with_loyalty("Karn", 5)
+        .with_mana_cost(ManaCost::generic(4))
+        .id();
+    let bystander = sc.add_creature(P2, "Bystander", 1, 1).id();
+    let conversion = sc
+        .add_spell_to_hand_from_oracle(P0, "Cyber Conversion", true, CYBER_CONVERSION)
+        .id();
+    let break_open = sc
+        .add_spell_to_hand_from_oracle(P0, "Break Open", true, BREAK_OPEN)
+        .id();
+    let mut r = sc.build();
+    control_by_p1(&mut r, karn);
+    (r, jack, karn, bystander, conversion, break_open)
+}
+
+fn attacked_by(r: &GameRunner, attacker: ObjectId) -> bool {
+    r.state()
+        .combat
+        .as_ref()
+        .unwrap()
+        .attacked_permanents
+        .contains_key(&attacker)
+}
+
+/// CR 506.4 + CR 506.4c + CR 708.2a: Cyber Conversion turns the attacked Karn face down,
+/// so it is a 2/2 Cyberman artifact creature and no planeswalker; Karn is removed from
+/// combat and stops being attacked, though the face change is written outside a layer pass.
+/// Break Open turns Karn face up, a planeswalker again, but that declares no new attack:
+/// the waiting trigger deals no damage to Karn or to anyone else.
+#[test]
+fn swordjack_trigger_deals_nothing_after_its_planeswalker_was_turned_face_down_and_up() {
+    let (mut r, jack, karn, _, conversion, break_open) = face_down_board();
+    attack(&mut r, &[(jack, AttackTarget::Planeswalker(karn))]);
+    assert_untargeted_triggers(&r, jack, 1);
+    assert!(is_planeswalker(&r, karn));
+    assert!(
+        r.state().objects[&karn]
+            .card_types
+            .core_types
+            .contains(&CoreType::Creature),
+        "reach: Karn is an artifact creature, so Cyber Conversion can target it"
+    );
+    assert!(attacked_by(&r, jack));
+
+    resolve_response(&mut r, conversion, karn);
+    assert!(
+        r.state().objects[&karn].face_down,
+        "reach: Karn is face down"
+    );
+    assert!(!is_planeswalker(&r, karn));
+    assert!(!attacked_by(&r, jack), "Karn is no longer attacked");
+    assert!(
+        r.state()
+            .combat
+            .as_ref()
+            .unwrap()
+            .attackers
+            .iter()
+            .any(|info| info.object_id == jack),
+        "CR 506.4c: Swordjack is still attacking"
+    );
+
+    resolve_response(&mut r, break_open, karn);
+    assert!(
+        !r.state().objects[&karn].face_down,
+        "reach: Karn is face up"
+    );
+    assert!(
+        is_planeswalker(&r, karn),
+        "reach: Karn is a planeswalker again"
+    );
+    assert!(!attacked_by(&r, jack));
+    assert_untargeted_triggers(&r, jack, 1);
+
+    let mut ev = Vec::new();
+    settle(&mut r, &mut ev, true, 0);
+    assert_eq!(
+        deal_damage_resolutions(&ev, jack),
+        1,
+        "the trigger resolved"
+    );
+    assert_eq!(damage_from(&ev, jack), vec![]);
+    assert_eq!(loyalty(&r, karn), 5);
+    assert_eq!((life(&r, P0), life(&r, P1), life(&r, P2)), (20, 20, 20));
+}
+
+/// Positive control for the same response sequence: Cyber Conversion and Break Open go to
+/// the bystander, Karn never stops being a planeswalker, and the trigger deals its 3 damage
+/// to Karn.
+#[test]
+fn swordjack_trigger_still_damages_a_planeswalker_another_creature_was_turned_face_down() {
+    let (mut r, jack, karn, bystander, conversion, break_open) = face_down_board();
+    attack(&mut r, &[(jack, AttackTarget::Planeswalker(karn))]);
+    assert_untargeted_triggers(&r, jack, 1);
+    resolve_response(&mut r, conversion, bystander);
+    assert!(r.state().objects[&bystander].face_down);
+    resolve_response(&mut r, break_open, bystander);
+    assert!(!r.state().objects[&bystander].face_down);
+    assert!(is_planeswalker(&r, karn));
+    assert!(attacked_by(&r, jack));
+
+    let mut ev = Vec::new();
+    settle(&mut r, &mut ev, true, 0);
+    assert_eq!(damage_from(&ev, jack), vec![(TargetRef::Object(karn), 3)]);
+    assert_eq!(loyalty(&r, karn), 2);
+    assert_eq!((life(&r, P0), life(&r, P1), life(&r, P2)), (20, 20, 20));
+}
+
+/// CR 506.4: a type change that leaves the attacked permanent a planeswalker does not end
+/// the attack. Liquimetal Coating makes the attacked Karn an artifact in addition to its
+/// other types, and Swordjack (two trinkets and the Coating: three artifacts) still deals
+/// its 3 damage to Karn.
+#[test]
+fn swordjack_trigger_still_damages_a_planeswalker_that_became_an_artifact() {
+    let mut sc = scenario();
+    let jack = sc
+        .add_creature_from_oracle(P0, "Fathom Fleet Swordjack", 2, 2, SWORDJACK)
+        .id();
+    for i in 0..2 {
+        sc.add_artifact_from_oracle(P0, &format!("Trinket {i}"), "");
+    }
+    let coating = sc
+        .add_artifact_from_oracle(P0, "Liquimetal Coating", LIQUIMETAL_COATING)
+        .id();
+    let karn = add_karn(&mut sc, 5);
+    let mut r = sc.build();
+    control_by_p1(&mut r, karn);
+    attack(&mut r, &[(jack, AttackTarget::Planeswalker(karn))]);
+    assert_untargeted_triggers(&r, jack, 1);
+
+    pass_to_p0(&mut r);
+    r.act(GameAction::ActivateAbility {
+        source_id: coating,
+        ability_index: 0,
+        payment_mode: Default::default(),
+    })
+    .expect("Liquimetal Coating activates");
+    if matches!(r.state().waiting_for, WaitingFor::TargetSelection { .. }) {
+        r.act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(karn)),
+        })
+        .expect("Karn is a legal target");
+    }
+    for _ in 0..24 {
+        if !r
+            .state()
+            .stack
+            .iter()
+            .any(|entry| entry.source_id == coating)
+        {
+            break;
+        }
+        r.act(GameAction::PassPriority).unwrap();
+    }
+    assert!(
+        r.state().objects[&karn]
+            .card_types
+            .core_types
+            .contains(&CoreType::Artifact),
+        "reach: Karn is an artifact"
+    );
+    assert!(is_planeswalker(&r, karn));
+    assert!(attacked_by(&r, jack), "Karn is still attacked");
+    assert_untargeted_triggers(&r, jack, 1);
 
     let mut ev = Vec::new();
     settle(&mut r, &mut ev, true, 0);

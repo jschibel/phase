@@ -52217,10 +52217,12 @@ mod restored_exact_attack_authority_tests {
             player.combat.as_mut().unwrap().attackers[0].attack_target = AttackTarget::Player(P1);
             player.combat.as_mut().unwrap().attacked_permanents.clear();
             let mut old = serialized(&player, trusted);
-            payload(&mut old, trusted)["combat"]
+            // An old payload predates both the pin map and its stored kinds.
+            let old_combat = payload(&mut old, trusted)["combat"]
                 .as_object_mut()
-                .unwrap()
-                .remove("attacked_permanents");
+                .unwrap();
+            old_combat.remove("attacked_permanents");
+            old_combat.remove("attacked_permanent_kinds");
             assert_eq!(
                 admitted(old).combat.as_ref().unwrap().attackers[0].object_id,
                 attacker

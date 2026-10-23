@@ -511,6 +511,9 @@ fn commit_final_attack_status(
     if let Some(combat_state) = state.combat.as_mut() {
         combat_state.attacked_permanents.remove(&context.source_id);
         combat_state
+            .attacked_permanent_kinds
+            .remove(&context.source_id);
+        combat_state
             .attackers
             .retain(|attacker| attacker.object_id != context.source_id);
     }
@@ -536,6 +539,8 @@ fn commit_final_attack_status(
         ));
         state.layers_dirty.mark_full();
     }
+    // CR 506.4: the new pin's kinds are the baseline for later type changes.
+    combat::record_attacked_kinds(state, context.source_id);
 }
 
 fn park_meld_entry_event(state: &mut GameState, source_id: ObjectId, events: &mut Vec<GameEvent>) {

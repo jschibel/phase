@@ -3543,9 +3543,6 @@ fn evaluate_layers_with_retirement_owner(
         .into_iter()
         .filter_map(|id| state.objects.get(&id).map(|o| (id, o.controller)))
         .collect();
-    // CR 506.4: the kinds of every permanent being attacked, before this pass, so
-    // the settled pass can retire the relations its type changes end.
-    let prev_attacked_kinds = super::combat::attacked_permanent_kinds(state);
 
     // CR 611.2b + CR 613.1: derive before ending durations. Every repeat
     // removes at least one stored effect, so convergence is monotone. Keep the
@@ -3556,13 +3553,7 @@ fn evaluate_layers_with_retirement_owner(
             break bf_ids;
         }
     };
-    finish_layer_evaluation(
-        state,
-        bf_ids,
-        prev_controllers,
-        &prev_attacked_kinds,
-        retirement_owner,
-    );
+    finish_layer_evaluation(state, bf_ids, prev_controllers, retirement_owner);
 }
 
 fn derive_layer_characteristics(state: &mut GameState) -> Vec<ObjectId> {
@@ -4073,10 +4064,6 @@ fn finish_layer_evaluation(
     state: &mut GameState,
     bf_ids: Vec<ObjectId>,
     prev_controllers: Vec<(ObjectId, PlayerId)>,
-    prev_attacked_kinds: &[(
-        crate::types::identifiers::ObjectIncarnationRef,
-        super::combat::AttackedPermanentKinds,
-    )],
     retirement_owner: StateDurationRetirementOwner,
 ) {
     // CR 613.11: Rule-changing continuous effects are applied after object
@@ -4118,11 +4105,13 @@ fn finish_layer_evaluation(
     // CR 506.4 + CR 506.4c + CR 506.4d + CR 506.4e: the same settled delta ends
     // being attacked for each permanent whose type change removes it from combat
     // (a planeswalker that stopped being one, a battle that stopped being one, a
-    // planeswalker-battle per CR 506.4e). Decided once, here, from the pre-pass
-    // kinds: the relation is retired, so restoring the type later declares no new
-    // attack. Only the incoming relations end; the attackers stay in combat
-    // (CR 506.4c) and the permanent keeps any blocking role (CR 506.4d).
-    let type_changed = super::combat::type_changed_attacked_permanents(state, prev_attacked_kinds);
+    // planeswalker-battle per CR 506.4e). Decided against the kinds stored with
+    // each pin at declaration or the last settled pass, so a face change written
+    // outside a pass (transform, face down, face up) is caught too. The relation
+    // is retired, so restoring the type later declares no new attack. Only the
+    // incoming relations end; the attackers stay in combat (CR 506.4c) and the
+    // permanent keeps any blocking role (CR 506.4d).
+    let type_changed = super::combat::type_changed_attacked_permanents(state);
     let attack_retired =
         retire_type_changed_attack_relations(state, &type_changed, retirement_owner);
     let controller_removed =
@@ -4131,6 +4120,9 @@ fn finish_layer_evaluation(
         evaluate_layers_with_retirement_owner(state, retirement_owner);
         return;
     }
+    // CR 506.4: this pass settled with no retirement left, so its kinds are the
+    // baseline the next settled pass compares against.
+    super::combat::refresh_attacked_kinds(state);
 
     super::pairing::cleanup_invalid_pairs(state);
     if super::effects::ring::normalize_ring_bearers(state) {
@@ -4197,23 +4189,24 @@ fn finish_layer_evaluation(
     state.layers_dirty = LayersDirty::Clean;
 }
 
-/// CR 506.4 + CR 733: retire the incoming attacked relations of each permanent in
-/// `changed`, journaled under a live layer settlement and replayed verbatim under
-/// an attachment command (whose own journal entry owns the settlement), exactly
-/// as [`remove_controller_changed_from_combat`] owns its removals.
+/// CR 506.4 + CR 733: retire the incoming attacked relations of each exact
+/// permanent incarnation in `changed`, journaled under a live layer settlement
+/// and replayed verbatim under an attachment command (whose own journal entry
+/// owns the settlement), exactly as [`remove_controller_changed_from_combat`]
+/// owns its removals.
 fn retire_type_changed_attack_relations(
     state: &mut GameState,
-    changed: &[ObjectId],
+    changed: &[ObjectIncarnationRef],
     owner: StateDurationRetirementOwner,
 ) -> bool {
     let mut retired = false;
-    for &id in changed {
+    for &pin in changed {
         retired |= match owner {
             StateDurationRetirementOwner::LayerSettlement => {
-                super::combat::retire_incoming_attack_relations_journaled(state, id)
+                super::combat::retire_incoming_attack_relations_journaled(state, pin)
             }
             StateDurationRetirementOwner::AttachmentCommand => {
-                !super::combat::retire_incoming_attack_relations(state, id).is_empty()
+                !super::combat::retire_incoming_attack_relations(state, pin).is_empty()
             }
         };
     }
