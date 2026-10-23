@@ -1141,6 +1141,91 @@ fn pick_looting(sticker: &AppliedSticker) -> bool {
     matches!(sticker, AppliedSticker::Ability { text, .. } if text.starts_with("{T}: Draw a card"))
 }
 
+/// CR 123.5 + CR 123.8 + CR 613.4b: a creature card returned to the battlefield
+/// keeps its P/T sticker, and that layer-7b setter can change a
+/// population read by another permanent. Grizzly Bears in the graveyard carries
+/// the 8/6 sticker (placed through the sticker resolver); the real Zombify
+/// returns it. A pre-existing creature whose static reads "a creature with power
+/// 4 or greater" (labeled staging: an Oracle-text card) must see the 8/6 entrant
+/// at the entry flush, not its printed 2/2.
+#[test]
+fn entering_pt_stickered_creature_updates_population_reads_of_other_permanents() {
+    let db = shared_card_db().expect("entry-flush sticker row requires the CardDB");
+    let mut scenario = main_phase();
+    let bears = scenario.add_real_card(P0, "Grizzly Bears", Zone::Graveyard, db);
+    let zombify = scenario.add_real_card(P0, "Zombify", Zone::Hand, db);
+    let watcher = scenario
+        .add_creature_from_oracle(
+            P0,
+            "Power Watcher",
+            1,
+            1,
+            "As long as you control a creature with power 4 or greater, this creature gets +2/+2.",
+        )
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        mana(&[
+            ManaType::Black,
+            ManaType::Colorless,
+            ManaType::Colorless,
+            ManaType::Colorless,
+        ]),
+    );
+    let mut runner = scenario.build();
+    set_player_sticker_sheets(
+        runner.state_mut(),
+        P0,
+        &["Ancestral Hot Dog Minotaur".to_string()],
+    );
+    runner.state_mut().players[0].add_player_counters(&PlayerCounterKind::Ticket, 10);
+    put_sticker_through_resolver(
+        &mut runner,
+        watcher,
+        bears,
+        StickerKind::PowerToughness,
+        &|sticker| {
+            matches!(
+                sticker,
+                AppliedSticker::PowerToughness {
+                    power: 8,
+                    toughness: 6,
+                    ..
+                }
+            )
+        },
+    );
+    flush_layers_full(&mut runner);
+    assert_eq!(
+        pt(runner.state(), bears),
+        (Some(8), Some(6)),
+        "graveyard 8/6"
+    );
+    assert_eq!(
+        pt(runner.state(), watcher),
+        (Some(1), Some(1)),
+        "no 4-power creature yet"
+    );
+
+    runner.cast(zombify).target_object(bears).commit();
+    for _ in 0..4 {
+        if runner.state().objects[&zombify].zone != Zone::Stack {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("pass priority to resolve Zombify");
+    }
+    assert_eq!(runner.state().objects[&bears].zone, Zone::Battlefield);
+    assert_eq!(runner.state().objects[&bears].stickers.len(), 1);
+    assert_eq!(pt(runner.state(), bears), (Some(8), Some(6)), "entrant 8/6");
+    assert_eq!(
+        pt(runner.state(), watcher),
+        (Some(3), Some(3)),
+        "the pre-existing watcher reads the 8/6 entrant at the entry flush"
+    );
+}
+
 fn copy_sticker_sheets(runner: &mut GameRunner) {
     set_player_sticker_sheets(
         runner.state_mut(),

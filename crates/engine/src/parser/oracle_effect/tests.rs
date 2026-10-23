@@ -84989,6 +84989,43 @@ fn repeat_directive_without_a_gate_or_with_successors_is_removed() {
     assert!(matches!(chain[2], Effect::Shuffle { .. }), "{mid:?}");
 }
 
+/// CR 608.2c: a "repeat this process" in an otherwise-branch is outside the
+/// supported "If C, do A and repeat this process" class (no printed card has one:
+/// the only "otherwise ... repeat this process" Oracle text is explore's reminder
+/// text). It fails closed — an honest `Unimplemented` gap, no surviving directive
+/// in either branch and no root loop — rather than looping or dropping silently.
+#[test]
+fn repeat_directive_in_an_otherwise_branch_fails_closed() {
+    fn every_effect(def: &AbilityDefinition, out: &mut Vec<Effect>) {
+        out.push((*def.effect).clone());
+        for next in [&def.sub_ability, &def.else_ability].into_iter().flatten() {
+            every_effect(next, out);
+        }
+    }
+    let parsed = parse_effect_chain(
+        "If you control a Forest, draw a card. Otherwise, mill a card and repeat this process.",
+        AbilityKind::Spell,
+    );
+    let mut effects = Vec::new();
+    every_effect(&parsed, &mut effects);
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::Draw { .. })),
+        "reach guard: the conditional head parsed: {parsed:?}"
+    );
+    assert!(
+        !effects.iter().any(Effect::is_repeat_directive),
+        "{parsed:?}"
+    );
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::Unimplemented { .. })
+                && e.unimplemented_description() == Some("repeat this process")),
+        "{parsed:?}"
+    );
+    assert_eq!(parsed.repeat_until, None, "{parsed:?}");
+}
+
 /// CR 608.2c: the `Bare` arm of the repeat-directive recognizer fires only for the
 /// comma-joined form ("..., put a loyalty counter on this planeswalker and repeat this
 /// process"), whose directive trails the gate of its own clause. The same instruction
